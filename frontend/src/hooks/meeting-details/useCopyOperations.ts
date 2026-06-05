@@ -194,8 +194,66 @@ export function useCopyOperations({
     }
   }, [aiSummary, meetingTitle, meeting, blockNoteSummaryRef]);
 
+  const handleSaveToObsidian = useCallback(async () => {
+    if (!hasVisibleSummaryContent(aiSummary)) {
+      toast.error('No summary content available to export');
+      return;
+    }
+
+    try {
+      let summaryMarkdown = '';
+      if (blockNoteSummaryRef.current?.getMarkdown) {
+        summaryMarkdown = await blockNoteSummaryRef.current.getMarkdown();
+      }
+      if (!summaryMarkdown && typeof aiSummary?.markdown === 'string') {
+        summaryMarkdown = aiSummary.markdown;
+      }
+      if (!summaryMarkdown && aiSummary) {
+        summaryMarkdown = Object.entries(aiSummary)
+          .filter(([key]) => key !== 'markdown' && key !== 'summary_json' && key !== '_section_order' && key !== 'MeetingName')
+          .map(([, section]) => {
+            if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
+              return `## ${section.title}\n\n${section.blocks.map((block: any) => `- ${block.content}`).join('\n')}`;
+            }
+            return '';
+          })
+          .filter((section) => section.trim())
+          .join('\n\n');
+      }
+      if (!summaryMarkdown.trim()) {
+        toast.error('No summary content available to export');
+        return;
+      }
+
+      const allTranscripts = await fetchAllTranscripts(meeting.id);
+      const transcriptMarkdown = allTranscripts
+        .map((transcript) => `${formatTranscriptTime(transcript.audio_start_time, transcript.timestamp)} ${transcript.text}`)
+        .join('\n\n');
+      const result = await invokeTauri('export_meeting_to_obsidian', {
+        meetingId: meeting.id,
+        title: meetingTitle || meeting.title || 'Untitled Meeting',
+        createdAt: meeting.created_at,
+        summaryMarkdown,
+        transcriptMarkdown,
+      }) as { relative_path: string };
+
+      toast.success('Saved to Obsidian', { description: result.relative_path });
+      await Analytics.track('obsidian_export_completed', {
+        meeting_id: meeting.id,
+        transcript_length: allTranscripts.length.toString(),
+        has_summary: 'true',
+      });
+    } catch (error) {
+      console.error('❌ Failed to save to Obsidian:', error);
+      toast.error('Failed to save to Obsidian', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [aiSummary, blockNoteSummaryRef, fetchAllTranscripts, meeting, meetingTitle]);
+
   return {
     handleCopyTranscript,
     handleCopySummary,
+    handleSaveToObsidian,
   };
 }

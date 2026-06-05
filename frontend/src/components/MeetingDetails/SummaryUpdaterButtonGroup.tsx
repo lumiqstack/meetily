@@ -2,7 +2,7 @@
 
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, Save, Loader2 } from 'lucide-react';
+import { BookOpen, Copy, Save, Loader2 } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 
 interface SummaryUpdaterButtonGroupProps {
@@ -10,6 +10,7 @@ interface SummaryUpdaterButtonGroupProps {
   isDirty: boolean;
   onSave: () => Promise<void>;
   onCopy: () => Promise<void>;
+  onSaveToObsidian: () => Promise<void>;
 }
 
 export function SummaryUpdaterButtonGroup({
@@ -17,6 +18,7 @@ export function SummaryUpdaterButtonGroup({
   isDirty,
   onSave,
   onCopy,
+  onSaveToObsidian,
 }: SummaryUpdaterButtonGroupProps) {
   return (
     <ButtonGroup>
@@ -58,6 +60,20 @@ export function SummaryUpdaterButtonGroup({
       >
         <Copy />
         <span className="hidden @[40rem]:inline">Copy</span>
+      </Button>
+
+      <Button
+        variant="outline"
+        size="sm"
+        title="Save to Obsidian"
+        onClick={() => {
+          Analytics.trackButtonClick('save_to_obsidian', 'meeting_details');
+          void onSaveToObsidian();
+        }}
+        className="cursor-pointer"
+      >
+        <BookOpen />
+        <span className="hidden lg:inline">Obsidian</span>
       </Button>
 
     </ButtonGroup>
