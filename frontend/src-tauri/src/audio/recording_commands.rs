@@ -106,6 +106,9 @@ static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
+// Tracks whether the current recording started the live transcription pipeline.
+static REALTIME_TRANSCRIPTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 const TRANSCRIPTION_RUNTIME_START_ERROR_CODE: &str =
     "TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED";
 const TRANSCRIPTION_RUNTIME_USER_MESSAGE: &str = "Speech recognition could not initialize. Restart Meetily. If the problem continues, repair or reinstall the app.";
@@ -147,6 +150,20 @@ fn map_recording_start_error<R: Runtime>(
             TRANSCRIPTION_RUNTIME_START_ERROR_CODE.to_string()
         }
         RecordingStartError::Other(error) => format!("Failed to start recording: {error}"),
+    }
+}
+
+async fn is_realtime_transcription_enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
+    match crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None).await {
+        Ok(Some(config)) => config.realtime_transcription_enabled,
+        Ok(None) => false,
+        Err(error) => {
+            warn!(
+                "Failed to read transcript config; defaulting realtime transcription off: {}",
+                error
+            );
+            false
+        }
     }
 }
 
@@ -322,30 +339,30 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
-    if let Err(error) = crate::ensure_onnx_runtime_available() {
-        return Err(map_recording_start_error(
-            &app,
-            RecordingStartError::TranscriptionRuntime(error),
-        ));
+    let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    if realtime_transcription_enabled {
+        if let Err(error) = crate::ensure_onnx_runtime_available() {
+            return Err(map_recording_start_error(
+                &app,
+                RecordingStartError::TranscriptionRuntime(error),
+            ));
+        }
+
+        info!("🔍 Validating transcription model availability before starting recording...");
+        if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
+            error!("Model validation failed: {}", validation_error);
+            let _ = app.emit("transcription-error", serde_json::json!({
+                "error": validation_error,
+                "userMessage": format!("Recording cannot start: {}", validation_error),
+                "actionable": false,
+                "phase": "startup"
+            }));
+            return Err(validation_error);
+        }
+        info!("✅ Transcription model validation passed");
+    } else {
+        info!("Realtime transcription disabled; skipping model validation and live worker startup");
     }
-
-    // Validate that transcription models are available before starting recording
-    info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": format!("Recording cannot start: {}", validation_error),
-            "actionable": false,
-            "phase": "startup"
-        }));
-
-        return Err(validation_error);
-    }
-    info!("✅ Transcription model validation passed");
 
     // Notify frontend that startup has begun (surfaces STARTING state)
     app.emit("recording-starting", serde_json::json!({
@@ -427,11 +444,14 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     finalize_recording_start();
     drop(engine_lifecycle_guard);
 
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
+    REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
+    if realtime_transcription_enabled {
+        let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
+    } else {
+        drop(transcription_receiver);
+        *TRANSCRIPTION_TASK.lock().unwrap() = None;
     }
 
     // CRITICAL: Listen for transcript-update events and save to recording manager
@@ -471,7 +491,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     app.emit("recording-started", serde_json::json!({
         "message": "Recording started successfully with parallel processing",
         "devices": ["Default Microphone", "Default System Audio"],
-        "workers": 3
+        "workers": if realtime_transcription_enabled { 3 } else { 0 },
+        "realtime_transcription_enabled": realtime_transcription_enabled
     })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
@@ -512,30 +533,30 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
-    if let Err(error) = crate::ensure_onnx_runtime_available() {
-        return Err(map_recording_start_error(
-            &app,
-            RecordingStartError::TranscriptionRuntime(error),
-        ));
+    let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    if realtime_transcription_enabled {
+        if let Err(error) = crate::ensure_onnx_runtime_available() {
+            return Err(map_recording_start_error(
+                &app,
+                RecordingStartError::TranscriptionRuntime(error),
+            ));
+        }
+
+        info!("🔍 Validating transcription model availability before starting recording...");
+        if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
+            error!("Model validation failed: {}", validation_error);
+            let _ = app.emit("transcription-error", serde_json::json!({
+                "error": validation_error,
+                "userMessage": format!("Recording cannot start: {}", validation_error),
+                "actionable": false,
+                "phase": "startup"
+            }));
+            return Err(validation_error);
+        }
+        info!("✅ Transcription model validation passed");
+    } else {
+        info!("Realtime transcription disabled; skipping model validation and live worker startup");
     }
-
-    // Validate that transcription models are available before starting recording
-    info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": format!("Recording cannot start: {}", validation_error),
-            "actionable": false,
-            "phase": "startup"
-        }));
-
-        return Err(validation_error);
-    }
-    info!("✅ Transcription model validation passed");
 
     // Notify frontend that startup has begun (surfaces STARTING state)
     app.emit("recording-starting", serde_json::json!({
@@ -614,11 +635,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     finalize_recording_start();
     drop(engine_lifecycle_guard);
 
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
-    {
+    REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
+    if realtime_transcription_enabled {
+        let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
+    } else {
+        drop(transcription_receiver);
+        *TRANSCRIPTION_TASK.lock().unwrap() = None;
     }
 
     // CRITICAL: Listen for transcript-update events and save to recording manager
@@ -661,7 +685,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
             system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
         ],
-        "workers": 3
+        "workers": if realtime_transcription_enabled { 3 } else { 0 },
+        "realtime_transcription_enabled": realtime_transcription_enabled
     })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
@@ -680,6 +705,8 @@ pub async fn stop_recording<R: Runtime>(
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
+    let realtime_transcription_was_active =
+        REALTIME_TRANSCRIPTION_ACTIVE.swap(false, Ordering::SeqCst);
 
     // Check if recording is active
     if !IS_RECORDING.load(Ordering::SeqCst) {
@@ -845,7 +872,8 @@ pub async fn stop_recording<R: Runtime>(
         }
     };
 
-    match config.as_deref() {
+    if realtime_transcription_was_active {
+        match config.as_deref() {
         Some("parakeet") => {
             info!("🦜 Unloading Parakeet model...");
             let engine_clone = {
@@ -896,6 +924,7 @@ pub async fn stop_recording<R: Runtime>(
             } else {
                 warn!("⚠️ No Whisper engine found to unload model");
             }
+        }
         }
     }
 
@@ -994,6 +1023,7 @@ pub async fn stop_recording<R: Runtime>(
             chunks_processed,
             transcript_segments_count,
             had_fatal_error,
+            realtime_transcription_was_active,
         )
         .await
         {
@@ -1085,7 +1115,8 @@ pub async fn stop_recording<R: Runtime>(
         serde_json::json!({
             "message": "Recording stopped - frontend will save after all transcripts received",
             "folder_path": folder_path_str,
-            "meeting_name": meeting_name_str
+            "meeting_name": meeting_name_str,
+            "realtime_transcription_enabled": realtime_transcription_was_active
         }),
     )
     .map_err(|e| e.to_string())?;
