@@ -30,6 +30,11 @@ const END_EVENT = 'teams-call-likely-ended';
 const START_COOLDOWN_KEY = 'teams_meeting_detection_start_dismissed_until';
 const STOP_COOLDOWN_KEY = 'teams_meeting_detection_stop_dismissed_until';
 
+const isTauriRuntime = () => (
+  typeof window !== 'undefined' &&
+  '__TAURI_INTERNALS__' in window
+);
+
 export function TeamsMeetingDetectionProvider({ children }: { children: React.ReactNode }) {
   const recordingState = useRecordingState();
   const {
@@ -50,12 +55,16 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
   }, [meetingDetectionSettings]);
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
+
     loadPreferences().catch(error => {
       console.error('[TeamsMeetingDetection] Failed to load preferences:', error);
     });
   }, [loadPreferences]);
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
+
     let cleanupFns: Array<() => void> = [];
     let cleanedUp = false;
 
