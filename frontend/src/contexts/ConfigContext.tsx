@@ -50,6 +50,19 @@ export interface MeetingDetectionSettings {
   teams_prompt_cooldown_minutes: number;
 }
 
+const DEFAULT_MEETING_DETECTION_SETTINGS: MeetingDetectionSettings = {
+  meeting_detection_enabled: false,
+  teams_detection_enabled: true,
+  teams_prompt_start: true,
+  teams_prompt_stop: true,
+  teams_prompt_cooldown_minutes: 30,
+};
+
+const isTauriRuntime = () => (
+  typeof window !== 'undefined' &&
+  '__TAURI_INTERNALS__' in window
+);
+
 interface ConfigContextType {
   // Model configuration
   modelConfig: ModelConfig;
@@ -450,11 +463,15 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       }
 
       try {
-        const meetingSettings = await invoke<MeetingDetectionSettings>('get_meeting_detection_settings');
-        setMeetingDetectionSettings(meetingSettings);
+        if (isTauriRuntime()) {
+          const meetingSettings = await invoke<MeetingDetectionSettings>('get_meeting_detection_settings');
+          setMeetingDetectionSettings(meetingSettings);
+        } else {
+          setMeetingDetectionSettings(DEFAULT_MEETING_DETECTION_SETTINGS);
+        }
       } catch (meetingDetectionError) {
         console.error('[ConfigContext] Failed to load meeting detection settings:', meetingDetectionError);
-        setMeetingDetectionSettings(null);
+        setMeetingDetectionSettings(DEFAULT_MEETING_DETECTION_SETTINGS);
       }
 
       // Load storage locations
@@ -492,6 +509,11 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const updateMeetingDetectionSettings = useCallback(async (settings: MeetingDetectionSettings) => {
+    if (!isTauriRuntime()) {
+      setMeetingDetectionSettings(settings);
+      return;
+    }
+
     try {
       await invoke('set_meeting_detection_settings', { settings });
       setMeetingDetectionSettings(settings);
