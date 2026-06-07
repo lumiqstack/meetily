@@ -9,6 +9,11 @@ import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
 import { toast } from "sonner"
 
+const isTauriRuntime = () => (
+  typeof window !== 'undefined' &&
+  '__TAURI_INTERNALS__' in window
+);
+
 export function PreferenceSettings() {
   const {
     notificationSettings,
@@ -37,6 +42,10 @@ export function PreferenceSettings() {
 
   useEffect(() => {
     const loadObsidianSettings = async () => {
+      if (!isTauriRuntime()) {
+        return;
+      }
+
       try {
         const settings = await invoke<{ vault_path?: string | null; filename_template?: string }>('get_obsidian_settings');
         setObsidianVaultPath(settings.vault_path || "");
@@ -155,6 +164,11 @@ export function PreferenceSettings() {
   };
 
   const handleSaveObsidianPath = async () => {
+    if (!isTauriRuntime()) {
+      toast.error('Obsidian settings are only available in the desktop app');
+      return;
+    }
+
     setIsSavingObsidianPath(true);
 
     try {
@@ -177,6 +191,11 @@ export function PreferenceSettings() {
   };
 
   const handleOpenObsidianMeetingsFolder = async () => {
+    if (!isTauriRuntime()) {
+      toast.error('Obsidian folders are only available in the desktop app');
+      return;
+    }
+
     try {
       await invoke('open_obsidian_meetings_folder');
       await Analytics.track('storage_folder_opened', {
@@ -189,6 +208,11 @@ export function PreferenceSettings() {
   };
 
   const handleClearObsidianPath = async () => {
+    if (!isTauriRuntime()) {
+      setObsidianVaultPath("");
+      return;
+    }
+
     setObsidianVaultPath("");
 
     try {
