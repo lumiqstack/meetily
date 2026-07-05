@@ -217,7 +217,8 @@ const Sidebar: React.FC = () => {
         provider: configToSave.provider,
         model: configToSave.model,
         realtimeTranscriptionEnabled: configToSave.realtimeTranscriptionEnabled ?? false,
-        apiKey: configToSave.apiKey ?? null
+        apiKey: configToSave.apiKey ?? null,
+        baseUrl: configToSave.baseUrl ?? null
       };
       console.log('Saving transcript config with payload:', payload);
 
@@ -226,6 +227,7 @@ const Sidebar: React.FC = () => {
         model: payload.model,
         realtimeTranscriptionEnabled: payload.realtimeTranscriptionEnabled,
         apiKey: payload.apiKey,
+        baseUrl: payload.baseUrl,
       });
 
 

@@ -136,6 +136,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     provider: 'parakeet',
     model: 'parakeet-tdt-0.6b-v3-int8',
     apiKey: null,
+    baseUrl: null,
     realtimeTranscriptionEnabled: false
   });
 
@@ -230,6 +231,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             provider: config.provider || 'parakeet',
             model: config.model || 'parakeet-tdt-0.6b-v3-int8',
             apiKey: config.apiKey || null,
+            baseUrl: config.baseUrl || null,
             realtimeTranscriptionEnabled: config.realtimeTranscriptionEnabled ?? false
           });
         }

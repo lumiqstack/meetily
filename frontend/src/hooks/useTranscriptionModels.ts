@@ -8,7 +8,7 @@ export interface RawModelInfo {
 }
 
 export interface ModelOption {
-  provider: 'whisper' | 'parakeet';
+  provider: 'whisper' | 'parakeet' | 'openaiCompatible';
   name: string;
   displayName: string;
   size_mb: number;
@@ -77,6 +77,16 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
       console.error('Failed to fetch Parakeet models:', err);
     }
 
+    // Offer the configured remote endpoint as a model option
+    if (transcriptModelConfig?.provider === 'openaiCompatible' && transcriptModelConfig?.model) {
+      allModels.unshift({
+        provider: 'openaiCompatible',
+        name: transcriptModelConfig.model,
+        displayName: `🌐 Remote: ${transcriptModelConfig.model}`,
+        size_mb: 0,
+      });
+    }
+
     setAvailableModels(allModels);
 
     // Set default model based on user's saved configuration
@@ -88,7 +98,8 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
     const configuredMatch = allModels.find(
       (m) =>
         (configuredProvider === 'localWhisper' && m.provider === 'whisper' && m.name === configuredModel) ||
-        (configuredProvider === 'parakeet' && m.provider === 'parakeet' && m.name === configuredModel)
+        (configuredProvider === 'parakeet' && m.provider === 'parakeet' && m.name === configuredModel) ||
+        (configuredProvider === 'openaiCompatible' && m.provider === 'openaiCompatible' && m.name === configuredModel)
     );
 
     // Only set default model if user hasn't manually selected one

@@ -177,6 +177,26 @@ impl SettingsRepository {
         Ok(())
     }
 
+    pub async fn save_transcript_base_url(
+        pool: &SqlitePool,
+        base_url: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, openaiCompatibleBaseUrl)
+            VALUES ('1', 'parakeet', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                openaiCompatibleBaseUrl = excluded.openaiCompatibleBaseUrl
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(base_url)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_api_key(
         pool: &SqlitePool,
         provider: &str,
@@ -189,6 +209,7 @@ impl SettingsRepository {
             "elevenLabs" => "elevenLabsApiKey",
             "groq" => "groqApiKey",
             "openai" => "openaiApiKey",
+            "openaiCompatible" => "openaiCompatibleApiKey",
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -221,6 +242,7 @@ impl SettingsRepository {
             "elevenLabs" => "elevenLabsApiKey",
             "groq" => "groqApiKey",
             "openai" => "openaiApiKey",
+            "openaiCompatible" => "openaiCompatibleApiKey",
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
