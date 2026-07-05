@@ -12,9 +12,10 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai' | 'openaiCompatible';
     model: string;
     apiKey?: string | null;
+    baseUrl?: string | null;
     realtimeTranscriptionEnabled: boolean;
 }
 
@@ -31,11 +32,26 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    const [remoteBaseUrl, setRemoteBaseUrl] = useState<string>(transcriptModelConfig.baseUrl || '');
+    const [remoteModel, setRemoteModel] = useState<string>(
+        transcriptModelConfig.provider === 'openaiCompatible' ? transcriptModelConfig.model : ''
+    );
+    const [remoteSaveStatus, setRemoteSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
         setUiProvider(transcriptModelConfig.provider);
     }, [transcriptModelConfig.provider]);
+
+    // Sync remote provider fields when backend config loads
+    useEffect(() => {
+        if (transcriptModelConfig.baseUrl) {
+            setRemoteBaseUrl(transcriptModelConfig.baseUrl);
+        }
+        if (transcriptModelConfig.provider === 'openaiCompatible' && transcriptModelConfig.model) {
+            setRemoteModel(transcriptModelConfig.model);
+        }
+    }, [transcriptModelConfig.baseUrl, transcriptModelConfig.provider, transcriptModelConfig.model]);
 
     useEffect(() => {
         if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
@@ -61,6 +77,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         elevenLabs: ['eleven_multilingual_v2'],
         groq: ['llama-3.3-70b-versatile'],
         openai: ['gpt-4o'],
+        openaiCompatible: [], // Model entered as free text in the remote settings panel
     };
     const requiresApiKey = transcriptModelConfig.provider === 'deepgram' || transcriptModelConfig.provider === 'elevenLabs' || transcriptModelConfig.provider === 'openai' || transcriptModelConfig.provider === 'groq';
 
@@ -99,6 +116,40 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const handleSaveRemoteConfig = async () => {
+        const baseUrl = remoteBaseUrl.trim();
+        const model = remoteModel.trim();
+        if (!baseUrl || !model) {
+            setRemoteSaveStatus('error');
+            return;
+        }
+
+        setRemoteSaveStatus('saving');
+        const updatedConfig: TranscriptModelProps = {
+            ...transcriptModelConfig,
+            provider: 'openaiCompatible',
+            model,
+            baseUrl,
+            apiKey: apiKey || null,
+        };
+
+        try {
+            await invoke('api_save_transcript_config', {
+                provider: 'openaiCompatible',
+                model,
+                realtimeTranscriptionEnabled: transcriptModelConfig.realtimeTranscriptionEnabled ?? false,
+                apiKey: apiKey || null,
+                baseUrl,
+            });
+            setTranscriptModelConfig(updatedConfig);
+            setRemoteSaveStatus('saved');
+            setTimeout(() => setRemoteSaveStatus('idle'), 2000);
+        } catch (err) {
+            console.error('Failed to save remote transcription config:', err);
+            setRemoteSaveStatus('error');
+        }
+    };
+
     const handleRealtimeToggle = async (checked: boolean) => {
         const updatedConfig = {
             ...transcriptModelConfig,
@@ -112,6 +163,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 model: updatedConfig.model,
                 realtimeTranscriptionEnabled: checked,
                 apiKey: updatedConfig.apiKey ?? null,
+                baseUrl: updatedConfig.baseUrl ?? null,
             });
         } catch (err) {
             console.error('Failed to save realtime transcription setting:', err);
@@ -167,6 +219,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 <SelectContent>
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
+                                    <SelectItem value="openaiCompatible">🌐 Remote (OpenAI-compatible)</SelectItem>
                                     {/* <SelectItem value="deepgram">☁️ Deepgram (Backup)</SelectItem>
                                     <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
                                     <SelectItem value="groq">☁️ Groq</SelectItem>
@@ -174,7 +227,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectContent>
                             </Select>
 
-                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && (
+                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && uiProvider !== 'openaiCompatible' && (
                                 <Select
                                     value={transcriptModelConfig.model}
                                     onValueChange={(value) => {
@@ -213,6 +266,86 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onModelSelect={handleParakeetModelSelect}
                                 autoSave={true}
                             />
+                        </div>
+                    )}
+
+                    {uiProvider === 'openaiCompatible' && (
+                        <div className="mt-6 space-y-4 rounded-md border border-gray-200 bg-white px-4 py-4">
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Server Base URL
+                                </Label>
+                                <Input
+                                    type="text"
+                                    className="focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                    value={remoteBaseUrl}
+                                    onChange={(e) => setRemoteBaseUrl(e.target.value)}
+                                    placeholder="http://127.0.0.1:8000/v1"
+                                />
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Any server exposing the OpenAI audio transcriptions API (oMLX, LiteLLM, vLLM, OpenAI, ...).
+                                    Audio is sent to {'{base}'}/audio/transcriptions.
+                                </p>
+                            </div>
+
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Model
+                                </Label>
+                                <Input
+                                    type="text"
+                                    className="focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                    value={remoteModel}
+                                    onChange={(e) => setRemoteModel(e.target.value)}
+                                    placeholder="whisper-1"
+                                />
+                            </div>
+
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    API Key (optional)
+                                </Label>
+                                <div className="relative">
+                                    <Input
+                                        type={showApiKey ? "text" : "password"}
+                                        className="pr-12 focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                        value={apiKey || ''}
+                                        onChange={(e) => setApiKey(e.target.value)}
+                                        placeholder="Enter API key if the server requires one"
+                                    />
+                                    <div className="absolute inset-y-0 right-0 pr-1 flex items-center">
+                                        <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="icon"
+                                            onClick={() => setShowApiKey(!showApiKey)}
+                                        >
+                                            {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                        </Button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-3">
+                                <Button
+                                    type="button"
+                                    onClick={handleSaveRemoteConfig}
+                                    disabled={isRecording || remoteSaveStatus === 'saving' || !remoteBaseUrl.trim() || !remoteModel.trim()}
+                                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                                >
+                                    {remoteSaveStatus === 'saving' ? 'Saving...' : 'Save Remote Settings'}
+                                </Button>
+                                {remoteSaveStatus === 'saved' && (
+                                    <span className="text-sm text-green-600">Saved</span>
+                                )}
+                                {remoteSaveStatus === 'error' && (
+                                    <span className="text-sm text-red-600">
+                                        {!remoteBaseUrl.trim() || !remoteModel.trim()
+                                            ? 'Base URL and model are required'
+                                            : 'Failed to save settings'}
+                                    </span>
+                                )}
+                            </div>
                         </div>
                     )}
 

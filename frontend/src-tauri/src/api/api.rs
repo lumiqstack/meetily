@@ -103,6 +103,9 @@ pub struct TranscriptConfig {
     pub realtime_transcription_enabled: bool,
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
+    /// Base URL for the openaiCompatible provider (e.g. "http://127.0.0.1:8000/v1")
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +116,8 @@ pub struct SaveTranscriptConfigRequest {
     pub realtime_transcription_enabled: bool,
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -624,6 +629,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                         model: config.model,
                         realtime_transcription_enabled: config.realtime_transcription_enabled,
                         api_key,
+                        base_url: config.openai_compatible_base_url,
                     }))
                 }
                 Err(e) => {
@@ -643,6 +649,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                 model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
                 realtime_transcription_enabled: false,
                 api_key: None,
+                base_url: None,
             }))
         }
         Err(e) => {
@@ -660,6 +667,7 @@ pub async fn api_save_transcript_config<R: Runtime>(
     model: String,
     realtime_transcription_enabled: Option<bool>,
     api_key: Option<String>,
+    base_url: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -696,6 +704,16 @@ pub async fn api_save_transcript_config<R: Runtime>(
             if let Err(e) = SettingsRepository::save_transcript_api_key(pool, &provider, &key).await
             {
                 log_error!("Failed to save transcript API key: {}", e);
+                return Err(e.to_string());
+            }
+        }
+    }
+
+    if let Some(url) = base_url {
+        if !url.is_empty() {
+            log_info!("Base URL provided, saving for transcript provider...");
+            if let Err(e) = SettingsRepository::save_transcript_base_url(pool, &url).await {
+                log_error!("Failed to save transcript base URL: {}", e);
                 return Err(e.to_string());
             }
         }

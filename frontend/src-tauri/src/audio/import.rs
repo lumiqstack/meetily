@@ -266,6 +266,7 @@ pub async fn start_import<R: Runtime>(
     IMPORT_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
     let result = run_import(
         app.clone(),
         source_path,
@@ -276,8 +277,11 @@ pub async fn start_import<R: Runtime>(
     )
     .await;
 
-    // Unload the engine after the batch job (success, failure, or cancellation)
-    super::common::unload_engine_after_batch(use_parakeet).await;
+    // Unload the engine after the batch job (success, failure, or cancellation).
+    // Remote transcription loads no local model, so there is nothing to unload.
+    if !use_remote {
+        super::common::unload_engine_after_batch(use_parakeet).await;
+    }
 
     // Guard will automatically clear flag on drop
     // No need for manual: IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -330,6 +334,7 @@ async fn run_import<R: Runtime>(
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
 
     emit_progress(&app, "copying", 5, "Creating meeting folder...");
 
@@ -508,13 +513,25 @@ async fn run_import<R: Runtime>(
     emit_progress(&app, "transcribing", 30, "Loading transcription engine...");
 
     // Initialize the appropriate engine
-    let whisper_engine = if !use_parakeet && total_segments > 0 {
+    let whisper_engine = if !use_parakeet && !use_remote && total_segments > 0 {
         Some(get_or_init_whisper(&app, model.as_deref()).await?)
     } else {
         None
     };
     let parakeet_engine = if use_parakeet && total_segments > 0 {
         Some(get_or_init_parakeet(&app, model.as_deref()).await?)
+    } else {
+        None
+    };
+    let remote_provider = if use_remote && total_segments > 0 {
+        Some(
+            crate::audio::transcription::OpenAICompatibleProvider::from_saved_settings(
+                &app,
+                model.clone(),
+            )
+            .await
+            .map_err(|e| anyhow!(e))?,
+        )
     } else {
         None
     };
@@ -579,7 +596,15 @@ async fn run_import<R: Runtime>(
         }
 
         // Transcribe
-        let (text, conf) = if use_parakeet {
+        let (text, conf) = if use_remote {
+            use crate::audio::transcription::TranscriptionProvider;
+            let engine = remote_provider.as_ref().unwrap();
+            let result = engine
+                .transcribe(segment.samples.clone(), language.clone())
+                .await
+                .map_err(|e| anyhow!("Remote transcription failed on segment {}: {}", i, e))?;
+            (result.text, result.confidence.unwrap_or(0.9))
+        } else if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
             let text = engine
                 .transcribe_audio(segment.samples.clone())

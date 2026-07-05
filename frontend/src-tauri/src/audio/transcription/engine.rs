@@ -75,6 +75,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
                 realtime_transcription_enabled: false,
                 api_key: None,
+                base_url: None,
             }
         }
         Err(e) => {
@@ -84,6 +85,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
                 realtime_transcription_enabled: false,
                 api_key: None,
+                base_url: None,
             }
         }
     };
@@ -137,10 +139,32 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 }
             }
         }
+        "openaiCompatible" => {
+            info!("🔍 Validating OpenAI-compatible transcription endpoint config...");
+            let base_url = config.base_url.as_deref().unwrap_or("").trim();
+            if base_url.is_empty() {
+                return Err(
+                    "Remote transcription endpoint is not configured. Please set the base URL in transcript settings.".to_string(),
+                );
+            }
+            if config.model.trim().is_empty() {
+                return Err(
+                    "Remote transcription model is not configured. Please set the model name in transcript settings.".to_string(),
+                );
+            }
+            // Construct the provider to validate the URL; no model download needed.
+            super::openai_compatible_provider::OpenAICompatibleProvider::new(
+                base_url,
+                config.model.clone(),
+                config.api_key.clone(),
+            )?;
+            info!("✅ OpenAI-compatible endpoint config valid: {}", base_url);
+            Ok(())
+        }
         other => {
             warn!("❌ Unsupported transcription provider for local recording: {}", other);
             Err(format!(
-                "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
+                "Provider '{}' is not supported for local transcription. Please select 'localWhisper', 'parakeet', or 'openaiCompatible'.",
                 other
             ))
         }
@@ -173,6 +197,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
                 realtime_transcription_enabled: false,
                 api_key: None,
+                base_url: None,
             }
         }
         Err(e) => {
@@ -182,6 +207,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
                 realtime_transcription_enabled: false,
                 api_key: None,
+                base_url: None,
             }
         }
     };
@@ -215,6 +241,24 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                     Err("Parakeet engine not initialized. This should not happen after validation.".to_string())
                 }
             }
+        }
+        "openaiCompatible" => {
+            info!("🌐 Initializing OpenAI-compatible remote transcription provider");
+            let base_url = config
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .ok_or_else(|| {
+                    "Remote transcription endpoint is not configured. Please set the base URL in transcript settings.".to_string()
+                })?;
+
+            let provider = super::openai_compatible_provider::OpenAICompatibleProvider::new(
+                base_url,
+                config.model.clone(),
+                config.api_key.clone(),
+            )?;
+            Ok(TranscriptionEngine::Provider(Arc::new(provider)))
         }
         "localWhisper" | _ => {
             info!("🎤 Initializing Whisper transcription engine");
