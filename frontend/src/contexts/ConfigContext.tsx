@@ -296,6 +296,33 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             }
           }
 
+          // If provider is copilot-cli, fetch the additional config
+          if (data.provider === 'copilot-cli') {
+            try {
+              const copilotConfig = await configService.getCopilotCliConfig();
+              if (copilotConfig) {
+                const resolvedModel = copilotConfig.model || data.model || 'auto';
+                setModelConfig(prev => ({
+                  ...prev,
+                  provider: data.provider,
+                  model: resolvedModel,
+                  whisperModel: data.whisperModel || prev.whisperModel,
+                  copilotCliBinaryPath: copilotConfig.binaryPath,
+                  copilotCliGithubToken: copilotConfig.githubToken,
+                }));
+
+                // Seed per-provider model cache from DB
+                const map = JSON.parse(localStorage.getItem('providerModelMap') || '{}');
+                map[data.provider] = resolvedModel;
+                localStorage.setItem('providerModelMap', JSON.stringify(map));
+
+                return; // Early return
+              }
+            } catch (err) {
+              console.error('[ConfigContext] Failed to fetch Copilot CLI config:', err);
+            }
+          }
+
           // For non-custom-openai providers, just set base config
           setModelConfig(prev => ({
             ...prev,
@@ -398,6 +425,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
     'builtin-ai': [],
     'custom-openai': [],
+    'copilot-cli': ['auto'],
   };
 
   // Toggle confidence indicator with localStorage persistence

@@ -1,5 +1,6 @@
 use crate::summary::llm_client::{generate_summary, LLMProvider};
 use crate::summary::templates::Template;
+use crate::summary::CopilotCliConfig;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -311,6 +312,7 @@ pub fn extract_meeting_name_from_markdown(markdown: &str) -> Option<String> {
 /// * `temperature` - Optional temperature (CustomOpenAI provider)
 /// * `top_p` - Optional top_p (CustomOpenAI provider)
 /// * `app_data_dir` - Optional app data directory (BuiltInAI provider)
+/// * `copilot_config` - Optional Copilot CLI configuration (CopilotCli provider)
 /// * `cancellation_token` - Optional cancellation token to stop processing
 /// * `summary_language` - Optional BCP-47 tag (e.g. "en-GB") to force summary output language
 /// * `detected_transcript_language` - Optional detected transcript language BCP-47 tag
@@ -336,6 +338,7 @@ pub async fn generate_meeting_summary(
     temperature: Option<f32>,
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
+    copilot_config: Option<&CopilotCliConfig>,
     cancellation_token: Option<&CancellationToken>,
     summary_language: Option<&str>,
     detected_transcript_language: Option<&str>,
@@ -412,6 +415,7 @@ pub async fn generate_meeting_summary(
                     temperature,
                     top_p,
                     app_data_dir,
+                    copilot_config,
                     cancellation_token,
                 )
                 .await
@@ -465,6 +469,7 @@ pub async fn generate_meeting_summary(
                     temperature,
                     top_p,
                     app_data_dir,
+                    copilot_config,
                     cancellation_token,
                 )
                 .await?
@@ -513,6 +518,7 @@ pub async fn generate_meeting_summary(
             temperature,
             top_p,
             app_data_dir,
+            copilot_config,
             cancellation_token,
         )
         .await?;
@@ -538,6 +544,7 @@ pub async fn generate_meeting_summary(
                 temperature,
                 top_p,
                 app_data_dir,
+                copilot_config,
                 cancellation_token,
             )
             .await
@@ -565,6 +572,7 @@ pub async fn generate_meeting_summary(
                     temperature,
                     top_p,
                     app_data_dir,
+                    copilot_config,
                     cancellation_token,
                 )
                 .await,
@@ -594,6 +602,7 @@ async fn run_markdown_transform(
     temperature: Option<f32>,
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
+    copilot_config: Option<&CopilotCliConfig>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
     if let Some(token) = cancellation_token {
@@ -615,6 +624,7 @@ async fn run_markdown_transform(
         temperature,
         top_p,
         app_data_dir,
+        copilot_config,
         cancellation_token,
     )
     .await
@@ -637,6 +647,7 @@ async fn translate_markdown(
     temperature: Option<f32>,
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
+    copilot_config: Option<&CopilotCliConfig>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
     info!("Translation pass: target language = {}", target_language);
@@ -660,6 +671,7 @@ async fn translate_markdown(
         temperature,
         top_p,
         app_data_dir,
+        copilot_config,
         cancellation_token,
     )
     .await
@@ -678,6 +690,7 @@ async fn normalize_markdown_to_english(
     temperature: Option<f32>,
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
+    copilot_config: Option<&CopilotCliConfig>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
     info!("English normalization pass: preserving Markdown structure");
@@ -700,6 +713,7 @@ async fn normalize_markdown_to_english(
         temperature,
         top_p,
         app_data_dir,
+        copilot_config,
         cancellation_token,
     )
     .await

@@ -30,7 +30,23 @@ pub struct CustomOpenAIConfig {
     pub top_p: Option<f32>,
 }
 
+/// GitHub Copilot CLI provider configuration
+/// Stored as JSON in the database. Authentication uses the user's `copilot login`
+/// credentials or the optional GitHub token below; no API key column is needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopilotCliConfig {
+    /// Explicit path to the `copilot` binary (optional; auto-detected when empty)
+    #[serde(rename = "binaryPath")]
+    pub binary_path: Option<String>,
+    /// Copilot model id (e.g. "auto", "claude-sonnet-4.5"); availability depends on the Copilot plan
+    pub model: Option<String>,
+    /// GitHub token passed to the CLI as COPILOT_GITHUB_TOKEN (optional)
+    #[serde(rename = "githubToken")]
+    pub github_token: Option<String>,
+}
+
 pub mod commands;
+pub mod copilot_cli;
 pub(crate) mod language_detection;
 pub mod llm_client;
 pub(crate) mod metadata;

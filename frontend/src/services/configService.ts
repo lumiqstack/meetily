@@ -9,7 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openrouter' | 'openai' | 'builtin-ai' | 'custom-openai';
+  provider: 'ollama' | 'groq' | 'claude' | 'openrouter' | 'openai' | 'builtin-ai' | 'custom-openai' | 'copilot-cli';
   model: string;
   whisperModel: string;
   /**
@@ -25,6 +25,9 @@ export interface ModelConfig {
   maxTokens?: number | null;
   temperature?: number | null;
   topP?: number | null;
+  // GitHub Copilot CLI fields (only populated when provider is 'copilot-cli')
+  copilotCliBinaryPath?: string | null;
+  copilotCliGithubToken?: string | null;
 }
 
 export interface CustomOpenAIConfig {
@@ -34,6 +37,12 @@ export interface CustomOpenAIConfig {
   maxTokens: number | null;
   temperature: number | null;
   topP: number | null;
+}
+
+export interface CopilotCliConfig {
+  binaryPath: string | null;
+  model: string | null;
+  githubToken: string | null;
 }
 
 export interface RecordingPreferences {
@@ -110,6 +119,43 @@ export class ConfigService {
       endpoint,
       apiKey,
       model,
+    });
+  }
+
+  /**
+   * Get GitHub Copilot CLI configuration
+   * @returns Promise with CopilotCliConfig or null if not configured
+   */
+  async getCopilotCliConfig(): Promise<CopilotCliConfig | null> {
+    return invoke<CopilotCliConfig | null>('api_get_copilot_cli_config');
+  }
+
+  /**
+   * Save GitHub Copilot CLI configuration
+   * @param config - CopilotCliConfig to save
+   * @returns Promise with result status
+   */
+  async saveCopilotCliConfig(config: CopilotCliConfig): Promise<{ status: string; message: string }> {
+    return invoke<{ status: string; message: string }>('api_save_copilot_cli_config', {
+      binaryPath: config.binaryPath,
+      model: config.model,
+      githubToken: config.githubToken,
+    });
+  }
+
+  /**
+   * Test the GitHub Copilot CLI by running a minimal prompt
+   * @returns Promise with test result
+   */
+  async testCopilotCli(
+    binaryPath: string | null,
+    model: string | null,
+    githubToken: string | null
+  ): Promise<{ status: string; message: string }> {
+    return invoke<{ status: string; message: string }>('api_test_copilot_cli', {
+      binaryPath,
+      model,
+      githubToken,
     });
   }
 }

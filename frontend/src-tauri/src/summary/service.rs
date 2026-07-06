@@ -320,8 +320,12 @@ impl SummaryService {
             }
         };
 
-        // Validate and setup api_key, Flexible for Ollama, BuiltInAI, and CustomOpenAI
-        let api_key = if provider == LLMProvider::Ollama || provider == LLMProvider::BuiltInAI || provider == LLMProvider::CustomOpenAI {
+        // Validate and setup api_key, Flexible for Ollama, BuiltInAI, CustomOpenAI, and CopilotCli
+        let api_key = if provider == LLMProvider::Ollama
+            || provider == LLMProvider::BuiltInAI
+            || provider == LLMProvider::CustomOpenAI
+            || provider == LLMProvider::CopilotCli
+        {
             // These providers don't require API keys from the standard database column
             String::new()
         } else {
@@ -390,6 +394,25 @@ impl SummaryService {
             api_key
         };
 
+        // Get Copilot CLI config if provider is CopilotCli (missing config is fine:
+        // the binary is auto-detected and auth falls back to `copilot login` credentials)
+        let copilot_cli_config = if provider == LLMProvider::CopilotCli {
+            match SettingsRepository::get_copilot_cli_config(&pool).await {
+                Ok(config) => {
+                    if config.is_some() {
+                        info!("✓ Using stored GitHub Copilot CLI config");
+                    }
+                    config
+                }
+                Err(e) => {
+                    warn!("Failed to retrieve Copilot CLI config: {}, using defaults", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Dynamically fetch context size based on provider and model
         let token_threshold = if provider == LLMProvider::Ollama {
             match METADATA_CACHE.get_or_fetch(&model_name, ollama_endpoint.as_deref()).await {
@@ -432,7 +455,7 @@ impl SummaryService {
                 }
             }
         } else {
-            // Cloud providers (OpenAI, Claude, Groq, CustomOpenAI) handle large contexts automatically
+            // Cloud providers (OpenAI, Claude, Groq, CustomOpenAI, CopilotCli) handle large contexts automatically
             100000  // Effectively unlimited for single-pass processing
         };
 
@@ -521,6 +544,7 @@ impl SummaryService {
             custom_openai_temperature,
             custom_openai_top_p,
             app_data_dir.as_ref(),
+            copilot_cli_config.as_ref(),
             Some(&cancellation_token),
             summary_language.as_deref(),
             detected_summary_language.as_deref(),

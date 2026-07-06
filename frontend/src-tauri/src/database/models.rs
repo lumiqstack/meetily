@@ -96,12 +96,23 @@ pub struct Setting {
     #[sqlx(rename = "customOpenAIConfig")]
     #[serde(rename = "customOpenAIConfig")]
     pub custom_openai_config: Option<String>,
+    /// GitHub Copilot CLI provider configuration stored as JSON
+    #[sqlx(rename = "copilotCliConfig")]
+    #[serde(rename = "copilotCliConfig")]
+    pub copilot_cli_config: Option<String>,
 }
 
 impl Setting {
     /// Parse the custom OpenAI config from JSON string
     pub fn get_custom_openai_config(&self) -> Option<crate::summary::CustomOpenAIConfig> {
         self.custom_openai_config.as_ref().and_then(|json| {
+            serde_json::from_str(json).ok()
+        })
+    }
+
+    /// Parse the Copilot CLI config from JSON string
+    pub fn get_copilot_cli_config(&self) -> Option<crate::summary::CopilotCliConfig> {
+        self.copilot_cli_config.as_ref().and_then(|json| {
             serde_json::from_str(json).ok()
         })
     }

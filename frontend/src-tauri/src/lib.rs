@@ -684,6 +684,10 @@ pub fn run() {
             api::api_save_custom_openai_config,
             api::api_get_custom_openai_config,
             api::api_test_custom_openai_connection,
+            // GitHub Copilot CLI commands
+            api::api_save_copilot_cli_config,
+            api::api_get_copilot_cli_config,
+            api::api_test_copilot_cli,
             // Summary commands
             summary::commands::api_process_transcript,
             summary::commands::api_get_summary,

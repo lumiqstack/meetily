@@ -73,6 +73,7 @@ pub enum LLMProvider {
     OpenRouter,
     BuiltInAI,
     CustomOpenAI,
+    CopilotCli,
 }
 
 impl LLMProvider {
@@ -86,6 +87,7 @@ impl LLMProvider {
             "openrouter" => Ok(Self::OpenRouter),
             "builtin-ai" | "local-llama" | "localllama" => Ok(Self::BuiltInAI),
             "custom-openai" => Ok(Self::CustomOpenAI),
+            "copilot-cli" => Ok(Self::CopilotCli),
             _ => Err(format!("Unsupported LLM provider: {}", s)),
         }
     }
@@ -106,6 +108,7 @@ impl LLMProvider {
 /// * `temperature` - Optional temperature (for CustomOpenAI provider)
 /// * `top_p` - Optional top_p (for CustomOpenAI provider)
 /// * `app_data_dir` - Optional app data directory (for BuiltInAI provider)
+/// * `copilot_config` - Optional Copilot CLI configuration (for CopilotCli provider)
 /// * `cancellation_token` - Optional token to cancel the request
 ///
 /// # Returns
@@ -123,6 +126,7 @@ pub async fn generate_summary(
     temperature: Option<f32>,
     top_p: Option<f32>,
     app_data_dir: Option<&PathBuf>,
+    copilot_config: Option<&crate::summary::CopilotCliConfig>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
     // Check if cancelled before starting
@@ -146,6 +150,23 @@ pub async fn generate_summary(
         )
         .await
         .map_err(|e| e.to_string());
+    }
+
+    // Handle Copilot CLI provider separately (spawns the `copilot` binary, no HTTP API)
+    if provider == &LLMProvider::CopilotCli {
+        let (binary_path, github_token) = copilot_config
+            .map(|c| (c.binary_path.as_deref(), c.github_token.as_deref()))
+            .unwrap_or((None, None));
+
+        return crate::summary::copilot_cli::generate_with_copilot_cli(
+            binary_path,
+            model_name,
+            github_token,
+            system_prompt,
+            user_prompt,
+            cancellation_token,
+        )
+        .await;
     }
 
     let (api_url, mut headers) = match provider {
@@ -194,9 +215,9 @@ pub async fn generate_summary(
             );
             ("https://api.anthropic.com/v1/messages".to_string(), header_map)
         }
-        LLMProvider::BuiltInAI => {
-            // This case is handled earlier with early returns
-            unreachable!("BuiltInAI is handled before this match statement")
+        LLMProvider::BuiltInAI | LLMProvider::CopilotCli => {
+            // These cases are handled earlier with early returns
+            unreachable!("BuiltInAI and CopilotCli are handled before this match statement")
         }
     };
 
@@ -342,5 +363,6 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+        LLMProvider::CopilotCli => "GitHub Copilot CLI",
     }
 }
