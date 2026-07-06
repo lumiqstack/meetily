@@ -13,7 +13,7 @@ use crate::{
         },
     },
     state::AppState,
-    summary::CustomOpenAIConfig,
+    summary::{CopilotCliConfig, CustomOpenAIConfig},
 };
 
 // Hardcoded server URL
@@ -1422,4 +1422,96 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
             }
         }
     }
+}
+
+// ===== GITHUB COPILOT CLI API COMMANDS =====
+
+/// Saves the GitHub Copilot CLI configuration
+/// Stored as JSON: {binaryPath, model, githubToken} - all fields optional
+#[tauri::command]
+pub async fn api_save_copilot_cli_config<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    binary_path: Option<String>,
+    model: Option<String>,
+    github_token: Option<String>,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_save_copilot_cli_config called: binaryPath={:?}, model={:?}",
+        &binary_path,
+        &model
+    );
+
+    let config = CopilotCliConfig {
+        binary_path: binary_path.filter(|p| !p.trim().is_empty()),
+        model: model.filter(|m| !m.trim().is_empty()),
+        github_token: github_token.filter(|t| !t.trim().is_empty()),
+    };
+
+    let pool = state.db_manager.pool();
+
+    match SettingsRepository::save_copilot_cli_config(pool, &config).await {
+        Ok(()) => {
+            log_info!("✅ Successfully saved Copilot CLI config");
+            Ok(serde_json::json!({
+                "status": "success",
+                "message": "GitHub Copilot CLI configuration saved successfully"
+            }))
+        }
+        Err(e) => {
+            log_error!("❌ Failed to save Copilot CLI config: {}", e);
+            Err(format!("Failed to save Copilot CLI configuration: {}", e))
+        }
+    }
+}
+
+/// Gets the GitHub Copilot CLI configuration
+#[tauri::command]
+pub async fn api_get_copilot_cli_config<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<CopilotCliConfig>, String> {
+    log_info!("api_get_copilot_cli_config called");
+
+    let pool = state.db_manager.pool();
+
+    match SettingsRepository::get_copilot_cli_config(pool).await {
+        Ok(config) => Ok(config),
+        Err(e) => {
+            log_error!("❌ Failed to get Copilot CLI config: {}", e);
+            Err(format!("Failed to get Copilot CLI configuration: {}", e))
+        }
+    }
+}
+
+/// Tests the GitHub Copilot CLI by running a minimal prompt through it
+/// Verifies the binary is found, authentication works, and the model is available
+#[tauri::command]
+pub async fn api_test_copilot_cli<R: Runtime>(
+    _app: AppHandle<R>,
+    binary_path: Option<String>,
+    model: Option<String>,
+    github_token: Option<String>,
+) -> Result<serde_json::Value, String> {
+    log_info!(
+        "api_test_copilot_cli called: binaryPath={:?}, model={:?}",
+        &binary_path,
+        &model
+    );
+
+    let response = crate::summary::copilot_cli::generate_with_copilot_cli(
+        binary_path.as_deref(),
+        model.as_deref().unwrap_or(""),
+        github_token.as_deref(),
+        "You are a connection test.",
+        "Reply with exactly: OK",
+        None,
+    )
+    .await?;
+
+    log_info!("✅ Copilot CLI test successful: {}", response);
+    Ok(serde_json::json!({
+        "status": "success",
+        "message": format!("GitHub Copilot CLI responded successfully: {}", response)
+    }))
 }

@@ -31,7 +31,7 @@ import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
 
 export interface ModelConfig {
-  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai';
+  provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai' | 'copilot-cli';
   model: string;
   whisperModel: string;
   apiKey?: string | null;
@@ -43,6 +43,9 @@ export interface ModelConfig {
   maxTokens?: number | null;
   temperature?: number | null;
   topP?: number | null;
+  // GitHub Copilot CLI fields
+  copilotCliBinaryPath?: string | null;
+  copilotCliGithubToken?: string | null;
 }
 
 interface OllamaModel {
@@ -101,6 +104,19 @@ const GROQ_FALLBACK_MODELS = [
   'gemma2-9b-it',
 ];
 
+// Copilot model availability depends on the user's Copilot plan;
+// 'auto' lets Copilot pick and works on every plan
+const COPILOT_CLI_MODELS = [
+  'auto',
+  'claude-sonnet-4.5',
+  'claude-sonnet-4',
+  'claude-haiku-4.5',
+  'gpt-5',
+  'gpt-5-mini',
+  'gpt-4.1',
+  'gemini-2.5-pro',
+];
+
 interface ModelSettingsModalProps {
   modelConfig: ModelConfig;
   setModelConfig: (config: ModelConfig | ((prev: ModelConfig) => ModelConfig)) => void;
@@ -154,6 +170,11 @@ export function ModelSettingsModal({
   const [customTopP, setCustomTopP] = useState<string>(modelConfig.topP?.toString() || '');
   const [isCustomOpenAIAdvancedOpen, setIsCustomOpenAIAdvancedOpen] = useState<boolean>(false);
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false);
+
+  // GitHub Copilot CLI state
+  const [copilotBinaryPath, setCopilotBinaryPath] = useState<string>(modelConfig.copilotCliBinaryPath || '');
+  const [copilotGithubToken, setCopilotGithubToken] = useState<string>(modelConfig.copilotCliGithubToken || '');
+  const [isTestingCopilot, setIsTestingCopilot] = useState<boolean>(false);
 
   // Combobox state
   const [modelComboboxOpen, setModelComboboxOpen] = useState<boolean>(false);
@@ -231,6 +252,7 @@ export function ModelSettingsModal({
     openrouter: openRouterModels.map((m) => m.id),
     'builtin-ai': builtinAiModels.map((m) => m.name),
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
+    'copilot-cli': COPILOT_CLI_MODELS,
   };
 
   const requiresApiKey =
@@ -303,6 +325,19 @@ export function ModelSettingsModal({
               console.error('Failed to fetch custom OpenAI config:', err);
             }
           }
+
+          // Fetch Copilot CLI config if that's the active provider
+          if (data.provider === 'copilot-cli') {
+            try {
+              const copilotConfig = (await invoke('api_get_copilot_cli_config')) as any;
+              if (copilotConfig) {
+                setCopilotBinaryPath(copilotConfig.binaryPath || '');
+                setCopilotGithubToken(copilotConfig.githubToken || '');
+              }
+            } catch (err) {
+              console.error('Failed to fetch Copilot CLI config:', err);
+            }
+          }
         }
       } catch (error) {
         console.error('Failed to fetch model config:', error);
@@ -367,6 +402,18 @@ export function ModelSettingsModal({
     modelConfig.maxTokens,
     modelConfig.temperature,
     modelConfig.topP
+  ]);
+
+  // Sync Copilot CLI state from modelConfig (context or props)
+  useEffect(() => {
+    if (modelConfig.provider === 'copilot-cli') {
+      setCopilotBinaryPath(modelConfig.copilotCliBinaryPath || '');
+      setCopilotGithubToken(modelConfig.copilotCliGithubToken || '');
+    }
+  }, [
+    modelConfig.provider,
+    modelConfig.copilotCliBinaryPath,
+    modelConfig.copilotCliGithubToken
   ]);
 
   // Reset hasAutoFetched flag and clear models when switching away from Ollama
@@ -634,6 +681,22 @@ export function ModelSettingsModal({
       }
     }
 
+    // For copilot-cli provider, save the CLI config first
+    if (modelConfig.provider === 'copilot-cli') {
+      try {
+        await invoke('api_save_copilot_cli_config', {
+          binaryPath: copilotBinaryPath.trim() || null,
+          model: modelConfig.model.trim() || 'auto',
+          githubToken: copilotGithubToken.trim() || null,
+        });
+        console.log('Copilot CLI config saved successfully');
+      } catch (err) {
+        console.error('Failed to save Copilot CLI config:', err);
+        toast.error('Failed to save GitHub Copilot CLI configuration');
+        return;
+      }
+    }
+
     const updatedConfig = {
       ...modelConfig,
       apiKey: typeof apiKey === 'string' ? apiKey.trim() || null : null,
@@ -647,8 +710,15 @@ export function ModelSettingsModal({
       maxTokens: modelConfig.provider === 'custom-openai' && customMaxTokens ? parseInt(customMaxTokens, 10) : null,
       temperature: modelConfig.provider === 'custom-openai' && customTemperature ? parseFloat(customTemperature) : null,
       topP: modelConfig.provider === 'custom-openai' && customTopP ? parseFloat(customTopP) : null,
+      // Include Copilot CLI fields
+      copilotCliBinaryPath: modelConfig.provider === 'copilot-cli' ? (copilotBinaryPath.trim() || null) : null,
+      copilotCliGithubToken: modelConfig.provider === 'copilot-cli' && copilotGithubToken.trim() ? copilotGithubToken.trim() : null,
       // For custom-openai, use the customOpenAIModel as the model field
-      model: modelConfig.provider === 'custom-openai' ? customOpenAIModel.trim() : modelConfig.model,
+      model: modelConfig.provider === 'custom-openai'
+        ? customOpenAIModel.trim()
+        : modelConfig.provider === 'copilot-cli'
+          ? (modelConfig.model.trim() || 'auto')
+          : modelConfig.model,
     };
     setModelConfig(updatedConfig);
     console.log('ModelSettingsModal - handleSave - Updated ModelConfig:', updatedConfig);
@@ -688,6 +758,24 @@ export function ModelSettingsModal({
       toast.error(errorMsg);
     } finally {
       setIsTestingConnection(false);
+    }
+  };
+
+  // Test GitHub Copilot CLI (binary resolution, authentication, and model availability)
+  const testCopilotCli = async () => {
+    setIsTestingCopilot(true);
+    try {
+      const result = await invoke<{ status: string; message: string }>('api_test_copilot_cli', {
+        binaryPath: copilotBinaryPath.trim() || null,
+        model: modelConfig.model.trim() || 'auto',
+        githubToken: copilotGithubToken.trim() || null,
+      });
+      toast.success(result.message || 'GitHub Copilot CLI is working!');
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      toast.error(errorMsg);
+    } finally {
+      setIsTestingCopilot(false);
     }
   };
 
@@ -868,6 +956,18 @@ export function ModelSettingsModal({
                     console.error('Failed to load custom OpenAI config:', err);
                   });
                 }
+
+                // Load Copilot CLI config when selected
+                if (provider === 'copilot-cli') {
+                  invoke<any>('api_get_copilot_cli_config').then((config) => {
+                    if (config) {
+                      setCopilotBinaryPath(config.binaryPath || '');
+                      setCopilotGithubToken(config.githubToken || '');
+                    }
+                  }).catch((err) => {
+                    console.error('Failed to load Copilot CLI config:', err);
+                  });
+                }
               }}
             >
               <SelectTrigger>
@@ -876,6 +976,7 @@ export function ModelSettingsModal({
               <SelectContent className="max-h-64 overflow-y-auto">
                 <SelectItem value="builtin-ai">Built-in AI (Offline, No API needed)</SelectItem>
                 <SelectItem value="claude">Claude</SelectItem>
+                <SelectItem value="copilot-cli">GitHub Copilot CLI</SelectItem>
                 <SelectItem value="custom-openai">Custom Server (OpenAI)</SelectItem>
                 <SelectItem value="groq">Groq</SelectItem>
                 <SelectItem value="ollama">Ollama</SelectItem>
@@ -1064,6 +1165,68 @@ export function ModelSettingsModal({
                 <>
                   <CheckCircle2 className="mr-2 h-4 w-4" />
                   Test Connection
+                </>
+              )}
+            </Button>
+          </div>
+        )}
+
+        {/* GitHub Copilot CLI Configuration Section */}
+        {modelConfig.provider === 'copilot-cli' && (
+          <div className="space-y-4 border-t pt-4">
+            <Alert>
+              <AlertDescription>
+                Summaries are generated locally through the GitHub Copilot CLI using your
+                Copilot subscription. Install it with <code className="font-mono text-xs">npm install -g @github/copilot</code> and
+                sign in with <code className="font-mono text-xs">copilot login</code>, or provide a GitHub token below.
+                Model availability depends on your Copilot plan; &quot;auto&quot; works on every plan.
+              </AlertDescription>
+            </Alert>
+
+            <div>
+              <Label htmlFor="copilot-binary-path">Binary Path (optional)</Label>
+              <Input
+                id="copilot-binary-path"
+                value={copilotBinaryPath}
+                onChange={(e) => setCopilotBinaryPath(e.target.value)}
+                placeholder="Auto-detected (e.g. /opt/homebrew/bin/copilot)"
+                className="mt-1"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Set this if the copilot binary is installed in a non-standard location
+              </p>
+            </div>
+
+            <div>
+              <Label htmlFor="copilot-github-token">GitHub Token (optional)</Label>
+              <Input
+                id="copilot-github-token"
+                type="password"
+                value={copilotGithubToken}
+                onChange={(e) => setCopilotGithubToken(e.target.value)}
+                placeholder="Leave empty to use `copilot login` credentials"
+                className="mt-1"
+              />
+            </div>
+
+            {/* Test Button */}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={testCopilotCli}
+              disabled={isTestingCopilot}
+              className="w-full"
+            >
+              {isTestingCopilot ? (
+                <>
+                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                  Testing Copilot CLI...
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="mr-2 h-4 w-4" />
+                  Test Copilot CLI
                 </>
               )}
             </Button>

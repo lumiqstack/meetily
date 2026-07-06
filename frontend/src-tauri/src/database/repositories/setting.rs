@@ -1,5 +1,5 @@
 use crate::database::models::{Setting, TranscriptSetting};
-use crate::summary::CustomOpenAIConfig;
+use crate::summary::{CopilotCliConfig, CustomOpenAIConfig};
 use sqlx::SqlitePool;
 
 #[derive(serde::Deserialize, Debug)]
@@ -87,7 +87,7 @@ impl SettingsRepository {
             "ollama" => "ollamaApiKey",
             "groq" => "groqApiKey",
             "openrouter" => "openRouterApiKey",
-            "builtin-ai" => return Ok(()), // No API key needed
+            "builtin-ai" | "copilot-cli" => return Ok(()), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -125,7 +125,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
-            "builtin-ai" => return Ok(None), // No API key needed
+            "builtin-ai" | "copilot-cli" => return Ok(None), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -270,6 +270,14 @@ impl SettingsRepository {
             return Ok(());
         }
 
+        // Copilot CLI uses JSON config - clear the entire config
+        if provider == "copilot-cli" {
+            sqlx::query("UPDATE settings SET copilotCliConfig = NULL WHERE id = '1'")
+                .execute(pool)
+                .await?;
+            return Ok(());
+        }
+
         let api_key_column = match provider {
             "openai" => "openaiApiKey",
             "ollama" => "ollamaApiKey",
@@ -366,6 +374,81 @@ impl SettingsRepository {
             "#,
         )
         .bind(&config.model)
+        .bind(config_json)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // ===== COPILOT CLI CONFIG METHODS =====
+
+    /// Gets the GitHub Copilot CLI configuration from JSON
+    ///
+    /// # Returns
+    /// * `Ok(Some(CopilotCliConfig))` - Config exists and is valid JSON
+    /// * `Ok(None)` - No config stored
+    /// * `Err(sqlx::Error)` - Database error
+    pub async fn get_copilot_cli_config(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<CopilotCliConfig>, sqlx::Error> {
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            r#"
+            SELECT copilotCliConfig
+            FROM settings
+            WHERE id = '1'
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        match row {
+            Some(record) => {
+                let config_json: Option<String> = record.get("copilotCliConfig");
+
+                if let Some(json) = config_json {
+                    let config: CopilotCliConfig = serde_json::from_str(&json).map_err(|e| {
+                        sqlx::Error::Protocol(
+                            format!("Invalid JSON in copilotCliConfig: {}", e).into(),
+                        )
+                    })?;
+
+                    Ok(Some(config))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Saves the GitHub Copilot CLI configuration as JSON
+    ///
+    /// # Arguments
+    /// * `pool` - Database connection pool
+    /// * `config` - CopilotCliConfig to save (binaryPath, model, githubToken)
+    pub async fn save_copilot_cli_config(
+        pool: &SqlitePool,
+        config: &CopilotCliConfig,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let config_json = serde_json::to_string(config).map_err(|e| {
+            sqlx::Error::Protocol(format!("Failed to serialize config to JSON: {}", e).into())
+        })?;
+
+        let model = config.model.as_deref().unwrap_or("auto");
+
+        sqlx::query(
+            r#"
+            INSERT INTO settings (id, provider, model, whisperModel, copilotCliConfig)
+            VALUES ('1', 'copilot-cli', $1, 'large-v3', $2)
+            ON CONFLICT(id) DO UPDATE SET
+                copilotCliConfig = excluded.copilotCliConfig
+            "#,
+        )
+        .bind(model)
         .bind(config_json)
         .execute(pool)
         .await?;

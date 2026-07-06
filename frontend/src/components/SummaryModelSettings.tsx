@@ -29,7 +29,7 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
       const data = await invoke('api_get_model_config') as any;
       if (data && data.provider !== null) {
         // Fetch API key if not included and provider requires it
-        if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && !data.apiKey) {
+        if (data.provider !== 'ollama' && data.provider !== 'builtin-ai' && data.provider !== 'copilot-cli' && !data.apiKey) {
           try {
             const apiKeyData = await invoke('api_get_api_key', {
               provider: data.provider
@@ -56,6 +56,19 @@ export function SummaryModelSettings({ refetchTrigger }: SummaryModelSettingsPro
             }
           } catch (err) {
             console.error('Failed to fetch custom OpenAI config:', err);
+          }
+        }
+        // Fetch Copilot CLI config if that's the active provider
+        if (data.provider === 'copilot-cli') {
+          try {
+            const copilotConfig = (await invoke('api_get_copilot_cli_config')) as any;
+            if (copilotConfig) {
+              data.copilotCliBinaryPath = copilotConfig.binaryPath || null;
+              data.copilotCliGithubToken = copilotConfig.githubToken || null;
+              data.model = copilotConfig.model || data.model || 'auto';
+            }
+          } catch (err) {
+            console.error('Failed to fetch Copilot CLI config:', err);
           }
         }
         setModelConfig(data);
