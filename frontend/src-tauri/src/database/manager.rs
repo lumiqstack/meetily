@@ -1,7 +1,11 @@
-use sqlx::{migrate::MigrateDatabase, Result, Sqlite, SqlitePool, Transaction};
+use sqlx::{migrate::MigrateDatabase, Result, Row, Sqlite, SqlitePool, Transaction};
 use std::fs;
 use std::path::Path;
 use tauri::Manager;
+
+const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION: i64 = 20260618000000;
+const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION: &str =
+    "add cloud transcript provider keys";
 
 #[derive(Clone)]
 pub struct DatabaseManager {
@@ -32,7 +36,9 @@ impl DatabaseManager {
 
         let pool = SqlitePool::connect(tauri_db_path).await?;
 
+        Self::reconcile_orphaned_cloud_transcript_provider_migration(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::ensure_cloud_transcript_provider_columns(&pool).await?;
 
         Ok(DatabaseManager { pool })
     }
@@ -155,6 +161,128 @@ impl DatabaseManager {
 
         // Now use the standard initialization which will detect and migrate the legacy db
         Self::new_from_app_handle(app_handle).await
+    }
+
+    async fn reconcile_orphaned_cloud_transcript_provider_migration(
+        pool: &SqlitePool,
+    ) -> Result<()> {
+        if !Self::table_exists(pool, "_sqlx_migrations").await? {
+            return Ok(());
+        }
+
+        let orphaned_migration: Option<(String,)> = sqlx::query_as(
+            "SELECT description FROM _sqlx_migrations WHERE version = ? AND success = 1",
+        )
+        .bind(ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some((description,)) = orphaned_migration else {
+            return Ok(());
+        };
+
+        if description != ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION {
+            log::warn!(
+                "Found unexpected SQLx migration version {} with description '{}'; leaving it for SQLx to validate",
+                ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION,
+                description
+            );
+            return Ok(());
+        }
+
+        if !Self::table_exists(pool, "transcript_settings").await? {
+            log::warn!(
+                "Found orphaned SQLx migration {} but transcript_settings table is missing; leaving migration metadata unchanged",
+                ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION
+            );
+            return Ok(());
+        }
+
+        log::warn!(
+            "Detected orphaned SQLx migration {} ('{}'); preserving schema columns and reconciling migration metadata",
+            ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION,
+            ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION
+        );
+
+        Self::ensure_cloud_transcript_provider_columns(pool).await?;
+
+        let result = sqlx::query(
+            "DELETE FROM _sqlx_migrations WHERE version = ? AND description = ?",
+        )
+        .bind(ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION)
+        .bind(ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION)
+        .execute(pool)
+        .await?;
+
+        log::info!(
+            "Removed orphaned SQLx migration metadata rows: {}",
+            result.rows_affected()
+        );
+
+        Ok(())
+    }
+
+    async fn ensure_cloud_transcript_provider_columns(pool: &SqlitePool) -> Result<()> {
+        if !Self::table_exists(pool, "transcript_settings").await? {
+            return Ok(());
+        }
+
+        Self::ensure_transcript_settings_column(pool, "deepinfraApiKey", "TEXT").await?;
+        Self::ensure_transcript_settings_column(pool, "openRouterApiKey", "TEXT").await?;
+
+        Ok(())
+    }
+
+    async fn table_exists(pool: &SqlitePool, table_name: &str) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table_name)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+
+    async fn ensure_transcript_settings_column(
+        pool: &SqlitePool,
+        column_name: &str,
+        column_type: &str,
+    ) -> Result<()> {
+        if Self::transcript_settings_column_exists(pool, column_name).await? {
+            return Ok(());
+        }
+
+        log::info!(
+            "Adding missing compatibility column transcript_settings.{}",
+            column_name
+        );
+
+        let statement = format!(
+            "ALTER TABLE transcript_settings ADD COLUMN {} {}",
+            column_name, column_type
+        );
+        sqlx::query(&statement).execute(pool).await?;
+
+        Ok(())
+    }
+
+    async fn transcript_settings_column_exists(
+        pool: &SqlitePool,
+        column_name: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query("PRAGMA table_info(transcript_settings)")
+            .fetch_all(pool)
+            .await?;
+
+        for row in rows {
+            let name: String = row.try_get("name")?;
+            if name == column_name {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub fn pool(&self) -> &SqlitePool {
