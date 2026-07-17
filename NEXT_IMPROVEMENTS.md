@@ -189,6 +189,48 @@ toast with Retry/Dismiss. Rust: 10 unit tests in `job_persistence.rs` (in-memory
 running the real migrations; mutation-validated where behavior predated its test).
 Frontend: 6 new store tests in `tests/lib/background-jobs.test.ts`.
 
+## 8. End-to-end crash-recovery verification (quality)
+
+**Problem**: The crash-recovery path from #7 is unit-tested at the module level
+(`job_persistence.rs` against in-memory SQLite, store tests for the frontend), but the
+full loop — process dies mid-import → relaunch → reconcile runs → interrupted-job toast
+appears → Retry actually restarts the job / Dismiss clears it — has never been exercised
+in the real app. The riskiest untested glue is exactly the part unit tests can't reach:
+Tauri command registration, the startup ordering in `database/setup.rs` (reconcile must
+see the journal row before the frontend queries it), and the toast lifecycle for
+Infinity-duration notices.
+
+**Task**: Drive it once manually or via the `/verify` flow: start a remote import of a
+long file, kill the process mid-transcription (`taskkill /f` on Windows), relaunch, and
+confirm (a) the interrupted toast lists the job, (b) the orphaned folder was removed
+(check the recordings dir and the startup log line), (c) Retry re-runs the import to
+completion under a new import ID, (d) Dismiss clears the notice and the
+`background_jobs` row. Repeat once for a retranscription to confirm its meeting folder
+survives. If any step needs fixing, capture it as a regression test where one is
+possible.
+
+## 9. Path normalization in the orphan-folder meeting guard (robustness, small)
+
+**Problem**: `reconcile_interrupted_jobs` protects a crashed import's folder from cleanup
+when a `meetings.folder_path` row references it, but the comparison is an exact string
+match (`WHERE folder_path = ?`). The journaled path and the meeting row are both written
+from the same `meeting_folder.to_string_lossy()` value today, so they match — but any
+future divergence (different separators on Windows, trailing separator, case difference,
+`\\?\` prefix) would silently disable the guard's protection… in the safe direction only
+because two other guards remain (metadata.json presence, import-kind check). The inverse
+risk is the real one: a *matching* meeting stored with a differently-normalized path
+would not be found, and the folder of a committed meeting could be deleted if
+metadata.json also failed to write.
+
+**Task**: Normalize both sides before comparing — e.g. compare
+`std::path::Path::new(a).components()` equality or canonicalize when the paths exist —
+in `job_persistence.rs`'s meeting-reference check. Unit-test with mixed separators
+(`C:/x/y` vs `C:\x\y`) and a trailing-slash variant. Keep the behavior fail-safe: if
+normalization or canonicalization errors, treat the folder as referenced (skip
+deletion).
+
 ---
 
 **Suggested order**: 1 and 3 first (correctness in the current diff), then 2, 4, 5, 6, 7.
+Post-#7 follow-ups: 9 (small, closes a latent data-loss edge), then 8 (one-time
+verification pass).
