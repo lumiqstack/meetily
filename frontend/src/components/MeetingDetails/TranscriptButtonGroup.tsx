@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
@@ -8,6 +8,10 @@ import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
 
+
+interface BackgroundRetranscriptionCompleteDetail {
+  meetingId: string;
+}
 
 interface TranscriptButtonGroupProps {
   transcriptCount: number;
@@ -36,6 +40,25 @@ export function TranscriptButtonGroup({
       await onRefetchTranscripts();
     }
   }, [onRefetchTranscripts]);
+
+  useEffect(() => {
+    if (!meetingId) return;
+
+    const handleBackgroundRetranscriptionComplete = (event: Event) => {
+      const detail = (event as CustomEvent<BackgroundRetranscriptionCompleteDetail>).detail;
+      if (detail?.meetingId !== meetingId) return;
+
+      handleRetranscribeComplete().catch((error) => {
+        console.error('Failed to refresh transcripts after background retranscription:', error);
+      });
+    };
+
+    window.addEventListener('meetily-background-retranscription-complete', handleBackgroundRetranscriptionComplete);
+
+    return () => {
+      window.removeEventListener('meetily-background-retranscription-complete', handleBackgroundRetranscriptionComplete);
+    };
+  }, [meetingId, handleRetranscribeComplete]);
 
   return (
     <div className="flex items-center justify-center w-full gap-2">

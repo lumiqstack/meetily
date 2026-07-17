@@ -3,16 +3,17 @@
 use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
-use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use crate::config::{DEFAULT_PARAKEET_MODEL, DEFAULT_WHISPER_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
@@ -22,32 +23,108 @@ use super::common::{create_transcript_segments, split_segment_at_silence, write_
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
-/// Global flag to track if import is in progress
-static IMPORT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Import IDs currently being processed.
+static ACTIVE_IMPORTS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// Global flag to signal cancellation
-static IMPORT_CANCELLED: AtomicBool = AtomicBool::new(false);
+/// Import IDs requested for cancellation.
+static CANCELLED_IMPORTS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// RAII guard for IMPORT_IN_PROGRESS flag
-/// Ensures flag is cleared even if import panics or returns early
-struct ImportGuard;
+fn clear_import_cancelled(import_id: &str) {
+    CANCELLED_IMPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(import_id);
+}
+
+fn is_import_cancelled(import_id: &str) -> bool {
+    CANCELLED_IMPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(import_id)
+}
+
+/// RAII guard for active import state.
+/// Ensures active job state is cleared even if import panics or returns early.
+struct ImportGuard {
+    import_id: String,
+    /// Claim on the shared local engines, held for the guard's lifetime.
+    /// `None` for remote jobs, which never touch the local engines.
+    _engine_claim: Option<crate::audio::engine_coordinator::LocalEngineClaim<'static>>,
+    /// Remote concurrency slot, held for the guard's lifetime.
+    /// `None` for local jobs, which are capped by the engine claim instead.
+    _remote_permit: Option<crate::audio::remote_concurrency::RemoteJobPermit>,
+}
 
 impl ImportGuard {
-    /// Create guard and set flag atomically
-    fn acquire() -> Result<Self, String> {
-        if IMPORT_IN_PROGRESS
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+    /// Reserve an import slot.
+    ///
+    /// Remote jobs are allowed to run concurrently, up to the cap enforced by
+    /// `remote_concurrency` (each still decodes audio locally and uploads to
+    /// the remote endpoint). Local jobs claim exclusive use of the shared
+    /// Whisper/Parakeet engines via the engine coordinator, so they fail while
+    /// a recording with realtime transcription, another local import, or a
+    /// local retranscription is active.
+    fn acquire(import_id: String, use_remote: bool) -> Result<Self, String> {
         {
-            return Err("Import already in progress".to_string());
+            let mut active = ACTIVE_IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
+
+            if active.contains(&import_id) {
+                return Err(format!("Import already in progress for job {}", import_id));
+            }
+
+            active.insert(import_id.clone());
         }
-        Ok(ImportGuard)
+
+        clear_import_cancelled(&import_id);
+
+        let release_active = |import_id: &str| {
+            ACTIVE_IMPORTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(import_id);
+        };
+
+        let mut engine_claim = None;
+        let mut remote_permit = None;
+
+        if use_remote {
+            match crate::audio::remote_concurrency::try_acquire_remote_slot() {
+                Ok(permit) => remote_permit = Some(permit),
+                Err(e) => {
+                    release_active(&import_id);
+                    return Err(format!("Cannot start a remote import: {}", e));
+                }
+            }
+        } else {
+            use crate::audio::engine_coordinator::{LocalEngineUser, LOCAL_ENGINE_COORDINATOR};
+            match LOCAL_ENGINE_COORDINATOR.try_claim(LocalEngineUser::Import) {
+                Ok(claim) => engine_claim = Some(claim),
+                Err(holder) => {
+                    release_active(&import_id);
+                    return Err(format!(
+                        "Cannot start a local import: {} is already using the on-device transcription engine. Wait for it to finish, or select a remote transcription provider to run jobs simultaneously.",
+                        holder
+                    ));
+                }
+            }
+        }
+
+        Ok(ImportGuard {
+            import_id,
+            _engine_claim: engine_claim,
+            _remote_permit: remote_permit,
+        })
     }
 }
 
 impl Drop for ImportGuard {
     fn drop(&mut self) {
-        IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        ACTIVE_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.import_id);
+
+        clear_import_cancelled(&self.import_id);
     }
 }
 
@@ -73,6 +150,7 @@ pub struct AudioFileInfo {
 /// Progress update emitted during import
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportProgress {
+    pub import_id: String,
     pub stage: String, // "copying", "decoding", "vad", "transcribing", "saving"
     pub progress_percentage: u32,
     pub message: String,
@@ -81,6 +159,7 @@ pub struct ImportProgress {
 /// Result of import
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportResult {
+    pub import_id: String,
     pub meeting_id: String,
     pub title: String,
     pub segments_count: usize,
@@ -90,12 +169,14 @@ pub struct ImportResult {
 /// Error during import
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportError {
+    pub import_id: String,
     pub error: String,
 }
 
 /// Warning emitted during import (non-fatal)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportWarning {
+    pub import_id: String,
     pub warning: String,
     pub details: Option<String>,
 }
@@ -103,17 +184,36 @@ pub struct ImportWarning {
 /// Response when import is started
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportStarted {
+    pub import_id: String,
     pub message: String,
 }
 
 /// Check if import is currently in progress
 pub fn is_import_in_progress() -> bool {
-    IMPORT_IN_PROGRESS.load(Ordering::SeqCst)
+    !ACTIVE_IMPORTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
 }
 
-/// Cancel ongoing import
-pub fn cancel_import() {
-    IMPORT_CANCELLED.store(true, Ordering::SeqCst);
+/// Cancel ongoing import.
+/// If `import_id` is None, all currently active imports are cancelled.
+/// Cancel-all snapshots the active set rather than setting a sticky global
+/// flag, so a job started while the cancelled ones drain runs normally.
+pub fn cancel_import(import_id: Option<&str>) {
+    let import_ids_to_cancel = if let Some(import_id) = import_id {
+        vec![import_id.to_string()]
+    } else {
+        ACTIVE_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    };
+
+    let mut cancelled = CANCELLED_IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    cancelled.extend(import_ids_to_cancel);
 }
 
 /// Validate an audio file and return its info using metadata-only approach
@@ -259,16 +359,38 @@ pub async fn start_import<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<ImportResult> {
-    // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
+    let import_id = format!("import-{}", Uuid::new_v4());
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let guard = ImportGuard::acquire(import_id.clone(), use_remote).map_err(|e| anyhow!(e))?;
 
-    // Reset cancellation flag
-    IMPORT_CANCELLED.store(false, Ordering::SeqCst);
+    start_import_with_guard(
+        app,
+        import_id,
+        source_path,
+        title,
+        language,
+        model,
+        provider,
+        guard,
+    )
+    .await
+}
 
+async fn start_import_with_guard<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: String,
+    source_path: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    _guard: ImportGuard,
+) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref() == Some("openaiCompatible");
     let result = run_import(
         app.clone(),
+        import_id.clone(),
         source_path,
         title,
         language,
@@ -283,14 +405,12 @@ pub async fn start_import<R: Runtime>(
         super::common::unload_engine_after_batch(use_parakeet).await;
     }
 
-    // Guard will automatically clear flag on drop
-    // No need for manual: IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
-
     match &result {
         Ok(res) => {
             let _ = app.emit(
                 "import-complete",
                 serde_json::json!({
+                    "import_id": res.import_id,
                     "meeting_id": res.meeting_id,
                     "title": res.title,
                     "segments_count": res.segments_count,
@@ -302,6 +422,7 @@ pub async fn start_import<R: Runtime>(
             let _ = app.emit(
                 "import-error",
                 ImportError {
+                    import_id: import_id.clone(),
                     error: e.to_string(),
                 },
             );
@@ -314,6 +435,7 @@ pub async fn start_import<R: Runtime>(
 /// Internal function to run import
 async fn run_import<R: Runtime>(
     app: AppHandle<R>,
+    import_id: String,
     source_path: String,
     title: String,
     language: Option<String>,
@@ -336,10 +458,10 @@ async fn run_import<R: Runtime>(
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref() == Some("openaiCompatible");
 
-    emit_progress(&app, "copying", 5, "Creating meeting folder...");
+    emit_progress(&app, &import_id, "copying", 5, "Creating meeting folder...");
 
     // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    if is_import_cancelled(&import_id) {
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -348,7 +470,7 @@ async fn run_import<R: Runtime>(
     let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
 
     // Copy audio file to meeting folder
-    emit_progress(&app, "copying", 10, "Copying audio file...");
+    emit_progress(&app, &import_id, "copying", 10, "Copying audio file...");
 
     let dest_filename = format!(
         "audio.{}",
@@ -369,20 +491,21 @@ async fn run_import<R: Runtime>(
     info!("Copied audio to: {}", dest_path.display());
 
     // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    if is_import_cancelled(&import_id) {
         // Cleanup: remove the meeting folder
         let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
-    emit_progress(&app, "decoding", 15, "Decoding audio file...");
+    emit_progress(&app, &import_id, "decoding", 15, "Decoding audio file...");
 
     // Decode the audio file with progress updates
     let app_for_decode = app.clone();
+    let import_id_for_decode = import_id.clone();
     let decode_progress = Box::new(move |progress: u32, msg: &str| {
         // Map decode progress: 15% + (progress * 0.05) to go from 15% to 20%
         let overall_progress = 15 + ((progress as f32 * 0.05) as u32);
-        emit_progress(&app_for_decode, "decoding", overall_progress, msg);
+        emit_progress(&app_for_decode, &import_id_for_decode, "decoding", overall_progress, msg);
     });
 
     let path_for_decode = dest_path.clone();
@@ -398,20 +521,21 @@ async fn run_import<R: Runtime>(
         duration_seconds, decoded.sample_rate, decoded.channels
     );
 
-    emit_progress(&app, "resampling", 20, "Converting audio format...");
+    emit_progress(&app, &import_id, "resampling", 20, "Converting audio format...");
 
     // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    if is_import_cancelled(&import_id) {
         let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
     // Convert to 16kHz mono format with progress updates
     let app_for_resample = app.clone();
+    let import_id_for_resample = import_id.clone();
     let resample_progress = Box::new(move |progress: u32, msg: &str| {
         // Map resample progress: 20% + (progress * 0.05) to go from 20% to 25%
         let overall_progress = 20 + ((progress as f32 * 0.05) as u32);
-        emit_progress(&app_for_resample, "resampling", overall_progress, msg);
+        emit_progress(&app_for_resample, &import_id_for_resample, "resampling", overall_progress, msg);
     });
 
     let audio_samples = tokio::task::spawn_blocking(move || {
@@ -424,16 +548,17 @@ async fn run_import<R: Runtime>(
         audio_samples.len()
     );
 
-    emit_progress(&app, "vad", 25, "Detecting speech segments...");
+    emit_progress(&app, &import_id, "vad", 25, "Detecting speech segments...");
 
     // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    if is_import_cancelled(&import_id) {
         let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
     // Use VAD to find speech segments
     let app_for_vad = app.clone();
+    let import_id_for_vad = import_id.clone();
 
     let speech_segments = tokio::task::spawn_blocking(move || {
         get_speech_chunks_with_progress(
@@ -443,6 +568,7 @@ async fn run_import<R: Runtime>(
                 let overall_progress = 25 + (vad_progress as f32 * 0.05) as u32;
                 emit_progress(
                     &app_for_vad,
+                    &import_id_for_vad,
                     "vad",
                     overall_progress,
                     &format!(
@@ -450,7 +576,7 @@ async fn run_import<R: Runtime>(
                         vad_progress, segments_found
                     ),
                 );
-                !IMPORT_CANCELLED.load(Ordering::SeqCst)
+                !is_import_cancelled(&import_id_for_vad)
             },
         )
     })
@@ -494,6 +620,7 @@ async fn run_import<R: Runtime>(
         let _ = app.emit(
             "import-warning",
             ImportWarning {
+                import_id: import_id.clone(),
                 warning: "No speech detected in audio file".to_string(),
                 details: Some(
                     "The file was imported successfully, but VAD did not detect any speech. \
@@ -505,12 +632,12 @@ async fn run_import<R: Runtime>(
     }
 
     // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    if is_import_cancelled(&import_id) {
         let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
-    emit_progress(&app, "transcribing", 30, "Loading transcription engine...");
+    emit_progress(&app, &import_id, "transcribing", 30, "Loading transcription engine...");
 
     // Initialize the appropriate engine
     let whisper_engine = if !use_parakeet && !use_remote && total_segments > 0 {
@@ -566,7 +693,7 @@ async fn run_import<R: Runtime>(
     let mut total_confidence = 0.0f32;
 
     for (i, segment) in processable_segments.iter().enumerate() {
-        if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+        if is_import_cancelled(&import_id) {
             let _ = std::fs::remove_dir_all(&meeting_folder);
             return Err(anyhow!("Import cancelled"));
         }
@@ -575,6 +702,7 @@ async fn run_import<R: Runtime>(
         let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
         emit_progress(
             &app,
+            &import_id,
             "transcribing",
             progress,
             &format!(
@@ -647,12 +775,12 @@ async fn run_import<R: Runtime>(
     );
 
     // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    if is_import_cancelled(&import_id) {
         let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
-    emit_progress(&app, "saving", 85, "Creating meeting...");
+    emit_progress(&app, &import_id, "saving", 85, "Creating meeting...");
 
     // Create transcript segments
     let segments = create_transcript_segments(&all_transcripts);
@@ -671,7 +799,7 @@ async fn run_import<R: Runtime>(
     .await?;
 
     // Write transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, "saving", 90, "Writing transcript files...");
+    emit_progress(&app, &import_id, "saving", 90, "Writing transcript files...");
 
     if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
@@ -688,9 +816,10 @@ async fn run_import<R: Runtime>(
         warn!("Failed to write metadata.json: {}", e);
     }
 
-    emit_progress(&app, "complete", 100, "Import complete");
+    emit_progress(&app, &import_id, "complete", 100, "Import complete");
 
     Ok(ImportResult {
+        import_id,
         meeting_id,
         title,
         segments_count: segments.len(),
@@ -699,10 +828,17 @@ async fn run_import<R: Runtime>(
 }
 
 /// Emit progress event
-fn emit_progress<R: Runtime>(app: &AppHandle<R>, stage: &str, progress: u32, message: &str) {
+fn emit_progress<R: Runtime>(
+    app: &AppHandle<R>,
+    import_id: &str,
+    stage: &str,
+    progress: u32,
+    message: &str,
+) {
     let _ = app.emit(
         "import-progress",
         ImportProgress {
+            import_id: import_id.to_string(),
             stage: stage.to_string(),
             progress_percentage: progress,
             message: message.to_string(),
@@ -988,38 +1124,61 @@ pub async fn validate_audio_file_command(path: String) -> Result<AudioFileInfo, 
 #[tauri::command]
 pub async fn start_import_audio_command<R: Runtime>(
     app: AppHandle<R>,
+    import_id: Option<String>,
     source_path: String,
     title: String,
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<ImportStarted, String> {
-    // Check if import is already in progress (guard will be acquired in start_import)
-    if IMPORT_IN_PROGRESS.load(Ordering::SeqCst) {
-        return Err("Import already in progress".to_string());
-    }
+    let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let guard = ImportGuard::acquire(import_id.clone(), use_remote)?;
+
+    let import_id_for_task = import_id.clone();
 
     // Spawn import in background
     tauri::async_runtime::spawn(async move {
-        let result = start_import(app, source_path, title, language, model, provider).await;
+        let result = start_import_with_guard(
+            app,
+            import_id_for_task.clone(),
+            source_path,
+            title,
+            language,
+            model,
+            provider,
+            guard,
+        )
+        .await;
 
         if let Err(e) = result {
-            error!("Import failed: {}", e);
+            error!("Import {} failed: {}", import_id_for_task, e);
         }
     });
 
     Ok(ImportStarted {
+        import_id,
         message: "Import started".to_string(),
     })
 }
 
 /// Cancel ongoing import
 #[tauri::command]
-pub async fn cancel_import_command() -> Result<(), String> {
-    if !is_import_in_progress() {
+pub async fn cancel_import_command(import_id: Option<String>) -> Result<(), String> {
+    if let Some(import_id) = import_id.as_deref() {
+        let active = ACTIVE_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(import_id);
+
+        if !active {
+            return Err("No import in progress for this job".to_string());
+        }
+    } else if !is_import_in_progress() {
         return Err("No import in progress".to_string());
     }
-    cancel_import();
+
+    cancel_import(import_id.as_deref());
     Ok(())
 }
 
@@ -1032,6 +1191,100 @@ pub async fn is_import_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::engine_coordinator::{
+        global_coordinator_test_lock, LocalEngineUser, LOCAL_ENGINE_COORDINATOR,
+    };
+
+    #[test]
+    fn local_import_is_rejected_while_recording_holds_engine() {
+        let _serial = global_coordinator_test_lock();
+        let recording_claim = LOCAL_ENGINE_COORDINATOR
+            .try_claim(LocalEngineUser::Recording)
+            .unwrap();
+
+        let local = ImportGuard::acquire("import-under-recording".to_string(), false);
+        let err = match local {
+            Ok(_) => panic!("local import must not run while recording holds the engine"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("recording"),
+            "error should name the conflicting consumer, got: {err}"
+        );
+        // The failed acquire must not leave the job registered as active.
+        assert!(!is_import_in_progress());
+
+        // Remote imports don't touch the local engine and stay allowed.
+        let remote = ImportGuard::acquire("import-under-recording-remote".to_string(), true);
+        assert!(remote.is_ok());
+        drop(remote);
+
+        // Once recording releases the engine, local imports work again.
+        drop(recording_claim);
+        let local_after = ImportGuard::acquire("import-after-recording".to_string(), false);
+        assert!(local_after.is_ok());
+    }
+
+    #[test]
+    fn remote_imports_beyond_cap_are_rejected_until_a_slot_frees() {
+        use crate::audio::remote_concurrency::MAX_CONCURRENT_REMOTE_JOBS;
+
+        let _serial = global_coordinator_test_lock();
+
+        let mut guards: Vec<ImportGuard> = (0..MAX_CONCURRENT_REMOTE_JOBS)
+            .map(|i| {
+                ImportGuard::acquire(format!("import-remote-cap-{i}"), true)
+                    .unwrap_or_else(|e| panic!("remote import {i} within the cap must acquire: {e}"))
+            })
+            .collect();
+
+        let over_cap = ImportGuard::acquire("import-remote-over-cap".to_string(), true);
+        let err = match over_cap {
+            Ok(_) => panic!("remote import beyond the cap must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_lowercase().contains("remote"),
+            "error should explain the remote-job limit, got: {err}"
+        );
+        // The rejected job must not be left registered as active.
+        assert!(!ACTIVE_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains("import-remote-over-cap"));
+
+        // Finishing one job frees a slot for the next.
+        guards.pop();
+        let after_free = ImportGuard::acquire("import-remote-after-free".to_string(), true);
+        assert!(
+            after_free.is_ok(),
+            "remote import must acquire once a slot frees: {:?}",
+            after_free.err()
+        );
+    }
+
+    #[test]
+    fn local_import_does_not_consume_remote_slots() {
+        use crate::audio::remote_concurrency::MAX_CONCURRENT_REMOTE_JOBS;
+
+        let _serial = global_coordinator_test_lock();
+
+        let _remote_guards: Vec<ImportGuard> = (0..MAX_CONCURRENT_REMOTE_JOBS)
+            .map(|i| {
+                ImportGuard::acquire(format!("import-remote-full-{i}"), true)
+                    .expect("remote import within the cap must acquire")
+            })
+            .collect();
+
+        // The remote cap is exhausted, but a local import uses the local
+        // engine, not a remote slot, so it must still acquire.
+        let local = ImportGuard::acquire("import-local-while-remote-full".to_string(), false);
+        assert!(
+            local.is_ok(),
+            "local import must not be blocked by the remote cap: {:?}",
+            local.err()
+        );
+    }
 
     #[test]
     fn test_audio_extensions() {
@@ -1060,17 +1313,57 @@ mod tests {
     }
 
     #[test]
+    fn job_started_during_cancel_all_drain_is_not_cancelled() {
+        let _serial = global_coordinator_test_lock();
+        // Remote jobs skip the engine coordinator, so this exercises only the
+        // cancellation bookkeeping.
+        let draining = ImportGuard::acquire("import-drain-old".to_string(), true)
+            .expect("first remote import should acquire");
+
+        cancel_import(None);
+        assert!(is_import_cancelled("import-drain-old"));
+
+        // The user cancelled the jobs active at the time, not future ones. A job
+        // started while the cancel-all is still draining must run normally.
+        let fresh = ImportGuard::acquire("import-drain-new".to_string(), true)
+            .expect("new import should acquire while old job drains");
+        assert!(
+            !is_import_cancelled("import-drain-new"),
+            "job started after cancel-all must not inherit the cancellation"
+        );
+
+        drop(draining);
+        assert!(
+            !is_import_cancelled("import-drain-new"),
+            "draining the cancelled job must not affect the new job"
+        );
+        drop(fresh);
+        assert!(!is_import_in_progress());
+    }
+
+    #[test]
     fn test_cancellation_flag() {
-        IMPORT_CANCELLED.store(false, Ordering::SeqCst);
-        IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let _serial = global_coordinator_test_lock();
+        ACTIVE_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        CANCELLED_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         assert!(!is_import_in_progress());
 
-        cancel_import();
-        assert!(IMPORT_CANCELLED.load(Ordering::SeqCst));
+        cancel_import(Some("import-1"));
+        assert!(is_import_cancelled("import-1"));
+        assert!(!is_import_cancelled("import-2"));
 
         // Reset
-        IMPORT_CANCELLED.store(false, Ordering::SeqCst);
+        CANCELLED_IMPORTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     #[test]

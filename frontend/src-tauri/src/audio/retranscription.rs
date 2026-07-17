@@ -10,38 +10,131 @@ use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-/// Global flag to track if retranscription is in progress
-static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Meeting IDs currently being retranscribed. This prevents two jobs from
+/// replacing the same meeting transcript concurrently while still allowing
+/// different remote meetings to be processed at the same time.
+static ACTIVE_RETRANSCRIPTION_MEETINGS: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// Global flag to signal cancellation
-static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
+/// Meeting IDs requested for cancellation.
+static CANCELLED_RETRANSCRIPTION_MEETINGS: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
 
-/// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
-/// Ensures flag is cleared even if retranscription panics or returns early
-struct RetranscriptionGuard;
+fn is_retranscription_active_for_meeting(meeting_id: &str) -> bool {
+    ACTIVE_RETRANSCRIPTION_MEETINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(meeting_id)
+}
+
+fn clear_retranscription_cancelled(meeting_id: &str) {
+    CANCELLED_RETRANSCRIPTION_MEETINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(meeting_id);
+}
+
+fn is_retranscription_cancelled(meeting_id: &str) -> bool {
+    CANCELLED_RETRANSCRIPTION_MEETINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(meeting_id)
+}
+
+/// RAII guard for active retranscription state.
+/// Ensures active job state is cleared even if retranscription panics or returns early.
+struct RetranscriptionGuard {
+    meeting_id: String,
+    /// Claim on the shared local engines, held for the guard's lifetime.
+    /// `None` for remote jobs, which never touch the local engines.
+    _engine_claim: Option<crate::audio::engine_coordinator::LocalEngineClaim<'static>>,
+    /// Remote concurrency slot, held for the guard's lifetime.
+    /// `None` for local jobs, which are capped by the engine claim instead.
+    _remote_permit: Option<crate::audio::remote_concurrency::RemoteJobPermit>,
+}
 
 impl RetranscriptionGuard {
-    /// Create guard and set flag atomically
-    fn acquire() -> Result<Self, String> {
-        if RETRANSCRIPTION_IN_PROGRESS
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+    /// Reserve a retranscription slot.
+    ///
+    /// Remote jobs are allowed to run concurrently with other remote jobs, up
+    /// to the cap enforced by `remote_concurrency` (shared with remote
+    /// imports). Local jobs claim exclusive use of the shared Whisper/Parakeet
+    /// engines via the engine coordinator, so they fail while a recording with
+    /// realtime transcription, a local import, or another local
+    /// retranscription is active.
+    fn acquire(meeting_id: String, use_remote: bool) -> Result<Self, String> {
         {
-            return Err("Retranscription already in progress".to_string());
+            let mut active = ACTIVE_RETRANSCRIPTION_MEETINGS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            if active.contains(&meeting_id) {
+                return Err(format!(
+                    "Retranscription already in progress for meeting {}",
+                    meeting_id
+                ));
+            }
+
+            active.insert(meeting_id.clone());
         }
-        Ok(RetranscriptionGuard)
+
+        clear_retranscription_cancelled(&meeting_id);
+
+        let release_active = |meeting_id: &str| {
+            ACTIVE_RETRANSCRIPTION_MEETINGS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(meeting_id);
+        };
+
+        let mut engine_claim = None;
+        let mut remote_permit = None;
+
+        if use_remote {
+            match crate::audio::remote_concurrency::try_acquire_remote_slot() {
+                Ok(permit) => remote_permit = Some(permit),
+                Err(e) => {
+                    release_active(&meeting_id);
+                    return Err(format!("Cannot start a remote retranscription: {}", e));
+                }
+            }
+        } else {
+            use crate::audio::engine_coordinator::{LocalEngineUser, LOCAL_ENGINE_COORDINATOR};
+            match LOCAL_ENGINE_COORDINATOR.try_claim(LocalEngineUser::Retranscription) {
+                Ok(claim) => engine_claim = Some(claim),
+                Err(holder) => {
+                    release_active(&meeting_id);
+                    return Err(format!(
+                        "Cannot start a local retranscription: {} is already using the on-device transcription engine. Wait for it to finish, or select a remote transcription provider to run jobs simultaneously.",
+                        holder
+                    ));
+                }
+            }
+        }
+
+        Ok(RetranscriptionGuard {
+            meeting_id,
+            _engine_claim: engine_claim,
+            _remote_permit: remote_permit,
+        })
     }
 }
 
 impl Drop for RetranscriptionGuard {
     fn drop(&mut self) {
-        RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
+        ACTIVE_RETRANSCRIPTION_MEETINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.meeting_id);
+
+        clear_retranscription_cancelled(&self.meeting_id);
     }
 }
 
@@ -76,14 +169,34 @@ pub struct RetranscriptionError {
     pub error: String,
 }
 
-/// Check if retranscription is currently in progress
+/// Check if any retranscription is currently in progress
 pub fn is_retranscription_in_progress() -> bool {
-    RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst)
+    !ACTIVE_RETRANSCRIPTION_MEETINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
 }
 
-/// Cancel ongoing retranscription
-pub fn cancel_retranscription() {
-    RETRANSCRIPTION_CANCELLED.store(true, Ordering::SeqCst);
+/// Cancel an ongoing retranscription.
+/// If `meeting_id` is None, all currently active retranscriptions are cancelled.
+/// Cancel-all snapshots the active set rather than setting a sticky global
+/// flag, so a job started while the cancelled ones drain runs normally.
+pub fn cancel_retranscription(meeting_id: Option<&str>) {
+    let meeting_ids_to_cancel = if let Some(meeting_id) = meeting_id {
+        vec![meeting_id.to_string()]
+    } else {
+        ACTIVE_RETRANSCRIPTION_MEETINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    };
+
+    let mut cancelled = CANCELLED_RETRANSCRIPTION_MEETINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cancelled.extend(meeting_ids_to_cancel);
 }
 
 /// Start retranscription of a meeting's audio
@@ -95,12 +208,30 @@ pub async fn start_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
-    // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let guard = RetranscriptionGuard::acquire(meeting_id.clone(), use_remote).map_err(|e| anyhow!(e))?;
 
-    // Reset cancellation flag
-    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+    start_retranscription_with_guard(
+        app,
+        meeting_id,
+        meeting_folder_path,
+        language,
+        model,
+        provider,
+        guard,
+    )
+    .await
+}
 
+async fn start_retranscription_with_guard<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    meeting_folder_path: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    _guard: RetranscriptionGuard,
+) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref() == Some("openaiCompatible");
     let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
@@ -111,8 +242,7 @@ pub async fn start_retranscription<R: Runtime>(
         super::common::unload_engine_after_batch(use_parakeet).await;
     }
 
-    // Guard will automatically clear flag on drop
-    // No need for manual: RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
+    // Guard will automatically clear active job state on drop.
 
     match &result {
         Ok(res) => {
@@ -197,7 +327,7 @@ async fn run_retranscription<R: Runtime>(
     emit_progress(&app, &meeting_id, "decoding", 5, "Decoding audio file...");
 
     // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+    if is_retranscription_cancelled(&meeting_id) {
         return Err(anyhow!("Retranscription cancelled"));
     }
 
@@ -218,7 +348,7 @@ async fn run_retranscription<R: Runtime>(
     emit_progress(&app, &meeting_id, "decoding", 15, "Converting audio format...");
 
     // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+    if is_retranscription_cancelled(&meeting_id) {
         return Err(anyhow!("Retranscription cancelled"));
     }
 
@@ -233,7 +363,7 @@ async fn run_retranscription<R: Runtime>(
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
 
     // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+    if is_retranscription_cancelled(&meeting_id) {
         return Err(anyhow!("Retranscription cancelled"));
     }
 
@@ -259,7 +389,7 @@ async fn run_retranscription<R: Runtime>(
                 );
 
                 // Return false to cancel if cancellation requested
-                !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+                !is_retranscription_cancelled(&meeting_id_for_vad)
             },
         )
     })
@@ -358,7 +488,7 @@ async fn run_retranscription<R: Runtime>(
 
     for (i, segment) in processable_segments.iter().enumerate() {
         // Check for cancellation before each segment
-        if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        if is_retranscription_cancelled(&meeting_id) {
             return Err(anyhow!("Retranscription cancelled"));
         }
 
@@ -437,7 +567,7 @@ async fn run_retranscription<R: Runtime>(
     );
 
     // Check for cancellation
-    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+    if is_retranscription_cancelled(&meeting_id) {
         return Err(anyhow!("Retranscription cancelled"));
     }
 
@@ -809,24 +939,22 @@ pub async fn start_retranscription_command<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<RetranscriptionStarted, String> {
-
-    // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
-    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
-        return Err("Retranscription already in progress".to_string());
-    }
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let guard = RetranscriptionGuard::acquire(meeting_id.clone(), use_remote)?;
 
     // Clone values for the spawned task
     let meeting_id_clone = meeting_id.clone();
 
     // Spawn the retranscription in a background task
     tauri::async_runtime::spawn(async move {
-        let result = start_retranscription(
+        let result = start_retranscription_with_guard(
             app,
             meeting_id_clone,
             meeting_folder_path,
             language,
             model,
             provider,
+            guard,
         )
         .await;
 
@@ -844,11 +972,20 @@ pub async fn start_retranscription_command<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn cancel_retranscription_command() -> Result<(), String> {
+pub async fn cancel_retranscription_command(meeting_id: Option<String>) -> Result<(), String> {
+    if let Some(meeting_id) = meeting_id.as_deref() {
+        if !is_retranscription_active_for_meeting(meeting_id) {
+            return Err("No retranscription in progress for this meeting".to_string());
+        }
+        cancel_retranscription(Some(meeting_id));
+        return Ok(());
+    }
+
     if !is_retranscription_in_progress() {
         return Err("No retranscription in progress".to_string());
     }
-    cancel_retranscription();
+
+    cancel_retranscription(None);
     Ok(())
 }
 
@@ -860,6 +997,100 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::engine_coordinator::{
+        global_coordinator_test_lock, LocalEngineUser, LOCAL_ENGINE_COORDINATOR,
+    };
+
+    #[test]
+    fn local_retranscription_is_rejected_while_engine_is_busy() {
+        let _serial = global_coordinator_test_lock();
+        // A local import holding the engine must also block local retranscription —
+        // the old per-module flags never provided this cross-job exclusion.
+        let import_claim = LOCAL_ENGINE_COORDINATOR
+            .try_claim(LocalEngineUser::Import)
+            .unwrap();
+
+        let local = RetranscriptionGuard::acquire("meeting-under-import".to_string(), false);
+        let err = match local {
+            Ok(_) => panic!("local retranscription must not run while an import holds the engine"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("import"),
+            "error should name the conflicting consumer, got: {err}"
+        );
+        // The failed acquire must not leave the meeting registered as active.
+        assert!(!is_retranscription_active_for_meeting("meeting-under-import"));
+
+        // Remote retranscriptions don't touch the local engine and stay allowed.
+        let remote = RetranscriptionGuard::acquire("meeting-under-import-remote".to_string(), true);
+        assert!(remote.is_ok());
+        drop(remote);
+
+        // Once the import releases the engine, local retranscription works again.
+        drop(import_claim);
+        let local_after = RetranscriptionGuard::acquire("meeting-after-import".to_string(), false);
+        assert!(local_after.is_ok());
+    }
+
+    #[test]
+    fn remote_retranscriptions_beyond_cap_are_rejected_until_a_slot_frees() {
+        use crate::audio::remote_concurrency::MAX_CONCURRENT_REMOTE_JOBS;
+
+        let _serial = global_coordinator_test_lock();
+
+        let mut guards: Vec<RetranscriptionGuard> = (0..MAX_CONCURRENT_REMOTE_JOBS)
+            .map(|i| {
+                RetranscriptionGuard::acquire(format!("meeting-remote-cap-{i}"), true)
+                    .unwrap_or_else(|e| {
+                        panic!("remote retranscription {i} within the cap must acquire: {e}")
+                    })
+            })
+            .collect();
+
+        let over_cap = RetranscriptionGuard::acquire("meeting-remote-over-cap".to_string(), true);
+        let err = match over_cap {
+            Ok(_) => panic!("remote retranscription beyond the cap must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_lowercase().contains("remote"),
+            "error should explain the remote-job limit, got: {err}"
+        );
+        // The rejected job must not be left registered as active.
+        assert!(!is_retranscription_active_for_meeting("meeting-remote-over-cap"));
+
+        // Finishing one job frees a slot for the next.
+        guards.pop();
+        let after_free = RetranscriptionGuard::acquire("meeting-remote-after-free".to_string(), true);
+        assert!(
+            after_free.is_ok(),
+            "remote retranscription must acquire once a slot frees: {:?}",
+            after_free.err()
+        );
+    }
+
+    #[test]
+    fn remote_cap_is_shared_with_other_remote_jobs() {
+        use crate::audio::remote_concurrency::{
+            try_acquire_remote_slot, RemoteJobPermit, MAX_CONCURRENT_REMOTE_JOBS,
+        };
+
+        let _serial = global_coordinator_test_lock();
+
+        // Slots taken by other remote jobs (e.g. imports) count against the
+        // same cap — the limited resources (local decode CPU and the remote
+        // endpoint) are shared across job kinds.
+        let _other_jobs: Vec<RemoteJobPermit> = (0..MAX_CONCURRENT_REMOTE_JOBS)
+            .map(|_| try_acquire_remote_slot().expect("slot within the cap must acquire"))
+            .collect();
+
+        let over_cap = RetranscriptionGuard::acquire("meeting-shared-cap".to_string(), true);
+        assert!(
+            over_cap.is_err(),
+            "remote retranscription must be rejected while other remote jobs hold every slot"
+        );
+    }
 
     #[test]
     fn test_create_transcript_segments_empty() {
@@ -938,19 +1169,59 @@ mod tests {
     }
 
     #[test]
+    fn job_started_during_cancel_all_drain_is_not_cancelled() {
+        let _serial = global_coordinator_test_lock();
+        // Remote jobs skip the engine coordinator, so this exercises only the
+        // cancellation bookkeeping.
+        let draining = RetranscriptionGuard::acquire("meeting-drain-old".to_string(), true)
+            .expect("first remote retranscription should acquire");
+
+        cancel_retranscription(None);
+        assert!(is_retranscription_cancelled("meeting-drain-old"));
+
+        // The user cancelled the jobs active at the time, not future ones. A job
+        // started while the cancel-all is still draining must run normally.
+        let fresh = RetranscriptionGuard::acquire("meeting-drain-new".to_string(), true)
+            .expect("new retranscription should acquire while old job drains");
+        assert!(
+            !is_retranscription_cancelled("meeting-drain-new"),
+            "job started after cancel-all must not inherit the cancellation"
+        );
+
+        drop(draining);
+        assert!(
+            !is_retranscription_cancelled("meeting-drain-new"),
+            "draining the cancelled job must not affect the new job"
+        );
+        drop(fresh);
+        assert!(!is_retranscription_in_progress());
+    }
+
+    #[test]
     fn test_cancellation_flag() {
-        // Reset flag to known state
-        RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
-        RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let _serial = global_coordinator_test_lock();
+        // Reset to known state
+        ACTIVE_RETRANSCRIPTION_MEETINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        CANCELLED_RETRANSCRIPTION_MEETINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         assert!(!is_retranscription_in_progress());
 
-        // Test cancellation
-        cancel_retranscription();
-        assert!(RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst));
+        // Test per-meeting cancellation
+        cancel_retranscription(Some("meeting-1"));
+        assert!(is_retranscription_cancelled("meeting-1"));
+        assert!(!is_retranscription_cancelled("meeting-2"));
 
         // Reset for other tests
-        RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+        CANCELLED_RETRANSCRIPTION_MEETINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     #[test]

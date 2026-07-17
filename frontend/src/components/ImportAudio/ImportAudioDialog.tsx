@@ -170,6 +170,7 @@ export function ImportAudioDialog({
     return availableModels.find((m) => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
   const isParakeetModel = selectedModel?.provider === 'parakeet';
+  const isRemoteModel = selectedModel?.provider === 'openaiCompatible';
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {
@@ -187,13 +188,30 @@ export function ImportAudioDialog({
   const handleStartImport = async () => {
     if (!fileInfo) return;
 
-    await startImport(
+    const importTitle = title || fileInfo.filename;
+    const started = await startImport(
       fileInfo.path,
-      title || fileInfo.filename,
+      importTitle,
       isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang,
       selectedModel?.name || null,
       selectedModel?.provider || null
     );
+
+    if (started && isRemoteModel) {
+      window.dispatchEvent(new CustomEvent('meetily-background-import-started', {
+        detail: {
+          importId: started.import_id,
+          title: importTitle,
+        },
+      }));
+
+      toast.info('Remote import started', {
+        description: 'It will continue in the background, and you can start another remote transcription now.',
+      });
+
+      reset();
+      onOpenChange(false);
+    }
   };
 
   const handleCancel = async () => {

@@ -7,6 +7,11 @@ use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
+/// Serializes engine load/unload transitions (currently only the post-batch
+/// unload below). This is NOT the mutual-exclusion mechanism between engine
+/// consumers — recording, imports, and retranscriptions coordinate through
+/// `audio::engine_coordinator` instead, which fails fast rather than queueing
+/// and is never held across an `.await`.
 static ENGINE_LIFECYCLE_LOCK: Lazy<Arc<AsyncMutex<()>>> =
     Lazy::new(|| Arc::new(AsyncMutex::new(())));
 
