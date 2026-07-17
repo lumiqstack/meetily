@@ -30,8 +30,27 @@ pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), Strin
             .await
             .map_err(|e| format!("Failed to initialize database manager: {}", e))?;
 
+        let pool = db_manager.pool().clone();
         app.manage(AppState { db_manager });
         info!("Database initialized successfully");
+
+        // Detect background jobs a previous process died under: mark them so
+        // the frontend can offer retry/dismiss, and clean up orphaned import
+        // folders. Best-effort — a reconcile failure must not block startup.
+        match crate::audio::job_persistence::reconcile_interrupted_jobs(&pool).await {
+            Ok(outcome) => {
+                if !outcome.interrupted.is_empty() {
+                    info!(
+                        "Found {} background job(s) interrupted by a previous shutdown",
+                        outcome.interrupted.len()
+                    );
+                }
+                for folder in &outcome.removed_folders {
+                    info!("Removed orphaned import folder: {}", folder);
+                }
+            }
+            Err(e) => log::warn!("Failed to reconcile interrupted background jobs: {}", e),
+        }
     }
 
     Ok(())

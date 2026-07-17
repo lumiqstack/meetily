@@ -158,11 +158,36 @@ behavior, poisoned-lock recovery (`unwrap_or_else(|e| e.into_inner())`). There i
 
 ## 7. Longer-term: job persistence across restarts
 
-Background jobs are fire-and-forget in-memory. If the app quits mid-import, the job
-vanishes and a partially-created meeting may be left behind with no resume or cleanup path.
-Options: persist a job table in SQLite and reconcile on startup (mark orphaned meetings,
-offer retry/cleanup), or at minimum detect and flag partial meetings on launch. Bigger
-design question — scope before implementing.
+**Status: DONE (2026-07-17).** Scoping first (as the item asked): crash analysis showed
+imports create their meeting folder early but commit the DB meeting row in one transaction
+at the very end, and retranscriptions replace transcripts in one end-of-job transaction —
+so a crash never leaves a partial DB meeting, it leaves (a) a silently vanished job and
+(b) for imports, an orphaned folder with a copied audio file. Design chosen: a durable
+job journal, not resume-from-checkpoint.
+
+Implemented via a TDD'd `background_jobs` SQLite journal
+(`audio/job_persistence.rs`, migration `20260716000000_add_background_jobs.sql`): one row
+per in-flight job (id, kind, title, source/folder/meeting, language/model/provider,
+created_at), inserted at job start in `start_import_with_guard` /
+`start_retranscription_with_guard` and deleted on every in-process finish (success,
+failure, cancel — all already surfaced live). Any row still present at startup is by
+definition interrupted: `reconcile_interrupted_jobs` (called from
+`database/setup.rs` after DB init) flags those rows and removes orphaned import folders,
+guarded three ways (imports only, no `metadata.json` inside, no `meetings.folder_path`
+row references it — the latter covers a crash between DB commit and metadata write).
+Retranscription folders are never touched. `list_interrupted_jobs_command` /
+`dismiss_interrupted_job_command` expose the journal; dismiss only deletes rows still
+flagged interrupted so a rerun that reused the ID (retranscriptions key by meeting ID)
+survives dismissal of its stale notice.
+
+Frontend: `BackgroundJobStore` gained a TDD'd `interrupted` status plus
+`registerInterrupted` / `dismissInterrupted` / `retryInterrupted` (retry re-invokes the
+original start command with the journaled settings, then drops the stale notice and
+registers the fresh job so the existing progress/completion listeners drive it).
+`BackgroundJobToastProvider` queries the journal on mount and renders a sticky per-job
+toast with Retry/Dismiss. Rust: 10 unit tests in `job_persistence.rs` (in-memory SQLite
+running the real migrations; mutation-validated where behavior predated its test).
+Frontend: 6 new store tests in `tests/lib/background-jobs.test.ts`.
 
 ---
 

@@ -5,12 +5,37 @@ export type BackgroundJobStatus =
   | 'cancelling'
   | 'completed'
   | 'error'
-  | 'cancelled';
+  | 'cancelled'
+  | 'interrupted';
+
+/**
+ * A job a previous app process died under, as journaled by the backend
+ * (`background_jobs` table, snake_case fields). Carries everything needed to
+ * retry the job with its original settings.
+ */
+export interface InterruptedJobInfo {
+  id: string;
+  kind: BackgroundJobKind;
+  title: string;
+  source_path: string | null;
+  folder_path: string | null;
+  meeting_id: string | null;
+  language: string | null;
+  model: string | null;
+  provider: string | null;
+  created_at: string;
+}
 
 export type CancelInvoker = (
   command: string,
   args: Record<string, string>
 ) => Promise<void>;
+
+/** Generic Tauri-command invoker used by interrupted-job actions. */
+export type CommandInvoker = (
+  command: string,
+  args: Record<string, unknown>
+) => Promise<unknown>;
 
 export interface BackgroundJob {
   id: string;
@@ -20,6 +45,8 @@ export interface BackgroundJob {
   progressPercentage: number;
   message: string;
   error: string | null;
+  /** Present only on jobs recovered from a crashed session. */
+  interrupted?: InterruptedJobInfo;
 }
 
 /** How long a job toast stays on screen for a given status. */
@@ -33,6 +60,8 @@ export function toastDurationMs(status: BackgroundJobStatus): number {
       return 10000;
     case 'running':
     case 'cancelling':
+    // An interrupted-job notice stays until the user retries or dismisses.
+    case 'interrupted':
       return Infinity;
   }
 }
@@ -101,6 +130,20 @@ export class BackgroundJobStore {
     this.notify();
   }
 
+  registerInterrupted(info: InterruptedJobInfo): void {
+    this.jobs.set(info.id, {
+      id: info.id,
+      kind: info.kind,
+      title: info.title,
+      status: 'interrupted',
+      progressPercentage: 0,
+      message: '',
+      error: null,
+      interrupted: info,
+    });
+    this.notify();
+  }
+
   applyProgress(id: string, progressPercentage: number, message: string): boolean {
     const job = this.jobs.get(id);
     if (!job) return false;
@@ -141,6 +184,68 @@ export class BackgroundJobStore {
       this.notify();
       return false;
     }
+  }
+
+  /**
+   * Restart an interrupted job with the settings journaled at its original
+   * start, then drop the stale notice. The fresh job is registered as
+   * running so the regular progress/completion listeners drive it.
+   */
+  async retryInterrupted(id: string, invoke: CommandInvoker): Promise<boolean> {
+    const job = this.jobs.get(id);
+    const info = job?.interrupted;
+    if (!job || job.status !== 'interrupted' || !info) return false;
+
+    let freshId: string;
+    try {
+      if (info.kind === 'import') {
+        const started = (await invoke('start_import_audio_command', {
+          sourcePath: info.source_path,
+          title: info.title,
+          language: info.language,
+          model: info.model,
+          provider: info.provider,
+        })) as { import_id: string };
+        freshId = started.import_id;
+      } else {
+        await invoke('start_retranscription_command', {
+          meetingId: info.meeting_id,
+          meetingFolderPath: info.folder_path,
+          language: info.language,
+          model: info.model,
+          provider: info.provider,
+        });
+        freshId = info.meeting_id ?? id;
+      }
+    } catch {
+      return false;
+    }
+
+    await invoke('dismiss_interrupted_job_command', { jobId: id });
+    this.remove(id);
+    if (info.kind === 'import') {
+      this.registerImport(freshId, info.title);
+    } else {
+      this.registerRetranscription(freshId, info.title);
+    }
+    return true;
+  }
+
+  /**
+   * Drop an interrupted-job notice: clears the backend journal row and
+   * removes the job from the store.
+   */
+  async dismissInterrupted(id: string, invoke: CommandInvoker): Promise<boolean> {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== 'interrupted') return false;
+
+    try {
+      await invoke('dismiss_interrupted_job_command', { jobId: id });
+    } catch {
+      return false;
+    }
+    this.remove(id);
+    return true;
   }
 
   remove(id: string): void {
