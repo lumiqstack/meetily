@@ -45,6 +45,9 @@ pub(crate) mod common;
 // Exclusive-use coordination for the shared local transcription engines
 pub(crate) mod engine_coordinator;
 
+// Shared job registry backing ImportGuard and RetranscriptionGuard
+pub(crate) mod job_registry;
+
 // Concurrency cap for remote (openaiCompatible) transcription jobs
 pub(crate) mod remote_concurrency;
 

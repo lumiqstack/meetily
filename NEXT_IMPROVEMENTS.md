@@ -126,6 +126,19 @@ via `tauri::async_runtime` is the natural fit.
 
 ## 5. Consolidate and test the guard machinery (maintainability)
 
+**Status: DONE (2026-07-16).** Resolved via `audio/job_registry.rs`: a TDD'd `JobRegistry`
+(active set + cancel set + engine claim / remote permit, RAII `JobGuard` cleanup) that both
+modules now instantiate as a `Lazy` static (`IMPORT_JOBS` keyed by import ID,
+`RETRANSCRIPTION_JOBS` keyed by meeting ID) — the bespoke `ImportGuard` /
+`RetranscriptionGuard` state machines are deleted and each module keeps only thin wrappers.
+Error messages are parameterized (`kind_title`/`kind`/`id_noun`) and byte-identical to the
+old ones. Unit tests cover: acquire/drop lifecycle, double-acquire same ID,
+local-engine exclusivity, remote-cap sharing, single-cancel + drain cleanup, stale
+cancel-flag clearing on ID reuse, cancel-all drain (mutation-validated against the old
+sticky-flag bug), and poisoned-lock recovery (mutation-validated against `.unwrap()`).
+The pre-existing tests in `import.rs` / `retranscription.rs` still pass unchanged in
+substance, now exercising the registry through the module wrappers.
+
 **Problem**: `ImportGuard` and `RetranscriptionGuard` are near-identical ~80-line state
 machines (active set + exclusive local flag + cancel set + drain-time cleanup) that will
 drift apart.

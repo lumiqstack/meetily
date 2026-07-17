@@ -11,9 +11,8 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
@@ -21,111 +20,25 @@ use uuid::Uuid;
 use super::audio_processing::create_meeting_folder;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
+use super::job_registry::{JobGuard, JobRegistry};
 use super::recording_preferences::get_default_recordings_folder;
 
-/// Import IDs currently being processed.
-static ACTIVE_IMPORTS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-
-/// Import IDs requested for cancellation.
-static CANCELLED_IMPORTS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-
-fn clear_import_cancelled(import_id: &str) {
-    CANCELLED_IMPORTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(import_id);
-}
+/// Registry of in-flight import jobs, keyed by import ID.
+///
+/// Remote jobs run concurrently up to the `remote_concurrency` cap; local
+/// jobs claim exclusive use of the shared Whisper/Parakeet engines via the
+/// engine coordinator. See `job_registry.rs` for the full semantics.
+static IMPORT_JOBS: Lazy<JobRegistry> = Lazy::new(|| {
+    JobRegistry::new(
+        crate::audio::engine_coordinator::LocalEngineUser::Import,
+        "Import",
+        "import",
+        "job",
+    )
+});
 
 fn is_import_cancelled(import_id: &str) -> bool {
-    CANCELLED_IMPORTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(import_id)
-}
-
-/// RAII guard for active import state.
-/// Ensures active job state is cleared even if import panics or returns early.
-struct ImportGuard {
-    import_id: String,
-    /// Claim on the shared local engines, held for the guard's lifetime.
-    /// `None` for remote jobs, which never touch the local engines.
-    _engine_claim: Option<crate::audio::engine_coordinator::LocalEngineClaim<'static>>,
-    /// Remote concurrency slot, held for the guard's lifetime.
-    /// `None` for local jobs, which are capped by the engine claim instead.
-    _remote_permit: Option<crate::audio::remote_concurrency::RemoteJobPermit>,
-}
-
-impl ImportGuard {
-    /// Reserve an import slot.
-    ///
-    /// Remote jobs are allowed to run concurrently, up to the cap enforced by
-    /// `remote_concurrency` (each still decodes audio locally and uploads to
-    /// the remote endpoint). Local jobs claim exclusive use of the shared
-    /// Whisper/Parakeet engines via the engine coordinator, so they fail while
-    /// a recording with realtime transcription, another local import, or a
-    /// local retranscription is active.
-    fn acquire(import_id: String, use_remote: bool) -> Result<Self, String> {
-        {
-            let mut active = ACTIVE_IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
-
-            if active.contains(&import_id) {
-                return Err(format!("Import already in progress for job {}", import_id));
-            }
-
-            active.insert(import_id.clone());
-        }
-
-        clear_import_cancelled(&import_id);
-
-        let release_active = |import_id: &str| {
-            ACTIVE_IMPORTS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(import_id);
-        };
-
-        let mut engine_claim = None;
-        let mut remote_permit = None;
-
-        if use_remote {
-            match crate::audio::remote_concurrency::try_acquire_remote_slot() {
-                Ok(permit) => remote_permit = Some(permit),
-                Err(e) => {
-                    release_active(&import_id);
-                    return Err(format!("Cannot start a remote import: {}", e));
-                }
-            }
-        } else {
-            use crate::audio::engine_coordinator::{LocalEngineUser, LOCAL_ENGINE_COORDINATOR};
-            match LOCAL_ENGINE_COORDINATOR.try_claim(LocalEngineUser::Import) {
-                Ok(claim) => engine_claim = Some(claim),
-                Err(holder) => {
-                    release_active(&import_id);
-                    return Err(format!(
-                        "Cannot start a local import: {} is already using the on-device transcription engine. Wait for it to finish, or select a remote transcription provider to run jobs simultaneously.",
-                        holder
-                    ));
-                }
-            }
-        }
-
-        Ok(ImportGuard {
-            import_id,
-            _engine_claim: engine_claim,
-            _remote_permit: remote_permit,
-        })
-    }
-}
-
-impl Drop for ImportGuard {
-    fn drop(&mut self) {
-        ACTIVE_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.import_id);
-
-        clear_import_cancelled(&self.import_id);
-    }
+    IMPORT_JOBS.is_cancelled(import_id)
 }
 
 /// VAD redemption time in milliseconds - bridges natural pauses in speech
@@ -190,30 +103,13 @@ pub struct ImportStarted {
 
 /// Check if import is currently in progress
 pub fn is_import_in_progress() -> bool {
-    !ACTIVE_IMPORTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
+    IMPORT_JOBS.has_active_jobs()
 }
 
 /// Cancel ongoing import.
 /// If `import_id` is None, all currently active imports are cancelled.
-/// Cancel-all snapshots the active set rather than setting a sticky global
-/// flag, so a job started while the cancelled ones drain runs normally.
 pub fn cancel_import(import_id: Option<&str>) {
-    let import_ids_to_cancel = if let Some(import_id) = import_id {
-        vec![import_id.to_string()]
-    } else {
-        ACTIVE_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect()
-    };
-
-    let mut cancelled = CANCELLED_IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
-    cancelled.extend(import_ids_to_cancel);
+    IMPORT_JOBS.cancel(import_id);
 }
 
 /// Validate an audio file and return its info using metadata-only approach
@@ -361,7 +257,9 @@ pub async fn start_import<R: Runtime>(
 ) -> Result<ImportResult> {
     let import_id = format!("import-{}", Uuid::new_v4());
     let use_remote = provider.as_deref() == Some("openaiCompatible");
-    let guard = ImportGuard::acquire(import_id.clone(), use_remote).map_err(|e| anyhow!(e))?;
+    let guard = IMPORT_JOBS
+        .acquire(import_id.clone(), use_remote)
+        .map_err(|e| anyhow!(e))?;
 
     start_import_with_guard(
         app,
@@ -384,7 +282,7 @@ async fn start_import_with_guard<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
-    _guard: ImportGuard,
+    _guard: JobGuard<'static>,
 ) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref() == Some("openaiCompatible");
@@ -1133,7 +1031,7 @@ pub async fn start_import_audio_command<R: Runtime>(
 ) -> Result<ImportStarted, String> {
     let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
     let use_remote = provider.as_deref() == Some("openaiCompatible");
-    let guard = ImportGuard::acquire(import_id.clone(), use_remote)?;
+    let guard = IMPORT_JOBS.acquire(import_id.clone(), use_remote)?;
 
     let import_id_for_task = import_id.clone();
 
@@ -1166,12 +1064,7 @@ pub async fn start_import_audio_command<R: Runtime>(
 #[tauri::command]
 pub async fn cancel_import_command(import_id: Option<String>) -> Result<(), String> {
     if let Some(import_id) = import_id.as_deref() {
-        let active = ACTIVE_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(import_id);
-
-        if !active {
+        if !IMPORT_JOBS.is_active(import_id) {
             return Err("No import in progress for this job".to_string());
         }
     } else if !is_import_in_progress() {
@@ -1202,7 +1095,7 @@ mod tests {
             .try_claim(LocalEngineUser::Recording)
             .unwrap();
 
-        let local = ImportGuard::acquire("import-under-recording".to_string(), false);
+        let local = IMPORT_JOBS.acquire("import-under-recording".to_string(), false);
         let err = match local {
             Ok(_) => panic!("local import must not run while recording holds the engine"),
             Err(err) => err,
@@ -1215,13 +1108,13 @@ mod tests {
         assert!(!is_import_in_progress());
 
         // Remote imports don't touch the local engine and stay allowed.
-        let remote = ImportGuard::acquire("import-under-recording-remote".to_string(), true);
+        let remote = IMPORT_JOBS.acquire("import-under-recording-remote".to_string(), true);
         assert!(remote.is_ok());
         drop(remote);
 
         // Once recording releases the engine, local imports work again.
         drop(recording_claim);
-        let local_after = ImportGuard::acquire("import-after-recording".to_string(), false);
+        let local_after = IMPORT_JOBS.acquire("import-after-recording".to_string(), false);
         assert!(local_after.is_ok());
     }
 
@@ -1231,14 +1124,14 @@ mod tests {
 
         let _serial = global_coordinator_test_lock();
 
-        let mut guards: Vec<ImportGuard> = (0..MAX_CONCURRENT_REMOTE_JOBS)
+        let mut guards: Vec<JobGuard<'static>> = (0..MAX_CONCURRENT_REMOTE_JOBS)
             .map(|i| {
-                ImportGuard::acquire(format!("import-remote-cap-{i}"), true)
+                IMPORT_JOBS.acquire(format!("import-remote-cap-{i}"), true)
                     .unwrap_or_else(|e| panic!("remote import {i} within the cap must acquire: {e}"))
             })
             .collect();
 
-        let over_cap = ImportGuard::acquire("import-remote-over-cap".to_string(), true);
+        let over_cap = IMPORT_JOBS.acquire("import-remote-over-cap".to_string(), true);
         let err = match over_cap {
             Ok(_) => panic!("remote import beyond the cap must be rejected"),
             Err(err) => err,
@@ -1248,14 +1141,11 @@ mod tests {
             "error should explain the remote-job limit, got: {err}"
         );
         // The rejected job must not be left registered as active.
-        assert!(!ACTIVE_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains("import-remote-over-cap"));
+        assert!(!IMPORT_JOBS.is_active("import-remote-over-cap"));
 
         // Finishing one job frees a slot for the next.
         guards.pop();
-        let after_free = ImportGuard::acquire("import-remote-after-free".to_string(), true);
+        let after_free = IMPORT_JOBS.acquire("import-remote-after-free".to_string(), true);
         assert!(
             after_free.is_ok(),
             "remote import must acquire once a slot frees: {:?}",
@@ -1269,16 +1159,16 @@ mod tests {
 
         let _serial = global_coordinator_test_lock();
 
-        let _remote_guards: Vec<ImportGuard> = (0..MAX_CONCURRENT_REMOTE_JOBS)
+        let _remote_guards: Vec<JobGuard<'static>> = (0..MAX_CONCURRENT_REMOTE_JOBS)
             .map(|i| {
-                ImportGuard::acquire(format!("import-remote-full-{i}"), true)
+                IMPORT_JOBS.acquire(format!("import-remote-full-{i}"), true)
                     .expect("remote import within the cap must acquire")
             })
             .collect();
 
         // The remote cap is exhausted, but a local import uses the local
         // engine, not a remote slot, so it must still acquire.
-        let local = ImportGuard::acquire("import-local-while-remote-full".to_string(), false);
+        let local = IMPORT_JOBS.acquire("import-local-while-remote-full".to_string(), false);
         assert!(
             local.is_ok(),
             "local import must not be blocked by the remote cap: {:?}",
@@ -1317,7 +1207,7 @@ mod tests {
         let _serial = global_coordinator_test_lock();
         // Remote jobs skip the engine coordinator, so this exercises only the
         // cancellation bookkeeping.
-        let draining = ImportGuard::acquire("import-drain-old".to_string(), true)
+        let draining = IMPORT_JOBS.acquire("import-drain-old".to_string(), true)
             .expect("first remote import should acquire");
 
         cancel_import(None);
@@ -1325,7 +1215,7 @@ mod tests {
 
         // The user cancelled the jobs active at the time, not future ones. A job
         // started while the cancel-all is still draining must run normally.
-        let fresh = ImportGuard::acquire("import-drain-new".to_string(), true)
+        let fresh = IMPORT_JOBS.acquire("import-drain-new".to_string(), true)
             .expect("new import should acquire while old job drains");
         assert!(
             !is_import_cancelled("import-drain-new"),
@@ -1344,26 +1234,19 @@ mod tests {
     #[test]
     fn test_cancellation_flag() {
         let _serial = global_coordinator_test_lock();
-        ACTIVE_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        CANCELLED_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
 
-        assert!(!is_import_in_progress());
+        let guard = IMPORT_JOBS
+            .acquire("import-1".to_string(), true)
+            .expect("import should acquire");
 
         cancel_import(Some("import-1"));
         assert!(is_import_cancelled("import-1"));
         assert!(!is_import_cancelled("import-2"));
 
-        // Reset
-        CANCELLED_IMPORTS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // Draining the job clears its cancel flag.
+        drop(guard);
+        assert!(!is_import_cancelled("import-1"));
+        assert!(!is_import_in_progress());
     }
 
     #[test]
