@@ -42,6 +42,12 @@ pub mod transcription;
 // Shared utilities for import and retranscription
 pub(crate) mod common;
 
+// Exclusive-use coordination for the shared local transcription engines
+pub(crate) mod engine_coordinator;
+
+// Concurrency cap for remote (openaiCompatible) transcription jobs
+pub(crate) mod remote_concurrency;
+
 // Shared constants
 pub mod constants;
 

@@ -330,8 +330,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         meeting_name
     );
 
-    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
-
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("🔍 IS_RECORDING state check: {}", current_recording_state);
@@ -340,6 +338,16 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    // Realtime transcription shares the global Whisper/Parakeet engines with
+    // local imports/retranscriptions, so claim them for the whole recording
+    // (see audio/engine_coordinator.rs). Held as an RAII value so any failed
+    // start below releases it; parked once the recording is actually running
+    // and released in stop_recording.
+    let engine_claim = if realtime_transcription_enabled {
+        Some(super::engine_coordinator::claim_recording_engine()?)
+    } else {
+        None
+    };
     if realtime_transcription_enabled {
         if let Err(error) = crate::ensure_onnx_runtime_available() {
             return Err(map_recording_start_error(
@@ -442,7 +450,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Flip recording live + reset per-session flags (speech-detected latch,
     // mic-recovery budget). Shared with the other start path — see helper.
     finalize_recording_start();
-    drop(engine_lifecycle_guard);
+    if let Some(claim) = engine_claim {
+        // Recording is now live: keep the engine claim until stop_recording.
+        super::engine_coordinator::store_recording_claim(claim);
+    }
 
     REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
     if realtime_transcription_enabled {
@@ -524,8 +535,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         mic_device_name, system_device_name, meeting_name
     );
 
-    let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
-
     // Check if already recording
     let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
     info!("🔍 IS_RECORDING state check: {}", current_recording_state);
@@ -534,6 +543,16 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    // Realtime transcription shares the global Whisper/Parakeet engines with
+    // local imports/retranscriptions, so claim them for the whole recording
+    // (see audio/engine_coordinator.rs). Held as an RAII value so any failed
+    // start below releases it; parked once the recording is actually running
+    // and released in stop_recording.
+    let engine_claim = if realtime_transcription_enabled {
+        Some(super::engine_coordinator::claim_recording_engine()?)
+    } else {
+        None
+    };
     if realtime_transcription_enabled {
         if let Err(error) = crate::ensure_onnx_runtime_available() {
             return Err(map_recording_start_error(
@@ -633,7 +652,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Flip recording live + reset per-session flags (speech-detected latch,
     // mic-recovery budget). Shared with the other start path — see helper.
     finalize_recording_start();
-    drop(engine_lifecycle_guard);
+    if let Some(claim) = engine_claim {
+        // Recording is now live: keep the engine claim until stop_recording.
+        super::engine_coordinator::store_recording_claim(claim);
+    }
 
     REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
     if realtime_transcription_enabled {
@@ -1080,6 +1102,9 @@ pub async fn stop_recording<R: Runtime>(
     info!("🔍 Setting IS_RECORDING to false");
     IS_RECORDING.store(false, Ordering::SeqCst);
     // IS_RECORDING_STOPPING is cleared by _stopping_guard on scope exit.
+    // Recording no longer uses the shared local engines; let queued local
+    // imports/retranscriptions claim them (no-op when realtime was disabled).
+    super::engine_coordinator::release_recording_claim();
 
     // Step 4.5: Prepare metadata for frontend (NO database save)
     // NOTE: We do NOT save to database here. The frontend will save after all transcripts are displayed.

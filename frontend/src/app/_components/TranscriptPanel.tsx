@@ -1,5 +1,6 @@
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { PermissionWarning } from '@/components/PermissionWarning';
+import { BackgroundJobsPanel } from '@/components/shared/BackgroundJobsPanel';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, GlobeIcon } from 'lucide-react';
@@ -100,6 +101,9 @@ export function TranscriptPanel({
           />
         </div>
       )}
+
+      {/* Background remote imports/retranscriptions in progress */}
+      <BackgroundJobsPanel />
 
       {/* Transcript content */}
       <div className="pb-20">

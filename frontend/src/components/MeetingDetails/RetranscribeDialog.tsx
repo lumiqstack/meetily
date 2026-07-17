@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu } from 'lucide-react';
+import { RefreshCw, Globe, Loader2, AlertCircle, X, Cpu } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -93,6 +93,7 @@ export function RetranscribeDialog({
     return availableModels.find(m => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
   const isParakeetModel = selectedModelDetails?.provider === 'parakeet';
+  const isRemoteModel = selectedModelDetails?.provider === 'openaiCompatible';
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {
@@ -221,6 +222,22 @@ export function RetranscribeDialog({
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
       });
+
+      if (isRemoteModel) {
+        window.dispatchEvent(new CustomEvent('meetily-background-retranscription-started', {
+          detail: {
+            meetingId,
+          },
+        }));
+
+        toast.info('Remote retranscription started', {
+          description: 'It will continue in the background, and you can start another remote transcription now.',
+        });
+
+        setIsProcessing(false);
+        setProgress(null);
+        onOpenChange(false);
+      }
     } catch (err: any) {
       setIsProcessing(false);
       const errorMsg = typeof err === 'string' ? err : (err?.message || String(err));
@@ -233,7 +250,7 @@ export function RetranscribeDialog({
   const handleCancel = async () => {
     if (isProcessing) {
       try {
-        await invoke('cancel_retranscription_command');
+        await invoke('cancel_retranscription_command', { meetingId });
         setIsProcessing(false);
         setProgress(null);
         toast.info('Retranscription cancelled');

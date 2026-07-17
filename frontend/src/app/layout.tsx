@@ -26,6 +26,7 @@ import { TeamsMeetingDetectionProvider } from '@/contexts/TeamsMeetingDetectionP
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
+import { BackgroundJobToastProvider } from '@/components/shared/BackgroundJobToast'
 
 
 const sourceSans3 = Source_Sans_3({
@@ -248,6 +249,8 @@ export default function RootLayout({
                               <ImportDialogProvider onOpen={handleOpenImportDialog}>
                                 {/* Download progress toast provider - listens for background downloads */}
                                 <DownloadProgressToastProvider />
+                                {/* Per-job progress toasts (with cancel) for backgrounded remote imports/retranscriptions */}
+                                <BackgroundJobToastProvider />
 
                                 {/* Show onboarding or main app */}
                                 {showOnboarding ? (
