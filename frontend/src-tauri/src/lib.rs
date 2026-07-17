@@ -790,6 +790,9 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Interrupted background job commands (crash recovery)
+            audio::job_persistence::list_interrupted_jobs_command,
+            audio::job_persistence::dismiss_interrupted_job_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

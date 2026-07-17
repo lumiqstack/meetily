@@ -8,6 +8,7 @@ import { Check, FileAudio, X } from 'lucide-react';
 import {
   BackgroundJob,
   BackgroundJobStore,
+  InterruptedJobInfo,
   cleanupDelayMs,
   toastDurationMs,
 } from '@/lib/background-jobs';
@@ -61,15 +62,20 @@ export function cancelBackgroundJob(id: string): Promise<boolean> {
 export function BackgroundJobCard({
   job,
   onCancel,
+  onRetry,
+  onDismiss,
   className,
 }: {
   job: BackgroundJob;
   onCancel: (id: string) => void;
+  onRetry?: (id: string) => void;
+  onDismiss?: (id: string) => void;
   className?: string;
 }) {
   const isActive = job.status === 'running' || job.status === 'cancelling';
   const isComplete = job.status === 'completed';
   const hasError = job.status === 'error';
+  const isInterrupted = job.status === 'interrupted';
 
   return (
     <div
@@ -110,7 +116,31 @@ export function BackgroundJobCard({
           )}
         </div>
 
-        {hasError ? (
+        {isInterrupted ? (
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs text-amber-600">
+              {`${job.kind === 'import' ? 'Import' : 'Retranscription'} interrupted by app restart`}
+            </p>
+            <div className="flex gap-3 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => onRetry?.(job.id)}
+                className="text-xs font-medium text-gray-900 hover:text-blue-600"
+                aria-label={`Retry ${job.kind}`}
+              >
+                Retry
+              </button>
+              <button
+                type="button"
+                onClick={() => onDismiss?.(job.id)}
+                className="text-xs text-gray-500 hover:text-red-600"
+                aria-label={`Dismiss interrupted ${job.kind}`}
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        ) : hasError ? (
           <p className="text-xs text-red-600">
             {job.error || `${job.kind === 'import' ? 'Import' : 'Retranscription'} failed`}
           </p>
@@ -155,6 +185,28 @@ export function BackgroundJobToastProvider() {
     () => backgroundJobStore.getJobs(),
     () => backgroundJobStore.getJobs()
   );
+
+  // Jobs a previous app process died under (crash, force-quit) are journaled
+  // by the backend and reconciled at startup; surface them once on mount so
+  // the user can retry or dismiss each one.
+  useEffect(() => {
+    let cancelled = false;
+    invoke<InterruptedJobInfo[]>('list_interrupted_jobs_command')
+      .then((interrupted) => {
+        if (cancelled) return;
+        interrupted.forEach((info) => {
+          if (!backgroundJobStore.has(info.id)) {
+            backgroundJobStore.registerInterrupted(info);
+          }
+        });
+      })
+      .catch((error) => {
+        console.warn('Failed to query interrupted background jobs:', error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Dialogs announce jobs that continue in the background.
   useEffect(() => {
@@ -308,6 +360,32 @@ export function BackgroundJobToastProvider() {
     });
   }, []);
 
+  const handleRetry = useCallback((id: string) => {
+    backgroundJobStore
+      .retryInterrupted(id, (command, args) => invoke(command, args))
+      .then((retried) => {
+        if (retried) {
+          // The notice toast has Infinity duration and (for imports) the
+          // fresh job runs under a new id, so drop the old toast explicitly.
+          toast.dismiss(`bg-job-${id}`);
+        } else {
+          toast.error('Failed to restart the interrupted job');
+        }
+      });
+  }, []);
+
+  const handleDismiss = useCallback((id: string) => {
+    backgroundJobStore
+      .dismissInterrupted(id, (command, args) => invoke(command, args))
+      .then((dismissed) => {
+        if (dismissed) {
+          toast.dismiss(`bg-job-${id}`);
+        } else {
+          toast.error('Failed to dismiss the interrupted job');
+        }
+      });
+  }, []);
+
   // Drop finished jobs from the store after their toast has auto-dismissed.
   const scheduledRemovalsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -328,7 +406,14 @@ export function BackgroundJobToastProvider() {
   useEffect(() => {
     jobs.forEach((job) => {
       toast.custom(
-        () => <BackgroundJobCard job={job} onCancel={handleCancel} />,
+        () => (
+          <BackgroundJobCard
+            job={job}
+            onCancel={handleCancel}
+            onRetry={handleRetry}
+            onDismiss={handleDismiss}
+          />
+        ),
         {
           id: `bg-job-${job.id}`,
           position: 'top-right',
@@ -336,7 +421,7 @@ export function BackgroundJobToastProvider() {
         }
       );
     });
-  }, [jobs, handleCancel]);
+  }, [jobs, handleCancel, handleRetry, handleDismiss]);
 
   return null;
 }

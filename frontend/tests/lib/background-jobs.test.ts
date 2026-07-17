@@ -255,3 +255,170 @@ describe("toast presentation timings", () => {
     expect(cleanupDelayMs("error")).toBe(11000);
   });
 });
+
+describe("interrupted jobs (crash recovery)", () => {
+  const interruptedImport = {
+    id: "import-crashed",
+    kind: "import" as const,
+    title: "Quarterly Review",
+    source_path: "C:/recordings/quarterly-review.mp4",
+    folder_path: null,
+    meeting_id: null,
+    language: "en",
+    model: null,
+    provider: "openaiCompatible",
+    created_at: "2026-07-16T10:00:00Z",
+  };
+
+  test("registerInterrupted exposes an interrupted job that stays until acted on", () => {
+    const store = new BackgroundJobStore();
+
+    store.registerInterrupted(interruptedImport);
+
+    const jobs = store.getJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      id: "import-crashed",
+      kind: "import",
+      title: "Quarterly Review",
+      status: "interrupted",
+    });
+    // The notice must stay on screen until the user retries or dismisses.
+    expect(toastDurationMs("interrupted")).toBe(Infinity);
+  });
+
+  test("dismissInterrupted invokes the dismiss command and drops the notice", async () => {
+    const store = new BackgroundJobStore();
+    store.registerInterrupted(interruptedImport);
+    const calls: Array<[string, Record<string, unknown>]> = [];
+
+    const ok = await store.dismissInterrupted("import-crashed", async (command, args) => {
+      calls.push([command, args]);
+      return undefined;
+    });
+
+    expect(ok).toBe(true);
+    expect(calls).toEqual([
+      ["dismiss_interrupted_job_command", { jobId: "import-crashed" }],
+    ]);
+    expect(store.getJobs()).toHaveLength(0);
+  });
+
+  test("dismissInterrupted keeps the notice when the command fails", async () => {
+    const store = new BackgroundJobStore();
+    store.registerInterrupted(interruptedImport);
+
+    const ok = await store.dismissInterrupted("import-crashed", async () => {
+      throw new Error("backend unavailable");
+    });
+
+    expect(ok).toBe(false);
+    expect(store.getJobs()).toHaveLength(1);
+    expect(store.getJobs()[0].status).toBe("interrupted");
+  });
+
+  test("retryInterrupted restarts an import with its recorded settings", async () => {
+    const store = new BackgroundJobStore();
+    store.registerInterrupted(interruptedImport);
+    const calls: Array<[string, Record<string, unknown>]> = [];
+
+    const ok = await store.retryInterrupted("import-crashed", async (command, args) => {
+      calls.push([command, args]);
+      if (command === "start_import_audio_command") {
+        return { import_id: "import-fresh" };
+      }
+      return undefined;
+    });
+
+    expect(ok).toBe(true);
+    expect(calls).toEqual([
+      [
+        "start_import_audio_command",
+        {
+          sourcePath: "C:/recordings/quarterly-review.mp4",
+          title: "Quarterly Review",
+          language: "en",
+          model: null,
+          provider: "openaiCompatible",
+        },
+      ],
+      ["dismiss_interrupted_job_command", { jobId: "import-crashed" }],
+    ]);
+
+    // The stale notice is replaced by a live job under the new import id, so
+    // the existing progress/completion listeners pick it up.
+    const jobs = store.getJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      id: "import-fresh",
+      kind: "import",
+      title: "Quarterly Review",
+      status: "running",
+    });
+  });
+
+  const interruptedRetranscription = {
+    id: "meeting-7",
+    kind: "retranscription" as const,
+    title: "Weekly Sync",
+    source_path: null,
+    folder_path: "C:/recordings/weekly-sync",
+    meeting_id: "meeting-7",
+    language: null,
+    model: "whisper-1",
+    provider: "openaiCompatible",
+    created_at: "2026-07-16T11:00:00Z",
+  };
+
+  test("retryInterrupted restarts a retranscription against its meeting folder", async () => {
+    const store = new BackgroundJobStore();
+    store.registerInterrupted(interruptedRetranscription);
+    const calls: Array<[string, Record<string, unknown>]> = [];
+
+    const ok = await store.retryInterrupted("meeting-7", async (command, args) => {
+      calls.push([command, args]);
+      return undefined;
+    });
+
+    expect(ok).toBe(true);
+    expect(calls).toEqual([
+      [
+        "start_retranscription_command",
+        {
+          meetingId: "meeting-7",
+          meetingFolderPath: "C:/recordings/weekly-sync",
+          language: null,
+          model: "whisper-1",
+          provider: "openaiCompatible",
+        },
+      ],
+      ["dismiss_interrupted_job_command", { jobId: "meeting-7" }],
+    ]);
+
+    const jobs = store.getJobs();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]).toMatchObject({
+      id: "meeting-7",
+      kind: "retranscription",
+      title: "Weekly Sync",
+      status: "running",
+    });
+  });
+
+  test("retryInterrupted keeps the notice when the restart fails", async () => {
+    const store = new BackgroundJobStore();
+    store.registerInterrupted(interruptedImport);
+
+    const ok = await store.retryInterrupted("import-crashed", async (command) => {
+      if (command === "start_import_audio_command") {
+        throw new Error("engine busy");
+      }
+      return undefined;
+    });
+
+    expect(ok).toBe(false);
+    expect(store.getJobs()).toHaveLength(1);
+    expect(store.getJobs()[0].status).toBe("interrupted");
+  });
+});
+

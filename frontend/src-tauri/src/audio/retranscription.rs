@@ -121,6 +121,31 @@ async fn start_retranscription_with_guard<R: Runtime>(
 ) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref() == Some("openaiCompatible");
+
+    // Journal the job so a crash mid-retranscription is reported on the next
+    // launch. The folder is a pre-existing meeting and is never cleaned up.
+    let title = Path::new(&meeting_folder_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Retranscription")
+        .to_string();
+    super::job_persistence::try_record_job_started(
+        &app,
+        &super::job_persistence::PersistedJob {
+            id: meeting_id.clone(),
+            kind: "retranscription".to_string(),
+            title,
+            source_path: None,
+            folder_path: Some(meeting_folder_path.clone()),
+            meeting_id: Some(meeting_id.clone()),
+            language: language.clone(),
+            model: model.clone(),
+            provider: provider.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .await;
+
     let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
 
     // Unload the engine after the batch job (success, failure, or cancellation).
@@ -153,6 +178,10 @@ async fn start_retranscription_with_guard<R: Runtime>(
             );
         }
     }
+
+    // The job finished in-process (either way, the user was told), so it
+    // must not be reported as interrupted on the next launch.
+    super::job_persistence::try_clear_job(&app, &meeting_id).await;
 
     result
 }

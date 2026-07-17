@@ -48,6 +48,9 @@ pub(crate) mod engine_coordinator;
 // Shared job registry backing ImportGuard and RetranscriptionGuard
 pub(crate) mod job_registry;
 
+// Durable journal for background jobs, reconciled on startup
+pub mod job_persistence;
+
 // Concurrency cap for remote (openaiCompatible) transcription jobs
 pub(crate) mod remote_concurrency;
 

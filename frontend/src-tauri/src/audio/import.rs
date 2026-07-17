@@ -286,6 +286,26 @@ async fn start_import_with_guard<R: Runtime>(
 ) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref() == Some("openaiCompatible");
+
+    // Journal the job so a crash mid-import is detected (and its orphaned
+    // folder cleaned up) on the next launch. See job_persistence.rs.
+    super::job_persistence::try_record_job_started(
+        &app,
+        &super::job_persistence::PersistedJob {
+            id: import_id.clone(),
+            kind: "import".to_string(),
+            title: title.clone(),
+            source_path: Some(source_path.clone()),
+            folder_path: None,
+            meeting_id: None,
+            language: language.clone(),
+            model: model.clone(),
+            provider: provider.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .await;
+
     let result = run_import(
         app.clone(),
         import_id.clone(),
@@ -327,6 +347,10 @@ async fn start_import_with_guard<R: Runtime>(
         }
     }
 
+    // The job finished in-process (either way, the user was told), so it
+    // must not be reported as interrupted on the next launch.
+    super::job_persistence::try_clear_job(&app, &import_id).await;
+
     result
 }
 
@@ -366,6 +390,15 @@ async fn run_import<R: Runtime>(
     // Create meeting folder
     let base_folder = get_default_recordings_folder();
     let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
+
+    // From here on a crash would leave this folder half-built; journal it so
+    // startup reconciliation can clean it up.
+    super::job_persistence::try_set_job_folder(
+        &app,
+        &import_id,
+        &meeting_folder.to_string_lossy(),
+    )
+    .await;
 
     // Copy audio file to meeting folder
     emit_progress(&app, &import_id, "copying", 10, "Copying audio file...");
