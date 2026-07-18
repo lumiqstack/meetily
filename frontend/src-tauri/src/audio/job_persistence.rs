@@ -131,13 +131,16 @@ pub async fn reconcile_interrupted_jobs(
             continue;
         }
         // The meeting may have been committed right before the crash
-        // (metadata.json is written after the DB transaction).
-        let meeting_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM meetings WHERE folder_path = ?")
-                .bind(folder)
-                .fetch_one(pool)
+        // (metadata.json is written after the DB transaction). Compared with
+        // normalization, not string equality: a rendering difference between
+        // the two writers must never hide the reference (a miss here deletes
+        // the folder of a real meeting). A DB error aborts reconciliation
+        // before any deletion — fail-safe.
+        let meeting_folders: Vec<String> =
+            sqlx::query_scalar("SELECT folder_path FROM meetings WHERE folder_path IS NOT NULL")
+                .fetch_all(pool)
                 .await?;
-        if meeting_count > 0 {
+        if meeting_folders.iter().any(|m| is_same_path(m, folder)) {
             continue;
         }
         match std::fs::remove_dir_all(folder) {
@@ -150,6 +153,32 @@ pub async fn reconcile_interrupted_jobs(
         interrupted,
         removed_folders,
     })
+}
+
+/// True when two recorded paths refer to the same folder even if the writers
+/// rendered them differently (e.g. `C:/x/y` vs `C:\x\y`, a trailing
+/// separator, or — on Windows, where filesystems are case-insensitive — a
+/// case difference). Pure comparison that never errors, so the check stays
+/// fail-safe.
+fn is_same_path(a: &str, b: &str) -> bool {
+    normalized_components(a) == normalized_components(b)
+}
+
+fn normalized_components(path: &str) -> Vec<String> {
+    // `\\?\C:\x` and `C:\x` name the same folder; strip the verbatim prefix
+    // so their drive components compare equal.
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    std::path::Path::new(path)
+        .components()
+        .map(|c| {
+            let component = c.as_os_str().to_string_lossy();
+            if cfg!(windows) {
+                component.to_lowercase()
+            } else {
+                component.into_owned()
+            }
+        })
+        .collect()
 }
 
 /// Drop an interrupted job the user has dismissed (or retried — the retry
@@ -426,6 +455,141 @@ mod tests {
         assert!(
             folder.exists(),
             "a folder referenced by a meeting row must be kept"
+        );
+        assert_eq!(outcome.removed_folders, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_a_committed_folder_despite_mixed_path_separators() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Committed Meeting");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("audio.mp4"), b"audio").unwrap();
+        let native = folder.to_string_lossy().to_string();
+
+        // The meeting row holds the native form while the journal recorded
+        // the same folder rendered with forward slashes. The guard must still
+        // see the reference — otherwise the folder of a committed meeting
+        // gets deleted whenever metadata.json also failed to write.
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES ('meeting-mixed-sep', 'Committed Meeting', '2026-07-16T10:00:00Z', '2026-07-16T10:00:00Z', ?)",
+        )
+        .bind(&native)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut job = import_job("import-mixed-separators");
+        job.folder_path = Some(native.replace('\\', "/"));
+        record_job_started(&pool, &job).await.unwrap();
+
+        let outcome = reconcile_interrupted_jobs(&pool).await.unwrap();
+
+        assert!(
+            folder.exists(),
+            "mixed separators must not defeat the meeting-reference guard"
+        );
+        assert_eq!(outcome.removed_folders, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_a_committed_folder_despite_a_trailing_separator() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Committed Meeting");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("audio.mp4"), b"audio").unwrap();
+        let native = folder.to_string_lossy().to_string();
+
+        // The meeting row carries a trailing separator the journal lacks.
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES ('meeting-trailing-sep', 'Committed Meeting', '2026-07-16T10:00:00Z', '2026-07-16T10:00:00Z', ?)",
+        )
+        .bind(format!("{native}{}", std::path::MAIN_SEPARATOR))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut job = import_job("import-trailing-separator");
+        job.folder_path = Some(native);
+        record_job_started(&pool, &job).await.unwrap();
+
+        let outcome = reconcile_interrupted_jobs(&pool).await.unwrap();
+
+        assert!(
+            folder.exists(),
+            "a trailing separator must not defeat the meeting-reference guard"
+        );
+        assert_eq!(outcome.removed_folders, Vec::<String>::new());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconcile_keeps_a_committed_folder_despite_a_case_difference() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Committed Meeting");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("audio.mp4"), b"audio").unwrap();
+        let native = folder.to_string_lossy().to_string();
+
+        // Windows filesystems are case-insensitive: a meeting row written
+        // with different casing still names the same folder on disk.
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES ('meeting-case-diff', 'Committed Meeting', '2026-07-16T10:00:00Z', '2026-07-16T10:00:00Z', ?)",
+        )
+        .bind(native.to_uppercase())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut job = import_job("import-case-difference");
+        job.folder_path = Some(native);
+        record_job_started(&pool, &job).await.unwrap();
+
+        let outcome = reconcile_interrupted_jobs(&pool).await.unwrap();
+
+        assert!(
+            folder.exists(),
+            "a case difference must not defeat the meeting-reference guard on Windows"
+        );
+        assert_eq!(outcome.removed_folders, Vec::<String>::new());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconcile_keeps_a_committed_folder_despite_a_verbatim_prefix() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Committed Meeting");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("audio.mp4"), b"audio").unwrap();
+        let native = folder.to_string_lossy().to_string();
+
+        // APIs like `canonicalize` render Windows paths with the `\\?\`
+        // verbatim prefix; the path still names the same folder.
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES ('meeting-verbatim', 'Committed Meeting', '2026-07-16T10:00:00Z', '2026-07-16T10:00:00Z', ?)",
+        )
+        .bind(format!(r"\\?\{native}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut job = import_job("import-verbatim-prefix");
+        job.folder_path = Some(native);
+        record_job_started(&pool, &job).await.unwrap();
+
+        let outcome = reconcile_interrupted_jobs(&pool).await.unwrap();
+
+        assert!(
+            folder.exists(),
+            "a \\\\?\\ verbatim prefix must not defeat the meeting-reference guard"
         );
         assert_eq!(outcome.removed_folders, Vec::<String>::new());
     }

@@ -191,6 +191,26 @@ Frontend: 6 new store tests in `tests/lib/background-jobs.test.ts`.
 
 ## 8. End-to-end crash-recovery verification (quality)
 
+**Status: DONE (2026-07-17).** Driven against the real app (release exe rebuilt with the
+#9 fix, run over the user's live `com.meetily.ai` data). Verified: (a) the
+`20260716000000` migration applied cleanly to a real grown DB whose newest migration was
+`20260706000000`; (b) the app survives `taskkill /f`; (c) after injecting a crashed
+import (orphan folder + journal row) and a crashed retranscription (journal row pointing
+at a real meeting folder), a relaunch flagged both rows `interrupted = 1`, logged "Found
+2 background job(s) interrupted by a previous shutdown", removed the orphan folder
+(logged), and left the real meeting folder byte-count-identical; (d) startup ordering is
+race-free by construction — reconcile runs under `block_on` inside Tauri's `setup` hook
+(`lib.rs`), which completes before the webview loads, so the frontend cannot query
+before rows are flagged; (e) `list_interrupted_jobs_command` /
+`dismiss_interrupted_job_command` are registered in `lib.rs` and invoked by name in
+`BackgroundJobToast.tsx` / `background-jobs.ts`; (f) the 25 `background-jobs` store
+tests (covering interrupted/retry/dismiss state transitions) pass. Injected rows and
+scratch files were cleaned up afterwards.
+
+Not exercised (requires interactive UI/a live remote endpoint): visually observing the
+sticky toast, and clicking Retry through a full re-import. These are covered by the
+store tests plus the verified command contract; a future manual pass can close them.
+
 **Problem**: The crash-recovery path from #7 is unit-tested at the module level
 (`job_persistence.rs` against in-memory SQLite, store tests for the frontend), but the
 full loop — process dies mid-import → relaunch → reconcile runs → interrupted-job toast
@@ -210,6 +230,16 @@ survives. If any step needs fixing, capture it as a regression test where one is
 possible.
 
 ## 9. Path normalization in the orphan-folder meeting guard (robustness, small)
+
+**Status: DONE (2026-07-17).** TDD'd in `job_persistence.rs`: the exact-match
+`WHERE folder_path = ?` query is replaced by fetching all meeting `folder_path`s and
+comparing with `is_same_path`, a pure normalized-component comparison
+(`Path::components()` equality after stripping a `\\?\` verbatim prefix, with
+per-component case-folding on Windows). Four RED→GREEN cycles, each watched failing
+first: mixed separators (`C:/x/y` vs `C:\x\y`), trailing separator, case difference
+(Windows-gated), and `\\?\` verbatim prefix (Windows-gated). Fail-safe is preserved:
+the comparison itself cannot error, and a DB error aborts reconciliation before any
+deletion. Full Rust suite green (241 passed).
 
 **Problem**: `reconcile_interrupted_jobs` protects a crashed import's folder from cleanup
 when a `meetings.folder_path` row references it, but the comparison is an exact string
@@ -233,4 +263,4 @@ deletion).
 
 **Suggested order**: 1 and 3 first (correctness in the current diff), then 2, 4, 5, 6, 7.
 Post-#7 follow-ups: 9 (small, closes a latent data-loss edge), then 8 (one-time
-verification pass).
+verification pass). All items complete as of 2026-07-17.
