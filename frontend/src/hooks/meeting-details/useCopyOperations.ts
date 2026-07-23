@@ -86,7 +86,7 @@ export function useCopyOperations({
     const header = `# Transcript of the Meeting: ${meeting.id} - ${meetingTitle ?? meeting.title}\n\n`;
     const date = `## Date: ${new Date(meeting.created_at).toLocaleDateString()}\n\n`;
     const fullTranscript = allTranscripts
-      .map(t => `${formatTranscriptTime(t.audio_start_time, t.timestamp)} ${t.text}  `)
+      .map(t => `${formatTranscriptTime(t.audio_start_time, t.timestamp)} ${t.speaker ? `${t.speaker}: ` : ''}${t.text}  `)
       .join('\n');
 
     await navigator.clipboard.writeText(header + date + fullTranscript);
@@ -205,7 +205,7 @@ export function useCopyOperations({
 
       const allTranscripts = await fetchAllTranscripts(meeting.id);
       const transcriptMarkdown = allTranscripts
-        .map(t => `${formatTranscriptTime(t.audio_start_time, t.timestamp)} ${t.text}`)
+        .map(t => `${formatTranscriptTime(t.audio_start_time, t.timestamp)} ${t.speaker ? `${t.speaker}: ` : ''}${t.text}`)
         .join('\n\n');
 
       const result = await invokeTauri('export_meeting_to_obsidian', {
