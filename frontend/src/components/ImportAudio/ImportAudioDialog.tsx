@@ -85,6 +85,21 @@ function isLikelyHttpUrl(value: string): boolean {
   return /^https?:\/\/\S+$/i.test(value.trim());
 }
 
+// Guess whether a link points at a recording or a Teams transcript, from the
+// file name in the `id` param. Returns null when it can't tell.
+function detectLinkContentMode(url: string): 'audio' | 'transcript' | null {
+  let raw = url.toLowerCase();
+  try {
+    const u = new URL(url);
+    raw = (u.searchParams.get('id') || u.pathname).toLowerCase();
+  } catch {
+    // fall back to scanning the whole string
+  }
+  if (raw.includes('transcript')) return 'transcript';
+  if (raw.includes('recording')) return 'audio';
+  return null;
+}
+
 export function ImportAudioDialog({
   open,
   onOpenChange,
@@ -101,6 +116,8 @@ export function ImportAudioDialog({
   const [titleModifiedByUser, setTitleModifiedByUser] = useState(false);
   const [sourceMode, setSourceMode] = useState<'file' | 'link'>('file');
   const [linkUrl, setLinkUrl] = useState('');
+  const [linkContentMode, setLinkContentMode] = useState<'audio' | 'transcript'>('audio');
+  const [linkModeTouched, setLinkModeTouched] = useState(false);
 
   // Always start as false — represents "dialog has not yet been opened".
   // Do NOT initialize from the `open` prop: if the component mounts with open=true
@@ -165,6 +182,8 @@ export function ImportAudioDialog({
       setShowAdvanced(false);
       setSourceMode('file');
       setLinkUrl('');
+      setLinkContentMode('audio');
+      setLinkModeTouched(false);
 
       // Validate preselected file if provided
       if (preselectedFile) {
@@ -222,13 +241,16 @@ export function ImportAudioDialog({
     if (sourceMode === 'link') {
       if (!linkValid) return;
 
+      const isTranscript = linkContentMode === 'transcript';
       const importTitle = title.trim() || deriveTitleFromUrl(linkUrl);
       const started = await startImportFromUrl(
         linkUrl.trim(),
         importTitle,
-        language,
-        modelName,
-        providerName
+        // Transcript import ignores language/model (no Whisper pass).
+        isTranscript ? null : language,
+        isTranscript ? null : modelName,
+        isTranscript ? null : providerName,
+        linkContentMode
       );
 
       // Link imports involve a sign-in window and a download, so they always
@@ -241,8 +263,10 @@ export function ImportAudioDialog({
           },
         }));
 
-        toast.info('Import started', {
-          description: 'Signing in and downloading in the background. A sign-in window may appear if needed.',
+        toast.info(isTranscript ? 'Transcript import started' : 'Import started', {
+          description: isTranscript
+            ? 'Fetching the Teams transcript in the background. A sign-in window may appear if needed.'
+            : 'Signing in and downloading in the background. A sign-in window may appear if needed.',
         });
 
         reset();
@@ -446,12 +470,46 @@ export function ImportAudioDialog({
                         if (!titleModifiedByUser && value) {
                           setTitle(deriveTitleFromUrl(value));
                         }
+                        if (!linkModeTouched && value) {
+                          const detected = detectLinkContentMode(value);
+                          if (detected) setLinkContentMode(detected);
+                        }
                       }}
                       placeholder="https://…sharepoint.com/…/stream.aspx?id=…"
                     />
                     <p className="text-xs text-muted-foreground">
-                      Paste the recording link from Teams or SharePoint. A sign-in window may appear
-                      the first time; after that it stays signed in and downloads run in the background.
+                      Paste a recording or transcript link from Teams or SharePoint. A sign-in window
+                      may appear the first time; after that it stays signed in and runs in the background.
+                    </p>
+                  </div>
+
+                  {/* What to import: recording audio vs Teams transcript */}
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">What to import</label>
+                    <div className="grid grid-cols-2 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
+                      <button
+                        type="button"
+                        onClick={() => { setLinkContentMode('audio'); setLinkModeTouched(true); }}
+                        className={`rounded-md py-2 transition-colors ${
+                          linkContentMode === 'audio' ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                        }`}
+                      >
+                        Recording audio
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setLinkContentMode('transcript'); setLinkModeTouched(true); }}
+                        className={`rounded-md py-2 transition-colors ${
+                          linkContentMode === 'transcript' ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                        }`}
+                      >
+                        Teams transcript
+                      </button>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {linkContentMode === 'transcript'
+                        ? "Imports Teams' generated transcript with speaker names — no re-transcription."
+                        : 'Downloads the recording and transcribes the audio.'}
                     </p>
                   </div>
 
@@ -469,8 +527,8 @@ export function ImportAudioDialog({
                 </div>
               )}
 
-              {/* Advanced options (collapsible) */}
-              {(fileInfo || sourceMode === 'link') && (
+              {/* Advanced options (collapsible) — irrelevant for transcript import */}
+              {(fileInfo || (sourceMode === 'link' && linkContentMode === 'audio')) && (
                 <div className="border rounded-lg">
                   <button
                     onClick={() => setShowAdvanced(!showAdvanced)}
@@ -594,7 +652,7 @@ export function ImportAudioDialog({
                 {sourceMode === 'link' ? (
                   <>
                     <Link2 className="h-4 w-4 mr-2" />
-                    Import from Link
+                    {linkContentMode === 'transcript' ? 'Import Transcript' : 'Import from Link'}
                   </>
                 ) : (
                   <>

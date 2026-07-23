@@ -143,6 +143,171 @@ where
         .ok_or_else(|| anyhow!("Download completed but no media file was produced"))
 }
 
+/// Fetch the meeting's transcript track (a WebVTT) via yt-dlp's subtitle
+/// support, without downloading the video. Returns the path to a `.vtt` file.
+/// If no transcript track exists, returns an error that includes yt-dlp's
+/// `--list-subs` output for diagnosis.
+pub async fn fetch_transcript(
+    ytdlp: &Path,
+    ffmpeg: Option<&Path>,
+    cookies_txt: &Path,
+    url: &str,
+    out_dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(out_dir).await.ok();
+    let out_template = out_dir.join("transcript.%(ext)s");
+
+    let mut cmd = Command::new(ytdlp);
+    cmd.arg("--no-playlist")
+        .arg("--skip-download")
+        .arg("--write-subs")
+        .arg("--write-auto-subs")
+        .arg("--sub-langs")
+        .arg("all")
+        .arg("--sub-format")
+        .arg("vtt/best")
+        .arg("--convert-subs")
+        .arg("vtt")
+        .arg("--cookies")
+        .arg(cookies_txt)
+        .arg("-o")
+        .arg(&out_template)
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_ffmpeg_location(&mut cmd, ffmpeg);
+    no_console_window(&mut cmd);
+
+    debug!("Fetching transcript subtitles for {url}");
+    let (_ok, output) = run_capture(cmd, cancel).await?;
+
+    if let Some(vtt) = find_vtt(out_dir) {
+        return Ok(vtt);
+    }
+
+    // No subtitle track was written. Ask yt-dlp what (if anything) is available
+    // so the error is actionable and we can see it in the logs.
+    let listed = list_subs(ytdlp, ffmpeg, cookies_txt, url, cancel)
+        .await
+        .unwrap_or_else(|e| format!("(could not list subtitles: {e})"));
+    warn!("No transcript track found. yt-dlp output:\n{output}\navailable subs:\n{listed}");
+
+    Err(anyhow!(
+        "No transcript was found for this link. Teams may not have generated a transcript for this meeting, or it isn't exposed for download.\n\nAvailable subtitle tracks:\n{}",
+        listed.trim()
+    ))
+}
+
+/// Run yt-dlp `--list-subs` and return its stdout (for diagnostics).
+async fn list_subs(
+    ytdlp: &Path,
+    ffmpeg: Option<&Path>,
+    cookies_txt: &Path,
+    url: &str,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let mut cmd = Command::new(ytdlp);
+    cmd.arg("--no-playlist")
+        .arg("--skip-download")
+        .arg("--list-subs")
+        .arg("--cookies")
+        .arg(cookies_txt)
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_ffmpeg_location(&mut cmd, ffmpeg);
+    no_console_window(&mut cmd);
+    let (_ok, output) = run_capture(cmd, cancel).await?;
+    Ok(output)
+}
+
+/// Spawn a yt-dlp command, drain both pipes concurrently (avoids deadlock),
+/// and wait — killing the child if `cancel` fires. Returns (success, combined
+/// stdout+stderr).
+async fn run_capture(mut cmd: Command, cancel: &CancellationToken) -> Result<(bool, String)> {
+    let mut child = cmd.spawn().context("Failed to start yt-dlp")?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let out_task = tokio::spawn(async move { drain(stdout).await });
+    let err_task = tokio::spawn(async move { drain(stderr).await });
+
+    let status = tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(anyhow!("Import cancelled"));
+        }
+        st = child.wait() => st.context("Failed to wait for yt-dlp")?,
+    };
+
+    let out = out_task.await.unwrap_or_default();
+    let err = err_task.await.unwrap_or_default();
+    Ok((status.success(), format!("{out}{err}")))
+}
+
+async fn drain<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> String {
+    let mut buf = String::new();
+    if let Some(r) = pipe {
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+    buf
+}
+
+fn apply_ffmpeg_location(cmd: &mut Command, ffmpeg: Option<&Path>) {
+    if let Some(ffmpeg_path) = ffmpeg {
+        if let Some(dir) = ffmpeg_path.parent() {
+            cmd.arg("--ffmpeg-location").arg(dir);
+        }
+    }
+}
+
+fn no_console_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW
+        cmd.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Find a downloaded `.vtt` in `dir`, preferring an English track.
+fn find_vtt(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut fallback: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_vtt = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("vtt"))
+            .unwrap_or(false);
+        if !is_vtt {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name.contains(".en") {
+            return Some(path);
+        }
+        fallback = fallback.or(Some(path));
+    }
+    fallback
+}
+
 fn parse_progress(line: &str) -> Option<u32> {
     let caps = DOWNLOAD_PCT.captures(line)?;
     let pct: f32 = caps.get(1)?.as_str().parse().ok()?;

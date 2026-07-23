@@ -838,8 +838,8 @@ async fn create_meeting_with_transcripts(
     // Insert transcripts
     for segment in segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -848,6 +848,7 @@ async fn create_meeting_with_transcripts(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -1158,6 +1159,7 @@ pub async fn start_import_from_url_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    mode: Option<String>,
 ) -> Result<ImportStarted, String> {
     let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
 
@@ -1179,6 +1181,7 @@ pub async fn start_import_from_url_command<R: Runtime>(
             language,
             model,
             provider,
+            mode,
             cancel,
         )
         .await;
@@ -1224,9 +1227,12 @@ async fn run_url_import<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    mode: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use super::{sharepoint, url_import, ytdlp};
+
+    let is_transcript = mode.as_deref() == Some("transcript");
 
     // Phase 1: authenticate. The engine is deliberately NOT held during login
     // or download so recording and other jobs remain usable meanwhile.
@@ -1251,6 +1257,16 @@ async fn run_url_import<R: Runtime>(
         }
     };
     let ffmpeg_path = super::ffmpeg::find_ffmpeg_path();
+
+    // Transcript mode: fetch the Teams transcript (VTT) and build the meeting
+    // from it directly — no download, no Whisper, no engine guard.
+    if is_transcript {
+        let result =
+            run_transcript_import(&app, &import_id, &url, &title, &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
+                .await;
+        auth.cleanup();
+        return result;
+    }
 
     // Phase 3: download into a dedicated working directory.
     let work_dir = std::env::temp_dir().join(format!("meetily-url-{}", import_id));
@@ -1310,6 +1326,119 @@ async fn run_url_import<R: Runtime>(
     .await;
 
     let _ = std::fs::remove_dir_all(&work_dir);
+    Ok(())
+}
+
+/// Build a meeting directly from a Teams transcript (VTT) — no audio download,
+/// no Whisper, no engine guard. Emits the same `import-*` events as the audio
+/// path so the frontend toast and sidebar refresh work unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn run_transcript_import<R: Runtime>(
+    app: &AppHandle<R>,
+    import_id: &str,
+    url: &str,
+    title: &str,
+    ytdlp_path: &Path,
+    ffmpeg_path: Option<&Path>,
+    auth: &super::sharepoint::AuthCookies,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    emit_progress(app, import_id, "downloading", 10, "Fetching Teams transcript…");
+
+    let work_dir = std::env::temp_dir().join(format!("meetily-vtt-{}", import_id));
+    let vtt_path = match super::url_import::fetch_transcript(
+        ytdlp_path,
+        ffmpeg_path,
+        &auth.cookies_txt,
+        url,
+        &work_dir,
+        cancel,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(e);
+        }
+    };
+
+    emit_progress(app, import_id, "saving", 60, "Parsing transcript…");
+    let content = tokio::fs::read_to_string(&vtt_path)
+        .await
+        .map_err(|e| anyhow!("Failed to read transcript file: {e}"))?;
+    let cues = super::vtt::parse_vtt(&content).map_err(|e| anyhow!(e))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let segments: Vec<TranscriptSegment> = cues
+        .iter()
+        .map(|c| TranscriptSegment {
+            id: format!("transcript-{}", Uuid::new_v4()),
+            text: c.text.clone(),
+            timestamp: now.clone(),
+            audio_start_time: Some(c.start_s),
+            audio_end_time: Some(c.end_s),
+            duration: Some((c.end_s - c.start_s).max(0.0)),
+            speaker: c.speaker.clone(),
+        })
+        .collect();
+
+    if segments.is_empty() {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(anyhow!("The transcript contained no readable text."));
+    }
+    if cancel.is_cancelled() {
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(anyhow!("Import cancelled"));
+    }
+
+    emit_progress(app, import_id, "saving", 85, "Creating meeting…");
+    let base_folder = get_default_recordings_folder();
+    let meeting_folder = create_meeting_folder(&base_folder, title, false)?;
+    // Keep the raw VTT alongside the meeting for reference.
+    let _ = std::fs::copy(&vtt_path, meeting_folder.join("transcript.vtt"));
+
+    let app_state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| anyhow!("App state not available"))?;
+    let meeting_id = create_meeting_with_transcripts(
+        app_state.db_manager.pool(),
+        title,
+        &segments,
+        meeting_folder.to_string_lossy().to_string(),
+    )
+    .await?;
+
+    let duration_seconds = cues.last().map(|c| c.end_s).unwrap_or(0.0);
+
+    if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
+        warn!("Failed to write transcripts.json: {}", e);
+    }
+    if let Err(e) = write_import_metadata(
+        &meeting_folder,
+        &meeting_id,
+        title,
+        duration_seconds,
+        "transcript.vtt",
+        "transcript-import",
+    ) {
+        warn!("Failed to write metadata.json: {}", e);
+    }
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+
+    emit_progress(app, import_id, "complete", 100, "Transcript imported");
+    let _ = app.emit(
+        "import-complete",
+        serde_json::json!({
+            "import_id": import_id,
+            "meeting_id": meeting_id,
+            "title": title,
+            "segments_count": segments.len(),
+            "duration_seconds": duration_seconds,
+        }),
+    );
+
     Ok(())
 }
 
@@ -1620,6 +1749,7 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                speaker: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1628,6 +1758,7 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                speaker: None,
             },
         ];
 
