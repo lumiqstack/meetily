@@ -262,6 +262,8 @@ describe("interrupted jobs (crash recovery)", () => {
     kind: "import" as const,
     title: "Quarterly Review",
     source_path: "C:/recordings/quarterly-review.mp4",
+    source_url: null,
+    mode: null,
     folder_path: null,
     meeting_id: null,
     language: "en",
@@ -357,11 +359,59 @@ describe("interrupted jobs (crash recovery)", () => {
     });
   });
 
+  test("retryInterrupted re-runs a URL import through the URL command with its mode", async () => {
+    const store = new BackgroundJobStore();
+    store.registerInterrupted({
+      ...interruptedImport,
+      id: "import-url-crashed",
+      // URL imports journal no local source file — the downloaded media was
+      // temporary. Retry must go back through the link, preserving the mode.
+      source_path: null,
+      source_url: "https://tenant.sharepoint.com/:v:/r/rec.mp4",
+      mode: "transcript",
+    });
+    const calls: Array<[string, Record<string, unknown>]> = [];
+
+    const ok = await store.retryInterrupted("import-url-crashed", async (command, args) => {
+      calls.push([command, args]);
+      if (command === "start_import_from_url_command") {
+        return { import_id: "import-fresh-url" };
+      }
+      return undefined;
+    });
+
+    expect(ok).toBe(true);
+    expect(calls[0]).toEqual([
+      "start_import_from_url_command",
+      {
+        url: "https://tenant.sharepoint.com/:v:/r/rec.mp4",
+        title: "Quarterly Review",
+        language: "en",
+        model: null,
+        provider: "openaiCompatible",
+        mode: "transcript",
+      },
+    ]);
+    // The stale notice is dismissed and the fresh job takes over.
+    expect(calls[1]).toEqual([
+      "dismiss_interrupted_job_command",
+      { jobId: "import-url-crashed" },
+    ]);
+    expect(store.getJobs()).toHaveLength(1);
+    expect(store.getJobs()[0]).toMatchObject({
+      id: "import-fresh-url",
+      kind: "import",
+      status: "running",
+    });
+  });
+
   const interruptedRetranscription = {
     id: "meeting-7",
     kind: "retranscription" as const,
     title: "Weekly Sync",
     source_path: null,
+    source_url: null,
+    mode: null,
     folder_path: "C:/recordings/weekly-sync",
     meeting_id: "meeting-7",
     language: null,

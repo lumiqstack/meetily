@@ -27,6 +27,10 @@ pub struct PersistedJob {
     pub title: String,
     /// Import: the original file the user selected (used for retry).
     pub source_path: Option<String>,
+    /// URL import: the original link (used for retry; file imports leave NULL).
+    pub source_url: Option<String>,
+    /// URL import: "audio" or "transcript". NULL for file imports.
+    pub mode: Option<String>,
     /// The meeting folder the job writes into. Imports learn this after
     /// creating the folder; retranscriptions know it upfront.
     pub folder_path: Option<String>,
@@ -49,20 +53,22 @@ pub struct ReconcileOutcome {
 }
 
 const JOB_COLUMNS: &str =
-    "id, kind, title, source_path, folder_path, meeting_id, language, model, provider, created_at";
+    "id, kind, title, source_path, source_url, mode, folder_path, meeting_id, language, model, provider, created_at";
 
 /// Record a job that is about to start. Called right after the in-memory
 /// registry accepts the job.
 pub async fn record_job_started(pool: &SqlitePool, job: &PersistedJob) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT OR REPLACE INTO background_jobs \
-         (id, kind, title, source_path, folder_path, meeting_id, language, model, provider, interrupted, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+         (id, kind, title, source_path, source_url, mode, folder_path, meeting_id, language, model, provider, interrupted, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
     )
     .bind(&job.id)
     .bind(&job.kind)
     .bind(&job.title)
     .bind(&job.source_path)
+    .bind(&job.source_url)
+    .bind(&job.mode)
     .bind(&job.folder_path)
     .bind(&job.meeting_id)
     .bind(&job.language)
@@ -294,6 +300,8 @@ mod tests {
             kind: "import".to_string(),
             title: "Quarterly Review.mp4".to_string(),
             source_path: Some("C:/recordings/quarterly-review.mp4".to_string()),
+            source_url: None,
+            mode: None,
             folder_path: None,
             meeting_id: None,
             language: Some("en".to_string()),
@@ -319,6 +327,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn url_import_journal_round_trips_source_url_and_mode() {
+        let pool = test_pool().await;
+        let mut job = import_job("import-url");
+        // URL imports have no local source file; retry needs the link + mode.
+        job.source_path = None;
+        job.source_url = Some("https://tenant.sharepoint.com/:v:/r/rec.mp4".to_string());
+        job.mode = Some("transcript".to_string());
+        record_job_started(&pool, &job).await.unwrap();
+
+        let outcome = reconcile_interrupted_jobs(&pool).await.unwrap();
+        assert_eq!(outcome.interrupted, vec![job]);
+    }
+
+    #[tokio::test]
     async fn set_job_folder_records_the_folder_for_crash_reporting() {
         let pool = test_pool().await;
         let mut job = import_job("import-with-folder");
@@ -340,6 +362,8 @@ mod tests {
             kind: "retranscription".to_string(),
             title: "Weekly Sync".to_string(),
             source_path: None,
+            source_url: None,
+            mode: None,
             folder_path: Some("C:/recordings/weekly-sync".to_string()),
             meeting_id: Some(meeting_id.to_string()),
             language: None,
