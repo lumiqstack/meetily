@@ -18,6 +18,10 @@ export interface InterruptedJobInfo {
   kind: BackgroundJobKind;
   title: string;
   source_path: string | null;
+  /** URL import: the original link. Retry must go through the URL command. */
+  source_url: string | null;
+  /** URL import: "audio" or "transcript". */
+  mode: string | null;
   folder_path: string | null;
   meeting_id: string | null;
   language: string | null;
@@ -198,7 +202,19 @@ export class BackgroundJobStore {
 
     let freshId: string;
     try {
-      if (info.kind === 'import') {
+      if (info.kind === 'import' && info.source_url) {
+        // URL imports (audio or Teams-transcript mode) have no local source
+        // file — the downloaded media was temporary. Re-run from the link.
+        const started = (await invoke('start_import_from_url_command', {
+          url: info.source_url,
+          title: info.title,
+          language: info.language,
+          model: info.model,
+          provider: info.provider,
+          mode: info.mode,
+        })) as { import_id: string };
+        freshId = started.import_id;
+      } else if (info.kind === 'import') {
         const started = (await invoke('start_import_audio_command', {
           sourcePath: info.source_path,
           title: info.title,

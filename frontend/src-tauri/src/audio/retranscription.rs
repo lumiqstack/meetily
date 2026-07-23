@@ -136,6 +136,8 @@ async fn start_retranscription_with_guard<R: Runtime>(
             kind: "retranscription".to_string(),
             title,
             source_path: None,
+            source_url: None,
+            mode: None,
             folder_path: Some(meeting_folder_path.clone()),
             meeting_id: Some(meeting_id.clone()),
             language: language.clone(),

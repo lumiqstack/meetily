@@ -296,11 +296,14 @@ pub async fn start_import<R: Runtime>(
         language,
         model,
         provider,
+        None,
+        None,
         guard,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_import_with_guard<R: Runtime>(
     app: AppHandle<R>,
     import_id: String,
@@ -309,6 +312,8 @@ async fn start_import_with_guard<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    source_url: Option<String>,
+    mode: Option<String>,
     _guard: JobGuard<'static>,
 ) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -323,6 +328,8 @@ async fn start_import_with_guard<R: Runtime>(
             kind: "import".to_string(),
             title: title.clone(),
             source_path: Some(source_path.clone()),
+            source_url,
+            mode,
             folder_path: None,
             meeting_id: None,
             language: language.clone(),
@@ -1106,6 +1113,8 @@ pub async fn start_import_audio_command<R: Runtime>(
             language,
             model,
             provider,
+            None,
+            None,
             guard,
         )
         .await;
@@ -1189,6 +1198,12 @@ pub async fn start_import_from_url_command<R: Runtime>(
         // Ensure the download registry entry is gone even on early error paths.
         URL_DOWNLOADS.remove(&id_task);
 
+        // The job finished in-process (success, failure, or cancellation — the
+        // user was told either way), so its journal row must not survive to be
+        // reported as interrupted on the next launch. Idempotent: the audio
+        // pipeline clears its own row on the success path.
+        super::job_persistence::try_clear_job(&app_task, &id_task).await;
+
         if let Err(e) = result {
             error!("URL import {} failed: {}", id_task, e);
             // The import pipeline (once reached) emits its own import-error and
@@ -1233,6 +1248,30 @@ async fn run_url_import<R: Runtime>(
     use super::{sharepoint, url_import, ytdlp};
 
     let is_transcript = mode.as_deref() == Some("transcript");
+
+    // Journal the job before any long-running phase: a crash during login,
+    // download, or transcript fetch must surface an interrupted notice on the
+    // next launch, and retry needs the original URL + mode (there is no local
+    // source file to fall back on). Cleared by the spawn wrapper on every
+    // in-process finish.
+    super::job_persistence::try_record_job_started(
+        &app,
+        &super::job_persistence::PersistedJob {
+            id: import_id.clone(),
+            kind: "import".to_string(),
+            title: title.clone(),
+            source_path: None,
+            source_url: Some(url.clone()),
+            mode: mode.clone(),
+            folder_path: None,
+            meeting_id: None,
+            language: language.clone(),
+            model: model.clone(),
+            provider: provider.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )
+    .await;
 
     // Phase 1: authenticate. The engine is deliberately NOT held during login
     // or download so recording and other jobs remain usable meanwhile.
@@ -1321,6 +1360,8 @@ async fn run_url_import<R: Runtime>(
         language,
         model,
         provider,
+        Some(url),
+        mode,
         guard,
     )
     .await;
@@ -1364,10 +1405,20 @@ async fn run_transcript_import<R: Runtime>(
     };
 
     emit_progress(app, import_id, "saving", 60, "Parsing transcript…");
-    let content = tokio::fs::read_to_string(&vtt_path)
-        .await
-        .map_err(|e| anyhow!("Failed to read transcript file: {e}"))?;
-    let cues = super::vtt::parse_vtt(&content).map_err(|e| anyhow!(e))?;
+    let content = match tokio::fs::read_to_string(&vtt_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(anyhow!("Failed to read transcript file: {e}"));
+        }
+    };
+    let cues = match super::vtt::parse_vtt(&content) {
+        Ok(c) => super::vtt::merge_cues(c),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(anyhow!(e));
+        }
+    };
 
     let now = chrono::Utc::now().to_rfc3339();
     let segments: Vec<TranscriptSegment> = cues
@@ -1392,22 +1443,53 @@ async fn run_transcript_import<R: Runtime>(
         return Err(anyhow!("Import cancelled"));
     }
 
+    // Resolve app state before creating the meeting folder so a missing state
+    // can't leave an orphaned folder behind.
+    let app_state = match app.try_state::<AppState>() {
+        Some(s) => s,
+        None => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(anyhow!("App state not available"));
+        }
+    };
+
     emit_progress(app, import_id, "saving", 85, "Creating meeting…");
     let base_folder = get_default_recordings_folder();
-    let meeting_folder = create_meeting_folder(&base_folder, title, false)?;
+    let meeting_folder = match create_meeting_folder(&base_folder, title, false) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(e.into());
+        }
+    };
+    // From here a folder exists on disk: record it in the journal so a crash
+    // before the DB commit is reconciled (and the orphan removed) at startup.
+    super::job_persistence::try_set_job_folder(
+        app,
+        import_id,
+        &meeting_folder.to_string_lossy(),
+    )
+    .await;
     // Keep the raw VTT alongside the meeting for reference.
     let _ = std::fs::copy(&vtt_path, meeting_folder.join("transcript.vtt"));
 
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| anyhow!("App state not available"))?;
-    let meeting_id = create_meeting_with_transcripts(
+    let meeting_id = match create_meeting_with_transcripts(
         app_state.db_manager.pool(),
         title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
     )
-    .await?;
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            // The meeting never reached the DB: remove the folder we just
+            // created (mirrors the audio pipeline's failure cleanup).
+            let _ = std::fs::remove_dir_all(&meeting_folder);
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(e.into());
+        }
+    };
 
     let duration_seconds = cues.last().map(|c| c.end_s).unwrap_or(0.0);
 
