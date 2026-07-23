@@ -299,6 +299,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />
@@ -355,6 +356,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         timestamp={segment.timestamp}
                                         text={getDisplayText(segment)}
                                         confidence={segment.confidence}
+                                        speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
                                     />
