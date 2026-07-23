@@ -37,6 +37,7 @@ import { useImportAudio, ImportResult } from '@/hooks/useImportAudio';
 import { useRouter } from 'next/navigation';
 import { useSidebar } from '../Sidebar/SidebarProvider';
 import { LANGUAGES } from '@/constants/languages';
+import { detectLinkContentMode } from '@/lib/link-content-mode';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 
 
@@ -85,20 +86,6 @@ function isLikelyHttpUrl(value: string): boolean {
   return /^https?:\/\/\S+$/i.test(value.trim());
 }
 
-// Guess whether a link points at a recording or a Teams transcript, from the
-// file name in the `id` param. Returns null when it can't tell.
-function detectLinkContentMode(url: string): 'audio' | 'transcript' | null {
-  let raw = url.toLowerCase();
-  try {
-    const u = new URL(url);
-    raw = (u.searchParams.get('id') || u.pathname).toLowerCase();
-  } catch {
-    // fall back to scanning the whole string
-  }
-  if (raw.includes('transcript')) return 'transcript';
-  if (raw.includes('recording')) return 'audio';
-  return null;
-}
 
 export function ImportAudioDialog({
   open,

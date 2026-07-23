@@ -192,7 +192,10 @@ pub async fn fetch_transcript(
     let listed = list_subs(ytdlp, ffmpeg, cookies_txt, url, cancel)
         .await
         .unwrap_or_else(|e| format!("(could not list subtitles: {e})"));
-    warn!("No transcript track found. yt-dlp output:\n{output}\navailable subs:\n{listed}");
+    // Raw yt-dlp output can contain tenant manifest URLs — keep it at debug;
+    // the warn line carries only the track list.
+    warn!("No transcript track found. Available subs:\n{listed}");
+    debug!("yt-dlp transcript-fetch output:\n{output}");
 
     Err(anyhow!(
         "No transcript was found for this link. Teams may not have generated a transcript for this meeting, or it isn't exposed for download.\n\nAvailable subtitle tracks:\n{}",

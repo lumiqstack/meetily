@@ -215,3 +215,27 @@ async fn write_cookies<R: Runtime>(
 
     Ok(AuthCookies { cookies_txt: path })
 }
+
+/// Remove cookie files a previous process left behind. The files hold live
+/// FedAuth/rtFa auth tokens in plain text and are normally deleted by
+/// `AuthCookies::cleanup` when the import finishes — but a crash mid-import
+/// skips that, so startup sweeps the whole directory. No import can be
+/// running this early, so every `sp-cookies-*.txt` here is stale.
+pub fn sweep_stale_cookie_files<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Ok(data_dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(data_dir.join("tmp")) else {
+        return; // No tmp dir yet — nothing to sweep.
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("sp-cookies-") && name.ends_with(".txt") {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => log::info!("Removed stale SharePoint cookie file: {name}"),
+                Err(e) => log::warn!("Failed to remove stale cookie file {name}: {e}"),
+            }
+        }
+    }
+}

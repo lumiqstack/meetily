@@ -259,8 +259,66 @@ in `job_persistence.rs`'s meeting-reference check. Unit-test with mixed separato
 normalization or canonicalization errors, treat the folder as referenced (skip
 deletion).
 
+## 10. Speaker attribution actually visible (correctness, small)
+
+**Status: DONE (2026-07-23).** Found by an as-built plan review of the VTT transcript
+import (`17f1695`): `TranscriptSegment` accepted and rendered a `speaker` prop, but both
+call sites in `VirtualizedTranscriptView.tsx` (virtualized + simple-list paths) never
+passed it — so the feature's whole point, speaker labels, never rendered. Fixed by
+passing `speaker={segment.speaker}` at both sites; regression-tested with a
+`renderToStaticMarkup` test (`tests/components/transcript-speaker.test.tsx`,
+mutation-validated: fails with the prop removed). Speaker names are now also included in
+transcript copy (`TranscriptContext.tsx`, `useCopyOperations.ts`), Obsidian export, and
+the transcript text fed to summary generation (`useSummaryGeneration.ts`) — all as
+`Speaker: text` prefixes, absent when `speaker` is null so recordings are unaffected.
+
+## 11. URL/transcript imports covered by crash recovery + faithful retry (correctness)
+
+**Status: DONE (2026-07-23).** Same review: `run_transcript_import` never journaled a
+`background_jobs` row (crash → no interrupted notice, orphaned folder invisible to the
+reconciler), and Retry was broken for *all* URL imports — the journal had no URL/mode,
+and audio-URL jobs journaled the deleted temp media path. Fixes:
+- Migration `20260723000000` adds nullable `source_url` + `mode` columns; `PersistedJob`
+  carries both. Scope decision: persisting the raw link locally was judged acceptable for
+  a local-only privacy-first app (the DB already holds full transcripts/audio) in
+  exchange for a working Retry.
+- `run_url_import` journals the job before any long phase (login/download/fetch crashes
+  now surface a notice); the spawn wrapper clears the row on every in-process finish;
+  the audio handoff threads `source_url`/`mode` through `start_import_with_guard`.
+- `run_transcript_import` records its meeting folder via `try_set_job_folder`, removes
+  the folder if the DB insert fails (mirroring the audio path), and no longer leaks its
+  temp work dir on read/parse errors.
+- Frontend `retryInterrupted` branches: jobs with `source_url` re-run through
+  `start_import_from_url_command` with the journaled mode; file imports keep the old
+  path. Tested in `background-jobs.test.ts` (URL-retry case) and
+  `job_persistence.rs` (`url_import_journal_round_trips_source_url_and_mode`).
+
+## 12. Startup sweep of stale SharePoint cookie files (security hygiene, small)
+
+**Status: DONE (2026-07-23).** `sp-cookies-<uuid>.txt` files (plaintext FedAuth/rtFa
+tokens) are deleted best-effort after each import, but a crash mid-import left them in
+`<app_data_dir>/tmp` indefinitely. `sharepoint::sweep_stale_cookie_files` now removes
+all `sp-cookies-*.txt` at startup (called first thing in
+`database/setup.rs::initialize_database_on_startup`; no import can be running that
+early). Also: the no-transcript-found `warn!` no longer dumps raw yt-dlp output (which
+can contain tenant manifest URLs) — the raw dump moved to `debug!`.
+
+## 13. Merge consecutive same-speaker cues (UX, small)
+
+**Status: DONE (2026-07-23).** The VTT plan promised merging but it was dropped in
+implementation: Teams emits one short cue per clause, so imports read as a choppy list
+with the speaker label repeated on every row. `vtt::merge_cues` now merges consecutive
+cues with an identical speaker when the gap is ≤3 s and the merged text stays ≤500
+chars (unit-tested: same-speaker merge, gap limit, length cap, speakerless-vs-named
+boundaries). Applied in `run_transcript_import` after parsing.
+
+Deferred from the same review: the Microsoft Stream transcript-API fallback (only
+needed if a real tenant link yields no yt-dlp subtitle track) and transcript/speaker
+search (no transcript search exists at all).
+
 ---
 
 **Suggested order**: 1 and 3 first (correctness in the current diff), then 2, 4, 5, 6, 7.
 Post-#7 follow-ups: 9 (small, closes a latent data-loss edge), then 8 (one-time
-verification pass). All items complete as of 2026-07-17.
+verification pass). Items 10–13 came out of the 2026-07-23 as-built review of the VTT
+transcript import. All items complete as of 2026-07-23.
