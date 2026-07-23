@@ -7,6 +7,10 @@ use crate::state::AppState;
 /// Initialize database on app startup
 /// Handles first launch detection and conditional initialization
 pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), String> {
+    // A crash mid-URL-import can leave plaintext SharePoint auth-cookie files
+    // behind; sweep them before anything else (needs no database).
+    crate::audio::sharepoint::sweep_stale_cookie_files(app);
+
     // Check if this is the first launch (no database exists yet)
     let is_first_launch = DatabaseManager::is_first_launch(app)
         .await
