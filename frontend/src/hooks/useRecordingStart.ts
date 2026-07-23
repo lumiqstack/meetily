@@ -5,6 +5,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
+import { configService } from '@/services/configService';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
@@ -34,7 +35,7 @@ export function useRecordingStart(
 
   const { clearTranscripts, setMeetingTitle } = useTranscripts();
   const { setIsMeetingActive } = useSidebar();
-  const { selectedDevices } = useConfig();
+  const { selectedDevices, transcriptModelConfig } = useConfig();
   const { setStatus } = useRecordingState();
 
   // Generate meeting title with timestamp
@@ -47,18 +48,6 @@ export function useRecordingStart(
     const minutes = String(now.getMinutes()).padStart(2, '0');
     const seconds = String(now.getSeconds()).padStart(2, '0');
     return `Meeting ${day}_${month}_${year}_${hours}_${minutes}_${seconds}`;
-  }, []);
-
-  // Check if Parakeet transcription model is ready
-  const checkParakeetReady = useCallback(async (): Promise<boolean> => {
-    try {
-      await invoke('parakeet_init');
-      const hasModels = await invoke<boolean>('parakeet_has_available_models');
-      return hasModels;
-    } catch (error) {
-      console.error('Failed to check Parakeet status:', error);
-      return false;
-    }
   }, []);
 
   // Check if any model is currently downloading
@@ -79,34 +68,94 @@ export function useRecordingStart(
     }
   }, []);
 
+  // Gate recording start on transcription readiness, mirroring the backend's
+  // validate_transcription_model_ready semantics: with realtime transcription
+  // disabled the backend records audio without loading any engine, so nothing
+  // needs to be ready up front; with it enabled, only the configured provider
+  // is validated (remote endpoints need config, not a downloaded model).
+  // Returns true when recording may proceed; shows toasts/modal otherwise.
+  const guardTranscriptionReady = useCallback(async (analyticsSource: string): Promise<boolean> => {
+    let config = transcriptModelConfig;
+    try {
+      const freshConfig = await configService.getTranscriptConfig();
+      if (freshConfig) {
+        config = freshConfig;
+      }
+    } catch (error) {
+      console.error('Failed to load transcript config, using cached config:', error);
+    }
+
+    if (!config?.realtimeTranscriptionEnabled) {
+      console.log('Realtime transcription disabled - skipping model readiness check');
+      return true;
+    }
+
+    const provider = config.provider || 'parakeet';
+
+    if (provider === 'openaiCompatible') {
+      if (config.baseUrl?.trim() && config.model?.trim()) {
+        return true;
+      }
+      toast.error('Remote transcription not configured', {
+        description: 'Set the server URL and model in transcript settings, or turn off realtime transcription to record without it.',
+        duration: 5000,
+      });
+      showModal?.('modelSelector', 'Transcription model setup required');
+      Analytics.trackButtonClick('start_recording_blocked_missing', analyticsSource);
+      return false;
+    }
+
+    if (provider === 'localWhisper') {
+      try {
+        await invoke('whisper_init');
+        const hasModels = await invoke<boolean>('whisper_has_available_models');
+        if (hasModels) {
+          return true;
+        }
+      } catch (error) {
+        console.error('Failed to check Whisper status:', error);
+      }
+    } else {
+      try {
+        await invoke('parakeet_init');
+        const hasModels = await invoke<boolean>('parakeet_has_available_models');
+        if (hasModels) {
+          return true;
+        }
+      } catch (error) {
+        console.error('Failed to check Parakeet status:', error);
+      }
+      if (await checkIfModelDownloading()) {
+        toast.info('Model download in progress', {
+          description: 'Please wait for the transcription model to finish downloading before recording.',
+          duration: 5000,
+        });
+        Analytics.trackButtonClick('start_recording_blocked_downloading', analyticsSource);
+        return false;
+      }
+    }
+
+    toast.error('Transcription model not ready', {
+      description: 'Please download a transcription model before recording.',
+      duration: 5000,
+    });
+    showModal?.('modelSelector', 'Transcription model setup required');
+    Analytics.trackButtonClick('start_recording_blocked_missing', analyticsSource);
+    return false;
+  }, [transcriptModelConfig, checkIfModelDownloading, showModal]);
+
   // Handle manual recording start (from button click)
   const handleRecordingStart = useCallback(async () => {
     try {
-      console.log('handleRecordingStart called - checking Parakeet model status');
+      console.log('handleRecordingStart called - checking transcription readiness');
 
-      // Check if Parakeet transcription model is ready before starting
-      const parakeetReady = await checkParakeetReady();
-      if (!parakeetReady) {
-        const isDownloading = await checkIfModelDownloading();
-        if (isDownloading) {
-          toast.info('Model download in progress', {
-            description: 'Please wait for the transcription model to finish downloading before recording.',
-            duration: 5000,
-          });
-          Analytics.trackButtonClick('start_recording_blocked_downloading', 'home_page');
-        } else {
-          toast.error('Transcription model not ready', {
-            description: 'Please download a transcription model before recording.',
-            duration: 5000,
-          });
-          showModal?.('modelSelector', 'Transcription model setup required');
-          Analytics.trackButtonClick('start_recording_blocked_missing', 'home_page');
-        }
+      const canProceed = await guardTranscriptionReady('home_page');
+      if (!canProceed) {
         setStatus(RecordingStatus.IDLE);
         return;
       }
 
-      console.log('Parakeet ready - setting up meeting title and state');
+      console.log('Transcription check passed - setting up meeting title and state');
 
       const randomTitle = generateMeetingTitle();
       setMeetingTitle(randomTitle);
@@ -141,7 +190,7 @@ export function useRecordingStart(
       // Re-throw so RecordingControls can handle device-specific errors
       throw error;
     }
-  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, checkParakeetReady, checkIfModelDownloading, selectedDevices, showModal, setStatus]);
+  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, guardTranscriptionReady, selectedDevices, showModal, setStatus]);
 
   // Check for autoStartRecording flag and start recording automatically
   useEffect(() => {
@@ -153,24 +202,8 @@ export function useRecordingStart(
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
 
-          // Check if Parakeet transcription model is ready before starting
-          const parakeetReady = await checkParakeetReady();
-          if (!parakeetReady) {
-            const isDownloading = await checkIfModelDownloading();
-            if (isDownloading) {
-              toast.info('Model download in progress', {
-                description: 'Please wait for the transcription model to finish downloading before recording.',
-                duration: 5000,
-              });
-              Analytics.trackButtonClick('start_recording_blocked_downloading', 'sidebar_auto');
-            } else {
-              toast.error('Transcription model not ready', {
-                description: 'Please download a transcription model before recording.',
-                duration: 5000,
-              });
-              showModal?.('modelSelector', 'Transcription model setup required');
-              Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_auto');
-            }
+          const canProceed = await guardTranscriptionReady('sidebar_auto');
+          if (!canProceed) {
             setStatus(RecordingStatus.IDLE);
             setIsAutoStarting(false);
             return;
@@ -224,8 +257,7 @@ export function useRecordingStart(
     setIsRecording,
     clearTranscripts,
     setIsMeetingActive,
-    checkParakeetReady,
-    checkIfModelDownloading,
+    guardTranscriptionReady,
     showModal,
     setStatus,
   ]);
@@ -238,27 +270,11 @@ export function useRecordingStart(
         return;
       }
 
-      console.log('Direct start from sidebar - checking Parakeet model status');
+      console.log('Direct start from sidebar - checking transcription readiness');
       setIsAutoStarting(true);
 
-      // Check if Parakeet transcription model is ready before starting
-      const parakeetReady = await checkParakeetReady();
-      if (!parakeetReady) {
-        const isDownloading = await checkIfModelDownloading();
-        if (isDownloading) {
-          toast.info('Model download in progress', {
-            description: 'Please wait for the transcription model to finish downloading before recording.',
-            duration: 5000,
-          });
-          Analytics.trackButtonClick('start_recording_blocked_downloading', 'sidebar_direct');
-        } else {
-          toast.error('Transcription model not ready', {
-            description: 'Please download a transcription model before recording.',
-            duration: 5000,
-          });
-          showModal?.('modelSelector', 'Transcription model setup required');
-          Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_direct');
-        }
+      const canProceed = await guardTranscriptionReady('sidebar_direct');
+      if (!canProceed) {
         setStatus(RecordingStatus.IDLE);
         setIsAutoStarting(false);
         return;
@@ -313,8 +329,7 @@ export function useRecordingStart(
     setIsRecording,
     clearTranscripts,
     setIsMeetingActive,
-    checkParakeetReady,
-    checkIfModelDownloading,
+    guardTranscriptionReady,
     showModal,
     setStatus,
   ]);
