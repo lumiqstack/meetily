@@ -41,6 +41,32 @@ fn is_import_cancelled(import_id: &str) -> bool {
     IMPORT_JOBS.is_cancelled(import_id)
 }
 
+/// Cancellation tokens for URL imports still in their download/authentication
+/// phase — before the shared import guard is acquired. Once the download
+/// finishes the job transitions into `IMPORT_JOBS` like any other import and is
+/// removed from here.
+static URL_DOWNLOADS: Lazy<dashmap::DashMap<String, tokio_util::sync::CancellationToken>> =
+    Lazy::new(dashmap::DashMap::new);
+
+fn is_url_download_active(import_id: &str) -> bool {
+    URL_DOWNLOADS.contains_key(import_id)
+}
+
+fn cancel_url_download(import_id: Option<&str>) {
+    match import_id {
+        Some(id) => {
+            if let Some(token) = URL_DOWNLOADS.get(id) {
+                token.cancel();
+            }
+        }
+        None => {
+            for entry in URL_DOWNLOADS.iter() {
+                entry.value().cancel();
+            }
+        }
+    }
+}
+
 /// VAD redemption time in milliseconds - bridges natural pauses in speech
 /// Batch processing needs longer redemption (2000ms) than live pipeline (400ms)
 /// because the entire file is processed at once by VAD, and 400ms fragments
@@ -101,9 +127,10 @@ pub struct ImportStarted {
     pub message: String,
 }
 
-/// Check if import is currently in progress
+/// Check if import is currently in progress (including URL imports still
+/// downloading, which have not yet claimed the shared import guard).
 pub fn is_import_in_progress() -> bool {
-    IMPORT_JOBS.has_active_jobs()
+    IMPORT_JOBS.has_active_jobs() || !URL_DOWNLOADS.is_empty()
 }
 
 /// Cancel ongoing import.
@@ -1093,18 +1120,196 @@ pub async fn start_import_audio_command<R: Runtime>(
     })
 }
 
-/// Cancel ongoing import
+/// Cancel ongoing import. Handles both file/URL imports that hold the shared
+/// import guard and URL imports still in their download/authentication phase.
 #[tauri::command]
 pub async fn cancel_import_command(import_id: Option<String>) -> Result<(), String> {
+    let url_active = match import_id.as_deref() {
+        Some(id) => is_url_download_active(id),
+        None => !URL_DOWNLOADS.is_empty(),
+    };
+
     if let Some(import_id) = import_id.as_deref() {
-        if !IMPORT_JOBS.is_active(import_id) {
+        if !url_active && !IMPORT_JOBS.is_active(import_id) {
             return Err("No import in progress for this job".to_string());
         }
-    } else if !is_import_in_progress() {
+    } else if !url_active && !is_import_in_progress() {
         return Err("No import in progress".to_string());
     }
 
+    cancel_url_download(import_id.as_deref());
     cancel_import(import_id.as_deref());
+    Ok(())
+}
+
+/// Start importing a meeting recording from a SharePoint / Microsoft Stream URL.
+///
+/// Authenticates via an embedded webview (reusing a persisted session so login
+/// is usually silent), downloads the recording with yt-dlp, then runs it
+/// through the normal import pipeline. Progress, completion, error, and
+/// cancellation all use the same `import-*` events as file imports, so the
+/// frontend needs no special handling.
+#[tauri::command]
+pub async fn start_import_from_url_command<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: Option<String>,
+    url: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+) -> Result<ImportStarted, String> {
+    let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
+
+    if is_url_download_active(&import_id) || IMPORT_JOBS.is_active(&import_id) {
+        return Err("This import is already in progress".to_string());
+    }
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    URL_DOWNLOADS.insert(import_id.clone(), cancel.clone());
+
+    let app_task = app.clone();
+    let id_task = import_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = run_url_import(
+            app_task.clone(),
+            id_task.clone(),
+            url,
+            title,
+            language,
+            model,
+            provider,
+            cancel,
+        )
+        .await;
+
+        // Ensure the download registry entry is gone even on early error paths.
+        URL_DOWNLOADS.remove(&id_task);
+
+        if let Err(e) = result {
+            error!("URL import {} failed: {}", id_task, e);
+            // The import pipeline (once reached) emits its own import-error and
+            // journals cleanup. Only pre-pipeline failures (auth/download/engine
+            // acquisition) surface here — and cancellation is not an error the
+            // user needs to see twice.
+            let msg = e.to_string();
+            if !msg.contains("cancelled") {
+                let _ = app_task.emit(
+                    "import-error",
+                    ImportError {
+                        import_id: id_task.clone(),
+                        error: msg,
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(ImportStarted {
+        import_id,
+        message: "Import started".to_string(),
+    })
+}
+
+/// Orchestrate a URL import: authenticate → download → hand off to the shared
+/// import pipeline. Returns `Ok(())` once the download has been handed to the
+/// pipeline (which then owns success/error reporting); returns `Err` only for
+/// failures that occur before the pipeline takes over.
+#[allow(clippy::too_many_arguments)]
+async fn run_url_import<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: String,
+    url: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    use super::{sharepoint, url_import, ytdlp};
+
+    // Phase 1: authenticate. The engine is deliberately NOT held during login
+    // or download so recording and other jobs remain usable meanwhile.
+    emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
+    let auth = sharepoint::ensure_auth_cookies(&app, &url, |msg| {
+        emit_progress(&app, &import_id, "downloading", 0, msg);
+    })
+    .await?;
+
+    if cancel.is_cancelled() {
+        auth.cleanup();
+        return Err(anyhow!("Import cancelled"));
+    }
+
+    // Phase 2: locate yt-dlp (downloaded on first use).
+    emit_progress(&app, &import_id, "downloading", 0, "Preparing downloader…");
+    let ytdlp_path = match ytdlp::ensure_ytdlp(&app).await {
+        Ok(p) => p,
+        Err(e) => {
+            auth.cleanup();
+            return Err(e);
+        }
+    };
+    let ffmpeg_path = super::ffmpeg::find_ffmpeg_path();
+
+    // Phase 3: download into a dedicated working directory.
+    let work_dir = std::env::temp_dir().join(format!("meetily-url-{}", import_id));
+    let dl_result = url_import::download_recording(
+        &ytdlp_path,
+        ffmpeg_path.as_deref(),
+        &auth.cookies_txt,
+        &url,
+        &work_dir,
+        |pct| {
+            emit_progress(
+                &app,
+                &import_id,
+                "downloading",
+                pct,
+                &format!("Downloading recording… {pct}%"),
+            )
+        },
+        &cancel,
+    )
+    .await;
+    auth.cleanup();
+
+    let media_path = match dl_result {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(e);
+        }
+    };
+
+    // Phase 4: claim the shared engine guard now (after the long download) and
+    // hand off to the normal pipeline, which journals + emits its own events.
+    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let guard = match IMPORT_JOBS.acquire(import_id.clone(), use_remote) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return Err(anyhow!(e));
+        }
+    };
+
+    // The import guard now owns this job; cancellation flows through IMPORT_JOBS.
+    URL_DOWNLOADS.remove(&import_id);
+
+    let media_path_str = media_path.to_string_lossy().to_string();
+    let _ = start_import_with_guard(
+        app.clone(),
+        import_id.clone(),
+        media_path_str,
+        title,
+        language,
+        model,
+        provider,
+        guard,
+    )
+    .await;
+
+    let _ = std::fs::remove_dir_all(&work_dir);
     Ok(())
 }
 

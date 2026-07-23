@@ -788,6 +788,7 @@ pub fn run() {
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,
             audio::import::start_import_audio_command,
+            audio::import::start_import_from_url_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
             // Interrupted background job commands (crash recovery)

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Upload,
   Globe,
+  Link2,
   Loader2,
   AlertCircle,
   CheckCircle2,
@@ -64,6 +65,26 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+// Derive a meeting title from a SharePoint/Stream recording link by taking the
+// recording's file name (the `id` query param, or the URL path) without its
+// extension.
+function deriveTitleFromUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    const id = u.searchParams.get('id');
+    const raw = id ? decodeURIComponent(id) : decodeURIComponent(u.pathname);
+    const base = raw.split('/').filter(Boolean).pop() || '';
+    const title = base.replace(/\.[^.]+$/, '').trim();
+    return title || 'Imported recording';
+  } catch {
+    return 'Imported recording';
+  }
+}
+
+function isLikelyHttpUrl(value: string): boolean {
+  return /^https?:\/\/\S+$/i.test(value.trim());
+}
+
 export function ImportAudioDialog({
   open,
   onOpenChange,
@@ -78,6 +99,8 @@ export function ImportAudioDialog({
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [titleModifiedByUser, setTitleModifiedByUser] = useState(false);
+  const [sourceMode, setSourceMode] = useState<'file' | 'link'>('file');
+  const [linkUrl, setLinkUrl] = useState('');
 
   // Always start as false — represents "dialog has not yet been opened".
   // Do NOT initialize from the `open` prop: if the component mounts with open=true
@@ -118,6 +141,7 @@ export function ImportAudioDialog({
     selectFile,
     validateFile,
     startImport,
+    startImportFromUrl,
     cancelImport,
     reset,
   } = useImportAudio({
@@ -139,6 +163,8 @@ export function ImportAudioDialog({
       setTitleModifiedByUser(false);
       setSelectedLang(selectedLanguage || 'auto');
       setShowAdvanced(false);
+      setSourceMode('file');
+      setLinkUrl('');
 
       // Validate preselected file if provided
       if (preselectedFile) {
@@ -185,16 +211,55 @@ export function ImportAudioDialog({
     }
   };
 
+  const linkValid = isLikelyHttpUrl(linkUrl);
+  const canImport = sourceMode === 'file' ? !!fileInfo : linkValid;
+
   const handleStartImport = async () => {
+    const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
+    const modelName = selectedModel?.name || null;
+    const providerName = selectedModel?.provider || null;
+
+    if (sourceMode === 'link') {
+      if (!linkValid) return;
+
+      const importTitle = title.trim() || deriveTitleFromUrl(linkUrl);
+      const started = await startImportFromUrl(
+        linkUrl.trim(),
+        importTitle,
+        language,
+        modelName,
+        providerName
+      );
+
+      // Link imports involve a sign-in window and a download, so they always
+      // continue in the background — hand off to the background toast and close.
+      if (started) {
+        window.dispatchEvent(new CustomEvent('meetily-background-import-started', {
+          detail: {
+            importId: started.import_id,
+            title: importTitle,
+          },
+        }));
+
+        toast.info('Import started', {
+          description: 'Signing in and downloading in the background. A sign-in window may appear if needed.',
+        });
+
+        reset();
+        onOpenChange(false);
+      }
+      return;
+    }
+
     if (!fileInfo) return;
 
     const importTitle = title || fileInfo.filename;
     const started = await startImport(
       fileInfo.path,
       importTitle,
-      isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang,
-      selectedModel?.name || null,
-      selectedModel?.provider || null
+      language,
+      modelName,
+      providerName
     );
 
     if (started && isRemoteModel) {
@@ -286,7 +351,32 @@ export function ImportAudioDialog({
           {/* File selection / info */}
           {!isProcessing && !error && (
             <>
-              {fileInfo ? (
+              {/* Source toggle: local file vs Teams/SharePoint link */}
+              <div className="grid grid-cols-2 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
+                <button
+                  type="button"
+                  onClick={() => setSourceMode('file')}
+                  className={`flex items-center justify-center gap-2 rounded-md py-2 transition-colors ${
+                    sourceMode === 'file' ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <FileAudio className="h-4 w-4" />
+                  Local File
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSourceMode('link')}
+                  className={`flex items-center justify-center gap-2 rounded-md py-2 transition-colors ${
+                    sourceMode === 'link' ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <Link2 className="h-4 w-4" />
+                  Teams / SharePoint Link
+                </button>
+              </div>
+
+              {sourceMode === 'file' && (
+                fileInfo ? (
                 <div className="bg-gray-50 rounded-lg p-4 space-y-3">
                   <div className="flex items-start gap-3">
                     <FileAudio className="h-8 w-8 text-blue-600 flex-shrink-0" />
@@ -341,10 +431,46 @@ export function ImportAudioDialog({
                   </Button>
                   <p className="text-sm text-gray-500 mt-2">MP4, WAV, MP3, FLAC, OGG, MKV, WebM, WMA</p>
                 </div>
+                )
+              )}
+
+              {sourceMode === 'link' && (
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Recording Link</label>
+                    <Input
+                      value={linkUrl}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setLinkUrl(value);
+                        if (!titleModifiedByUser && value) {
+                          setTitle(deriveTitleFromUrl(value));
+                        }
+                      }}
+                      placeholder="https://…sharepoint.com/…/stream.aspx?id=…"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Paste the recording link from Teams or SharePoint. A sign-in window may appear
+                      the first time; after that it stays signed in and downloads run in the background.
+                    </p>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Meeting Title</label>
+                    <Input
+                      value={title}
+                      onChange={(e) => {
+                        setTitle(e.target.value);
+                        setTitleModifiedByUser(true);
+                      }}
+                      placeholder="Enter meeting title"
+                    />
+                  </div>
+                </div>
               )}
 
               {/* Advanced options (collapsible) */}
-              {fileInfo && (
+              {(fileInfo || sourceMode === 'link') && (
                 <div className="border rounded-lg">
                   <button
                     onClick={() => setShowAdvanced(!showAdvanced)}
@@ -463,10 +589,19 @@ export function ImportAudioDialog({
               <Button
                 onClick={handleStartImport}
                 className="bg-blue-600 hover:bg-blue-700"
-                disabled={!fileInfo}
+                disabled={!canImport}
               >
-                <Upload className="h-4 w-4 mr-2" />
-                Import
+                {sourceMode === 'link' ? (
+                  <>
+                    <Link2 className="h-4 w-4 mr-2" />
+                    Import from Link
+                  </>
+                ) : (
+                  <>
+                    <Upload className="h-4 w-4 mr-2" />
+                    Import
+                  </>
+                )}
               </Button>
             </>
           )}
