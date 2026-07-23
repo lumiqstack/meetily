@@ -74,7 +74,8 @@ export interface UseImportAudioReturn {
     title: string,
     language?: string | null,
     model?: string | null,
-    provider?: string | null
+    provider?: string | null,
+    mode?: 'audio' | 'transcript' | null
   ) => Promise<ImportStarted | null>;
   cancelImport: () => Promise<void>;
   reset: () => void;
@@ -317,7 +318,8 @@ export function useImportAudio({
       title: string,
       language?: string | null,
       model?: string | null,
-      provider?: string | null
+      provider?: string | null,
+      mode?: 'audio' | 'transcript' | null
     ) => {
       const importId = createClientImportId();
 
@@ -329,7 +331,7 @@ export function useImportAudio({
 
       try {
         await Analytics.track('import_audio_started', {
-          source: 'url',
+          source: mode === 'transcript' ? 'url_transcript' : 'url',
           language: language || 'auto',
           model_provider: provider || '',
           model_name: model || '',
@@ -342,6 +344,7 @@ export function useImportAudio({
           language: language || null,
           model: model || null,
           provider: provider || null,
+          mode: mode || null,
         });
 
         activeImportIdRef.current = started.import_id;
