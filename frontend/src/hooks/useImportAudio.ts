@@ -69,6 +69,13 @@ export interface UseImportAudioReturn {
     model?: string | null,
     provider?: string | null
   ) => Promise<ImportStarted | null>;
+  startImportFromUrl: (
+    url: string,
+    title: string,
+    language?: string | null,
+    model?: string | null,
+    provider?: string | null
+  ) => Promise<ImportStarted | null>;
   cancelImport: () => Promise<void>;
   reset: () => void;
 }
@@ -301,6 +308,62 @@ export function useImportAudio({
     [fileInfo]
   );
 
+  // Start importing from a SharePoint/Teams recording link. Shares all the
+  // same import-* events and state as file imports; the backend authenticates,
+  // downloads, then runs the standard import pipeline.
+  const startImportFromUrl = useCallback(
+    async (
+      url: string,
+      title: string,
+      language?: string | null,
+      model?: string | null,
+      provider?: string | null
+    ) => {
+      const importId = createClientImportId();
+
+      activeImportIdRef.current = importId;
+      isCancelledRef.current = false;
+      setStatus('processing');
+      setError(null);
+      setProgress(null);
+
+      try {
+        await Analytics.track('import_audio_started', {
+          source: 'url',
+          language: language || 'auto',
+          model_provider: provider || '',
+          model_name: model || '',
+        });
+
+        const started = await invoke<ImportStarted>('start_import_from_url_command', {
+          importId,
+          url,
+          title,
+          language: language || null,
+          model: model || null,
+          provider: provider || null,
+        });
+
+        activeImportIdRef.current = started.import_id;
+        return started;
+      } catch (err: any) {
+        if (activeImportIdRef.current === importId) {
+          activeImportIdRef.current = null;
+        }
+
+        setStatus('error');
+        const errorMsg = typeof err === 'string' ? err : (err?.message || String(err) || 'Failed to start import');
+        setError(errorMsg);
+
+        await Analytics.trackError('import_audio_failed', errorMsg);
+
+        onErrorRef.current?.(errorMsg);
+        return null;
+      }
+    },
+    []
+  );
+
   // Cancel ongoing import
   const cancelImport = useCallback(async () => {
     const importId = activeImportIdRef.current;
@@ -342,6 +405,7 @@ export function useImportAudio({
     selectFile,
     validateFile,
     startImport,
+    startImportFromUrl,
     cancelImport,
     reset,
   };

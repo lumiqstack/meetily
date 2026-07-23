@@ -63,6 +63,11 @@ pub mod retranscription;
 // Import module (import external audio files as new meetings)
 pub mod import;
 
+// Import from URL: SharePoint/Stream recording download + auth
+pub mod ytdlp;
+pub mod sharepoint;
+pub mod url_import;
+
 pub use devices::{
     default_input_device, default_output_device, get_device_and_config, list_audio_devices,
     parse_audio_device, trigger_audio_permission,
