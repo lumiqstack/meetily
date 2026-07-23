@@ -73,6 +73,36 @@ pub fn parse_vtt(content: &str) -> Result<Vec<TranscriptCue>, String> {
     Ok(cues)
 }
 
+/// Longest silence between two cues that still merges them (seconds).
+const MERGE_MAX_GAP_S: f64 = 3.0;
+/// Cap on a merged cue's text so segments stay readable.
+const MERGE_MAX_CHARS: usize = 500;
+
+/// Merge consecutive cues from the same speaker into one segment. Teams emits
+/// very short cues (often one clause each), which reads as a choppy transcript
+/// with the speaker label repeated on every row. Cues merge only when the
+/// speaker matches exactly (two speakerless cues count as the same speaker),
+/// the silence between them is short, and the merged text stays readable.
+pub fn merge_cues(cues: Vec<TranscriptCue>) -> Vec<TranscriptCue> {
+    let mut merged: Vec<TranscriptCue> = Vec::with_capacity(cues.len());
+    for cue in cues {
+        if let Some(prev) = merged.last_mut() {
+            let gap = cue.start_s - prev.end_s;
+            if prev.speaker == cue.speaker
+                && gap <= MERGE_MAX_GAP_S
+                && prev.text.len() + 1 + cue.text.len() <= MERGE_MAX_CHARS
+            {
+                prev.end_s = prev.end_s.max(cue.end_s);
+                prev.text.push(' ');
+                prev.text.push_str(&cue.text);
+                continue;
+            }
+        }
+        merged.push(cue);
+    }
+    merged
+}
+
 /// Parse a timing line like `00:00:03.120 --> 00:00:06.740 position:50%`.
 fn parse_timing(line: &str) -> Option<(f64, f64)> {
     let mut parts = line.split("-->");
@@ -171,5 +201,77 @@ mod tests {
     #[test]
     fn empty_input_errors() {
         assert!(parse_vtt("WEBVTT\n\n").is_err());
+    }
+
+    #[test]
+    fn handles_unclosed_voice_tag() {
+        let vtt = "WEBVTT\n\n\
+            00:00:01.000 --> 00:00:02.000\n\
+            <v Jane Smith>Missing the closing tag";
+        let cues = parse_vtt(vtt).unwrap();
+        assert_eq!(cues[0].speaker.as_deref(), Some("Jane Smith"));
+        assert_eq!(cues[0].text, "Missing the closing tag");
+    }
+
+    #[test]
+    fn tolerates_missing_webvtt_header() {
+        let vtt = "00:00:01.000 --> 00:00:02.000\n\
+            <v Ann>Header-less file</v>";
+        let cues = parse_vtt(vtt).unwrap();
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].speaker.as_deref(), Some("Ann"));
+    }
+
+    fn cue(speaker: Option<&str>, start_s: f64, end_s: f64, text: &str) -> TranscriptCue {
+        TranscriptCue {
+            speaker: speaker.map(str::to_string),
+            start_s,
+            end_s,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn merges_consecutive_same_speaker_cues() {
+        let merged = merge_cues(vec![
+            cue(Some("Jane"), 0.0, 2.0, "Hello everyone,"),
+            cue(Some("Jane"), 2.2, 4.0, "thanks for joining."),
+            cue(Some("John"), 4.5, 6.0, "Happy to be here."),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "Hello everyone, thanks for joining.");
+        assert!((merged[0].end_s - 4.0).abs() < 1e-6);
+        assert_eq!(merged[1].speaker.as_deref(), Some("John"));
+    }
+
+    #[test]
+    fn does_not_merge_across_long_gaps() {
+        let merged = merge_cues(vec![
+            cue(Some("Jane"), 0.0, 2.0, "Before the pause."),
+            cue(Some("Jane"), 10.0, 12.0, "After the pause."),
+        ]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_respects_text_length_cap() {
+        let long = "x".repeat(490);
+        let merged = merge_cues(vec![
+            cue(Some("Jane"), 0.0, 2.0, &long),
+            cue(Some("Jane"), 2.1, 4.0, "would overflow the cap"),
+        ]);
+        assert_eq!(merged.len(), 2, "an over-cap merge must be rejected");
+    }
+
+    #[test]
+    fn speakerless_cues_merge_with_each_other_but_not_with_named() {
+        let merged = merge_cues(vec![
+            cue(None, 0.0, 1.0, "First."),
+            cue(None, 1.2, 2.0, "Second."),
+            cue(Some("Jane"), 2.1, 3.0, "Named."),
+        ]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "First. Second.");
+        assert_eq!(merged[1].speaker.as_deref(), Some("Jane"));
     }
 }
