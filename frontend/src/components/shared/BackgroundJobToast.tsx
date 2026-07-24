@@ -73,6 +73,7 @@ export function BackgroundJobCard({
   className?: string;
 }) {
   const isActive = job.status === 'running' || job.status === 'cancelling';
+  const isQueued = job.status === 'queued';
   const isComplete = job.status === 'completed';
   const hasError = job.status === 'error';
   const isInterrupted = job.status === 'interrupted';
@@ -103,10 +104,12 @@ export function BackgroundJobCard({
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between gap-2 mb-1">
           <p className="text-sm font-medium text-gray-900 truncate">{job.title}</p>
-          {isActive && (
+          {(isActive || isQueued) && (
             <button
               type="button"
-              onClick={() => onCancel(job.id)}
+              onClick={() =>
+                isQueued ? backgroundJobStore.cancelQueued(job.id) : onCancel(job.id)
+              }
               disabled={job.status === 'cancelling'}
               className="flex-shrink-0 text-xs text-gray-500 hover:text-red-600 disabled:opacity-50 disabled:hover:text-gray-500"
               aria-label={`Cancel ${job.kind}`}
@@ -148,6 +151,8 @@ export function BackgroundJobCard({
           <p className="text-xs text-green-600">{job.message || 'Complete'}</p>
         ) : job.status === 'cancelled' ? (
           <p className="text-xs text-gray-600">Cancelled</p>
+        ) : isQueued ? (
+          <p className="text-xs text-gray-500">Queued — waiting for a free slot…</p>
         ) : (
           <>
             {/* Progress bar */}
