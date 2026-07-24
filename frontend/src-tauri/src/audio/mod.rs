@@ -67,6 +67,7 @@ pub mod import;
 // Import from URL: SharePoint/Stream recording download + auth
 pub mod ytdlp;
 pub mod sharepoint;
+pub mod sharepoint_sync;
 pub mod url_import;
 pub mod vtt;
 
