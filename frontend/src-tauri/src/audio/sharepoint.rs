@@ -30,6 +30,9 @@ const AUTH_COOKIE_NAMES: &[&str] = &["fedauth", "rtfa", "edgeaccesscookie"];
 const SILENT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long to wait for the user to complete an interactive login.
 const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Silent-SSO hop to a sibling host (e.g. `tenant-my.sharepoint.com`) after
+/// the primary host is signed in.
+const EXTRA_HOST_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(1200);
 
 /// Result of an authentication attempt: the path to a Netscape `cookies.txt`
@@ -43,6 +46,123 @@ impl AuthCookies {
     pub fn cleanup(&self) {
         let _ = std::fs::remove_file(&self.cookies_txt);
     }
+}
+
+/// Multi-host authentication result: per-host cookie sets for building
+/// `Cookie:` headers on direct REST calls (FedAuth is per-host in SharePoint
+/// Online, so e.g. `tenant.sharepoint.com` and `tenant-my.sharepoint.com`
+/// each need their own set). Cookie values must never be logged.
+pub struct MultiHostAuth {
+    pub host_cookies: std::collections::HashMap<String, Vec<Cookie<'static>>>,
+}
+
+/// Like `ensure_auth_cookies`, but additionally visits `extra_hosts` with the
+/// same (hidden) webview session so their per-host auth cookies get minted —
+/// SSO normally completes these hops silently once the primary host is signed
+/// in. Hosts that fail to authenticate are simply absent from the result; the
+/// caller decides whether that is fatal.
+pub async fn ensure_multi_host_auth<R: Runtime, F: Fn(&str)>(
+    app: &AppHandle<R>,
+    target_url: &str,
+    extra_hosts: &[String],
+    on_status: F,
+) -> Result<MultiHostAuth> {
+    let url = Url::parse(target_url).context("The SharePoint link is not a valid URL")?;
+    if !is_sharepoint_host(&url) {
+        return Err(anyhow!(
+            "This link is not a SharePoint URL (expected a *.sharepoint.com host)."
+        ));
+    }
+
+    if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
+        let _ = existing.close();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow!("Could not resolve app data dir: {e}"))?
+        .join("sp-webview");
+    std::fs::create_dir_all(&data_dir).ok();
+
+    on_status("Connecting to SharePoint…");
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        AUTH_WINDOW_LABEL,
+        WebviewUrl::External(url.clone()),
+    )
+    .title("Sign in to SharePoint — Meetily")
+    .inner_size(1024.0, 768.0)
+    .data_directory(data_dir)
+    .visible(false)
+    .build()
+    .context("Failed to open the SharePoint sign-in window")?;
+
+    // Authenticate the primary host: silent first, then interactive.
+    let primary = match poll_for_auth(&window, &url, SILENT_TIMEOUT).await? {
+        Some(cookies) => {
+            info!("SharePoint session authenticated silently");
+            cookies
+        }
+        None => {
+            on_status("Waiting for you to sign in to SharePoint…");
+            debug!("Silent auth failed; showing login window");
+            let _ = window.show();
+            let _ = window.set_focus();
+            let result = poll_for_auth(&window, &url, INTERACTIVE_TIMEOUT).await;
+            match result? {
+                Some(cookies) => {
+                    info!("SharePoint session authenticated interactively");
+                    let _ = window.hide();
+                    cookies
+                }
+                None => {
+                    let _ = window.close();
+                    return Err(anyhow!(
+                        "Timed out waiting for SharePoint sign-in. Please try again."
+                    ));
+                }
+            }
+        }
+    };
+
+    let mut host_cookies = std::collections::HashMap::new();
+    let primary_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    host_cookies.insert(primary_host.clone(), primary);
+
+    // Visit each extra host so SSO mints its per-host cookies; these hops are
+    // normally silent, so a short timeout suffices.
+    for host in extra_hosts {
+        let host = host.to_ascii_lowercase();
+        if host == primary_host || host_cookies.contains_key(&host) {
+            continue;
+        }
+        let Ok(host_url) = Url::parse(&format!("https://{host}/")) else {
+            continue;
+        };
+        if !is_sharepoint_host(&host_url) {
+            warn!("Refusing to visit non-SharePoint host during auth: {host}");
+            continue;
+        }
+        on_status(&format!("Authorizing {host}…"));
+        if let Err(e) = window.navigate(host_url.clone()) {
+            warn!("Could not navigate auth window to {host}: {e}");
+            continue;
+        }
+        match poll_for_auth(&window, &host_url, EXTRA_HOST_TIMEOUT).await {
+            Ok(Some(cookies)) => {
+                info!("Authenticated silently on {host}");
+                host_cookies.insert(host, cookies);
+            }
+            Ok(None) => warn!("No auth cookies appeared for {host}; continuing without it"),
+            Err(e) => warn!("Cookie read failed for {host}: {e}"),
+        }
+    }
+
+    let _ = window.close();
+    Ok(MultiHostAuth { host_cookies })
 }
 
 /// Ensure we have valid SharePoint auth cookies for `target_url`, showing an
