@@ -13,7 +13,10 @@ import {
   HardDrive,
   ChevronDown,
   ChevronUp,
+  FolderOpen,
+  Files,
 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
 import {
   Dialog,
   DialogContent,
@@ -39,6 +42,20 @@ import { useSidebar } from '../Sidebar/SidebarProvider';
 import { LANGUAGES } from '@/constants/languages';
 import { detectLinkContentMode } from '@/lib/link-content-mode';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { getSharedImportQueue } from '@/lib/import-queue';
+import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
+
+/** Matches the Rust BatchCandidate returned by the batch-selection commands. */
+interface BatchCandidate {
+  path: string;
+  file_name: string;
+  size_bytes: number;
+}
+
+/** Meeting title for a batch item: the file name without its extension. */
+function titleFromFileName(fileName: string): string {
+  return fileName.replace(/\.[^.]+$/, '').trim() || fileName;
+}
 
 
 interface ImportAudioDialogProps {
@@ -102,6 +119,7 @@ export function ImportAudioDialog({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [titleModifiedByUser, setTitleModifiedByUser] = useState(false);
   const [sourceMode, setSourceMode] = useState<'file' | 'link'>('file');
+  const [batchFiles, setBatchFiles] = useState<BatchCandidate[]>([]);
   const [linkUrl, setLinkUrl] = useState('');
   const [linkContentMode, setLinkContentMode] = useState<'audio' | 'transcript'>('audio');
   const [linkModeTouched, setLinkModeTouched] = useState(false);
@@ -168,6 +186,7 @@ export function ImportAudioDialog({
       setSelectedLang(selectedLanguage || 'auto');
       setShowAdvanced(false);
       setSourceMode('file');
+      setBatchFiles([]);
       setLinkUrl('');
       setLinkContentMode('audio');
       setLinkModeTouched(false);
@@ -214,11 +233,80 @@ export function ImportAudioDialog({
     const info = await selectFile();
     if (info) {
       setTitle(info.filename);
+      setBatchFiles([]);
     }
   };
 
+  const addBatchCandidates = useCallback((incoming: BatchCandidate[]) => {
+    if (incoming.length === 0) return;
+    setBatchFiles((prev) => {
+      const seen = new Set(prev.map((f) => f.path));
+      return [...prev, ...incoming.filter((f) => !seen.has(f.path))];
+    });
+  }, []);
+
+  const handleAddFiles = async () => {
+    try {
+      const picked = await invoke<BatchCandidate[]>('select_audio_files_command');
+      addBatchCandidates(picked);
+    } catch (e) {
+      toast.error('Could not select files', { description: String(e) });
+    }
+  };
+
+  const handleAddFolder = async () => {
+    try {
+      const result = await invoke<{ candidates: BatchCandidate[]; truncated: boolean } | null>(
+        'select_audio_folder_command'
+      );
+      if (!result) return;
+      if (result.candidates.length === 0) {
+        toast.info('No audio files found in that folder');
+        return;
+      }
+      if (result.truncated) {
+        toast.warning('Folder scan stopped at 500 files', {
+          description: 'Import this batch first, then add the rest.',
+        });
+      }
+      addBatchCandidates(result.candidates);
+    } catch (e) {
+      toast.error('Could not scan folder', { description: String(e) });
+    }
+  };
+
+  const handleRemoveBatchFile = (path: string) => {
+    setBatchFiles((prev) => prev.filter((f) => f.path !== path));
+  };
+
+  const handleStartBatch = () => {
+    const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
+    const queue = getSharedImportQueue(backgroundJobStore, (command, args) =>
+      invoke(command, args)
+    );
+    queue.enqueueBatch(
+      batchFiles.map((f) => ({ path: f.path, title: titleFromFileName(f.file_name) })),
+      {
+        language,
+        model: selectedModel?.name || null,
+        provider: selectedModel?.provider || null,
+      }
+    );
+
+    toast.info(`Importing ${batchFiles.length} files`, {
+      description: isRemoteModel
+        ? 'Up to 3 run at a time in the background.'
+        : 'They run one at a time in the background.',
+    });
+
+    setBatchFiles([]);
+    reset();
+    onOpenChange(false);
+  };
+
   const linkValid = isLikelyHttpUrl(linkUrl);
-  const canImport = sourceMode === 'file' ? !!fileInfo : linkValid;
+  const canImport =
+    sourceMode === 'file' ? !!fileInfo || batchFiles.length > 0 : linkValid;
 
   const handleStartImport = async () => {
     const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
@@ -259,6 +347,11 @@ export function ImportAudioDialog({
         reset();
         onOpenChange(false);
       }
+      return;
+    }
+
+    if (batchFiles.length > 0) {
+      handleStartBatch();
       return;
     }
 
@@ -386,7 +479,58 @@ export function ImportAudioDialog({
                 </button>
               </div>
 
-              {sourceMode === 'file' && (
+              {sourceMode === 'file' && batchFiles.length > 0 && (
+                <div className="bg-gray-50 rounded-lg p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="font-medium text-gray-900">
+                      {batchFiles.length} file{batchFiles.length === 1 ? '' : 's'} selected
+                    </p>
+                    <span className="text-sm text-gray-500">
+                      {formatFileSize(batchFiles.reduce((sum, f) => sum + f.size_bytes, 0))}
+                    </span>
+                  </div>
+                  <div className="max-h-44 overflow-y-auto space-y-1 pr-1">
+                    {batchFiles.map((file) => (
+                      <div
+                        key={file.path}
+                        className="flex items-center gap-2 bg-white rounded-md border border-gray-200 px-2 py-1.5"
+                      >
+                        <FileAudio className="h-4 w-4 text-blue-600 flex-shrink-0" />
+                        <span className="flex-1 min-w-0 truncate text-sm text-gray-800">
+                          {file.file_name}
+                        </span>
+                        <span className="text-xs text-gray-400 flex-shrink-0">
+                          {formatFileSize(file.size_bytes)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveBatchFile(file.path)}
+                          className="flex-shrink-0 text-gray-400 hover:text-red-600"
+                          aria-label={`Remove ${file.file_name}`}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button variant="outline" size="sm" onClick={handleAddFiles}>
+                      <Files className="h-4 w-4 mr-2" />
+                      Add Files
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={handleAddFolder}>
+                      <FolderOpen className="h-4 w-4 mr-2" />
+                      Add Folder
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Each file becomes its own meeting, titled after the file name. Imports run in
+                    the background{isRemoteModel ? ', up to 3 at a time' : ', one at a time'}.
+                  </p>
+                </div>
+              )}
+
+              {sourceMode === 'file' && batchFiles.length === 0 && (
                 fileInfo ? (
                 <div className="bg-gray-50 rounded-lg p-4 space-y-3">
                   <div className="flex items-start gap-3">
@@ -441,6 +585,16 @@ export function ImportAudioDialog({
                     )}
                   </Button>
                   <p className="text-sm text-gray-500 mt-2">MP4, WAV, MP3, FLAC, OGG, MKV, WebM, WMA</p>
+                  <div className="flex items-center justify-center gap-2 mt-3">
+                    <Button variant="outline" size="sm" onClick={handleAddFiles}>
+                      <Files className="h-4 w-4 mr-2" />
+                      Multiple Files
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={handleAddFolder}>
+                      <FolderOpen className="h-4 w-4 mr-2" />
+                      Whole Folder
+                    </Button>
+                  </div>
                 </div>
                 )
               )}
@@ -515,7 +669,9 @@ export function ImportAudioDialog({
               )}
 
               {/* Advanced options (collapsible) — irrelevant for transcript import */}
-              {(fileInfo || (sourceMode === 'link' && linkContentMode === 'audio')) && (
+              {(fileInfo ||
+                (sourceMode === 'file' && batchFiles.length > 0) ||
+                (sourceMode === 'link' && linkContentMode === 'audio')) && (
                 <div className="border rounded-lg">
                   <button
                     onClick={() => setShowAdvanced(!showAdvanced)}
@@ -640,6 +796,11 @@ export function ImportAudioDialog({
                   <>
                     <Link2 className="h-4 w-4 mr-2" />
                     {linkContentMode === 'transcript' ? 'Import Transcript' : 'Import from Link'}
+                  </>
+                ) : batchFiles.length > 0 ? (
+                  <>
+                    <Files className="h-4 w-4 mr-2" />
+                    Import {batchFiles.length} File{batchFiles.length === 1 ? '' : 's'}
                   </>
                 ) : (
                   <>

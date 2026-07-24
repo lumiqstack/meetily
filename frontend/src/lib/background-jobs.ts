@@ -1,6 +1,7 @@
 export type BackgroundJobKind = 'import' | 'retranscription';
 
 export type BackgroundJobStatus =
+  | 'queued'
   | 'running'
   | 'cancelling'
   | 'completed'
@@ -62,6 +63,7 @@ export function toastDurationMs(status: BackgroundJobStatus): number {
       return 5000;
     case 'error':
       return 10000;
+    case 'queued':
     case 'running':
     case 'cancelling':
     // An interrupted-job notice stays until the user retries or dismisses.
@@ -119,6 +121,44 @@ export class BackgroundJobStore {
       error: null,
     });
     this.notify();
+  }
+
+  /** Register an import waiting in a batch queue (not yet started). */
+  registerQueued(importId: string, title: string): void {
+    this.jobs.set(importId, {
+      id: importId,
+      kind: 'import',
+      title,
+      status: 'queued',
+      progressPercentage: 0,
+      message: 'Waiting…',
+      error: null,
+    });
+    this.notify();
+  }
+
+  /** A queued import's turn arrived: mark it running. */
+  promoteToActive(id: string): boolean {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== 'queued') return false;
+
+    job.status = 'running';
+    job.message = '';
+    this.notify();
+    return true;
+  }
+
+  /**
+   * Drop a job that never started — no backend call needed, unlike
+   * cancelJob. Refuses to touch anything already running.
+   */
+  cancelQueued(id: string): boolean {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== 'queued') return false;
+
+    this.jobs.delete(id);
+    this.notify();
+    return true;
   }
 
   registerRetranscription(meetingId: string, title?: string): void {

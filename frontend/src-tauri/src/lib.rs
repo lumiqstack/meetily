@@ -787,6 +787,8 @@ pub fn run() {
             // Import audio commands
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,
+            audio::import::select_audio_files_command,
+            audio::import::select_audio_folder_command,
             audio::import::start_import_audio_command,
             audio::import::start_import_from_url_command,
             audio::import::cancel_import_command,

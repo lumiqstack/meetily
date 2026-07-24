@@ -86,6 +86,97 @@ pub struct AudioFileInfo {
     pub format: String,
 }
 
+/// Candidate file for a batch import: enough for the selection list; full
+/// validation happens per file when its import actually starts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchCandidate {
+    pub path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+}
+
+/// Result of scanning a folder for importable audio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FolderScanResult {
+    pub candidates: Vec<BatchCandidate>,
+    /// True when the scan stopped at the file cap — more audio exists.
+    pub truncated: bool,
+}
+
+/// Bounds for recursive folder scans: enough for any sane recordings
+/// directory while keeping a mistaken "pick C:\" recoverable.
+pub(crate) const FOLDER_SCAN_MAX_DEPTH: usize = 8;
+pub(crate) const FOLDER_SCAN_MAX_FILES: usize = 500;
+
+/// Recursively collect audio files under `root` (by extension), skipping
+/// dot-directories and dot-files. Deterministic: entries are visited in
+/// name order and the result is sorted by path.
+pub(crate) fn scan_folder_for_audio(
+    root: &Path,
+    max_depth: usize,
+    max_files: usize,
+) -> FolderScanResult {
+    fn visit(
+        dir: &Path,
+        depth: usize,
+        max_depth: usize,
+        max_files: usize,
+        candidates: &mut Vec<BatchCandidate>,
+        truncated: &mut bool,
+    ) {
+        if depth > max_depth || *truncated {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // Unreadable subdir: skip rather than fail the scan.
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            if *truncated {
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, depth + 1, max_depth, max_files, candidates, truncated);
+            } else {
+                let extension = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_default();
+                if !AUDIO_EXTENSIONS.contains(&extension.as_str()) {
+                    continue;
+                }
+                if candidates.len() >= max_files {
+                    *truncated = true;
+                    return;
+                }
+                let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                candidates.push(BatchCandidate {
+                    path: path.to_string_lossy().to_string(),
+                    file_name: name,
+                    size_bytes,
+                });
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut truncated = false;
+    visit(root, 0, max_depth, max_files, &mut candidates, &mut truncated);
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    FolderScanResult {
+        candidates,
+        truncated,
+    }
+}
+
 /// Progress update emitted during import
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportProgress {
@@ -1086,6 +1177,79 @@ pub async fn validate_audio_file_command(path: String) -> Result<AudioFileInfo, 
     validate_audio_file(Path::new(&path)).map_err(|e| e.to_string())
 }
 
+/// Select multiple audio files for a batch import. Files that fail
+/// validation are skipped with a log line — the user reviews the returned
+/// list in the dialog before anything starts.
+#[tauri::command]
+pub async fn select_audio_files_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<BatchCandidate>, String> {
+    info!("Opening multi-file dialog for batch audio import");
+
+    let app_clone = app.clone();
+    let picked = tokio::task::spawn_blocking(move || {
+        app_clone
+            .dialog()
+            .file()
+            .add_filter(
+                "Audio Files",
+                &AUDIO_EXTENSIONS.iter().map(|s| *s).collect::<Vec<_>>(),
+            )
+            .blocking_pick_files()
+    })
+    .await
+    .map_err(|e| format!("File dialog task failed: {}", e))?;
+
+    let Some(paths) = picked else {
+        return Ok(Vec::new());
+    };
+
+    let mut candidates = Vec::new();
+    for picked_path in paths {
+        let path_str = picked_path.to_string();
+        match validate_audio_file(Path::new(&path_str)) {
+            Ok(info) => candidates.push(BatchCandidate {
+                path: info.path,
+                file_name: info.filename,
+                size_bytes: info.size_bytes,
+            }),
+            Err(e) => warn!("Skipping unimportable selection {}: {}", path_str, e),
+        }
+    }
+    Ok(candidates)
+}
+
+/// Pick a folder and scan it recursively for importable audio files.
+/// Returns None when the user cancels the picker.
+#[tauri::command]
+pub async fn select_audio_folder_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<FolderScanResult>, String> {
+    info!("Opening folder dialog for batch audio import");
+
+    let app_clone = app.clone();
+    let picked = tokio::task::spawn_blocking(move || app_clone.dialog().file().blocking_pick_folder())
+        .await
+        .map_err(|e| format!("Folder dialog task failed: {}", e))?;
+
+    let Some(folder) = picked else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(folder.to_string());
+    let result = tokio::task::spawn_blocking(move || {
+        scan_folder_for_audio(&root, FOLDER_SCAN_MAX_DEPTH, FOLDER_SCAN_MAX_FILES)
+    })
+    .await
+    .map_err(|e| format!("Folder scan task failed: {}", e))?;
+
+    info!(
+        "Folder scan found {} audio file(s){}",
+        result.candidates.len(),
+        if result.truncated { " (truncated)" } else { "" }
+    );
+    Ok(Some(result))
+}
+
 /// Start importing an audio file (Beta gated using configContext.betaFeatures)
 #[tauri::command]
 pub async fn start_import_audio_command<R: Runtime>(
@@ -1969,6 +2133,74 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    mod folder_scan {
+        use super::super::{scan_folder_for_audio, FOLDER_SCAN_MAX_DEPTH};
+
+        fn touch(path: &std::path::Path) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        #[test]
+        fn finds_audio_recursively_and_skips_non_audio_and_dot_entries() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            touch(&root.join("a.mp3"));
+            touch(&root.join("notes.txt"));
+            touch(&root.join(".hidden.mp3"));
+            touch(&root.join("nested/deep/b.WAV")); // extension match is case-insensitive
+            touch(&root.join(".git/c.mp3")); // dot-dir skipped entirely
+
+            let result = scan_folder_for_audio(root, FOLDER_SCAN_MAX_DEPTH, 500);
+            let names: Vec<&str> = result
+                .candidates
+                .iter()
+                .map(|c| c.file_name.as_str())
+                .collect();
+            assert_eq!(names, vec!["a.mp3", "b.WAV"]);
+            assert!(!result.truncated);
+        }
+
+        #[test]
+        fn respects_the_depth_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            touch(&root.join("l1/l2/shallow.mp3"));
+            touch(&root.join("l1/l2/l3/too-deep.mp3"));
+
+            let result = scan_folder_for_audio(root, 2, 500);
+            let names: Vec<&str> = result
+                .candidates
+                .iter()
+                .map(|c| c.file_name.as_str())
+                .collect();
+            assert_eq!(names, vec!["shallow.mp3"]);
+        }
+
+        #[test]
+        fn truncates_at_the_file_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for i in 0..5 {
+                touch(&root.join(format!("file-{i}.mp3")));
+            }
+
+            let result = scan_folder_for_audio(root, FOLDER_SCAN_MAX_DEPTH, 3);
+            assert_eq!(result.candidates.len(), 3);
+            assert!(result.truncated, "hitting the cap must be reported");
+        }
+
+        #[test]
+        fn empty_folder_yields_empty_untruncated_result() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = scan_folder_for_audio(dir.path(), FOLDER_SCAN_MAX_DEPTH, 500);
+            assert!(result.candidates.is_empty());
+            assert!(!result.truncated);
         }
     }
 }
