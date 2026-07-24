@@ -613,6 +613,7 @@ impl AudioCapture {
             timestamp,
             chunk_id,
             device_type: self.device_type.clone(),
+            dominant_source: None,
         };
 
         // NOTE: Raw audio is NOT sent to recording saver to prevent echo
@@ -694,6 +695,10 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Me/Others speaker attribution: label each pre-mix window by dominant
+    // source, aggregate across the windows behind each VAD segment.
+    window_labeler: super::source_attribution::WindowLabeler,
+    segment_aggregator: super::source_attribution::SegmentAggregator,
 }
 
 impl AudioPipeline {
@@ -760,6 +765,8 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            window_labeler: super::source_attribution::WindowLabeler::new(),
+            segment_aggregator: super::source_attribution::SegmentAggregator::new(),
         }
     }
 
@@ -822,8 +829,18 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                            // Speaker attribution: decide the window's dominant
+                            // source while mic and system are still separate.
+                            let window_label = self.window_labeler.label(&mic_window, &sys_window);
+
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
+
+                            // Weight the window's label by its (mixed) energy so
+                            // loud speech outvotes quiet crosstalk per segment.
+                            let window_energy: f32 =
+                                mixed_clean.iter().map(|s| s * s).sum();
+                            self.segment_aggregator.add(window_label, window_energy);
 
                             // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
                             // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
@@ -834,6 +851,16 @@ impl AudioPipeline {
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
                             match self.vad_processor.process_audio(&mixed_with_gain) {
                                 Ok(speech_segments) => {
+                                    // One label per emission batch: the windows
+                                    // accumulated since the last VAD segment(s)
+                                    // back everything emitted now. (VAD segment
+                                    // boundaries can drift a window either way —
+                                    // acceptable for a binary Me/Others label.)
+                                    let batch_source = if speech_segments.is_empty() {
+                                        None
+                                    } else {
+                                        self.segment_aggregator.finalize()
+                                    };
                                     for segment in speech_segments {
                                         let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
@@ -847,6 +874,7 @@ impl AudioPipeline {
                                                 timestamp: segment.start_timestamp_ms / 1000.0,
                                                 chunk_id: self.chunk_id_counter,
                                                 device_type: DeviceType::Microphone,  // Mixed audio
+                                                dominant_source: batch_source.clone(),
                                             };
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -873,6 +901,7 @@ impl AudioPipeline {
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
                                     device_type: DeviceType::Microphone,  // Mixed audio
+                                    dominant_source: None,
                                 };
                                 let _ = sender.send(recording_chunk);
                             }
@@ -903,6 +932,11 @@ impl AudioPipeline {
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {
             Ok(final_segments) => {
+                let batch_source = if final_segments.is_empty() {
+                    None
+                } else {
+                    self.segment_aggregator.finalize()
+                };
                 for segment in final_segments {
                     let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
@@ -917,6 +951,7 @@ impl AudioPipeline {
                             timestamp: segment.start_timestamp_ms / 1000.0,
                             chunk_id: self.chunk_id_counter,
                             device_type: DeviceType::Microphone,
+                            dominant_source: batch_source.clone(),
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -1039,6 +1074,7 @@ impl AudioPipelineManager {
                 timestamp: 0.0,
                 chunk_id: u64::MAX, // Special ID to indicate flush
                 device_type: super::recording_state::DeviceType::Microphone,
+                dominant_source: None,
             };
 
             if let Err(e) = sender.send(flush_chunk) {
@@ -1059,6 +1095,7 @@ impl AudioPipelineManager {
                         timestamp: 0.0,
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
+                        dominant_source: None,
                     };
                     let _ = sender.send(additional_flush);
                 }

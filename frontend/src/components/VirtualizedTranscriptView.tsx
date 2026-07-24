@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
+import { displaySpeaker } from "@/lib/speaker-label";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -100,7 +101,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
                 </Tooltip>
                 <div className="flex-1">
                     {speaker && (
-                        <p className="text-xs font-semibold text-blue-600 mb-0.5">{speaker}</p>
+                        <p className="text-xs font-semibold text-blue-600 mb-0.5">{displaySpeaker(speaker)}</p>
                     )}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">

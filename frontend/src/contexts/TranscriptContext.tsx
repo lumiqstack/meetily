@@ -5,6 +5,7 @@ import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
+import { displaySpeaker } from '@/lib/speaker-label';
 import { recordingService } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
 
@@ -315,6 +316,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: update.audio_start_time,
             audio_end_time: update.audio_end_time,
             duration: update.duration,
+            speaker: update.speaker ?? null,
           };
 
           // Add to buffer
@@ -383,6 +385,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: segment.audio_start_time,
             audio_end_time: segment.audio_end_time,
             duration: segment.duration,
+            speaker: segment.speaker ?? null,
           }));
 
           setTranscripts(formattedTranscripts);
@@ -424,6 +427,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       audio_start_time: update.audio_start_time,
       audio_end_time: update.audio_end_time,
       duration: update.duration,
+      speaker: update.speaker ?? null,
     };
 
     setTranscripts(prev => {
@@ -465,7 +469,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     };
 
     const fullTranscript = transcripts
-      .map(t => `${formatTime(t.audio_start_time)} ${t.speaker ? `${t.speaker}: ` : ''}${t.text}`)
+      .map(t => {
+        const speaker = displaySpeaker(t.speaker);
+        return `${formatTime(t.audio_start_time)} ${speaker ? `${speaker}: ` : ''}${t.text}`;
+      })
       .join('\n');
     navigator.clipboard.writeText(fullTranscript);
 
