@@ -17,6 +17,10 @@ pub enum DeviceType {
 /// Audio chunk with metadata for processing
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
+    /// For VAD transcription chunks: which source dominated the mixed audio
+    /// (drives Me/Others speaker labels). None for raw capture, recording,
+    /// and flush chunks — and when neither source clearly dominated.
+    pub dominant_source: Option<DeviceType>,
     pub data: Vec<f32>,
     pub sample_rate: u32,
     pub timestamp: f64,

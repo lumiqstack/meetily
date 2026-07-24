@@ -31,6 +31,7 @@ export interface TranscriptUpdate {
   audio_start_time: number; // Seconds from recording start
   audio_end_time: number;   // Seconds from recording start
   duration: number;          // Segment duration in seconds
+  speaker?: string | null;   // "mic" / "system" source attribution; absent when ambiguous
 }
 
 export interface Block {

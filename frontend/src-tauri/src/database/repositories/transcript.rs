@@ -47,8 +47,8 @@ impl TranscriptsRepository {
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&transcript_id)
             .bind(&meeting_id)
@@ -57,6 +57,7 @@ impl TranscriptsRepository {
             .bind(segment.audio_start_time)
             .bind(segment.audio_end_time)
             .bind(segment.duration)
+            .bind(&segment.speaker)
             .execute(&mut *transaction)
             .await;
 
@@ -263,6 +264,32 @@ mod tests {
         TranscriptsRepository::save_transcript(pool, title, &segments, None)
             .await
             .expect("save_transcript")
+    }
+
+    #[tokio::test]
+    async fn save_transcript_persists_speaker() {
+        let pool = test_pool().await;
+        let mut labeled = seg("hello from the mic");
+        labeled.speaker = Some("mic".to_string());
+        let unlabeled = seg("ambiguous crosstalk");
+
+        let meeting_id =
+            TranscriptsRepository::save_transcript(&pool, "Labeled", &[labeled, unlabeled], None)
+                .await
+                .unwrap();
+
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT speaker FROM transcripts WHERE meeting_id = ? ORDER BY transcript",
+        )
+        .bind(&meeting_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(None,), (Some("mic".to_string()),)],
+            "speaker must round-trip; ambiguous segments stay NULL"
+        );
     }
 
     #[tokio::test]
