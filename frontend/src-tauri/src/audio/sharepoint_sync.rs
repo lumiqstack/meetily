@@ -384,7 +384,10 @@ pub(crate) fn build_search_probe_url(root_host: &str, kql: &str, rowlimit: u32) 
     let encoded: String = url::form_urlencoded::byte_serialize(kql.replace('\'', "''").as_bytes())
         .collect::<String>()
         .replace('+', "%20");
-    format!("https://{root_host}/_api/search/query?querytext='{encoded}'&rowlimit={rowlimit}")
+    format!(
+        "https://{root_host}/_api/search/query?querytext='{encoded}'&rowlimit={rowlimit}&\
+         selectproperties='Title,Path,FileExtension,FileType'"
+    )
 }
 
 fn rows_len_at(json: &serde_json::Value, pointer: &str) -> Option<usize> {
@@ -408,6 +411,27 @@ pub(crate) fn summarize_search_body(
         .unwrap_or_default();
     let p = parsed.as_ref();
     let prefix: String = body.chars().take(400).collect();
+    // Titles/paths of the first few hits, so a non-zero probe shows WHAT
+    // matched (file names and site paths only — no secrets).
+    let samples = p
+        .and_then(|v| v.pointer("/PrimaryQueryResult/RelevantResults/Table/Rows"))
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .take(3)
+                .filter_map(|row| {
+                    let cells = row.get("Cells")?.as_array()?;
+                    let get = |key: &str| {
+                        cells.iter().find_map(|c| {
+                            (c.get("Key")?.as_str()? == key)
+                                .then(|| c.get("Value")?.as_str().map(str::to_string))
+                                .flatten()
+                        })
+                    };
+                    Some(serde_json::json!({"title": get("Title"), "path": get("Path")}))
+                })
+                .collect::<Vec<_>>()
+        });
     serde_json::json!({
         "method": method,
         "query": kql,
@@ -417,6 +441,7 @@ pub(crate) fn summarize_search_body(
         "rowsAtResultsWrapped": p.and_then(|v| rows_len_at(v, "/PrimaryQueryResult/RelevantResults/Table/Rows/results")),
         "rowsAtVerbose": p.and_then(|v| rows_len_at(v, "/d/query/PrimaryQueryResult/RelevantResults/Table/Rows/results")),
         "totalRows": p.and_then(|v| v.pointer("/PrimaryQueryResult/RelevantResults/TotalRows")).cloned(),
+        "samples": samples,
         "bodyPrefix": prefix,
     })
 }
@@ -729,15 +754,22 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
         search_probes.push(serde_json::json!({"error": "no root-host cookies harvested"}));
     } else {
         let header = build_cookie_header(root_cookies);
+        // Round 2 ladder: `*` proved search alive but FileExtension:mp4
+        // matched nothing tenant-wide (GET and POST alike). Distinguish "the
+        // property is dead — use filetype:" from "video is excluded from the
+        // classic index — cookies can't reach what the hub uses".
         for (kql, limit) in [
-            ("*", 5u32),
-            ("FileExtension:mp4", 10),
-            ("ContentTypeId:0x0120D520A808*", 10),
+            ("*", 3u32),
+            ("filetype:mp4", 10),          // modern property, same intent
+            ("filetype:docx", 3),          // control: property queries work at all?
+            ("FileExtension:docx", 3),     // control: is FileExtension itself dead?
+            ("\"Meeting Recording\"", 10), // free text present in every recording name
+            ("AMER AI Community", 10),     // free text for the known shared recording
         ] {
             search_probes.push(probe_search_get(&client, &root_host, &header, kql, limit).await);
         }
         search_probes
-            .push(probe_search_post(&client, &root_host, &header, "FileExtension:mp4", 10).await);
+            .push(probe_search_post(&client, &root_host, &header, "filetype:mp4", 10).await);
     }
 
     Ok(serde_json::json!({
@@ -1113,23 +1145,27 @@ mod tests {
 
     #[test]
     fn search_probe_url_encodes_kql() {
-        let url = build_search_probe_url("t.sharepoint.com", "ContentTypeId:0x0120D520A808*", 10);
-        assert_eq!(
-            url,
-            "https://t.sharepoint.com/_api/search/query?querytext='ContentTypeId%3A0x0120D520A808*'&rowlimit=10"
-        );
-        let wildcard = build_search_probe_url("t.sharepoint.com", "*", 5);
-        assert!(wildcard.contains("querytext='*'") || wildcard.contains("querytext='%2A'"));
+        let url = build_search_probe_url("t.sharepoint.com", "filetype:mp4", 10);
+        assert!(url.starts_with(
+            "https://t.sharepoint.com/_api/search/query?querytext='filetype%3Amp4'&rowlimit=10"
+        ));
+        assert!(url.contains("selectproperties='Title,Path,FileExtension,FileType'"));
+
+        let phrase = build_search_probe_url("t.sharepoint.com", "\"Meeting Recording\"", 10);
+        assert!(phrase.contains("querytext='%22Meeting%20Recording%22'"));
     }
 
     #[test]
     fn search_body_summary_counts_rows_at_each_wrapping() {
-        // nometadata shape (what we parse today).
-        let plain = r#"{"PrimaryQueryResult":{"RelevantResults":{"TotalRows":7,"Table":{"Rows":[{},{}]}}},"ElapsedTime":12}"#;
+        // nometadata shape (what we parse today), with sample extraction.
+        let plain = r#"{"PrimaryQueryResult":{"RelevantResults":{"TotalRows":7,"Table":{"Rows":[
+            {"Cells":[{"Key":"Title","Value":"AMER AI Community"},{"Key":"Path","Value":"https://t.sharepoint.com/sites/ai/x.mp4"}]},
+            {}]}}},"ElapsedTime":12}"#;
         let s = summarize_search_body("GET", "*", 200, plain);
         assert_eq!(s["rowsAtPrimary"], serde_json::json!(2));
         assert_eq!(s["rowsAtResultsWrapped"], serde_json::Value::Null);
         assert_eq!(s["totalRows"], serde_json::json!(7));
+        assert_eq!(s["samples"][0]["title"], serde_json::json!("AMER AI Community"));
 
         // minimalmetadata/verbose-style "results" wrapping — the suspected
         // silent-zero culprit.
