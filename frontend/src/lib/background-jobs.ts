@@ -1,4 +1,10 @@
-export type BackgroundJobKind = 'import' | 'retranscription';
+export type BackgroundJobKind = 'import' | 'retranscription' | 'summary';
+
+/** Store id for a summary job. Retranscription jobs use the bare meeting id,
+ * so summary jobs are prefixed to allow both for one meeting at once. */
+export function summaryJobId(meetingId: string): string {
+  return `summary:${meetingId}`;
+}
 
 export type BackgroundJobStatus =
   | 'queued'
@@ -174,6 +180,19 @@ export class BackgroundJobStore {
     this.notify();
   }
 
+  registerSummary(meetingId: string, title?: string): void {
+    this.jobs.set(summaryJobId(meetingId), {
+      id: summaryJobId(meetingId),
+      kind: 'summary',
+      title: title || 'Summary generation',
+      status: 'running',
+      progressPercentage: 0,
+      message: '',
+      error: null,
+    });
+    this.notify();
+  }
+
   registerInterrupted(info: InterruptedJobInfo): void {
     this.jobs.set(info.id, {
       id: info.id,
@@ -219,6 +238,10 @@ export class BackgroundJobStore {
     try {
       if (job.kind === 'import') {
         await invoke('cancel_import_command', { importId: id });
+      } else if (job.kind === 'summary') {
+        await invoke('api_cancel_summary', {
+          meetingId: id.slice('summary:'.length),
+        });
       } else {
         await invoke('cancel_retranscription_command', { meetingId: id });
       }

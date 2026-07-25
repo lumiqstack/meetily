@@ -11,6 +11,18 @@ pub struct MeetingModel {
     pub folder_path: Option<String>,
 }
 
+/// A meeting with outstanding work: a recording without transcripts, or
+/// transcripts without a completed AI summary. Derived, not stored.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct PendingMeetingModel {
+    pub id: String,
+    pub title: String,
+    pub created_at: DateTimeUtc,
+    pub folder_path: Option<String>,
+    pub transcript_count: i64,
+    pub summary_status: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct DateTimeUtc(pub DateTime<Utc>);

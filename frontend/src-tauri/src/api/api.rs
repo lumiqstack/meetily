@@ -6,7 +6,7 @@ use tauri_plugin_store::StoreExt;
 
 use crate::{
     database::{
-        models::MeetingModel,
+        models::{MeetingModel, PendingMeetingModel},
         repositories::{
             meeting::MeetingsRepository, setting::SettingsRepository,
             transcript::TranscriptsRepository,
@@ -363,6 +363,24 @@ pub async fn api_get_meetings<R: Runtime>(
         }
         Err(e) => {
             log_error!("Error getting meetings: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn api_get_pending_meetings<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PendingMeetingModel>, String> {
+    let pool = state.db_manager.pool();
+    match MeetingsRepository::get_pending_meetings(pool).await {
+        Ok(pending) => {
+            log_info!("Found {} meetings with pending work", pending.len());
+            Ok(pending)
+        }
+        Err(e) => {
+            log_error!("Error getting pending meetings: {}", e);
             Err(e.to_string())
         }
     }

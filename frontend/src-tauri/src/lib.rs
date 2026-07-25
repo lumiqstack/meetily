@@ -740,6 +740,7 @@ pub fn run() {
             anthropic::anthropic::get_anthropic_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
+            api::api_get_pending_meetings,
             api::api_search_transcripts,
             api::api_get_profile,
             api::api_save_profile,
