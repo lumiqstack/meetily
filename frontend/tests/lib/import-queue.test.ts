@@ -160,6 +160,66 @@ describe("ImportQueue start failures", () => {
   });
 });
 
+describe("ImportQueue URL items (SharePoint sync)", () => {
+  function urlItems(n: number): { url: string; title: string }[] {
+    return Array.from({ length: n }, (_, i) => ({
+      url: `https://t-my.sharepoint.com/_layouts/15/stream.aspx?id=/personal/u/Recordings/rec-${i}.mp4`,
+      title: `Rec ${i}`,
+    }));
+  }
+
+  test("uses the URL import command with audio mode", async () => {
+    const store = new BackgroundJobStore();
+    const started: StartedCall[] = [];
+    const queue = new ImportQueue(store, fakeInvoke(started), idsFrom("import-url"));
+
+    queue.enqueueBatch(urlItems(1), { provider: "whisper", retryDelayMs: 0 });
+    await flush();
+
+    expect(started.length).toBe(1);
+    expect(started[0].command).toBe("start_import_from_url_command");
+    expect(started[0].args.url).toContain("stream.aspx");
+    expect(started[0].args.mode).toBe("audio");
+    expect(started[0].args.sourcePath).toBeUndefined();
+  });
+
+  test("URL items run one at a time even on the remote provider (shared auth webview)", async () => {
+    const store = new BackgroundJobStore();
+    const started: StartedCall[] = [];
+    const queue = new ImportQueue(store, fakeInvoke(started), idsFrom("import-urlseq"));
+
+    queue.enqueueBatch(urlItems(3), { provider: "openaiCompatible", retryDelayMs: 0 });
+    await flush();
+    expect(started.length).toBe(1);
+
+    store.applyComplete("import-urlseq-1");
+    await flush();
+    expect(started.length).toBe(2);
+  });
+
+  test("onItemCompleted fires for completed items only", async () => {
+    const store = new BackgroundJobStore();
+    const started: StartedCall[] = [];
+    const completed: string[] = [];
+    const queue = new ImportQueue(store, fakeInvoke(started), idsFrom("import-mark"));
+
+    queue.enqueueBatch(urlItems(2), {
+      provider: "whisper",
+      retryDelayMs: 0,
+      onItemCompleted: (item) => completed.push(item.url ?? ""),
+    });
+    await flush();
+
+    store.applyComplete("import-mark-1");
+    await flush();
+    store.applyError("import-mark-2", "download failed");
+    await flush();
+
+    expect(completed.length).toBe(1);
+    expect(completed[0]).toContain("rec-0.mp4");
+  });
+});
+
 describe("ImportQueue cancellation", () => {
   test("an item cancelled from the store (toast) is skipped, not started", async () => {
     const store = new BackgroundJobStore();

@@ -20,8 +20,10 @@
 use anyhow::{anyhow, Context, Result};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Runtime};
+use tauri_plugin_store::StoreExt;
 
 /// One recording found on SharePoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -418,6 +420,175 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
         },
         "cookieNames": cookie_names,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Sync state: hub URL, last sync date, and which recordings were already
+// imported. Stored in sharepoint_sync.json via tauri-plugin-store. Holds only
+// hostnames, server-relative paths, names, and dates — never cookies or
+// token-bearing query strings.
+// ---------------------------------------------------------------------------
+
+const SYNC_STORE_FILE: &str = "sharepoint_sync.json";
+const SYNC_STORE_KEY: &str = "state";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharePointSyncState {
+    #[serde(default)]
+    pub hub_url: Option<String>,
+    /// ISO date of the last confirmed sync; the next scan defaults to it.
+    #[serde(default)]
+    pub last_sync_date: Option<String>,
+    /// file_url -> ISO timestamp the import was queued.
+    #[serde(default)]
+    pub imported: HashMap<String, String>,
+}
+
+fn load_sync_state<R: Runtime>(app: &AppHandle<R>) -> SharePointSyncState {
+    let Ok(store) = app.store(SYNC_STORE_FILE) else {
+        return SharePointSyncState::default();
+    };
+    store
+        .get(SYNC_STORE_KEY)
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+fn save_sync_state<R: Runtime>(app: &AppHandle<R>, state: &SharePointSyncState) -> Result<()> {
+    let store = app
+        .store(SYNC_STORE_FILE)
+        .map_err(|e| anyhow!("Could not open the sync store: {e}"))?;
+    store.set(
+        SYNC_STORE_KEY,
+        serde_json::to_value(state).context("Could not serialize sync state")?,
+    );
+    store
+        .save()
+        .map_err(|e| anyhow!("Could not persist the sync store: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_sharepoint_sync_state_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<SharePointSyncState, String> {
+    Ok(load_sync_state(&app))
+}
+
+#[tauri::command]
+pub async fn set_sharepoint_sync_prefs_command<R: Runtime>(
+    app: AppHandle<R>,
+    hub_url: Option<String>,
+    last_sync_date: Option<String>,
+) -> Result<(), String> {
+    let mut state = load_sync_state(&app);
+    if hub_url.is_some() {
+        state.hub_url = hub_url;
+    }
+    if last_sync_date.is_some() {
+        state.last_sync_date = last_sync_date;
+    }
+    save_sync_state(&app, &state).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn mark_sharepoint_imported_command<R: Runtime>(
+    app: AppHandle<R>,
+    file_url: String,
+) -> Result<(), String> {
+    let mut state = load_sync_state(&app);
+    state
+        .imported
+        .insert(file_url, chrono::Utc::now().to_rfc3339());
+    save_sync_state(&app, &state).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Production scan command
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SharePointScanItem {
+    #[serde(flatten)]
+    pub recording: SharePointRecording,
+    pub already_imported: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SharePointScanResult {
+    /// Which enumeration strategy produced the list: "onedrive" or "search".
+    pub strategy: String,
+    pub recordings: Vec<SharePointScanItem>,
+}
+
+/// Enumerate recordings newer than `since_iso`, annotated with whether each
+/// was already imported through this feature. OneDrive listing is the primary
+/// strategy; Search REST is the fallback (known to return nothing on some
+/// tenants — its failure only matters if OneDrive also failed).
+#[tauri::command]
+pub async fn sharepoint_scan_recordings_command<R: Runtime>(
+    app: AppHandle<R>,
+    hub_url: String,
+    since_iso: String,
+) -> Result<SharePointScanResult, String> {
+    let url = url::Url::parse(&hub_url).map_err(|e| format!("Invalid hub URL: {e}"))?;
+    let root_host = url
+        .host_str()
+        .ok_or("Hub URL has no host")?
+        .to_ascii_lowercase();
+    let my_host = derive_my_host(&root_host)
+        .ok_or("Could not derive the OneDrive host from the hub URL")?;
+
+    let auth = super::sharepoint::ensure_multi_host_auth(
+        &app,
+        &hub_url,
+        &[my_host.clone()],
+        |msg| info!("[sp-scan] {msg}"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let client = sp_client().map_err(|e| e.to_string())?;
+    let empty: Vec<Cookie<'static>> = Vec::new();
+
+    let my_cookies = auth.host_cookies.get(&my_host).unwrap_or(&empty);
+    let (strategy, recordings) = if my_cookies.is_empty() {
+        ("search", None)
+    } else {
+        match enumerate_onedrive_recordings(&client, &my_host, my_cookies, &since_iso).await {
+            Ok(list) => ("onedrive", Some(list)),
+            Err(e) => {
+                warn!("[sp-scan] OneDrive enumeration failed, falling back to search: {e:#}");
+                ("search", None)
+            }
+        }
+    };
+
+    let recordings = match recordings {
+        Some(list) => list,
+        None => {
+            let root_cookies = auth.host_cookies.get(&root_host).unwrap_or(&empty);
+            enumerate_via_search(&client, &root_host, &my_host, root_cookies, &since_iso)
+                .await
+                .map_err(|e| format!("Both enumeration strategies failed: {e:#}"))?
+        }
+    };
+    info!(
+        "[sp-scan] {} recording(s) via {strategy} since {since_iso}",
+        recordings.len()
+    );
+
+    let imported = load_sync_state(&app).imported;
+    Ok(SharePointScanResult {
+        strategy: strategy.to_string(),
+        recordings: recordings
+            .into_iter()
+            .map(|recording| SharePointScanItem {
+                already_imported: imported.contains_key(&recording.file_url),
+                recording,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

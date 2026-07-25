@@ -796,8 +796,12 @@ pub fn run() {
             // Interrupted background job commands (crash recovery)
             audio::job_persistence::list_interrupted_jobs_command,
             audio::job_persistence::dismiss_interrupted_job_command,
-            // SharePoint sync spike (debug enumeration; gated before any UI)
+            // SharePoint recordings sync
             audio::sharepoint_sync::sharepoint_enumerate_recordings_debug_command,
+            audio::sharepoint_sync::sharepoint_scan_recordings_command,
+            audio::sharepoint_sync::get_sharepoint_sync_state_command,
+            audio::sharepoint_sync::set_sharepoint_sync_prefs_command,
+            audio::sharepoint_sync::mark_sharepoint_imported_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
