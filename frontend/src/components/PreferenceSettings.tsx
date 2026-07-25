@@ -30,6 +30,7 @@ export function PreferenceSettings() {
   const [previousNotificationsEnabled, setPreviousNotificationsEnabled] = useState<boolean | null>(null);
   const [obsidianVaultPath, setObsidianVaultPath] = useState("");
   const [obsidianFilenameTemplate, setObsidianFilenameTemplate] = useState("{date} {title}.md");
+  const [obsidianAutoExport, setObsidianAutoExport] = useState(true);
   const [isSavingObsidianPath, setIsSavingObsidianPath] = useState(false);
   const hasTrackedViewRef = useRef(false);
 
@@ -47,9 +48,10 @@ export function PreferenceSettings() {
       }
 
       try {
-        const settings = await invoke<{ vault_path?: string | null; filename_template?: string }>('get_obsidian_settings');
+        const settings = await invoke<{ vault_path?: string | null; filename_template?: string; auto_export?: boolean }>('get_obsidian_settings');
         setObsidianVaultPath(settings.vault_path || "");
         setObsidianFilenameTemplate(settings.filename_template || "{date} {title}.md");
+        setObsidianAutoExport(settings.auto_export ?? true);
       } catch (error) {
         console.error('Failed to load Obsidian settings:', error);
       }
@@ -172,12 +174,14 @@ export function PreferenceSettings() {
     setIsSavingObsidianPath(true);
 
     try {
-      const settings = await invoke<{ vault_path?: string | null; filename_template?: string }>('set_obsidian_settings', {
+      const settings = await invoke<{ vault_path?: string | null; filename_template?: string; auto_export?: boolean }>('set_obsidian_settings', {
         vaultPath: obsidianVaultPath.trim() || null,
         filenameTemplate: obsidianFilenameTemplate.trim() || "{date} {title}.md",
+        autoExport: obsidianAutoExport,
       });
       setObsidianVaultPath(settings.vault_path || "");
       setObsidianFilenameTemplate(settings.filename_template || "{date} {title}.md");
+      setObsidianAutoExport(settings.auto_export ?? true);
       toast.success('Obsidian vault saved');
       await Analytics.track('obsidian_vault_path_saved', {
         configured: (!!settings.vault_path).toString(),
@@ -404,6 +408,18 @@ export function PreferenceSettings() {
               />
               <div className="text-xs text-gray-600">
                 Filename placeholders: {"{date}"}, {"{title}"}, {"{id}"}, {"{short_id}"}
+              </div>
+              <label className="flex items-center gap-2 text-sm text-gray-900 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={obsidianAutoExport}
+                  onChange={(event) => setObsidianAutoExport(event.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300 accent-gray-900"
+                />
+                Auto-export summaries to Obsidian
+              </label>
+              <div className="text-xs text-gray-600">
+                When enabled, every completed AI summary is saved to the vault automatically. Remember to Save after changing.
               </div>
               <div className="flex gap-2">
                 <button

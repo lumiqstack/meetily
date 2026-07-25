@@ -360,6 +360,18 @@ export function BackgroundJobToastProvider() {
         }
       );
       if (!register(unlistenRetranscriptionError)) return;
+
+      // The Rust core auto-exports completed summaries to Obsidian when the
+      // user has it enabled; surface each written note.
+      const unlistenObsidianExport = await listen<{ meeting_id: string; relative_path: string }>(
+        'obsidian-export-complete',
+        (event) => {
+          toast.success('Saved to Obsidian', {
+            description: event.payload.relative_path,
+          });
+        }
+      );
+      if (!register(unlistenObsidianExport)) return;
     };
 
     setupListeners();

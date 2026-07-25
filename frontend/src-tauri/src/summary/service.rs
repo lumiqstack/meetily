@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -332,7 +332,7 @@ impl SummaryService {
     /// * `custom_prompt` - Optional user-provided context
     /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
     pub async fn process_transcript_background<R: tauri::Runtime>(
-        _app: AppHandle<R>,
+        app: AppHandle<R>,
         pool: SqlitePool,
         meeting_id: String,
         started_at: DateTime<Utc>,
@@ -499,7 +499,7 @@ impl SummaryService {
         };
 
         // Get app data directory for BuiltInAI provider
-        let app_data_dir = _app.path().app_data_dir().ok();
+        let app_data_dir = app.path().app_data_dir().ok();
 
         if let Some(code) = &summary_language {
             info!("📝 Summary language preference: {}", code);
@@ -638,6 +638,13 @@ impl SummaryService {
                             }
                         }
                         info!("Summary saved successfully for meeting_id: {}", meeting_id);
+                        Self::auto_export_to_obsidian(
+                            &app,
+                            &pool,
+                            &meeting_id,
+                            &generated.final_markdown,
+                        )
+                        .await;
                     }
                     Ok(false) => warn!("Skipped stale summary completion for meeting_id: {}", meeting_id),
                     Err(error) => error!(
@@ -667,6 +674,70 @@ impl SummaryService {
             }
         }
         Self::cleanup_cancellation_token(&meeting_id, started_at);
+    }
+
+    async fn auto_export_to_obsidian<R: tauri::Runtime>(
+        app: &AppHandle<R>,
+        pool: &SqlitePool,
+        meeting_id: &str,
+        final_markdown: &str,
+    ) {
+        let settings = match crate::obsidian::load_obsidian_settings(app).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                warn!("Obsidian auto-export: failed to load settings: {}", error);
+                return;
+            }
+        };
+        if !settings.auto_export || settings.vault_path.is_none() {
+            return;
+        }
+
+        let meeting = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
+            Ok(Some(meeting)) => meeting,
+            Ok(None) => {
+                warn!("Obsidian auto-export: meeting {} not found", meeting_id);
+                return;
+            }
+            Err(error) => {
+                warn!("Obsidian auto-export: failed to load meeting {}: {}", meeting_id, error);
+                return;
+            }
+        };
+        let transcript_markdown = match MeetingsRepository::get_meeting_transcripts_paginated(
+            pool, meeting_id, i64::MAX, 0,
+        )
+        .await
+        {
+            Ok((segments, _)) => crate::obsidian::format_transcript_markdown(&segments),
+            Err(error) => {
+                warn!("Obsidian auto-export: failed to load transcripts for {}: {}", meeting_id, error);
+                return;
+            }
+        };
+
+        match crate::obsidian::export_meeting_note(
+            app,
+            meeting_id,
+            &meeting.title,
+            &meeting.created_at.0.to_rfc3339(),
+            &strip_title_if_present(final_markdown),
+            &transcript_markdown,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!("Obsidian auto-export: wrote {} for meeting {}", result.file_path, meeting_id);
+                let _ = app.emit(
+                    "obsidian-export-complete",
+                    serde_json::json!({
+                        "meeting_id": meeting_id,
+                        "relative_path": result.relative_path,
+                    }),
+                );
+            }
+            Err(error) => warn!("Obsidian auto-export failed for meeting {}: {}", meeting_id, error),
+        }
     }
 
     /// Updates the summary process status to failed with error message
