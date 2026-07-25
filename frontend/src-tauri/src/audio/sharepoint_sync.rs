@@ -372,6 +372,149 @@ pub(crate) async fn download_direct_file<F: Fn(u32)>(
     Ok(dest)
 }
 
+// ---------------------------------------------------------------------------
+// Search diagnostics probes (spike): the tenant's Search REST returned zero
+// rows where the video hub clearly finds results, so the debug command runs a
+// ladder of read-only query variants and reports enough response shape to
+// tell a parse bug from a query bug from a blocked endpoint. Outputs carry
+// search metadata only — never cookie material.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn build_search_probe_url(root_host: &str, kql: &str, rowlimit: u32) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(kql.replace('\'', "''").as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    format!("https://{root_host}/_api/search/query?querytext='{encoded}'&rowlimit={rowlimit}")
+}
+
+fn rows_len_at(json: &serde_json::Value, pointer: &str) -> Option<usize> {
+    json.pointer(pointer).and_then(|v| v.as_array()).map(|a| a.len())
+}
+
+/// Summarize a search response body: status, top-level keys, row counts at
+/// the pointer we parse today plus the alternate wrappings SPO uses, and a
+/// short body prefix for anything the counts don't explain.
+pub(crate) fn summarize_search_body(
+    method: &str,
+    kql: &str,
+    status: u16,
+    body: &str,
+) -> serde_json::Value {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let top_keys: Vec<String> = parsed
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    let p = parsed.as_ref();
+    let prefix: String = body.chars().take(400).collect();
+    serde_json::json!({
+        "method": method,
+        "query": kql,
+        "status": status,
+        "topLevelKeys": top_keys,
+        "rowsAtPrimary": p.and_then(|v| rows_len_at(v, "/PrimaryQueryResult/RelevantResults/Table/Rows")),
+        "rowsAtResultsWrapped": p.and_then(|v| rows_len_at(v, "/PrimaryQueryResult/RelevantResults/Table/Rows/results")),
+        "rowsAtVerbose": p.and_then(|v| rows_len_at(v, "/d/query/PrimaryQueryResult/RelevantResults/Table/Rows/results")),
+        "totalRows": p.and_then(|v| v.pointer("/PrimaryQueryResult/RelevantResults/TotalRows")).cloned(),
+        "bodyPrefix": prefix,
+    })
+}
+
+async fn probe_search_get(
+    client: &reqwest::Client,
+    root_host: &str,
+    cookie_header: &str,
+    kql: &str,
+    rowlimit: u32,
+) -> serde_json::Value {
+    let url = build_search_probe_url(root_host, kql, rowlimit);
+    match client
+        .get(&url)
+        .header("Cookie", cookie_header)
+        .header("Accept", "application/json;odata=nometadata")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            summarize_search_body("GET", kql, status, &body)
+        }
+        Err(e) => serde_json::json!({"method": "GET", "query": kql, "error": e.to_string()}),
+    }
+}
+
+/// Some tenants restrict GET search; POST /_api/search/postquery needs a
+/// request digest from /_api/contextinfo first.
+async fn probe_search_post(
+    client: &reqwest::Client,
+    root_host: &str,
+    cookie_header: &str,
+    kql: &str,
+    rowlimit: u32,
+) -> serde_json::Value {
+    let digest = match client
+        .post(format!("https://{root_host}/_api/contextinfo"))
+        .header("Cookie", cookie_header)
+        .header("Accept", "application/json;odata=nometadata")
+        .header("Content-Length", "0")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            let digest = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| {
+                v.pointer("/FormDigestValue")
+                    .or_else(|| v.pointer("/d/GetContextWebInformation/FormDigestValue"))
+                    .and_then(|d| d.as_str().map(String::from))
+            });
+            match digest {
+                Some(d) => d,
+                None => {
+                    return serde_json::json!({
+                        "method": "POST", "query": kql,
+                        "error": format!("contextinfo {status} returned no digest"),
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "method": "POST", "query": kql,
+                "error": format!("contextinfo failed: {e}"),
+            })
+        }
+    };
+
+    let request_body = serde_json::json!({
+        "request": {
+            "__metadata": {"type": "Microsoft.Office.Server.Search.REST.SearchRequest"},
+            "Querytext": kql,
+            "RowLimit": rowlimit,
+            "TrimDuplicates": false,
+        }
+    });
+    match client
+        .post(format!("https://{root_host}/_api/search/postquery"))
+        .header("Cookie", cookie_header)
+        .header("Accept", "application/json;odata=nometadata")
+        .header("Content-Type", "application/json;odata=verbose")
+        .header("X-RequestDigest", digest)
+        .body(request_body.to_string())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            summarize_search_body("POST", kql, status, &body)
+        }
+        Err(e) => serde_json::json!({"method": "POST", "query": kql, "error": e.to_string()}),
+    }
+}
+
 /// `Cookie:` header value from harvested webview cookies.
 pub(crate) fn build_cookie_header(cookies: &[Cookie<'static>]) -> String {
     cookies
@@ -578,6 +721,25 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
         Err(e) => warn!("[sp-sync spike] Search REST failed: {e:#}"),
     }
 
+    // Diagnostics ladder for the search path: is search alive, does a plain
+    // mp4 query return rows, does the Stream content type, and does POST
+    // behave differently from GET.
+    let mut search_probes = Vec::new();
+    if root_cookies.is_empty() {
+        search_probes.push(serde_json::json!({"error": "no root-host cookies harvested"}));
+    } else {
+        let header = build_cookie_header(root_cookies);
+        for (kql, limit) in [
+            ("*", 5u32),
+            ("FileExtension:mp4", 10),
+            ("ContentTypeId:0x0120D520A808*", 10),
+        ] {
+            search_probes.push(probe_search_get(&client, &root_host, &header, kql, limit).await);
+        }
+        search_probes
+            .push(probe_search_post(&client, &root_host, &header, "FileExtension:mp4", 10).await);
+    }
+
     Ok(serde_json::json!({
         "onedrive": match onedrive {
             Ok(list) => serde_json::json!({ "ok": true, "count": list.len(), "recordings": list }),
@@ -588,6 +750,7 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
             Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
         },
         "cookieNames": cookie_names,
+        "searchProbes": search_probes,
     }))
 }
 
@@ -946,6 +1109,39 @@ mod tests {
             build_search_query_url("t.sharepoint.com", None, "2026-07-01T00:00:00Z");
         assert!(!unscoped.contains("personal"));
         assert!(unscoped.contains("FileExtension%3Amp4"));
+    }
+
+    #[test]
+    fn search_probe_url_encodes_kql() {
+        let url = build_search_probe_url("t.sharepoint.com", "ContentTypeId:0x0120D520A808*", 10);
+        assert_eq!(
+            url,
+            "https://t.sharepoint.com/_api/search/query?querytext='ContentTypeId%3A0x0120D520A808*'&rowlimit=10"
+        );
+        let wildcard = build_search_probe_url("t.sharepoint.com", "*", 5);
+        assert!(wildcard.contains("querytext='*'") || wildcard.contains("querytext='%2A'"));
+    }
+
+    #[test]
+    fn search_body_summary_counts_rows_at_each_wrapping() {
+        // nometadata shape (what we parse today).
+        let plain = r#"{"PrimaryQueryResult":{"RelevantResults":{"TotalRows":7,"Table":{"Rows":[{},{}]}}},"ElapsedTime":12}"#;
+        let s = summarize_search_body("GET", "*", 200, plain);
+        assert_eq!(s["rowsAtPrimary"], serde_json::json!(2));
+        assert_eq!(s["rowsAtResultsWrapped"], serde_json::Value::Null);
+        assert_eq!(s["totalRows"], serde_json::json!(7));
+
+        // minimalmetadata/verbose-style "results" wrapping — the suspected
+        // silent-zero culprit.
+        let wrapped = r#"{"PrimaryQueryResult":{"RelevantResults":{"Table":{"Rows":{"results":[{},{},{}]}}}}}"#;
+        let s = summarize_search_body("GET", "*", 200, wrapped);
+        assert_eq!(s["rowsAtPrimary"], serde_json::Value::Null);
+        assert_eq!(s["rowsAtResultsWrapped"], serde_json::json!(3));
+
+        // Non-JSON body doesn't panic and keeps a prefix.
+        let s = summarize_search_body("GET", "*", 403, "<html>blocked</html>");
+        assert_eq!(s["status"], serde_json::json!(403));
+        assert_eq!(s["bodyPrefix"], serde_json::json!("<html>blocked</html>"));
     }
 
     #[test]
