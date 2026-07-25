@@ -59,7 +59,7 @@ function titleFromFileName(fileName: string): string {
   return fileName.replace(/\.[^.]+$/, '').trim() || fileName;
 }
 
-/** Matches the Rust SharePointScanItem (SharePointRecording + flag). */
+/** Matches the Rust SharePointScanItem (SharePointRecording + flags). */
 interface SharePointScanItem {
   name: string;
   file_url: string;
@@ -67,6 +67,8 @@ interface SharePointScanItem {
   created: string;
   size_bytes: number | null;
   already_imported: boolean;
+  /** "mine" (own OneDrive Recordings folder) or "shared" (found via search). */
+  source: 'mine' | 'shared';
 }
 
 interface SharePointSyncState {
@@ -898,6 +900,11 @@ export function ImportAudioDialog({
                             <span className="flex-1 min-w-0 truncate text-sm text-gray-800">
                               {titleFromFileName(rec.name)}
                             </span>
+                            {rec.source === 'shared' && (
+                              <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wide text-blue-700 bg-blue-100 rounded px-1.5 py-0.5">
+                                Shared
+                              </span>
+                            )}
                             {rec.already_imported && (
                               <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wide text-green-700 bg-green-100 rounded px-1.5 py-0.5">
                                 Imported

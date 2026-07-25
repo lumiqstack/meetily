@@ -22,7 +22,7 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::webview::Cookie;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 /// One recording found on SharePoint.
@@ -92,21 +92,19 @@ pub(crate) fn build_recordings_query_url(
     )
 }
 
-/// Search REST URL on the root host: video files newest first, optionally
-/// scoped to the user's personal site. Search permission-trims results to
-/// what the caller can read, so the unscoped variant is still safe — it just
-/// also surfaces recordings shared from other people's OneDrives.
-pub(crate) fn build_search_query_url(
-    root_host: &str,
-    my_host: Option<&str>,
-    since_iso: &str,
-) -> String {
+/// Search REST URL on the root host: tenant-wide video files newest first.
+/// Search permission-trims results to what the caller can read, so this also
+/// surfaces recordings shared from other people's OneDrives and team sites —
+/// which is exactly what the video hub shows.
+///
+/// Tenant findings (validated 2026-07-25 via the probe ladder): `filetype:`
+/// matches videos while `FileExtension:` silently returns zero for them, and
+/// the `Path` cell for video rows is a `DispForm.aspx?ID=n` link rather than
+/// the file — the direct URL lives in `DefaultEncodingURL`/`OriginalPath`,
+/// so those are requested too.
+pub(crate) fn build_search_query_url(root_host: &str, since_iso: &str) -> String {
     let date = since_iso.split('T').next().unwrap_or(since_iso);
-    let scope = my_host
-        .map(|h| format!(" AND Path:\"https://{h}/personal\""))
-        .unwrap_or_default();
-    let query =
-        format!("(FileExtension:mp4 OR FileExtension:webm) AND LastModifiedTime>={date}{scope}");
+    let query = format!("(filetype:mp4 OR filetype:webm) AND LastModifiedTime>={date}");
     // querytext is a single-quoted OData string literal carrying KQL; percent-
     // encode the payload and double any single quotes.
     let encoded: String = url::form_urlencoded::byte_serialize(query.replace('\'', "''").as_bytes())
@@ -114,7 +112,7 @@ pub(crate) fn build_search_query_url(
         .replace('+', "%20");
     format!(
         "https://{root_host}/_api/search/query?querytext='{encoded}'&rowlimit=200&\
-         selectproperties='Title,Path,LastModifiedTime,Size'&\
+         selectproperties='Title,Path,OriginalPath,DefaultEncodingURL,LastModifiedTime,Created,Size'&\
          sortlist='LastModifiedTime:descending'"
     )
 }
@@ -181,6 +179,10 @@ pub(crate) fn parse_onedrive_files(
 }
 
 /// Parse Search REST results (odata=nometadata shape): rows of Key/Value cells.
+/// For video rows the `Path` cell is often a `DispForm.aspx?ID=n` list-item
+/// link, so the direct file URL is taken from the first of
+/// `DefaultEncodingURL`/`OriginalPath`/`Path` that ends in a media extension;
+/// rows where none does are dropped (they can't be downloaded directly).
 pub(crate) fn parse_search_results(json: &serde_json::Value) -> Vec<SharePointRecording> {
     let rows = json
         .pointer("/PrimaryQueryResult/RelevantResults/Table/Rows")
@@ -199,19 +201,48 @@ pub(crate) fn parse_search_results(json: &serde_json::Value) -> Vec<SharePointRe
                         .flatten()
                 })
             };
-            let path = get("Path")?;
-            let url = url::Url::parse(&path).ok()?;
+            let (file_url, url) = ["DefaultEncodingURL", "OriginalPath", "Path"]
+                .into_iter()
+                .find_map(|key| {
+                    let candidate = get(key)?;
+                    let parsed = url::Url::parse(&candidate).ok()?;
+                    has_media_extension(&percent_decode_component(parsed.path()))
+                        .then_some((candidate, parsed))
+                })?;
             let host = url.host_str()?.to_string();
-            let name = path.rsplit('/').next().unwrap_or("recording").to_string();
+            let name = percent_decode_component(
+                url.path().rsplit('/').next().unwrap_or("recording"),
+            );
             Some(SharePointRecording {
-                stream_url: stream_url_for(&host, url.path()),
-                file_url: path,
+                stream_url: stream_url_for(&host, &percent_decode_component(url.path())),
+                file_url,
                 name,
-                created: get("LastModifiedTime").unwrap_or_default(),
+                created: get("Created")
+                    .or_else(|| get("LastModifiedTime"))
+                    .unwrap_or_default(),
                 size_bytes: get("Size").and_then(|s| s.parse().ok()),
             })
         })
         .collect()
+}
+
+/// Canonical comparison key for a SharePoint file URL: percent-decoded and
+/// lowercased, so the OneDrive listing (raw spaces) and Search REST (encoded
+/// spaces) forms of the same file collide during dedupe.
+pub(crate) fn file_url_key(file_url: &str) -> String {
+    percent_decode_component(file_url).to_lowercase()
+}
+
+/// The meeting title a file would get when imported (mirrors the frontend's
+/// `titleFromFileName`), lowercased for case-insensitive comparison against
+/// existing meeting titles.
+pub(crate) fn title_stem(file_name: &str) -> String {
+    let stem = match file_name.rfind('.') {
+        Some(idx) if idx > 0 => &file_name[..idx],
+        _ => file_name,
+    };
+    let stem = stem.trim();
+    if stem.is_empty() { file_name } else { stem }.to_lowercase()
 }
 
 /// Extensions we can hand to the audio import pipeline after downloading.
@@ -386,7 +417,7 @@ pub(crate) fn build_search_probe_url(root_host: &str, kql: &str, rowlimit: u32) 
         .replace('+', "%20");
     format!(
         "https://{root_host}/_api/search/query?querytext='{encoded}'&rowlimit={rowlimit}&\
-         selectproperties='Title,Path,FileExtension,FileType'"
+         selectproperties='Title,Path,OriginalPath,DefaultEncodingURL,FileExtension,FileType'"
     )
 }
 
@@ -428,7 +459,12 @@ pub(crate) fn summarize_search_body(
                                 .flatten()
                         })
                     };
-                    Some(serde_json::json!({"title": get("Title"), "path": get("Path")}))
+                    Some(serde_json::json!({
+                        "title": get("Title"),
+                        "path": get("Path"),
+                        "originalPath": get("OriginalPath"),
+                        "defaultEncodingURL": get("DefaultEncodingURL"),
+                    }))
                 })
                 .collect::<Vec<_>>()
         });
@@ -635,39 +671,25 @@ pub(crate) async fn enumerate_onedrive_recordings(
     Ok(parse_onedrive_files(&listing, my_host))
 }
 
-/// Fallback enumeration: Search REST on the root host. Tries the query
-/// scoped to the user's personal site first; if that returns nothing (Path
-/// scoping is finicky across tenants), retries unscoped — permission
-/// trimming still limits results to what the user can read.
+/// Shared-scope enumeration: Search REST on the root host, tenant-wide.
+/// Permission trimming limits results to what the user can read, so this
+/// yields their own recordings plus anything shared with them — the same
+/// population the video hub renders.
 pub(crate) async fn enumerate_via_search(
     client: &reqwest::Client,
     root_host: &str,
-    my_host: &str,
     cookies: &[Cookie<'static>],
     since_iso: &str,
 ) -> Result<Vec<SharePointRecording>> {
     let cookie_header = build_cookie_header(cookies);
-    let scoped = sp_get_json(
+    let response = sp_get_json(
         client,
-        &build_search_query_url(root_host, Some(my_host), since_iso),
+        &build_search_query_url(root_host, since_iso),
         &cookie_header,
     )
     .await
     .context("SharePoint search query failed")?;
-    let recordings = parse_search_results(&scoped);
-    if !recordings.is_empty() {
-        return Ok(recordings);
-    }
-
-    info!("Scoped SharePoint search returned nothing; retrying unscoped");
-    let unscoped = sp_get_json(
-        client,
-        &build_search_query_url(root_host, None, since_iso),
-        &cookie_header,
-    )
-    .await
-    .context("Unscoped SharePoint search query failed")?;
-    Ok(parse_search_results(&unscoped))
+    Ok(parse_search_results(&response))
 }
 
 /// Spike/debug command: authenticate, try both enumeration strategies against
@@ -735,7 +757,7 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
 
     // Strategy (b): Search REST on the root host.
     let root_cookies = auth.host_cookies.get(&root_host).unwrap_or(&empty);
-    let search = enumerate_via_search(&client, &root_host, &my_host, root_cookies, &since_iso).await;
+    let search = enumerate_via_search(&client, &root_host, root_cookies, &since_iso).await;
     match &search {
         Ok(list) => {
             info!("[sp-sync spike] Search REST OK: {} recording(s)", list.len());
@@ -876,19 +898,62 @@ pub struct SharePointScanItem {
     #[serde(flatten)]
     pub recording: SharePointRecording,
     pub already_imported: bool,
+    /// "mine" for the user's own OneDrive Recordings folder, "shared" for
+    /// recordings surfaced via tenant-wide search (other people's OneDrives,
+    /// team sites).
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SharePointScanResult {
-    /// Which enumeration strategy produced the list: "onedrive" or "search".
+    /// Which enumeration strategies contributed, e.g. "onedrive+search".
     pub strategy: String,
     pub recordings: Vec<SharePointScanItem>,
 }
 
-/// Enumerate recordings newer than `since_iso`, annotated with whether each
-/// was already imported through this feature. OneDrive listing is the primary
-/// strategy; Search REST is the fallback (known to return nothing on some
-/// tenants — its failure only matters if OneDrive also failed).
+/// Merge own-folder and search results into one annotated, newest-first list.
+/// Split out from the command for testability.
+pub(crate) fn merge_scan_results(
+    own: Vec<SharePointRecording>,
+    shared: Vec<SharePointRecording>,
+    imported_urls: &[String],
+    meeting_titles: &[String],
+) -> Vec<SharePointScanItem> {
+    let imported: std::collections::HashSet<String> =
+        imported_urls.iter().map(|u| file_url_key(u)).collect();
+    let titles: std::collections::HashSet<String> = meeting_titles
+        .iter()
+        .map(|t| t.trim().to_lowercase())
+        .collect();
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<SharePointScanItem> = Vec::new();
+    for (recording, source) in own
+        .into_iter()
+        .map(|r| (r, "mine"))
+        .chain(shared.into_iter().map(|r| (r, "shared")))
+    {
+        if !seen.insert(file_url_key(&recording.file_url)) {
+            continue; // own-folder hit already covers this file
+        }
+        let already_imported = imported.contains(&file_url_key(&recording.file_url))
+            || titles.contains(&title_stem(&recording.name));
+        items.push(SharePointScanItem {
+            already_imported,
+            source: source.to_string(),
+            recording,
+        });
+    }
+    items.sort_by(|a, b| b.recording.created.cmp(&a.recording.created));
+    items
+}
+
+/// Enumerate recordings newer than `since_iso` from both sources — the user's
+/// own OneDrive Recordings folder and tenant-wide search (recordings shared
+/// with them) — deduped by file URL and annotated with whether each is
+/// already in Meetily (imported through this feature, or an existing meeting
+/// carries the title the import would create). Either source may fail without
+/// failing the scan, as long as the other succeeds.
 #[tauri::command]
 pub async fn sharepoint_scan_recordings_command<R: Runtime>(
     app: AppHandle<R>,
@@ -915,43 +980,70 @@ pub async fn sharepoint_scan_recordings_command<R: Runtime>(
     let client = sp_client().map_err(|e| e.to_string())?;
     let empty: Vec<Cookie<'static>> = Vec::new();
 
+    // Own recordings: OneDrive folder listing on the -my host.
     let my_cookies = auth.host_cookies.get(&my_host).unwrap_or(&empty);
-    let (strategy, recordings) = if my_cookies.is_empty() {
-        ("search", None)
+    let own = if my_cookies.is_empty() {
+        Err(anyhow!("no cookies harvested for {my_host}"))
     } else {
-        match enumerate_onedrive_recordings(&client, &my_host, my_cookies, &since_iso).await {
-            Ok(list) => ("onedrive", Some(list)),
-            Err(e) => {
-                warn!("[sp-scan] OneDrive enumeration failed, falling back to search: {e:#}");
-                ("search", None)
-            }
-        }
+        enumerate_onedrive_recordings(&client, &my_host, my_cookies, &since_iso).await
     };
 
-    let recordings = match recordings {
-        Some(list) => list,
-        None => {
-            let root_cookies = auth.host_cookies.get(&root_host).unwrap_or(&empty);
-            enumerate_via_search(&client, &root_host, &my_host, root_cookies, &since_iso)
-                .await
-                .map_err(|e| format!("Both enumeration strategies failed: {e:#}"))?
+    // Shared recordings: tenant-wide search on the root host.
+    let root_cookies = auth.host_cookies.get(&root_host).unwrap_or(&empty);
+    let shared = if root_cookies.is_empty() {
+        Err(anyhow!("no cookies harvested for {root_host}"))
+    } else {
+        enumerate_via_search(&client, &root_host, root_cookies, &since_iso).await
+    };
+
+    let mut strategies: Vec<&str> = Vec::new();
+    let own = match own {
+        Ok(list) => {
+            strategies.push("onedrive");
+            list
+        }
+        Err(e) => {
+            warn!("[sp-scan] OneDrive enumeration failed: {e:#}");
+            Vec::new()
         }
     };
+    let shared = match shared {
+        Ok(list) => {
+            strategies.push("search");
+            list
+        }
+        Err(e) => {
+            warn!("[sp-scan] Search enumeration failed: {e:#}");
+            Vec::new()
+        }
+    };
+    if strategies.is_empty() {
+        return Err("Both enumeration strategies failed — check the log for details".to_string());
+    }
     info!(
-        "[sp-scan] {} recording(s) via {strategy} since {since_iso}",
-        recordings.len()
+        "[sp-scan] {} own + {} shared recording(s) via {} since {since_iso}",
+        own.len(),
+        shared.len(),
+        strategies.join("+")
     );
 
-    let imported = load_sync_state(&app).imported;
+    // Existing meeting titles, for the "skip the ones I already have" rule.
+    // Best-effort: a DB hiccup only disables title-based dedupe.
+    let meeting_titles: Vec<String> = match app.try_state::<crate::state::AppState>() {
+        Some(state) => sqlx::query_scalar::<_, String>("SELECT title FROM meetings")
+            .fetch_all(state.db_manager.pool())
+            .await
+            .unwrap_or_else(|e| {
+                warn!("[sp-scan] Could not read meeting titles for dedupe: {e}");
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    let imported_urls: Vec<String> = load_sync_state(&app).imported.into_keys().collect();
+
     Ok(SharePointScanResult {
-        strategy: strategy.to_string(),
-        recordings: recordings
-            .into_iter()
-            .map(|recording| SharePointScanItem {
-                already_imported: imported.contains_key(&recording.file_url),
-                recording,
-            })
-            .collect(),
+        strategy: strategies.join("+"),
+        recordings: merge_scan_results(own, shared, &imported_urls, &meeting_titles),
     })
 }
 
@@ -1124,23 +1216,21 @@ mod tests {
     }
 
     #[test]
-    fn search_query_url_encodes_kql_and_scopes_optionally() {
-        let scoped = build_search_query_url(
-            "t.sharepoint.com",
-            Some("t-my.sharepoint.com"),
-            "2026-07-01T00:00:00Z",
-        );
-        assert!(scoped.starts_with("https://t.sharepoint.com/_api/search/query?querytext='"));
-        assert!(scoped.contains("LastModifiedTime%3E%3D2026-07-01"));
-        assert!(scoped.contains("t-my.sharepoint.com%2Fpersonal"));
+    fn search_query_url_uses_filetype_and_requests_url_properties() {
+        let url = build_search_query_url("t.sharepoint.com", "2026-07-01T00:00:00Z");
+        assert!(url.starts_with("https://t.sharepoint.com/_api/search/query?querytext='"));
+        // filetype: matches videos on tenants where FileExtension: is dead.
+        assert!(url.contains("filetype%3Amp4"));
+        assert!(!url.contains("FileExtension%3Amp4"));
+        assert!(url.contains("LastModifiedTime%3E%3D2026-07-01"));
+        // Tenant-wide — no personal-site scoping.
+        assert!(!url.contains("personal"));
+        // The direct file URL lives in these properties for video rows.
+        assert!(url.contains("OriginalPath"));
+        assert!(url.contains("DefaultEncodingURL"));
         // Raw spaces/quotes must not survive into the querytext literal.
-        let literal = scoped.split("querytext='").nth(1).unwrap().split('\'').next().unwrap();
+        let literal = url.split("querytext='").nth(1).unwrap().split('\'').next().unwrap();
         assert!(!literal.contains(' ') && !literal.contains('"'));
-
-        let unscoped =
-            build_search_query_url("t.sharepoint.com", None, "2026-07-01T00:00:00Z");
-        assert!(!unscoped.contains("personal"));
-        assert!(unscoped.contains("FileExtension%3Amp4"));
     }
 
     #[test]
@@ -1149,7 +1239,9 @@ mod tests {
         assert!(url.starts_with(
             "https://t.sharepoint.com/_api/search/query?querytext='filetype%3Amp4'&rowlimit=10"
         ));
-        assert!(url.contains("selectproperties='Title,Path,FileExtension,FileType'"));
+        assert!(url.contains(
+            "selectproperties='Title,Path,OriginalPath,DefaultEncodingURL,FileExtension,FileType'"
+        ));
 
         let phrase = build_search_probe_url("t.sharepoint.com", "\"Meeting Recording\"", 10);
         assert!(phrase.contains("querytext='%22Meeting%20Recording%22'"));
@@ -1202,7 +1294,105 @@ mod tests {
     }
 
     #[test]
+    fn search_parser_prefers_direct_url_over_dispform_path() {
+        // Real tenant shape for video rows: Path is a DispForm list-item
+        // link; the file URL lives in DefaultEncodingURL/OriginalPath.
+        let json = serde_json::json!({"PrimaryQueryResult":{"RelevantResults":{"Table":{"Rows":[
+            {"Cells":[
+                {"Key":"Title","Value":"AMER AI Community: Coding in Flow"},
+                {"Key":"Path","Value":"https://t-my.sharepoint.com/personal/other_corp_com/Documents/Forms/DispForm.aspx?ID=69201"},
+                {"Key":"DefaultEncodingURL","Value":"https://t-my.sharepoint.com/personal/other_corp_com/Documents/Recordings/AMER%20AI%20Community-20260710-Meeting%20Recording.mp4"},
+                {"Key":"Created","Value":"2026-07-10T15:00:00Z"},
+                {"Key":"Size","Value":"104857600"}
+            ]},
+            {"Cells":[
+                {"Key":"Title","Value":"video without any direct url"},
+                {"Key":"Path","Value":"https://t.sharepoint.com/sites/x/Forms/DispForm.aspx?ID=387"}
+            ]}
+        ]}}}});
+
+        let recs = parse_search_results(&json);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "AMER AI Community-20260710-Meeting Recording.mp4");
+        assert!(recs[0].file_url.ends_with("Meeting%20Recording.mp4"));
+        assert_eq!(recs[0].created, "2026-07-10T15:00:00Z");
+        assert_eq!(recs[0].size_bytes, Some(104_857_600));
+        assert!(recs[0]
+            .stream_url
+            .starts_with("https://t-my.sharepoint.com/_layouts/15/stream.aspx?id=/personal/"));
+        // The stream URL re-encodes the decoded path exactly once.
+        assert!(recs[0].stream_url.ends_with("Meeting%20Recording.mp4"));
+        assert!(!recs[0].stream_url.contains("%2520"));
+    }
+
+    #[test]
     fn search_parser_tolerates_empty_results() {
         assert!(parse_search_results(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn file_url_keys_collide_across_encodings_and_case() {
+        assert_eq!(
+            file_url_key("https://T-my.sharepoint.com/personal/u/Documents/Recordings/Team%20Sync.mp4"),
+            file_url_key("https://t-my.sharepoint.com/personal/u/Documents/Recordings/Team Sync.mp4"),
+        );
+        assert_ne!(
+            file_url_key("https://h/a.mp4"),
+            file_url_key("https://h/b.mp4")
+        );
+    }
+
+    #[test]
+    fn title_stem_matches_the_frontend_rule() {
+        // frontend: fileName.replace(/\.[^.]+$/, '').trim() || fileName — lowercased here.
+        assert_eq!(title_stem("Weekly Sync-20260721-Meeting Recording.mp4"),
+                   "weekly sync-20260721-meeting recording");
+        assert_eq!(title_stem("archive.tar.gz"), "archive.tar");
+        assert_eq!(title_stem(".hidden"), ".hidden");
+        assert_eq!(title_stem("NoExtension"), "noextension");
+    }
+
+    fn rec(name: &str, file_url: &str, created: &str) -> SharePointRecording {
+        SharePointRecording {
+            name: name.to_string(),
+            file_url: file_url.to_string(),
+            stream_url: format!("https://h/_layouts/15/stream.aspx?id={name}"),
+            created: created.to_string(),
+            size_bytes: Some(1),
+        }
+    }
+
+    #[test]
+    fn merge_dedupes_by_url_tags_sources_and_flags_existing() {
+        let own = vec![
+            rec("Mine.mp4", "https://h/personal/me/Documents/Recordings/Mine.mp4", "2026-07-20T10:00:00Z"),
+            rec("Old Sync.mp4", "https://h/personal/me/Documents/Recordings/Old Sync.mp4", "2026-07-01T10:00:00Z"),
+        ];
+        let shared = vec![
+            // Same file as own[0], but percent-encoded the way search returns it.
+            rec("Mine.mp4", "https://h/personal/me/Documents/Recordings/Mine.mp4", "2026-07-20T10:00:00Z"),
+            rec("Theirs.mp4", "https://h/personal/other/Documents/Recordings/Theirs.mp4", "2026-07-22T10:00:00Z"),
+            rec("Already Meeting.mp4", "https://h/personal/other/Documents/Recordings/Already%20Meeting.mp4", "2026-07-21T10:00:00Z"),
+        ];
+        let imported = vec![
+            "https://h/personal/me/Documents/Recordings/Old%20Sync.mp4".to_string(),
+        ];
+        let titles = vec!["already meeting".to_string()];
+
+        let items = merge_scan_results(own, shared, &imported, &titles);
+        assert_eq!(items.len(), 4);
+        // Newest first.
+        assert_eq!(items[0].recording.name, "Theirs.mp4");
+        assert_eq!(items[0].source, "shared");
+        assert!(!items[0].already_imported);
+        // Title match against an existing meeting flags it.
+        assert_eq!(items[1].recording.name, "Already Meeting.mp4");
+        assert!(items[1].already_imported);
+        // Duplicate collapsed to the own-folder entry.
+        assert_eq!(items[2].recording.name, "Mine.mp4");
+        assert_eq!(items[2].source, "mine");
+        // Imported map matches across percent-encoding.
+        assert_eq!(items[3].recording.name, "Old Sync.mp4");
+        assert!(items[3].already_imported);
     }
 }
