@@ -151,7 +151,7 @@ pub async fn ensure_multi_host_auth<R: Runtime, F: Fn(&str)>(
             warn!("Could not navigate auth window to {host}: {e}");
             continue;
         }
-        match poll_for_auth(&window, &host_url, EXTRA_HOST_TIMEOUT).await {
+        match poll_for_fedauth(&window, &host_url, EXTRA_HOST_TIMEOUT).await {
             Ok(Some(cookies)) => {
                 info!("Authenticated silently on {host}");
                 host_cookies.insert(host, cookies);
@@ -249,6 +249,32 @@ async fn poll_for_auth<R: Runtime>(
     loop {
         let cookies = read_cookies(window, url).await?;
         if has_auth_cookie(&cookies) {
+            return Ok(Some(cookies));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Like `poll_for_auth`, but requires the host-scoped `FedAuth` cookie
+/// specifically. Domain-wide cookies (rtFa lives on `.sharepoint.com`)
+/// satisfy `has_auth_cookie` the moment we hop to a sibling host — before
+/// that host's own FedAuth is minted — and a cookie set without FedAuth
+/// gets 401s from that host's REST API.
+async fn poll_for_fedauth<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    url: &Url,
+    timeout: Duration,
+) -> Result<Option<Vec<Cookie<'static>>>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let cookies = read_cookies(window, url).await?;
+        if cookies
+            .iter()
+            .any(|c| c.name().eq_ignore_ascii_case("fedauth"))
+        {
             return Ok(Some(cookies));
         }
         if tokio::time::Instant::now() >= deadline {
