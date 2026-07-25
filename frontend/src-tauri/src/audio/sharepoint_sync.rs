@@ -90,23 +90,26 @@ pub(crate) fn build_recordings_query_url(
     )
 }
 
-/// Search REST URL on the root host: mp4 files under the user's personal
-/// site, newest first. `LastModifiedTime>=` uses the search date format.
-pub(crate) fn build_search_query_url(root_host: &str, my_host: &str, since_iso: &str) -> String {
+/// Search REST URL on the root host: video files newest first, optionally
+/// scoped to the user's personal site. Search permission-trims results to
+/// what the caller can read, so the unscoped variant is still safe — it just
+/// also surfaces recordings shared from other people's OneDrives.
+pub(crate) fn build_search_query_url(
+    root_host: &str,
+    my_host: Option<&str>,
+    since_iso: &str,
+) -> String {
     let date = since_iso.split('T').next().unwrap_or(since_iso);
-    let query = format!(
-        "(FileExtension:mp4 OR FileExtension:webm) AND Path:https://{my_host}/personal/* AND LastModifiedTime>={date}"
-    );
-    let encoded: String = query
-        .chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            '\'' => "''".to_string(),
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            _ => c.to_string(),
-        })
-        .collect();
+    let scope = my_host
+        .map(|h| format!(" AND Path:\"https://{h}/personal\""))
+        .unwrap_or_default();
+    let query =
+        format!("(FileExtension:mp4 OR FileExtension:webm) AND LastModifiedTime>={date}{scope}");
+    // querytext is a single-quoted OData string literal carrying KQL; percent-
+    // encode the payload and double any single quotes.
+    let encoded: String = url::form_urlencoded::byte_serialize(query.replace('\'', "''").as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
     format!(
         "https://{root_host}/_api/search/query?querytext='{encoded}'&rowlimit=200&\
          selectproperties='Title,Path,LastModifiedTime,Size'&\
@@ -207,6 +210,18 @@ pub(crate) fn build_cookie_header(cookies: &[Cookie<'static>]) -> String {
         .join("; ")
 }
 
+/// Reqwest client for SharePoint REST: redirects disabled so an auth bounce
+/// to login.microsoftonline.com shows up as a diagnosable 3xx instead of a
+/// confusing error deep in the redirect chain (reqwest also strips the Cookie
+/// header on cross-host redirects, which would guarantee failure anyway).
+fn sp_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Meetily")
+        .build()
+        .context("Could not build HTTP client")
+}
+
 /// Authenticated JSON GET against SharePoint REST.
 async fn sp_get_json(
     client: &reqwest::Client,
@@ -222,6 +237,18 @@ async fn sp_get_json(
         .context("SharePoint request failed")?;
 
     let status = response.status();
+    if status.is_redirection() {
+        let target_host = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| url::Url::parse(loc).ok())
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Err(anyhow!(
+            "SharePoint redirected ({status}) to {target_host} — cookies not accepted for this host"
+        ));
+    }
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
         // Log the status and a short, cookie-free prefix of the body.
@@ -269,7 +296,10 @@ pub(crate) async fn enumerate_onedrive_recordings(
     Ok(parse_onedrive_files(&listing, my_host))
 }
 
-/// Fallback enumeration: Search REST on the root host.
+/// Fallback enumeration: Search REST on the root host. Tries the query
+/// scoped to the user's personal site first; if that returns nothing (Path
+/// scoping is finicky across tenants), retries unscoped — permission
+/// trimming still limits results to what the user can read.
 pub(crate) async fn enumerate_via_search(
     client: &reqwest::Client,
     root_host: &str,
@@ -278,14 +308,27 @@ pub(crate) async fn enumerate_via_search(
     since_iso: &str,
 ) -> Result<Vec<SharePointRecording>> {
     let cookie_header = build_cookie_header(cookies);
-    let results = sp_get_json(
+    let scoped = sp_get_json(
         client,
-        &build_search_query_url(root_host, my_host, since_iso),
+        &build_search_query_url(root_host, Some(my_host), since_iso),
         &cookie_header,
     )
     .await
     .context("SharePoint search query failed")?;
-    Ok(parse_search_results(&results))
+    let recordings = parse_search_results(&scoped);
+    if !recordings.is_empty() {
+        return Ok(recordings);
+    }
+
+    info!("Scoped SharePoint search returned nothing; retrying unscoped");
+    let unscoped = sp_get_json(
+        client,
+        &build_search_query_url(root_host, None, since_iso),
+        &cookie_header,
+    )
+    .await
+    .context("Unscoped SharePoint search query failed")?;
+    Ok(parse_search_results(&unscoped))
 }
 
 /// Spike/debug command: authenticate, try both enumeration strategies against
@@ -317,10 +360,22 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
     .await
     .map_err(|e| e.to_string())?;
 
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = sp_client().map_err(|e| e.to_string())?;
     let empty: Vec<Cookie<'static>> = Vec::new();
+
+    // Diagnostics: which cookie NAMES each host yielded (values never leave
+    // the auth layer's cookies flow — do not add them here).
+    let cookie_names: serde_json::Value = auth
+        .host_cookies
+        .iter()
+        .map(|(host, cookies)| {
+            (
+                host.clone(),
+                serde_json::json!(cookies.iter().map(|c| c.name()).collect::<Vec<_>>()),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>()
+        .into();
 
     // Strategy (a): OneDrive folder listing on the -my host.
     let my_cookies = auth.host_cookies.get(&my_host).unwrap_or(&empty);
@@ -361,6 +416,7 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
             Ok(list) => serde_json::json!({ "ok": true, "count": list.len(), "recordings": list }),
             Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
         },
+        "cookieNames": cookie_names,
     }))
 }
 
@@ -468,6 +524,26 @@ mod tests {
         assert!(parse_onedrive_files(&serde_json::json!({"value": "nope"}), "h").is_empty());
         let partial = serde_json::json!({"value": [{"Name": "x.mp4"}]});
         assert!(parse_onedrive_files(&partial, "h").is_empty());
+    }
+
+    #[test]
+    fn search_query_url_encodes_kql_and_scopes_optionally() {
+        let scoped = build_search_query_url(
+            "t.sharepoint.com",
+            Some("t-my.sharepoint.com"),
+            "2026-07-01T00:00:00Z",
+        );
+        assert!(scoped.starts_with("https://t.sharepoint.com/_api/search/query?querytext='"));
+        assert!(scoped.contains("LastModifiedTime%3E%3D2026-07-01"));
+        assert!(scoped.contains("t-my.sharepoint.com%2Fpersonal"));
+        // Raw spaces/quotes must not survive into the querytext literal.
+        let literal = scoped.split("querytext='").nth(1).unwrap().split('\'').next().unwrap();
+        assert!(!literal.contains(' ') && !literal.contains('"'));
+
+        let unscoped =
+            build_search_query_url("t.sharepoint.com", None, "2026-07-01T00:00:00Z");
+        assert!(!unscoped.contains("personal"));
+        assert!(unscoped.contains("FileExtension%3Amp4"));
     }
 
     #[test]
