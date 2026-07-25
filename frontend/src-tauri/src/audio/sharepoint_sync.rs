@@ -119,11 +119,9 @@ pub(crate) fn build_search_query_url(
     )
 }
 
-/// The stream.aspx player page for a OneDrive file — the URL shape the
-/// existing yt-dlp import path understands.
-pub(crate) fn stream_url_for(my_host: &str, server_relative_path: &str) -> String {
-    let encoded: String = server_relative_path
-        .chars()
+/// Percent-encode a server-relative path for use in a URL, keeping `/`.
+fn encode_server_relative_path(path: &str) -> String {
+    path.chars()
         .map(|c| match c {
             ' ' => "%20".to_string(),
             '\'' => "%27".to_string(),
@@ -132,8 +130,16 @@ pub(crate) fn stream_url_for(my_host: &str, server_relative_path: &str) -> Strin
             '+' => "%2B".to_string(),
             _ => c.to_string(),
         })
-        .collect();
-    format!("https://{my_host}/_layouts/15/stream.aspx?id={encoded}")
+        .collect()
+}
+
+/// The stream.aspx player page for a OneDrive file — the URL shape the
+/// existing yt-dlp import path understands.
+pub(crate) fn stream_url_for(my_host: &str, server_relative_path: &str) -> String {
+    format!(
+        "https://{my_host}/_layouts/15/stream.aspx?id={}",
+        encode_server_relative_path(server_relative_path)
+    )
 }
 
 /// Parse the OneDrive folder listing (odata=nometadata shape).
@@ -201,6 +207,164 @@ pub(crate) fn parse_search_results(json: &serde_json::Value) -> Vec<SharePointRe
             })
         })
         .collect()
+}
+
+/// Extensions we can hand to the audio import pipeline after downloading.
+const DIRECT_MEDIA_EXTENSIONS: &[&str] = &[
+    ".mp4", ".m4a", ".mp3", ".wav", ".webm", ".mkv", ".mov", ".ogg", ".flac", ".wma",
+];
+
+fn has_media_extension(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    DIRECT_MEDIA_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Decode %XX sequences in a URL path component (no `+`-as-space).
+pub(crate) fn percent_decode_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// If `raw` points straight at a media file on a SharePoint host — either a
+/// direct file URL or a `stream.aspx?id=<path>` player page wrapping one —
+/// return the direct file URL. Such files can be downloaded with a plain
+/// authenticated GET, skipping yt-dlp (whose Stream page scraping breaks on
+/// newer SharePoint UIs).
+pub(crate) fn direct_sharepoint_media_url(raw: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !(host.ends_with(".sharepoint.com") || host.ends_with(".sharepoint.us")) {
+        return None;
+    }
+
+    if has_media_extension(parsed.path()) {
+        return Some(parsed);
+    }
+
+    if parsed.path().to_ascii_lowercase().ends_with("/stream.aspx") {
+        let id = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "id")
+            .map(|(_, v)| v.into_owned())?;
+        if id.starts_with('/') && has_media_extension(&id) {
+            return url::Url::parse(&format!(
+                "https://{host}{}",
+                encode_server_relative_path(&id)
+            ))
+            .ok();
+        }
+    }
+    None
+}
+
+/// Download a direct SharePoint file with the host's auth cookies, streaming
+/// to `work_dir` with percentage progress and cancellation.
+pub(crate) async fn download_direct_file<F: Fn(u32)>(
+    file_url: &url::Url,
+    cookie_header: &str,
+    work_dir: &std::path::Path,
+    on_progress: F,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(work_dir)
+        .with_context(|| format!("Could not create work dir {}", work_dir.display()))?;
+
+    let client = sp_client()?;
+    let mut response = client
+        .get(file_url.as_str())
+        .header("Cookie", cookie_header)
+        .send()
+        .await
+        .context("The download request to SharePoint failed")?;
+
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(anyhow!(
+            "SharePoint redirected the download ({status}) — the sign-in was not accepted. Please try again."
+        ));
+    }
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Could not download the recording: SharePoint returned {status}. It may be inaccessible, deleted, or require different permissions."
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.starts_with("text/html") {
+        return Err(anyhow!(
+            "SharePoint answered with a sign-in page instead of the recording. Please try again."
+        ));
+    }
+
+    let total = response.content_length();
+    let raw_name = file_url
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|s| !s.is_empty())
+        .map(percent_decode_component)
+        .unwrap_or_else(|| "recording.mp4".to_string());
+    // Keep the name Windows-safe.
+    let file_name: String = raw_name
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            _ => c,
+        })
+        .collect();
+    let dest = work_dir.join(file_name);
+
+    let mut file = tokio::fs::File::create(&dest)
+        .await
+        .with_context(|| format!("Could not create {}", dest.display()))?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u32 = 0;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("The download stream from SharePoint failed")?
+    {
+        if cancel.is_cancelled() {
+            drop(file);
+            let _ = tokio::fs::remove_file(&dest).await;
+            return Err(anyhow!("Import cancelled"));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .context("Could not write the downloaded recording to disk")?;
+        downloaded += chunk.len() as u64;
+        if let Some(total) = total {
+            let pct = ((downloaded.saturating_mul(100)) / total.max(1)).min(100) as u32;
+            if pct != last_pct {
+                last_pct = pct;
+                on_progress(pct);
+            }
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .context("Could not finish writing the downloaded recording")?;
+    info!(
+        "Direct SharePoint download complete: {} ({downloaded} bytes)",
+        dest.display()
+    );
+    Ok(dest)
 }
 
 /// `Cookie:` header value from harvested webview cookies.
@@ -695,6 +859,46 @@ mod tests {
         assert!(parse_onedrive_files(&serde_json::json!({"value": "nope"}), "h").is_empty());
         let partial = serde_json::json!({"value": [{"Name": "x.mp4"}]});
         assert!(parse_onedrive_files(&partial, "h").is_empty());
+    }
+
+    #[test]
+    fn direct_media_url_accepts_files_and_stream_pages() {
+        // Direct file URL (raw spaces get encoded by the parser).
+        let direct = direct_sharepoint_media_url(
+            "https://t-my.sharepoint.com/personal/u/Documents/Recordings/Team Sync-Meeting Recording.mp4",
+        )
+        .expect("direct file should match");
+        assert!(direct.path().ends_with("Recording.mp4"));
+
+        // stream.aspx wrapping a media path.
+        let wrapped = direct_sharepoint_media_url(
+            "https://t-my.sharepoint.com/_layouts/15/stream.aspx?id=/personal/u/Documents/Recordings/Standup%20Notes.mp4&ga=1",
+        )
+        .expect("stream.aspx with media id should match");
+        assert_eq!(wrapped.host_str(), Some("t-my.sharepoint.com"));
+        assert!(wrapped.path().to_ascii_lowercase().ends_with(".mp4"));
+
+        // Non-media and non-SharePoint URLs don't match.
+        assert!(direct_sharepoint_media_url(
+            "https://t.sharepoint.com/_layouts/15/videohub.aspx"
+        )
+        .is_none());
+        assert!(direct_sharepoint_media_url("https://example.com/video.mp4").is_none());
+        assert!(direct_sharepoint_media_url(
+            "https://t.sharepoint.com/_layouts/15/stream.aspx?id=/sites/x/page.aspx"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn percent_decoding_handles_encoded_and_malformed_input() {
+        assert_eq!(
+            percent_decode_component("Team%20Sync%20%26%20Q%27A.mp4"),
+            "Team Sync & Q'A.mp4"
+        );
+        assert_eq!(percent_decode_component("plain.mp4"), "plain.mp4");
+        // Malformed escapes pass through instead of panicking.
+        assert_eq!(percent_decode_component("bad%zz%2"), "bad%zz%2");
     }
 
     #[test]
