@@ -142,7 +142,9 @@ pub(crate) fn stream_url_for(my_host: &str, server_relative_path: &str) -> Strin
     )
 }
 
-/// Parse the OneDrive folder listing (odata=nometadata shape).
+/// Parse the OneDrive folder listing (odata=nometadata shape). The folder
+/// holds more than recordings — Teams also drops transcript documents,
+/// shortcuts, etc. there — so only media files are kept.
 pub(crate) fn parse_onedrive_files(
     json: &serde_json::Value,
     my_host: &str,
@@ -154,6 +156,9 @@ pub(crate) fn parse_onedrive_files(
         .iter()
         .filter_map(|item| {
             let name = item.get("Name")?.as_str()?.to_string();
+            if !has_media_extension(&name) {
+                return None;
+            }
             let rel = item.get("ServerRelativeUrl")?.as_str()?.to_string();
             let created = item
                 .get("TimeCreated")
@@ -851,6 +856,28 @@ mod tests {
             recs[0].file_url,
             "https://t-my.sharepoint.com/personal/u_c_com/Documents/Recordings/Standup-20260721.mp4"
         );
+    }
+
+    #[test]
+    fn onedrive_parser_drops_non_media_files() {
+        let json = serde_json::json!({"value": [
+            {"Name": "Standup.mp4",
+             "ServerRelativeUrl": "/personal/u/Documents/Recordings/Standup.mp4",
+             "TimeCreated": "2026-07-21T10:00:00Z", "Length": 1000},
+            {"Name": "Kickoff-Meeting Transcript.docx",
+             "ServerRelativeUrl": "/personal/u/Documents/Recordings/Kickoff-Meeting Transcript.docx",
+             "TimeCreated": "2026-05-12T10:00:00Z", "Length": 495_000},
+            {"Name": "Recordings.url",
+             "ServerRelativeUrl": "/personal/u/Documents/Recordings/Recordings.url",
+             "TimeCreated": "2026-05-27T10:00:00Z", "Length": 9_900},
+            {"Name": "notes.vtt",
+             "ServerRelativeUrl": "/personal/u/Documents/Recordings/notes.vtt",
+             "TimeCreated": "2026-05-01T10:00:00Z", "Length": 20_000}
+        ]});
+
+        let recs = parse_onedrive_files(&json, "t-my.sharepoint.com");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].name, "Standup.mp4");
     }
 
     #[test]
