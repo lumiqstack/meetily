@@ -15,6 +15,8 @@ import {
   ChevronUp,
   FolderOpen,
   Files,
+  Cloud,
+  RefreshCw,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -55,6 +57,31 @@ interface BatchCandidate {
 /** Meeting title for a batch item: the file name without its extension. */
 function titleFromFileName(fileName: string): string {
   return fileName.replace(/\.[^.]+$/, '').trim() || fileName;
+}
+
+/** Matches the Rust SharePointScanItem (SharePointRecording + flag). */
+interface SharePointScanItem {
+  name: string;
+  file_url: string;
+  stream_url: string;
+  created: string;
+  size_bytes: number | null;
+  already_imported: boolean;
+}
+
+interface SharePointSyncState {
+  hubUrl?: string | null;
+  lastSyncDate?: string | null;
+  imported?: Record<string, string>;
+}
+
+/** Default scan window: the stored last sync date, else 30 days back. */
+function defaultSinceDate(lastSyncDate?: string | null): string {
+  if (lastSyncDate && /^\d{4}-\d{2}-\d{2}/.test(lastSyncDate)) {
+    return lastSyncDate.slice(0, 10);
+  }
+  const d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 10);
 }
 
 
@@ -118,11 +145,17 @@ export function ImportAudioDialog({
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [titleModifiedByUser, setTitleModifiedByUser] = useState(false);
-  const [sourceMode, setSourceMode] = useState<'file' | 'link'>('file');
+  const [sourceMode, setSourceMode] = useState<'file' | 'link' | 'sharepoint'>('file');
   const [batchFiles, setBatchFiles] = useState<BatchCandidate[]>([]);
   const [linkUrl, setLinkUrl] = useState('');
   const [linkContentMode, setLinkContentMode] = useState<'audio' | 'transcript'>('audio');
   const [linkModeTouched, setLinkModeTouched] = useState(false);
+  const [spHubUrl, setSpHubUrl] = useState('');
+  const [spSinceDate, setSpSinceDate] = useState(() => defaultSinceDate());
+  const [spScanning, setSpScanning] = useState(false);
+  const [spItems, setSpItems] = useState<SharePointScanItem[] | null>(null);
+  const [spSelected, setSpSelected] = useState<Set<string>>(new Set());
+  const spPrefsLoaded = useRef(false);
 
   // Always start as false — represents "dialog has not yet been opened".
   // Do NOT initialize from the `open` prop: if the component mounts with open=true
@@ -190,6 +223,10 @@ export function ImportAudioDialog({
       setLinkUrl('');
       setLinkContentMode('audio');
       setLinkModeTouched(false);
+      setSpScanning(false);
+      setSpItems(null);
+      setSpSelected(new Set());
+      spPrefsLoaded.current = false;
 
       // Validate preselected file if provided
       if (preselectedFile) {
@@ -279,6 +316,98 @@ export function ImportAudioDialog({
     setBatchFiles((prev) => prev.filter((f) => f.path !== path));
   };
 
+  // Prefill the SharePoint hub URL / date from the persisted sync state the
+  // first time the user opens that tab in this dialog session.
+  useEffect(() => {
+    if (sourceMode !== 'sharepoint' || spPrefsLoaded.current) return;
+    spPrefsLoaded.current = true;
+    invoke<SharePointSyncState>('get_sharepoint_sync_state_command')
+      .then((state) => {
+        if (state.hubUrl) setSpHubUrl(state.hubUrl);
+        setSpSinceDate(defaultSinceDate(state.lastSyncDate));
+      })
+      .catch(() => {
+        /* defaults are fine */
+      });
+  }, [sourceMode]);
+
+  const spHubValid = isLikelyHttpUrl(spHubUrl) && /\.sharepoint\.(com|us)/i.test(spHubUrl);
+
+  const handleSharePointScan = async () => {
+    if (!spHubValid || spScanning) return;
+    setSpScanning(true);
+    setSpItems(null);
+    try {
+      const result = await invoke<{ strategy: string; recordings: SharePointScanItem[] }>(
+        'sharepoint_scan_recordings_command',
+        { hubUrl: spHubUrl.trim(), sinceIso: `${spSinceDate}T00:00:00Z` }
+      );
+      setSpItems(result.recordings);
+      // Preselect everything not yet imported.
+      setSpSelected(
+        new Set(result.recordings.filter((r) => !r.already_imported).map((r) => r.file_url))
+      );
+      if (result.recordings.length === 0) {
+        toast.info('No recordings found since that date');
+      }
+    } catch (e) {
+      toast.error('Could not scan SharePoint recordings', { description: String(e) });
+    } finally {
+      setSpScanning(false);
+    }
+  };
+
+  const toggleSpSelected = (fileUrl: string) => {
+    setSpSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(fileUrl)) next.delete(fileUrl);
+      else next.add(fileUrl);
+      return next;
+    });
+  };
+
+  const handleStartSharePointImport = () => {
+    const selected = (spItems ?? []).filter((r) => spSelected.has(r.file_url));
+    if (selected.length === 0) return;
+
+    const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
+    const queue = getSharedImportQueue(backgroundJobStore, (command, args) =>
+      invoke(command, args)
+    );
+    queue.enqueueBatch(
+      selected.map((r) => ({ url: r.stream_url, title: titleFromFileName(r.name) })),
+      {
+        language,
+        model: selectedModel?.name || null,
+        provider: selectedModel?.provider || null,
+        onItemCompleted: (item) => {
+          const rec = selected.find((r) => r.stream_url === item.url);
+          if (rec) {
+            void invoke('mark_sharepoint_imported_command', { fileUrl: rec.file_url }).catch(
+              () => {
+                /* re-scan will just show it unchecked again */
+              }
+            );
+          }
+        },
+      }
+    );
+
+    // Remember the hub and advance the sync date to today.
+    void invoke('set_sharepoint_sync_prefs_command', {
+      hubUrl: spHubUrl.trim(),
+      lastSyncDate: new Date().toISOString().slice(0, 10),
+    }).catch(() => {});
+
+    toast.info(`Importing ${selected.length} recording${selected.length === 1 ? '' : 's'}`, {
+      description:
+        'They download and transcribe one at a time in the background. A sign-in window may appear if needed.',
+    });
+
+    reset();
+    onOpenChange(false);
+  };
+
   const handleStartBatch = () => {
     const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
     const queue = getSharedImportQueue(backgroundJobStore, (command, args) =>
@@ -306,12 +435,21 @@ export function ImportAudioDialog({
 
   const linkValid = isLikelyHttpUrl(linkUrl);
   const canImport =
-    sourceMode === 'file' ? !!fileInfo || batchFiles.length > 0 : linkValid;
+    sourceMode === 'file'
+      ? !!fileInfo || batchFiles.length > 0
+      : sourceMode === 'sharepoint'
+      ? spSelected.size > 0
+      : linkValid;
 
   const handleStartImport = async () => {
     const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
     const modelName = selectedModel?.name || null;
     const providerName = selectedModel?.provider || null;
+
+    if (sourceMode === 'sharepoint') {
+      handleStartSharePointImport();
+      return;
+    }
 
     if (sourceMode === 'link') {
       if (!linkValid) return;
@@ -455,8 +593,8 @@ export function ImportAudioDialog({
           {/* File selection / info */}
           {!isProcessing && !error && (
             <>
-              {/* Source toggle: local file vs Teams/SharePoint link */}
-              <div className="grid grid-cols-2 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
+              {/* Source toggle: local file vs link vs SharePoint sync */}
+              <div className="grid grid-cols-3 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
                 <button
                   type="button"
                   onClick={() => setSourceMode('file')}
@@ -475,7 +613,17 @@ export function ImportAudioDialog({
                   }`}
                 >
                   <Link2 className="h-4 w-4" />
-                  Teams / SharePoint Link
+                  Teams Link
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSourceMode('sharepoint')}
+                  className={`flex items-center justify-center gap-2 rounded-md py-2 transition-colors ${
+                    sourceMode === 'sharepoint' ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <Cloud className="h-4 w-4" />
+                  SharePoint
                 </button>
               </div>
 
@@ -668,9 +816,107 @@ export function ImportAudioDialog({
                 </div>
               )}
 
+              {sourceMode === 'sharepoint' && (
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-gray-700">Video Hub URL</label>
+                    <Input
+                      value={spHubUrl}
+                      onChange={(e) => setSpHubUrl(e.target.value)}
+                      placeholder="https://yourcompany.sharepoint.com/_layouts/15/videohub.aspx"
+                    />
+                  </div>
+                  <div className="flex items-end gap-2">
+                    <div className="space-y-1 flex-1">
+                      <label className="text-sm font-medium text-gray-700">
+                        Recordings since
+                      </label>
+                      <Input
+                        type="date"
+                        value={spSinceDate}
+                        onChange={(e) => setSpSinceDate(e.target.value)}
+                        max={new Date().toISOString().slice(0, 10)}
+                      />
+                    </div>
+                    <Button
+                      onClick={handleSharePointScan}
+                      disabled={!spHubValid || spScanning || !spSinceDate}
+                      variant="outline"
+                    >
+                      {spScanning ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          Scanning…
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="h-4 w-4 mr-2" />
+                          Scan
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Lists your meeting recordings from OneDrive/SharePoint. A sign-in window may
+                    appear the first time.
+                  </p>
+
+                  {spItems && spItems.length > 0 && (
+                    <div className="bg-gray-50 rounded-lg p-3 space-y-2">
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="font-medium text-gray-900">
+                          {spSelected.size} of {spItems.length} selected
+                        </span>
+                        <button
+                          type="button"
+                          className="text-blue-600 hover:underline text-xs"
+                          onClick={() =>
+                            setSpSelected(
+                              spSelected.size === spItems.length
+                                ? new Set()
+                                : new Set(spItems.map((r) => r.file_url))
+                            )
+                          }
+                        >
+                          {spSelected.size === spItems.length ? 'Select none' : 'Select all'}
+                        </button>
+                      </div>
+                      <div className="max-h-44 overflow-y-auto space-y-1 pr-1">
+                        {spItems.map((rec) => (
+                          <label
+                            key={rec.file_url}
+                            className="flex items-center gap-2 bg-white rounded-md border border-gray-200 px-2 py-1.5 cursor-pointer"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={spSelected.has(rec.file_url)}
+                              onChange={() => toggleSpSelected(rec.file_url)}
+                              className="flex-shrink-0"
+                            />
+                            <span className="flex-1 min-w-0 truncate text-sm text-gray-800">
+                              {titleFromFileName(rec.name)}
+                            </span>
+                            {rec.already_imported && (
+                              <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wide text-green-700 bg-green-100 rounded px-1.5 py-0.5">
+                                Imported
+                              </span>
+                            )}
+                            <span className="text-xs text-gray-400 flex-shrink-0">
+                              {rec.created ? rec.created.slice(0, 10) : ''}
+                              {rec.size_bytes ? ` · ${formatFileSize(rec.size_bytes)}` : ''}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Advanced options (collapsible) — irrelevant for transcript import */}
               {(fileInfo ||
                 (sourceMode === 'file' && batchFiles.length > 0) ||
+                (sourceMode === 'sharepoint' && spSelected.size > 0) ||
                 (sourceMode === 'link' && linkContentMode === 'audio')) && (
                 <div className="border rounded-lg">
                   <button
@@ -792,7 +1038,13 @@ export function ImportAudioDialog({
                 className="bg-blue-600 hover:bg-blue-700"
                 disabled={!canImport}
               >
-                {sourceMode === 'link' ? (
+                {sourceMode === 'sharepoint' ? (
+                  <>
+                    <Cloud className="h-4 w-4 mr-2" />
+                    Import {spSelected.size > 0 ? spSelected.size : ''} Recording
+                    {spSelected.size === 1 ? '' : 's'}
+                  </>
+                ) : sourceMode === 'link' ? (
                   <>
                     <Link2 className="h-4 w-4 mr-2" />
                     {linkContentMode === 'transcript' ? 'Import Transcript' : 'Import from Link'}

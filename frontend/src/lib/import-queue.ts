@@ -23,7 +23,10 @@ const MAX_ACTIVE_LOCAL = 1; // Local engine is single-holder.
 const TERMINAL: ReadonlySet<string> = new Set(['completed', 'error', 'cancelled']);
 
 export interface BatchImportItem {
-  path: string;
+  /** Local file path — mutually exclusive with `url`. */
+  path?: string;
+  /** Remote recording URL (SharePoint/Teams) — imported via the URL pipeline. */
+  url?: string;
   title: string;
 }
 
@@ -33,6 +36,8 @@ export interface BatchImportOptions {
   provider?: string | null;
   /** Delay before the single retry of a rejected start. Tests pass 0. */
   retryDelayMs?: number;
+  /** Called when an item's import completes successfully (not on error/cancel). */
+  onItemCompleted?: (item: BatchImportItem) => void;
 }
 
 type Invoker = (command: string, args: Record<string, unknown>) => Promise<unknown>;
@@ -46,8 +51,13 @@ function defaultIdGenerator(): string {
   return `import-${crypto.randomUUID()}`;
 }
 
-function isRemote(options: BatchImportOptions): boolean {
-  return options.provider === REMOTE_PROVIDER;
+/**
+ * URL imports always run one at a time regardless of provider: each one may
+ * open the shared hidden SharePoint auth webview, and two concurrent imports
+ * would fight over that single window.
+ */
+function usesRemotePool(item: QueuedItem): boolean {
+  return item.options.provider === REMOTE_PROVIDER && !item.url;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,6 +66,7 @@ export class ImportQueue {
   private queue: QueuedItem[] = [];
   private activeLocal = new Set<string>();
   private activeRemote = new Set<string>();
+  private activeItems = new Map<string, QueuedItem>();
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -120,6 +131,11 @@ export class ImportQueue {
         if (!job || TERMINAL.has(job.status)) {
           pool.delete(id);
           freed = true;
+          const item = this.activeItems.get(id);
+          this.activeItems.delete(id);
+          if (item && job?.status === 'completed') {
+            item.options.onItemCompleted?.(item);
+          }
         }
       }
     }
@@ -137,12 +153,13 @@ export class ImportQueue {
         continue;
       }
 
-      const pool = isRemote(head.options) ? this.activeRemote : this.activeLocal;
-      const capacity = isRemote(head.options) ? MAX_ACTIVE_REMOTE : MAX_ACTIVE_LOCAL;
+      const pool = usesRemotePool(head) ? this.activeRemote : this.activeLocal;
+      const capacity = usesRemotePool(head) ? MAX_ACTIVE_REMOTE : MAX_ACTIVE_LOCAL;
       if (pool.size >= capacity) return;
 
       this.queue.shift();
       pool.add(head.id);
+      this.activeItems.set(head.id, head);
       void this.startItem(head, pool);
     }
   }
@@ -154,24 +171,27 @@ export class ImportQueue {
    */
   private async startItem(item: QueuedItem, pool: Set<string>): Promise<void> {
     this.store.promoteToActive(item.id);
-    const args = {
+    const common = {
       importId: item.id,
-      sourcePath: item.path,
       title: item.title,
       language: item.options.language ?? null,
       model: item.options.model ?? null,
       provider: item.options.provider ?? null,
     };
+    const [command, args] = item.url
+      ? (['start_import_from_url_command', { ...common, url: item.url, mode: 'audio' }] as const)
+      : (['start_import_audio_command', { ...common, sourcePath: item.path }] as const);
 
     try {
-      await this.invoke('start_import_audio_command', args);
+      await this.invoke(command, args);
     } catch {
       await sleep(item.options.retryDelayMs ?? 2000);
       try {
-        await this.invoke('start_import_audio_command', args);
+        await this.invoke(command, args);
       } catch (retryError) {
         this.store.applyError(item.id, String(retryError));
         pool.delete(item.id);
+        this.activeItems.delete(item.id);
         this.startNext();
       }
     }
