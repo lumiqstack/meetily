@@ -210,9 +210,23 @@ pub(crate) fn parse_search_results(json: &serde_json::Value) -> Vec<SharePointRe
                         .then_some((candidate, parsed))
                 })?;
             let host = url.host_str()?.to_string();
-            let name = percent_decode_component(
+            let file_name = percent_decode_component(
                 url.path().rsplit('/').next().unwrap_or("recording"),
             );
+            // Stream/town-hall videos are often stored under generic file
+            // names ("audio.mp4"); the Title cell carries the real video
+            // title, so prefer it and keep the extension from the file.
+            let name = match get("Title").map(|t| t.trim().to_string()) {
+                Some(title) if !title.is_empty() => {
+                    let ext = file_name.rfind('.').map(|i| &file_name[i..]).unwrap_or("");
+                    if title.to_lowercase().ends_with(&ext.to_lowercase()) {
+                        title
+                    } else {
+                        format!("{title}{ext}")
+                    }
+                }
+                _ => file_name,
+            };
             Some(SharePointRecording {
                 stream_url: stream_url_for(&host, &percent_decode_component(url.path())),
                 file_url,
@@ -1313,7 +1327,8 @@ mod tests {
 
         let recs = parse_search_results(&json);
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].name, "AMER AI Community-20260710-Meeting Recording.mp4");
+        // Title cell wins over the URL's file name for display/meeting title.
+        assert_eq!(recs[0].name, "AMER AI Community: Coding in Flow.mp4");
         assert!(recs[0].file_url.ends_with("Meeting%20Recording.mp4"));
         assert_eq!(recs[0].created, "2026-07-10T15:00:00Z");
         assert_eq!(recs[0].size_bytes, Some(104_857_600));
@@ -1323,6 +1338,31 @@ mod tests {
         // The stream URL re-encodes the decoded path exactly once.
         assert!(recs[0].stream_url.ends_with("Meeting%20Recording.mp4"));
         assert!(!recs[0].stream_url.contains("%2520"));
+    }
+
+    #[test]
+    fn search_parser_uses_title_over_generic_file_names() {
+        // Stream/town-hall videos are stored as e.g. "audio.mp4" — the row
+        // Title is the only human-usable name.
+        let json = serde_json::json!({"PrimaryQueryResult":{"RelevantResults":{"Table":{"Rows":[
+            {"Cells":[
+                {"Key":"Title","Value":"Company Town Hall Q3"},
+                {"Key":"Path","Value":"https://t.sharepoint.com/sites/events/Recordings/audio.mp4"}
+            ]},
+            {"Cells":[
+                {"Key":"Title","Value":"Already Suffixed.mp4"},
+                {"Key":"Path","Value":"https://t.sharepoint.com/sites/events/Recordings/audio.mp4"}
+            ]},
+            {"Cells":[
+                {"Key":"Path","Value":"https://t.sharepoint.com/sites/events/Recordings/No Title Row.mp4"}
+            ]}
+        ]}}}});
+
+        let recs = parse_search_results(&json);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].name, "Company Town Hall Q3.mp4");
+        assert_eq!(recs[1].name, "Already Suffixed.mp4");
+        assert_eq!(recs[2].name, "No Title Row.mp4");
     }
 
     #[test]
