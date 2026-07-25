@@ -16,6 +16,9 @@ pub struct ObsidianSettings {
     pub vault_path: Option<String>,
     #[serde(default = "default_filename_template")]
     pub filename_template: String,
+    /// Export every completed AI summary to the vault automatically.
+    #[serde(default = "default_auto_export")]
+    pub auto_export: bool,
 }
 
 impl Default for ObsidianSettings {
@@ -23,12 +26,17 @@ impl Default for ObsidianSettings {
         Self {
             vault_path: None,
             filename_template: default_filename_template(),
+            auto_export: default_auto_export(),
         }
     }
 }
 
 fn default_filename_template() -> String {
     DEFAULT_FILENAME_TEMPLATE.to_string()
+}
+
+fn default_auto_export() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +210,37 @@ fn build_obsidian_markdown(
     )
 }
 
+/// Render transcript segments as the same markdown the manual "Save to
+/// Obsidian" button produces from the frontend (`useCopyOperations.ts`):
+/// `[MM:SS] Speaker: text` per segment, blank line between segments.
+/// Speaker source tags map like the frontend's `displaySpeaker`.
+pub fn format_transcript_markdown(segments: &[crate::database::models::Transcript]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            let time = match segment.audio_start_time {
+                Some(seconds) => {
+                    let total_secs = seconds.max(0.0) as u64;
+                    format!("[{:02}:{:02}]", total_secs / 60, total_secs % 60)
+                }
+                // Old transcripts without audio_start_time carry wall-clock time.
+                None => segment.timestamp.clone(),
+            };
+            let speaker = match segment.speaker.as_deref() {
+                Some("mic") => Some("Me"),
+                Some("system") => Some("Others"),
+                Some(name) => Some(name),
+                None => None,
+            };
+            match speaker {
+                Some(speaker) => format!("{} {}: {}", time, speaker, segment.transcript),
+                None => format!("{} {}", time, segment.transcript),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[tauri::command]
 pub async fn get_obsidian_settings<R: Runtime>(
     app: AppHandle<R>,
@@ -240,6 +279,7 @@ pub async fn set_obsidian_settings<R: Runtime>(
     app: AppHandle<R>,
     vault_path: Option<String>,
     filename_template: Option<String>,
+    auto_export: Option<bool>,
 ) -> Result<ObsidianSettings, String> {
     let normalized_path = vault_path
         .map(|path| path.trim().to_string())
@@ -249,10 +289,14 @@ pub async fn set_obsidian_settings<R: Runtime>(
         validate_vault_path(Path::new(path)).map_err(|e| e.to_string())?;
     }
 
-    let settings = ObsidianSettings {
-        vault_path: normalized_path,
-        filename_template: normalize_filename_template(filename_template),
-    };
+    let mut settings = load_obsidian_settings(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+    settings.vault_path = normalized_path;
+    settings.filename_template = normalize_filename_template(filename_template);
+    if let Some(auto_export) = auto_export {
+        settings.auto_export = auto_export;
+    }
     save_obsidian_settings(&app, &settings)
         .await
         .map_err(|e| e.to_string())?;
@@ -276,16 +320,18 @@ pub async fn open_obsidian_meetings_folder<R: Runtime>(app: AppHandle<R>) -> Res
     open_folder(&path).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn export_meeting_to_obsidian<R: Runtime>(
-    app: AppHandle<R>,
-    meeting_id: String,
-    title: String,
-    created_at: String,
-    summary_markdown: String,
-    transcript_markdown: String,
+/// Write a meeting note into the configured vault. Shared by the manual
+/// "Save to Obsidian" command and the automatic export after summary
+/// completion.
+pub async fn export_meeting_note<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    title: &str,
+    created_at: &str,
+    summary_markdown: &str,
+    transcript_markdown: &str,
 ) -> Result<ObsidianExportResult, String> {
-    let settings = load_obsidian_settings(&app)
+    let settings = load_obsidian_settings(app)
         .await
         .map_err(|e| e.to_string())?;
     let vault_path = settings
@@ -298,19 +344,15 @@ pub async fn export_meeting_to_obsidian<R: Runtime>(
     std::fs::create_dir_all(&meetings_dir)
         .map_err(|e| format!("Failed to create Meetings folder: {}", e))?;
 
-    let filename = render_filename_template(
-        &settings.filename_template,
-        &meeting_id,
-        &title,
-        &created_at,
-    );
+    let filename =
+        render_filename_template(&settings.filename_template, meeting_id, title, created_at);
     let file_path = meetings_dir.join(filename);
     let markdown = build_obsidian_markdown(
-        &meeting_id,
-        &title,
-        &created_at,
-        &summary_markdown,
-        &transcript_markdown,
+        meeting_id,
+        title,
+        created_at,
+        summary_markdown,
+        transcript_markdown,
     );
 
     std::fs::write(&file_path, markdown)
@@ -329,4 +371,79 @@ pub async fn export_meeting_to_obsidian<R: Runtime>(
             file_path.file_name().unwrap_or_default().to_string_lossy()
         ),
     })
+}
+
+#[tauri::command]
+pub async fn export_meeting_to_obsidian<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    title: String,
+    created_at: String,
+    summary_markdown: String,
+    transcript_markdown: String,
+) -> Result<ObsidianExportResult, String> {
+    export_meeting_note(
+        &app,
+        &meeting_id,
+        &title,
+        &created_at,
+        &summary_markdown,
+        &transcript_markdown,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::models::Transcript;
+
+    #[test]
+    fn settings_without_auto_export_field_default_to_enabled() {
+        // Pre-existing obsidian_settings.json files predate the flag.
+        let settings: ObsidianSettings = serde_json::from_str(
+            r#"{"vault_path": "D:/vault", "filename_template": "{date} {title}.md"}"#,
+        )
+        .unwrap();
+        assert!(settings.auto_export);
+    }
+
+    fn segment(
+        text: &str,
+        speaker: Option<&str>,
+        audio_start_time: Option<f64>,
+        timestamp: &str,
+    ) -> Transcript {
+        Transcript {
+            id: String::new(),
+            meeting_id: String::new(),
+            transcript: text.to_string(),
+            timestamp: timestamp.to_string(),
+            summary: None,
+            action_items: None,
+            key_points: None,
+            audio_start_time,
+            audio_end_time: None,
+            duration: None,
+            speaker: speaker.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn transcript_markdown_matches_frontend_format() {
+        let segments = vec![
+            segment("hello there", Some("mic"), Some(65.9), "10:00:00"),
+            segment("hi back", Some("system"), Some(70.0), "10:00:05"),
+            segment("named speaker", Some("Alice Smith"), Some(0.0), "10:00:10"),
+            segment("no speaker, old row", None, None, "10:00:15"),
+        ];
+
+        assert_eq!(
+            format_transcript_markdown(&segments),
+            "[01:05] Me: hello there\n\n\
+             [01:10] Others: hi back\n\n\
+             [00:00] Alice Smith: named speaker\n\n\
+             10:00:15 no speaker, old row"
+        );
+    }
 }

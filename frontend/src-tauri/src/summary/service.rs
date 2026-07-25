@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use once_cell::sync::Lazy;
@@ -283,7 +283,7 @@ impl SummaryService {
     /// the main thread. It updates the database with progress and results.
     ///
     /// # Arguments
-    /// * `_app` - Tauri app handle (for future use)
+    /// * `app` - Tauri app handle (Obsidian auto-export, event emission)
     /// * `pool` - SQLx connection pool
     /// * `meeting_id` - Unique identifier for the meeting
     /// * `text` - Full transcript text
@@ -292,7 +292,7 @@ impl SummaryService {
     /// * `custom_prompt` - Optional user-provided context
     /// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
     pub async fn process_transcript_background<R: tauri::Runtime>(
-        _app: AppHandle<R>,
+        app: AppHandle<R>,
         pool: SqlitePool,
         meeting_id: String,
         text: String,
@@ -460,7 +460,7 @@ impl SummaryService {
         };
 
         // Get app data directory for BuiltInAI provider
-        let app_data_dir = _app.path().app_data_dir().ok();
+        let app_data_dir = app.path().app_data_dir().ok();
 
         if let Some(code) = &summary_language {
             info!("📝 Summary language preference: {}", code);
@@ -604,6 +604,8 @@ impl SummaryService {
                         "Summary saved successfully for meeting_id: {}",
                         meeting_id
                     );
+                    Self::auto_export_to_obsidian(&app, &pool, &meeting_id, &final_markdown)
+                        .await;
                 }
             }
             Err(e) => {
@@ -616,6 +618,94 @@ impl SummaryService {
                 } else {
                     Self::update_process_failed(&pool, &meeting_id, &e).await;
                 }
+            }
+        }
+    }
+
+    /// Exports the freshly completed summary to the user's Obsidian vault
+    /// when auto-export is enabled and a vault is configured. Best-effort:
+    /// failures are logged and never affect the summary itself.
+    async fn auto_export_to_obsidian<R: tauri::Runtime>(
+        app: &AppHandle<R>,
+        pool: &SqlitePool,
+        meeting_id: &str,
+        final_markdown: &str,
+    ) {
+        let settings = match crate::obsidian::load_obsidian_settings(app).await {
+            Ok(settings) => settings,
+            Err(e) => {
+                warn!("Obsidian auto-export: failed to load settings: {}", e);
+                return;
+            }
+        };
+        if !settings.auto_export || settings.vault_path.is_none() {
+            return;
+        }
+
+        // Fetched after the meeting-name update above, so the note carries
+        // the fresh AI-derived title.
+        let meeting = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
+            Ok(Some(meeting)) => meeting,
+            Ok(None) => {
+                warn!("Obsidian auto-export: meeting {} not found", meeting_id);
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "Obsidian auto-export: failed to load meeting {}: {}",
+                    meeting_id, e
+                );
+                return;
+            }
+        };
+
+        let transcript_markdown = match MeetingsRepository::get_meeting_transcripts_paginated(
+            pool, meeting_id, i64::MAX, 0,
+        )
+        .await
+        {
+            Ok((segments, _)) => crate::obsidian::format_transcript_markdown(&segments),
+            Err(e) => {
+                warn!(
+                    "Obsidian auto-export: failed to load transcripts for {}: {}",
+                    meeting_id, e
+                );
+                return;
+            }
+        };
+
+        // Same content the manual Save button exports: the stored summary
+        // markdown with the leading H1 stripped.
+        let summary_markdown = strip_title_if_present(final_markdown);
+
+        match crate::obsidian::export_meeting_note(
+            app,
+            meeting_id,
+            &meeting.title,
+            &meeting.created_at.0.to_rfc3339(),
+            &summary_markdown,
+            &transcript_markdown,
+        )
+        .await
+        {
+            Ok(result) => {
+                info!(
+                    "Obsidian auto-export: wrote {} for meeting {}",
+                    result.file_path, meeting_id
+                );
+                let _ = app.emit(
+                    "obsidian-export-complete",
+                    serde_json::json!({
+                        "meeting_id": meeting_id,
+                        "relative_path": result.relative_path,
+                    }),
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Obsidian auto-export failed for meeting {}: {}",
+                    meeting_id, e
+                );
             }
         }
     }
