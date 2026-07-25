@@ -1437,67 +1437,123 @@ async fn run_url_import<R: Runtime>(
     )
     .await;
 
-    // Phase 1: authenticate. The engine is deliberately NOT held during login
-    // or download so recording and other jobs remain usable meanwhile.
-    emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
-    let auth = sharepoint::ensure_auth_cookies(&app, &url, |msg| {
-        emit_progress(&app, &import_id, "downloading", 0, msg);
-    })
-    .await?;
-
-    if cancel.is_cancelled() {
-        auth.cleanup();
-        return Err(anyhow!("Import cancelled"));
-    }
-
-    // Phase 2: locate yt-dlp (downloaded on first use).
-    emit_progress(&app, &import_id, "downloading", 0, "Preparing downloader…");
-    let ytdlp_path = match ytdlp::ensure_ytdlp(&app).await {
-        Ok(p) => p,
-        Err(e) => {
-            auth.cleanup();
-            return Err(e);
-        }
-    };
-    let ffmpeg_path = super::ffmpeg::find_ffmpeg_path();
-
-    // Transcript mode: fetch the Teams transcript (VTT) and build the meeting
-    // from it directly — no download, no Whisper, no engine guard.
-    if is_transcript {
-        let result =
-            run_transcript_import(&app, &import_id, &url, &title, &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
-                .await;
-        auth.cleanup();
-        return result;
-    }
-
-    // Phase 3: download into a dedicated working directory.
     let work_dir = std::env::temp_dir().join(format!("meetily-url-{}", import_id));
-    let dl_result = url_import::download_recording(
-        &ytdlp_path,
-        ffmpeg_path.as_deref(),
-        &auth.cookies_txt,
-        &url,
-        &work_dir,
-        |pct| {
-            emit_progress(
-                &app,
-                &import_id,
-                "downloading",
-                pct,
-                &format!("Downloading recording… {pct}%"),
-            )
-        },
-        &cancel,
-    )
-    .await;
-    auth.cleanup();
 
-    let media_path = match dl_result {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&work_dir);
-            return Err(e);
+    // Direct-download path: URLs pointing straight at a media file on a
+    // SharePoint host (the sync scan's file URLs, or a stream.aspx link
+    // wrapping one) skip yt-dlp — we hold the host's cookies, so a plain
+    // authenticated GET works and is immune to yt-dlp's Stream page
+    // scraping breaking on newer SharePoint UIs.
+    let direct_media = if is_transcript {
+        None
+    } else {
+        super::sharepoint_sync::direct_sharepoint_media_url(&url)
+    };
+
+    let media_path = if let Some(file_url) = direct_media {
+        emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
+        let host = file_url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let auth = sharepoint::ensure_multi_host_auth(
+            &app,
+            &format!("https://{host}/"),
+            &[],
+            |msg| emit_progress(&app, &import_id, "downloading", 0, msg),
+        )
+        .await?;
+        if cancel.is_cancelled() {
+            return Err(anyhow!("Import cancelled"));
+        }
+        let cookies = auth
+            .host_cookies
+            .get(&host)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| anyhow!("SharePoint sign-in did not produce cookies for {host}"))?;
+        let dl_result = super::sharepoint_sync::download_direct_file(
+            &file_url,
+            &super::sharepoint_sync::build_cookie_header(cookies),
+            &work_dir,
+            |pct| {
+                emit_progress(
+                    &app,
+                    &import_id,
+                    "downloading",
+                    pct,
+                    &format!("Downloading recording… {pct}%"),
+                )
+            },
+            &cancel,
+        )
+        .await;
+        match dl_result {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work_dir);
+                return Err(e);
+            }
+        }
+    } else {
+        // Phase 1: authenticate. The engine is deliberately NOT held during
+        // login or download so recording and other jobs remain usable
+        // meanwhile.
+        emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
+        let auth = sharepoint::ensure_auth_cookies(&app, &url, |msg| {
+            emit_progress(&app, &import_id, "downloading", 0, msg);
+        })
+        .await?;
+
+        if cancel.is_cancelled() {
+            auth.cleanup();
+            return Err(anyhow!("Import cancelled"));
+        }
+
+        // Phase 2: locate yt-dlp (downloaded on first use).
+        emit_progress(&app, &import_id, "downloading", 0, "Preparing downloader…");
+        let ytdlp_path = match ytdlp::ensure_ytdlp(&app).await {
+            Ok(p) => p,
+            Err(e) => {
+                auth.cleanup();
+                return Err(e);
+            }
+        };
+        let ffmpeg_path = super::ffmpeg::find_ffmpeg_path();
+
+        // Transcript mode: fetch the Teams transcript (VTT) and build the
+        // meeting from it directly — no download, no Whisper, no engine guard.
+        if is_transcript {
+            let result =
+                run_transcript_import(&app, &import_id, &url, &title, &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
+                    .await;
+            auth.cleanup();
+            return result;
+        }
+
+        // Phase 3: download into a dedicated working directory.
+        let dl_result = url_import::download_recording(
+            &ytdlp_path,
+            ffmpeg_path.as_deref(),
+            &auth.cookies_txt,
+            &url,
+            &work_dir,
+            |pct| {
+                emit_progress(
+                    &app,
+                    &import_id,
+                    "downloading",
+                    pct,
+                    &format!("Downloading recording… {pct}%"),
+                )
+            },
+            &cancel,
+        )
+        .await;
+        auth.cleanup();
+
+        match dl_result {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&work_dir);
+                return Err(e);
+            }
         }
     };
 

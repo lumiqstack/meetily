@@ -375,13 +375,15 @@ export function ImportAudioDialog({
       invoke(command, args)
     );
     queue.enqueueBatch(
-      selected.map((r) => ({ url: r.stream_url, title: titleFromFileName(r.name) })),
+      // The direct file URL downloads via an authenticated GET in the backend
+      // (no yt-dlp page scraping, which breaks on newer Stream UIs).
+      selected.map((r) => ({ url: r.file_url, title: titleFromFileName(r.name) })),
       {
         language,
         model: selectedModel?.name || null,
         provider: selectedModel?.provider || null,
         onItemCompleted: (item) => {
-          const rec = selected.find((r) => r.stream_url === item.url);
+          const rec = selected.find((r) => r.file_url === item.url);
           if (rec) {
             void invoke('mark_sharepoint_imported_command', { fileUrl: rec.file_url }).catch(
               () => {
