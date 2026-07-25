@@ -4,50 +4,14 @@ import { ModelConfig } from '@/components/ModelSettingsModal';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { displaySpeaker } from '@/lib/speaker-label';
 import Analytics from '@/lib/analytics';
 import { isOllamaNotInstalledError } from '@/lib/utils';
 import { BuiltInModelInfo } from '@/lib/builtin-ai';
 import {
-  detectAndCacheSummaryLanguage,
-  readMeetingSummaryLanguage,
-  readCachedDetectedSummaryLanguage,
-} from '@/lib/summary-language-preferences';
-
-async function resolveSummaryLanguage(
-  meetingId: string,
-  transcriptTexts: string[]
-): Promise<string | null> {
-  try {
-    const perMeeting = await readMeetingSummaryLanguage(meetingId);
-    if (perMeeting.language) return perMeeting.language;
-  } catch (err) {
-    console.warn('Failed to load meeting summary language:', err);
-    toast.warning('Could not load saved summary language', {
-      description: 'Using Auto for this generation.',
-    });
-  }
-
-  try {
-    const cachedDetected = await readCachedDetectedSummaryLanguage(meetingId);
-    if (cachedDetected) return cachedDetected;
-  } catch (err) {
-    console.warn('Failed to load cached detected summary language:', err);
-  }
-
-  try {
-    const detection = await detectAndCacheSummaryLanguage(meetingId, transcriptTexts);
-    if (detection.reason === 'tie') {
-      toast.warning('Bilingual transcript detected', {
-        description: 'Pick a summary language manually if Auto chooses the wrong fallback.',
-      });
-    }
-    return detection.language;
-  } catch (err) {
-    console.warn('Failed to detect transcript summary language:', err);
-    return null;
-  }
-}
+  resolveSummaryLanguage,
+  buildSummaryTranscriptPayload as buildSummaryTranscriptPayloadShared,
+  fetchAllTranscripts as fetchAllTranscriptsShared,
+} from '@/lib/summary-payload';
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
@@ -400,61 +364,15 @@ export function useSummaryGeneration({
   ]);
 
   // Helper function to fetch ALL transcripts for summary generation
-  const fetchAllTranscripts = useCallback(async (meetingId: string): Promise<Transcript[]> => {
-    try {
-      console.log('📊 Fetching all transcripts for meeting:', meetingId);
+  const fetchAllTranscripts = useCallback(
+    (meetingId: string): Promise<Transcript[]> => fetchAllTranscriptsShared(meetingId),
+    []
+  );
 
-      // First, get total count by fetching first page
-      const firstPage = await invokeTauri('api_get_meeting_transcripts', {
-        meetingId,
-        limit: 1,
-        offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
-
-      const totalCount = firstPage.total_count;
-      console.log(`📊 Total transcripts in database: ${totalCount}`);
-
-      if (totalCount === 0) {
-        return [];
-      }
-
-      // Fetch all transcripts in one call
-      const allData = await invokeTauri('api_get_meeting_transcripts', {
-        meetingId,
-        limit: totalCount,
-        offset: 0,
-      }) as { transcripts: Transcript[]; total_count: number; has_more: boolean };
-
-      console.log(`✅ Fetched ${allData.transcripts.length} transcripts from database`);
-      return allData.transcripts;
-    } catch (error) {
-      console.error('❌ Error fetching all transcripts:', error);
-      toast.error('Failed to fetch transcripts for summary generation');
-      return [];
-    }
-  }, []);
-
-  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[]) => {
-    const formatTime = (seconds: number | undefined, fallbackTimestamp: string): string => {
-      if (seconds === undefined) {
-        return fallbackTimestamp;
-      }
-      const totalSecs = Math.floor(seconds);
-      const mins = Math.floor(totalSecs / 60);
-      const secs = totalSecs % 60;
-      return `[${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
-    };
-
-    return {
-      transcriptText: allTranscripts
-        .map(t => {
-          const speaker = displaySpeaker(t.speaker);
-          return `${formatTime(t.audio_start_time, t.timestamp)} ${speaker ? `${speaker}: ` : ''}${t.text}`;
-        })
-        .join('\n'),
-      transcriptTexts: allTranscripts.map(t => t.text),
-    };
-  }, []);
+  const buildSummaryTranscriptPayload = useCallback(
+    (allTranscripts: Transcript[]) => buildSummaryTranscriptPayloadShared(allTranscripts),
+    []
+  );
 
   // Public API: Generate summary from transcripts
   const handleGenerateSummary = useCallback(async (customPrompt: string = '') => {

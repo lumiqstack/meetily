@@ -1,5 +1,5 @@
 use crate::api::{MeetingDetails, MeetingTranscript};
-use crate::database::models::{MeetingModel, Transcript};
+use crate::database::models::{MeetingModel, PendingMeetingModel, Transcript};
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqliteConnection, SqlitePool};
 use tracing::{error, info};
@@ -13,6 +13,33 @@ impl MeetingsRepository {
                 .fetch_all(pool)
                 .await?;
         Ok(meetings)
+    }
+
+    /// Meetings with outstanding work: a recording folder but no transcripts
+    /// (pending transcription), or transcripts but no completed/in-flight
+    /// summary (pending AI summary). In-flight `PENDING` summaries are
+    /// excluded so callers never offer to duplicate a running job.
+    pub async fn get_pending_meetings(
+        pool: &SqlitePool,
+    ) -> Result<Vec<PendingMeetingModel>, sqlx::Error> {
+        let pending = sqlx::query_as::<_, PendingMeetingModel>(
+            r#"
+            SELECT m.id, m.title, m.created_at, m.folder_path,
+                   COALESCE(t.cnt, 0) AS transcript_count,
+                   sp.status AS summary_status
+            FROM meetings m
+            LEFT JOIN (
+                SELECT meeting_id, COUNT(*) AS cnt FROM transcripts GROUP BY meeting_id
+            ) t ON t.meeting_id = m.id
+            LEFT JOIN summary_processes sp ON sp.meeting_id = m.id
+            WHERE (m.folder_path IS NOT NULL AND m.folder_path <> '' AND COALESCE(t.cnt, 0) = 0)
+               OR (COALESCE(t.cnt, 0) > 0 AND (sp.status IS NULL OR sp.status IN ('failed', 'cancelled')))
+            ORDER BY m.created_at DESC
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(pending)
     }
 
     pub async fn delete_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<bool, SqlxError> {
@@ -272,4 +299,103 @@ async fn delete_meeting_with_transaction(
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations must apply to a fresh database");
+        pool
+    }
+
+    async fn insert_meeting(pool: &SqlitePool, id: &str, folder_path: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES (?, ?, '2026-07-24T10:00:00Z', '2026-07-24T10:00:00Z', ?)",
+        )
+        .bind(id)
+        .bind(format!("Meeting {}", id))
+        .bind(folder_path)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_transcript(pool: &SqlitePool, meeting_id: &str) {
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp)
+             VALUES (?, ?, 'hello', '2026-07-24T10:00:00Z')",
+        )
+        .bind(format!("t-{}", meeting_id))
+        .bind(meeting_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_summary_process(pool: &SqlitePool, meeting_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO summary_processes (meeting_id, status, created_at, updated_at)
+             VALUES (?, ?, '2026-07-24T10:00:00Z', '2026-07-24T10:00:00Z')",
+        )
+        .bind(meeting_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_meetings_covers_each_derived_state() {
+        let pool = test_pool().await;
+
+        // Recording but no transcripts -> pending transcription.
+        insert_meeting(&pool, "needs-transcript", Some("C:/rec/a")).await;
+
+        // Transcripts but no summary process row -> pending summary.
+        insert_meeting(&pool, "needs-summary", None).await;
+        insert_transcript(&pool, "needs-summary").await;
+
+        // Transcripts with a failed summary -> pending summary (retry).
+        insert_meeting(&pool, "failed-summary", Some("C:/rec/b")).await;
+        insert_transcript(&pool, "failed-summary").await;
+        insert_summary_process(&pool, "failed-summary", "failed").await;
+
+        // Completed summary -> not pending.
+        insert_meeting(&pool, "all-done", Some("C:/rec/c")).await;
+        insert_transcript(&pool, "all-done").await;
+        insert_summary_process(&pool, "all-done", "completed").await;
+
+        // Summary already running -> excluded so it is never started twice.
+        insert_meeting(&pool, "summary-running", None).await;
+        insert_transcript(&pool, "summary-running").await;
+        insert_summary_process(&pool, "summary-running", "PENDING").await;
+
+        // Neither recording nor transcripts -> excluded.
+        insert_meeting(&pool, "empty", None).await;
+
+        let pending = MeetingsRepository::get_pending_meetings(&pool).await.unwrap();
+        let mut ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["failed-summary", "needs-summary", "needs-transcript"]);
+
+        let by_id = |id: &str| pending.iter().find(|p| p.id == id).unwrap();
+        assert_eq!(by_id("needs-transcript").transcript_count, 0);
+        assert_eq!(by_id("needs-summary").transcript_count, 1);
+        assert_eq!(by_id("needs-summary").summary_status, None);
+        assert_eq!(
+            by_id("failed-summary").summary_status.as_deref(),
+            Some("failed")
+        );
+    }
 }

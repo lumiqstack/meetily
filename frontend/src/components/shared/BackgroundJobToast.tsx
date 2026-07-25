@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useRef, useSyncExternalStore } from 'rea
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { Check, FileAudio, X } from 'lucide-react';
+import { Check, FileAudio, FileText, X } from 'lucide-react';
 import {
   BackgroundJob,
   BackgroundJobStore,
@@ -52,6 +52,17 @@ interface RetranscriptionError {
   error: string;
 }
 
+function jobKindLabel(kind: BackgroundJob['kind']): string {
+  switch (kind) {
+    case 'import':
+      return 'Import';
+    case 'summary':
+      return 'Summary generation';
+    default:
+      return 'Retranscription';
+  }
+}
+
 /** Cancel a background job through the store, invoking the matching Tauri command. */
 export function cancelBackgroundJob(id: string): Promise<boolean> {
   return backgroundJobStore.cancelJob(id, async (command, args) => {
@@ -95,6 +106,8 @@ export function BackgroundJobCard({
           <Check className="w-4 h-4 text-green-600" />
         ) : hasError || job.status === 'cancelled' ? (
           <X className={`w-4 h-4 ${hasError ? 'text-red-600' : 'text-gray-600'}`} />
+        ) : job.kind === 'summary' ? (
+          <FileText className="w-4 h-4 text-gray-600" />
         ) : (
           <FileAudio className="w-4 h-4 text-gray-600" />
         )}
@@ -122,7 +135,7 @@ export function BackgroundJobCard({
         {isInterrupted ? (
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs text-amber-600">
-              {`${job.kind === 'import' ? 'Import' : 'Retranscription'} interrupted by app restart`}
+              {`${jobKindLabel(job.kind)} interrupted by app restart`}
             </p>
             <div className="flex gap-3 flex-shrink-0">
               <button
@@ -145,7 +158,7 @@ export function BackgroundJobCard({
           </div>
         ) : hasError ? (
           <p className="text-xs text-red-600">
-            {job.error || `${job.kind === 'import' ? 'Import' : 'Retranscription'} failed`}
+            {job.error || `${jobKindLabel(job.kind)} failed`}
           </p>
         ) : isComplete ? (
           <p className="text-xs text-green-600">{job.message || 'Complete'}</p>

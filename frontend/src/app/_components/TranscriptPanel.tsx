@@ -1,6 +1,7 @@
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { PermissionWarning } from '@/components/PermissionWarning';
 import { BackgroundJobsPanel } from '@/components/shared/BackgroundJobsPanel';
+import { PendingWorkPanel } from '@/components/shared/PendingWorkPanel';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, GlobeIcon } from 'lucide-react';
@@ -103,9 +104,6 @@ export function TranscriptPanel({
         </div>
       )}
 
-      {/* Background remote imports/retranscriptions in progress */}
-      <BackgroundJobsPanel />
-
       {/* Transcript content */}
       <div className="pb-20">
         <div className="flex justify-center">
@@ -121,6 +119,12 @@ export function TranscriptPanel({
             />
           </div>
         </div>
+
+        {/* Background remote imports/retranscriptions in progress */}
+        <BackgroundJobsPanel />
+
+        {/* Meetings still needing a transcript or AI summary */}
+        {!isRecording && <PendingWorkPanel />}
       </div>
     </div>
   );
