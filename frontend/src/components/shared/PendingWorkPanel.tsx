@@ -4,9 +4,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { Loader2 } from 'lucide-react';
+import { Loader2, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { ConfirmationModal } from '@/components/ConfirmationModel/confirmation-modal';
 import { useConfig } from '@/contexts/ConfigContext';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { backgroundJobStore } from './BackgroundJobToast';
 import { summaryJobId } from '@/lib/background-jobs';
 import {
@@ -47,7 +49,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  * missed; a slow poll of the backend job flag is kept as a safety net.
  */
 function waitForRetranscription(meetingId: string): {
-  promise: Promise<boolean>;
+  promise: Promise<{ ok: boolean; error?: string }>;
   cancel: () => void;
 } {
   let settled = false;
@@ -56,12 +58,12 @@ function waitForRetranscription(meetingId: string): {
     cleanupFns.splice(0).forEach((fn) => fn());
   };
 
-  const promise = new Promise<boolean>((resolve) => {
-    const settle = (ok: boolean) => {
+  const promise = new Promise<{ ok: boolean; error?: string }>((resolve) => {
+    const settle = (ok: boolean, error?: string) => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(ok);
+      resolve({ ok, error });
     };
 
     listen<{ meeting_id: string }>('retranscription-complete', (event) => {
@@ -69,7 +71,7 @@ function waitForRetranscription(meetingId: string): {
     }).then((unlisten) => (settled ? unlisten() : cleanupFns.push(unlisten)));
 
     listen<{ meeting_id: string; error: string }>('retranscription-error', (event) => {
-      if (event.payload.meeting_id === meetingId) settle(false);
+      if (event.payload.meeting_id === meetingId) settle(false, event.payload.error);
     }).then((unlisten) => (settled ? unlisten() : cleanupFns.push(unlisten)));
 
     const interval = setInterval(async () => {
@@ -83,7 +85,11 @@ function waitForRetranscription(meetingId: string): {
           limit: 1,
           offset: 0,
         })) as { total_count: number };
-        settle(page.total_count > 0);
+        if (page.total_count > 0) {
+          settle(true);
+        } else {
+          settle(false, 'Transcription finished without producing any transcripts');
+        }
       } catch {
         // Keep waiting; the next tick or an event will settle it.
       }
@@ -109,10 +115,26 @@ function waitForRetranscription(meetingId: string): {
  */
 export function PendingWorkPanel() {
   const { modelConfig, transcriptModelConfig } = useConfig();
+  const { refetchMeetings } = useSidebar();
   const [items, setItems] = useState<PendingItem[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [failures, setFailures] = useState<Map<string, string>>(new Map());
+  const [deleteTarget, setDeleteTarget] = useState<PendingItem | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const processingRef = useRef(false);
+
+  const markFailed = useCallback((meetingId: string, message: string) => {
+    setFailures((prev) => new Map(prev).set(meetingId, message));
+  }, []);
+
+  const clearFailed = useCallback((meetingId: string) => {
+    setFailures((prev) => {
+      if (!prev.has(meetingId)) return prev;
+      const next = new Map(prev);
+      next.delete(meetingId);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -125,9 +147,11 @@ export function PendingWorkPanel() {
         kind: m.transcript_count === 0 ? 'transcription' : 'summary',
       }));
       setItems(mapped);
-      setSelected((prev) => {
-        const valid = new Set(mapped.map((i) => i.meetingId));
-        return new Set([...prev].filter((id) => valid.has(id)));
+      const valid = new Set(mapped.map((i) => i.meetingId));
+      setSelected((prev) => new Set([...prev].filter((id) => valid.has(id))));
+      setFailures((prev) => {
+        if (![...prev.keys()].some((id) => !valid.has(id))) return prev;
+        return new Map([...prev].filter(([id]) => valid.has(id)));
       });
     } catch (error) {
       console.warn('Failed to load pending meetings:', error);
@@ -175,6 +199,7 @@ export function PendingWorkPanel() {
       if (!item.folderPath) {
         backgroundJobStore.registerRetranscription(item.meetingId, item.title);
         backgroundJobStore.applyError(item.meetingId, 'Meeting folder path not available');
+        markFailed(item.meetingId, 'Meeting folder path not available');
         return false;
       }
 
@@ -192,17 +217,27 @@ export function PendingWorkPanel() {
         waiter.cancel();
         const message = typeof err === 'string' ? err : err instanceof Error ? err.message : String(err);
         backgroundJobStore.applyError(item.meetingId, message);
+        markFailed(item.meetingId, message);
         return false;
       }
-      return waiter.promise;
+      const result = await waiter.promise;
+      if (!result.ok) {
+        markFailed(item.meetingId, result.error ?? 'Transcription failed');
+      }
+      return result.ok;
     },
-    [transcriptModelConfig]
+    [transcriptModelConfig, markFailed]
   );
 
   const runSummary = useCallback(
     async (item: PendingItem): Promise<boolean> => {
       const jobId = summaryJobId(item.meetingId);
       backgroundJobStore.registerSummary(item.meetingId, item.title);
+      const fail = (message: string): false => {
+        backgroundJobStore.applyError(jobId, message);
+        markFailed(item.meetingId, message);
+        return false;
+      };
       try {
         const transcripts = await fetchAllTranscripts(item.meetingId);
         if (!transcripts.length) {
@@ -240,16 +275,13 @@ export function PendingWorkPanel() {
             return true;
           }
           if (status === 'failed' || status === 'error') {
-            backgroundJobStore.applyError(jobId, result.error || 'Summary generation failed');
-            return false;
+            return fail(result.error || 'Summary generation failed');
           }
           if (status === 'cancelled') {
-            backgroundJobStore.applyError(jobId, 'Summary generation cancelled');
-            return false;
+            return fail('Summary generation cancelled');
           }
           if (status === 'idle') {
-            backgroundJobStore.applyError(jobId, 'Summary process not found');
-            return false;
+            return fail('Summary process not found');
           }
           backgroundJobStore.applyProgress(
             jobId,
@@ -257,15 +289,13 @@ export function PendingWorkPanel() {
             'Generating summary...'
           );
         }
-        backgroundJobStore.applyError(jobId, 'Timed out waiting for summary');
-        return false;
+        return fail('Timed out waiting for summary');
       } catch (err) {
         const message = typeof err === 'string' ? err : err instanceof Error ? err.message : String(err);
-        backgroundJobStore.applyError(jobId, message);
-        return false;
+        return fail(message);
       }
     },
-    [modelConfig]
+    [modelConfig, markFailed]
   );
 
   const handleProcess = useCallback(async () => {
@@ -277,6 +307,7 @@ export function PendingWorkPanel() {
     setIsProcessing(true);
     try {
       for (const item of chosen) {
+        clearFailed(item.meetingId);
         if (item.kind === 'transcription') {
           const transcribed = await runTranscription(item);
           // One click fully processes the meeting: chain the summary once
@@ -300,7 +331,29 @@ export function PendingWorkPanel() {
       setSelected(new Set());
       await refresh();
     }
-  }, [items, selected, runTranscription, runSummary, refresh]);
+  }, [items, selected, runTranscription, runSummary, refresh, clearFailed]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!deleteTarget) return;
+    const { meetingId } = deleteTarget;
+    setDeleteTarget(null);
+    try {
+      await invoke('api_delete_meeting', { meetingId });
+      clearFailed(meetingId);
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(meetingId);
+        return next;
+      });
+      await refresh();
+      await refetchMeetings();
+      toast.success('Meeting deleted');
+    } catch (error) {
+      toast.error('Failed to delete meeting', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [deleteTarget, clearFailed, refresh, refetchMeetings]);
 
   if (items.length === 0 && !isProcessing) {
     return null;
@@ -326,35 +379,69 @@ export function PendingWorkPanel() {
             </label>
           )}
           <div className="space-y-1">
-            {items.map((item) => (
-              <label
-                key={item.meetingId}
-                className="flex items-center gap-2 py-1.5 cursor-pointer select-none"
-              >
-                <input
-                  type="checkbox"
-                  checked={selected.has(item.meetingId)}
-                  onChange={() => toggleItem(item.meetingId)}
-                  disabled={isProcessing}
-                  className="h-4 w-4 rounded border-gray-300 accent-gray-900"
-                />
-                <span className="flex-1 min-w-0 text-sm text-gray-900 truncate">
-                  {item.title}
-                </span>
-                <span
-                  className={`flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full ${
-                    item.kind === 'transcription'
-                      ? 'bg-blue-50 text-blue-700'
-                      : 'bg-amber-50 text-amber-700'
-                  }`}
+            {items.map((item) => {
+              const failure = failures.get(item.meetingId);
+              return (
+                <label
+                  key={item.meetingId}
+                  className="flex items-center gap-2 py-1.5 cursor-pointer select-none"
                 >
-                  {item.kind === 'transcription' ? 'Needs transcript' : 'Needs summary'}
-                </span>
-                <span className="flex-shrink-0 text-xs text-gray-400">
-                  {new Date(item.createdAt).toLocaleDateString()}
-                </span>
-              </label>
-            ))}
+                  <input
+                    type="checkbox"
+                    checked={selected.has(item.meetingId)}
+                    onChange={() => toggleItem(item.meetingId)}
+                    disabled={isProcessing}
+                    className="h-4 w-4 rounded border-gray-300 accent-gray-900"
+                  />
+                  <span className="flex-1 min-w-0">
+                    <span className="block text-sm text-gray-900 truncate">
+                      {item.title}
+                    </span>
+                    {failure && (
+                      <span
+                        className="block text-[11px] text-red-600 truncate"
+                        title={failure}
+                      >
+                        {failure}
+                      </span>
+                    )}
+                  </span>
+                  {failure ? (
+                    <span className="flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full bg-red-50 text-red-700">
+                      Failed
+                    </span>
+                  ) : (
+                    <span
+                      className={`flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full ${
+                        item.kind === 'transcription'
+                          ? 'bg-blue-50 text-blue-700'
+                          : 'bg-amber-50 text-amber-700'
+                      }`}
+                    >
+                      {item.kind === 'transcription' ? 'Needs transcript' : 'Needs summary'}
+                    </span>
+                  )}
+                  <span className="flex-shrink-0 text-xs text-gray-400">
+                    {new Date(item.createdAt).toLocaleDateString()}
+                  </span>
+                  {failure && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDeleteTarget(item);
+                      }}
+                      disabled={isProcessing}
+                      className="flex-shrink-0 p-1 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors disabled:opacity-50"
+                      title="Remove meeting"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </label>
+              );
+            })}
           </div>
           <div className="flex justify-end pt-2 mt-1 border-t border-gray-100">
             <Button
@@ -374,6 +461,12 @@ export function PendingWorkPanel() {
           </div>
         </div>
       </div>
+      <ConfirmationModal
+        isOpen={deleteTarget !== null}
+        text="Are you sure you want to delete this meeting? This action cannot be undone."
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </div>
   );
 }
