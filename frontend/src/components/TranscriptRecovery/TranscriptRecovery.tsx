@@ -85,8 +85,9 @@ export function TranscriptRecovery({
       console.log('Recovery successful:', result);
       onClose();
     } catch (error) {
+      // onRecover (page.tsx handleRecovery) already shows an error toast with
+      // the actual failure reason, so no additional alert here.
       console.error('Recovery failed:', error);
-      alert('Failed to recover meeting. Please try again.');
     } finally {
       setIsRecovering(false);
     }
@@ -113,6 +114,8 @@ export function TranscriptRecovery({
   };
 
   const selectedMeeting = recoverableMeetings.find(m => m.meetingId === selectedMeetingId);
+  // Nothing to recover if the meeting has neither transcripts nor audio
+  const nothingToRecover = !!selectedMeeting && selectedMeeting.transcriptCount === 0 && !selectedMeeting.folderPath;
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -249,8 +252,10 @@ export function TranscriptRecovery({
                         )}
                       </div>
                     ) : (
-                      <div className="flex items-center justify-center h-full text-muted-foreground">
-                        No transcripts to preview
+                      <div className="flex items-center justify-center h-full text-muted-foreground text-center px-6">
+                        {selectedMeeting.folderPath
+                          ? 'No transcripts were saved before the interruption. Recovering will restore the audio and re-transcribe it automatically.'
+                          : 'No transcripts to preview'}
                       </div>
                     )}
                   </ScrollArea>
@@ -291,7 +296,8 @@ export function TranscriptRecovery({
           </Button>
           <Button
             onClick={handleRecover}
-            disabled={!selectedMeetingId || isRecovering || isDeleting}
+            disabled={!selectedMeetingId || nothingToRecover || isRecovering || isDeleting}
+            title={nothingToRecover ? 'No transcripts or audio were saved for this meeting' : undefined}
           >
             {isRecovering ? (
               <>

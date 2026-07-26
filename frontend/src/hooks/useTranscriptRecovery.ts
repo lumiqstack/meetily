@@ -10,6 +10,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { indexedDBService, MeetingMetadata, StoredTranscript } from '@/services/indexedDBService';
 import { storageService } from '@/services/storageService';
 import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-preferences';
+import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
+import { useConfig } from '@/contexts/ConfigContext';
 import { toast } from 'sonner';
 
 interface AudioRecoveryStatus {
@@ -20,12 +22,20 @@ interface AudioRecoveryStatus {
   message: string;
 }
 
+export interface RecoveryResult {
+  success: boolean;
+  audioRecoveryStatus?: AudioRecoveryStatus | null;
+  meetingId?: string;
+  retranscriptionStarted?: boolean;
+  retranscriptionSkippedReason?: string;
+}
+
 export interface UseTranscriptRecoveryReturn {
   recoverableMeetings: MeetingMetadata[];
   isLoading: boolean;
   isRecovering: boolean;
   checkForRecoverableTranscripts: () => Promise<void>;
-  recoverMeeting: (meetingId: string) => Promise<{ success: boolean; audioRecoveryStatus?: AudioRecoveryStatus | null; meetingId?: string }>;
+  recoverMeeting: (meetingId: string) => Promise<RecoveryResult>;
   loadMeetingTranscripts: (meetingId: string) => Promise<StoredTranscript[]>;
   deleteRecoverableMeeting: (meetingId: string) => Promise<void>;
 }
@@ -34,6 +44,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
   const [recoverableMeetings, setRecoverableMeetings] = useState<MeetingMetadata[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
+  const { transcriptModelConfig, selectedLanguage } = useConfig();
 
   /**
    * Check for recoverable meetings in IndexedDB
@@ -107,7 +118,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
   /**
    * Recover a meeting from IndexedDB
    */
-  const recoverMeeting = useCallback(async (meetingId: string): Promise<{ success: boolean; audioRecoveryStatus?: AudioRecoveryStatus | null; meetingId?: string }> => {
+  const recoverMeeting = useCallback(async (meetingId: string): Promise<RecoveryResult> => {
     setIsRecovering(true);
     try {
       // 1. Load meeting metadata
@@ -118,9 +129,6 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
 
       // 2. Load all transcripts
       const transcripts = await loadMeetingTranscripts(meetingId);
-      if (transcripts.length === 0) {
-        throw new Error('No transcripts found for this meeting');
-      }
 
       // 3. Check for folder path
       let folderPath = metadata.folderPath;
@@ -133,6 +141,89 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         } catch (error) {
           folderPath = undefined;
         }
+      }
+
+      // Audio-only path: nothing was transcribed before the interruption, but
+      // audio checkpoints may still exist on disk.
+      if (transcripts.length === 0) {
+        if (!folderPath) {
+          throw new Error('No transcripts and no audio were saved for this meeting, so there is nothing to recover.');
+        }
+
+        // Merge checkpoints into audio.mp4. The command resolves even on
+        // failure, so the returned status must be checked explicitly.
+        const audioRecoveryStatus = await invoke<AudioRecoveryStatus>(
+          'recover_audio_from_checkpoints',
+          { meetingFolder: folderPath, sampleRate: 48000 }
+        );
+        if (audioRecoveryStatus.status !== 'success') {
+          throw new Error(`No transcripts were saved and audio recovery failed: ${audioRecoveryStatus.message}`);
+        }
+
+        // Create the meeting with an empty transcript list so retranscription
+        // has a meeting row to attach to.
+        const saveResponse = await storageService.saveMeeting(metadata.title, [], folderPath);
+        const savedMeetingId = saveResponse.meeting_id;
+
+        try {
+          await applyPinnedSummaryLanguageToMeeting(savedMeetingId);
+        } catch (error) {
+          console.warn('Failed to apply pinned summary language to recovered meeting:', error);
+          toast.warning('Could not apply default summary language', {
+            description: 'The recovered meeting was saved, but the default summary language was not applied.',
+          });
+        }
+
+        await indexedDBService.markMeetingSaved(meetingId);
+
+        // Retranscription reads the merged audio.mp4, not the checkpoints, so
+        // cleaning up now is safe.
+        try {
+          await invoke('cleanup_checkpoints', { meetingFolder: folderPath });
+        } catch (error) {
+          console.warn('Checkpoint cleanup failed (non-fatal):', error);
+        }
+
+        setRecoverableMeetings(prev => prev.filter(m => m.meetingId !== meetingId));
+
+        // Kick off background re-transcription of the recovered audio.
+        // Failure here is non-fatal: the audio and meeting are already saved
+        // and the user can retranscribe manually from the meeting page.
+        const BATCH_PROVIDERS = new Set(['localWhisper', 'whisper', 'parakeet', 'openaiCompatible']);
+        let retranscriptionStarted = false;
+        let retranscriptionSkippedReason: string | undefined;
+
+        if (!BATCH_PROVIDERS.has(transcriptModelConfig.provider)) {
+          retranscriptionSkippedReason = `Provider "${transcriptModelConfig.provider}" cannot re-transcribe saved audio. Open the meeting and use "Retranscribe" to pick a supported model.`;
+        } else {
+          const isParakeet = transcriptModelConfig.provider === 'parakeet';
+          const language = isParakeet || !selectedLanguage || selectedLanguage === 'auto' ? null : selectedLanguage;
+          try {
+            // Register the job toast before invoking so no progress event is missed
+            window.dispatchEvent(new CustomEvent('meetily-background-retranscription-started', {
+              detail: { meetingId: savedMeetingId, title: metadata.title },
+            }));
+            await invoke('start_retranscription_command', {
+              meetingId: savedMeetingId,
+              meetingFolderPath: folderPath,
+              language,
+              model: transcriptModelConfig.model || null,
+              provider: transcriptModelConfig.provider,
+            });
+            retranscriptionStarted = true;
+          } catch (error) {
+            backgroundJobStore.remove(savedMeetingId);
+            retranscriptionSkippedReason = error instanceof Error ? error.message : String(error);
+          }
+        }
+
+        return {
+          success: true,
+          audioRecoveryStatus,
+          meetingId: savedMeetingId,
+          retranscriptionStarted,
+          retranscriptionSkippedReason,
+        };
       }
 
       // 4. Attempt audio recovery if folder path exists
@@ -221,7 +312,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
     } finally {
       setIsRecovering(false);
     }
-  }, [loadMeetingTranscripts]);
+  }, [loadMeetingTranscripts, transcriptModelConfig, selectedLanguage]);
 
   /**
    * Delete a recoverable meeting
