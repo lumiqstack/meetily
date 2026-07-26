@@ -124,18 +124,34 @@ export default function Home() {
       const result = await recoverMeeting(meetingId);
 
       if (result.success) {
-        toast.success('Meeting recovered successfully!', {
-          description: result.audioRecoveryStatus?.status === 'success'
-            ? 'Transcripts and audio recovered'
-            : 'Transcripts recovered (no audio available)',
-          action: result.meetingId ? {
-            label: 'View Meeting',
-            onClick: () => {
-              router.push(`/meeting-details?id=${result.meetingId}`);
-            }
-          } : undefined,
-          duration: 10000,
-        });
+        const viewAction = result.meetingId ? {
+          label: 'View Meeting',
+          onClick: () => {
+            router.push(`/meeting-details?id=${result.meetingId}`);
+          }
+        } : undefined;
+
+        if (result.retranscriptionStarted) {
+          toast.success('Meeting recovered — transcribing audio', {
+            description: 'The recovered audio is being transcribed in the background.',
+            action: viewAction,
+            duration: 10000,
+          });
+        } else if (result.retranscriptionSkippedReason) {
+          toast.success('Meeting audio recovered', {
+            description: `Transcription was not started automatically: ${result.retranscriptionSkippedReason}`,
+            action: viewAction,
+            duration: 10000,
+          });
+        } else {
+          toast.success('Meeting recovered successfully!', {
+            description: result.audioRecoveryStatus?.status === 'success'
+              ? 'Transcripts and audio recovered'
+              : 'Transcripts recovered (no audio available)',
+            action: viewAction,
+            duration: 10000,
+          });
+        }
 
         // Refresh sidebar to show the newly recovered meeting
         await refetchMeetings();
