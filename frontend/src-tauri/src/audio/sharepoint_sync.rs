@@ -94,8 +94,19 @@ pub(crate) fn build_recordings_query_url(
         // The path segment goes inside an OData string literal; spaces and
         // unicode are fine there, but quotes must be doubled.
         odata_escape(&folder),
-        odata_escape(since_iso),
+        odata_escape(&odata_datetime(since_iso)),
     )
+}
+
+/// OData `datetime'…'` literals require a full ISO timestamp. Persisted sync
+/// state can carry a bare date (`2026-07-27`), which SharePoint rejects with
+/// InvalidClientQueryException — widen it to midnight UTC.
+fn odata_datetime(since_iso: &str) -> String {
+    if !since_iso.contains('T') {
+        format!("{since_iso}T00:00:00Z")
+    } else {
+        since_iso.to_string()
+    }
 }
 
 /// Search REST URL on the root host: tenant-wide video files newest first.
@@ -1412,6 +1423,13 @@ mod tests {
         assert!(url.contains("'/personal/user_corp_com/Documents/Recordings'"));
         assert!(url.contains("$filter=TimeCreated%20ge%20datetime'2026-07-01T00:00:00Z'"));
         assert!(url.contains("$orderby=TimeCreated%20desc"));
+    }
+
+    #[test]
+    fn bare_date_since_is_widened_to_a_full_odata_datetime() {
+        // Persisted sync state stores bare dates; OData rejects them.
+        let url = build_recordings_query_url("t-my.sharepoint.com", "/personal/u_c_com", "2026-07-27");
+        assert!(url.contains("datetime'2026-07-27T00:00:00Z'"));
     }
 
     #[test]
