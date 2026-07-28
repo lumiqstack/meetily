@@ -140,11 +140,6 @@ pub async fn ensure_multi_host_auth_mode<R: Runtime, F: Fn(&str)>(
 
     let _flow = AUTH_FLOW_LOCK.lock().await;
 
-    if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
-        let _ = existing.close();
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-
     let data_dir = app
         .path()
         .app_data_dir()
@@ -154,17 +149,7 @@ pub async fn ensure_multi_host_auth_mode<R: Runtime, F: Fn(&str)>(
 
     on_status("Connecting to SharePoint…");
 
-    let window = WebviewWindowBuilder::new(
-        app,
-        AUTH_WINDOW_LABEL,
-        WebviewUrl::External(url.clone()),
-    )
-    .title("Sign in to SharePoint — Meetily")
-    .inner_size(1024.0, 768.0)
-    .data_directory(data_dir)
-    .visible(false)
-    .build()
-    .context("Failed to open the SharePoint sign-in window")?;
+    let window = create_auth_window(app, &url, &data_dir).await?;
 
     // Authenticate the primary host: silent first, then interactive.
     let primary = match poll_for_auth(&window, &url, SILENT_TIMEOUT).await? {
@@ -270,13 +255,6 @@ pub async fn ensure_auth_cookies_mode<R: Runtime, F: Fn(&str)>(
 
     let _flow = AUTH_FLOW_LOCK.lock().await;
 
-    // Close any stale auth window from a previous attempt.
-    if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
-        let _ = existing.close();
-        // Give the runtime a moment to release the label.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-
     let data_dir = app
         .path()
         .app_data_dir()
@@ -286,17 +264,7 @@ pub async fn ensure_auth_cookies_mode<R: Runtime, F: Fn(&str)>(
 
     on_status("Connecting to SharePoint…");
 
-    let window = WebviewWindowBuilder::new(
-        app,
-        AUTH_WINDOW_LABEL,
-        WebviewUrl::External(url.clone()),
-    )
-    .title("Sign in to SharePoint — Meetily")
-    .inner_size(1024.0, 768.0)
-    .data_directory(data_dir)
-    .visible(false)
-    .build()
-    .context("Failed to open the SharePoint sign-in window")?;
+    let window = create_auth_window(app, &url, &data_dir).await?;
 
     // Phase 1: silent — maybe the persisted session is still valid.
     if let Some(cookies) = poll_for_auth(&window, &url, SILENT_TIMEOUT).await? {
@@ -332,6 +300,50 @@ pub async fn ensure_auth_cookies_mode<R: Runtime, F: Fn(&str)>(
             "Timed out waiting for SharePoint sign-in. Please try the import again."
         )),
     }
+}
+
+/// Create the hidden auth webview, evicting any leftover window first.
+///
+/// Eviction uses `destroy()`, not `close()`: a webview whose browser process
+/// already died (e.g. after a cookie-read panic) ignores the polite close and
+/// squats on the label forever, making every subsequent auth flow fail with
+/// "Failed to open the SharePoint sign-in window" until the app restarts
+/// (observed 2026-07-28). Creation is retried once after a longer settle for
+/// the same reason.
+async fn create_auth_window<R: Runtime>(
+    app: &AppHandle<R>,
+    url: &Url,
+    data_dir: &std::path::Path,
+) -> Result<tauri::WebviewWindow<R>> {
+    if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
+        let _ = existing.destroy();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    match build_auth_window(app, url, data_dir) {
+        Ok(w) => Ok(w),
+        Err(first) => {
+            warn!("Auth window creation failed ({first}); destroying leftovers and retrying once");
+            if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
+                let _ = existing.destroy();
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            build_auth_window(app, url, data_dir)
+                .context("Failed to open the SharePoint sign-in window")
+        }
+    }
+}
+
+fn build_auth_window<R: Runtime>(
+    app: &AppHandle<R>,
+    url: &Url,
+    data_dir: &std::path::Path,
+) -> tauri::Result<tauri::WebviewWindow<R>> {
+    WebviewWindowBuilder::new(app, AUTH_WINDOW_LABEL, WebviewUrl::External(url.clone()))
+        .title("Sign in to SharePoint — Meetily")
+        .inner_size(1024.0, 768.0)
+        .data_directory(data_dir.to_path_buf())
+        .visible(false)
+        .build()
 }
 
 /// Build a yt-dlp cookie file from cookies already harvested by a
