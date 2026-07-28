@@ -34,7 +34,7 @@ static RETRANSCRIPTION_JOBS: Lazy<JobRegistry> = Lazy::new(|| {
     )
 });
 
-fn is_retranscription_active_for_meeting(meeting_id: &str) -> bool {
+pub(crate) fn is_retranscription_active_for_meeting(meeting_id: &str) -> bool {
     RETRANSCRIPTION_JOBS.is_active(meeting_id)
 }
 

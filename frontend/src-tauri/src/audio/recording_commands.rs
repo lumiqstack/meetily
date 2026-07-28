@@ -108,6 +108,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // start below releases it; parked once the recording is actually running
     // and released in stop_recording.
     let engine_claim = if realtime_transcription_enabled {
+        // A background pipeline transcription holds the engine at a lower
+        // priority than the user starting a meeting: ask it to stop first.
+        // User-started jobs are untouched and still fail the claim below.
+        crate::pipeline::yield_engine_for_recording(std::time::Duration::from_secs(15)).await;
         Some(super::engine_coordinator::claim_recording_engine()?)
     } else {
         None
@@ -400,6 +404,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // start below releases it; parked once the recording is actually running
     // and released in stop_recording.
     let engine_claim = if realtime_transcription_enabled {
+        // A background pipeline transcription holds the engine at a lower
+        // priority than the user starting a meeting: ask it to stop first.
+        // User-started jobs are untouched and still fail the claim below.
+        crate::pipeline::yield_engine_for_recording(std::time::Duration::from_secs(15)).await;
         Some(super::engine_coordinator::claim_recording_engine()?)
     } else {
         None

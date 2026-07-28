@@ -22,6 +22,9 @@ pub enum NotificationType {
     TranscriptionComplete,
     MeetingReminder(u64), // Duration in minutes
     SystemError(String),
+    /// The automatic pipeline needs the user: currently only an expired
+    /// SharePoint session, which stops imports until they sign in.
+    PipelineAuthRequired,
     Test, // For testing notifications
 }
 

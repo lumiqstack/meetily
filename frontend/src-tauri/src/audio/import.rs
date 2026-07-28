@@ -52,6 +52,28 @@ fn is_url_download_active(import_id: &str) -> bool {
     URL_DOWNLOADS.contains_key(import_id)
 }
 
+/// Remove `meetily-url-*` / `meetily-vtt-*` work directories orphaned by a
+/// previous process (crash or kill skips the normal cleanup). Safe at startup:
+/// every import id is a fresh UUID, so a directory from an earlier process can
+/// never be picked up again.
+pub fn sweep_orphaned_work_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("meetily-url-") || name.starts_with("meetily-vtt-"))
+            && entry.path().is_dir()
+        {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => info!("Removed orphaned import work dir {name}"),
+                Err(e) => warn!("Could not remove orphaned import work dir {name}: {e}"),
+            }
+        }
+    }
+}
+
 fn cancel_url_download(import_id: Option<&str>) {
     match import_id {
         Some(id) => {
@@ -460,6 +482,9 @@ async fn start_import_with_guard<R: Runtime>(
                     "duration_seconds": res.duration_seconds
                 }),
             );
+            // A freshly imported meeting is pending a summary; let the
+            // automatic pipeline pick it up without waiting for its tick.
+            crate::pipeline::wake();
         }
         Err(e) => {
             let _ = app.emit(
@@ -883,7 +908,12 @@ async fn run_import<R: Runtime>(
     })
 }
 
-/// Emit progress event
+/// Emit progress event.
+///
+/// Targeted at the main window only: a broadcast `emit` also queues the event
+/// into every other webview — including the hidden SharePoint auth window,
+/// which during URL imports is mid-teardown and has been observed wedging the
+/// emitting task (frozen progress card while the download ran fine).
 fn emit_progress<R: Runtime>(
     app: &AppHandle<R>,
     import_id: &str,
@@ -891,7 +921,8 @@ fn emit_progress<R: Runtime>(
     progress: u32,
     message: &str,
 ) {
-    let _ = app.emit(
+    let _ = app.emit_to(
+        "main",
         "import-progress",
         ImportProgress {
             import_id: import_id.to_string(),
@@ -1356,6 +1387,7 @@ pub async fn start_import_from_url_command<R: Runtime>(
             provider,
             mode,
             cancel,
+            super::sharepoint::AuthMode::AllowInteractive,
         )
         .await;
 
@@ -1393,6 +1425,48 @@ pub async fn start_import_from_url_command<R: Runtime>(
     })
 }
 
+/// Run a URL import to completion, for callers that need to await the result
+/// rather than react to `import-*` events — currently the automatic pipeline.
+///
+/// Uses [`AuthMode::SilentOnly`] semantics via `auth_mode` so a background
+/// import never pops a sign-in window; the caller surfaces that as a pause.
+#[allow(clippy::too_many_arguments)]
+pub async fn import_from_url_internal<R: Runtime>(
+    app: AppHandle<R>,
+    url: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: Option<String>,
+    auth_mode: super::sharepoint::AuthMode,
+) -> Result<()> {
+    let import_id = format!("import-{}", Uuid::new_v4());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    URL_DOWNLOADS.insert(import_id.clone(), cancel.clone());
+
+    let result = run_url_import(
+        app.clone(),
+        import_id.clone(),
+        url,
+        title,
+        language,
+        model,
+        provider,
+        mode,
+        cancel,
+        auth_mode,
+    )
+    .await;
+
+    URL_DOWNLOADS.remove(&import_id);
+    // The job finished in-process either way, so its journal row must not
+    // survive to be reported as interrupted on the next launch.
+    super::job_persistence::try_clear_job(&app, &import_id).await;
+
+    result
+}
+
 /// Orchestrate a URL import: authenticate → download → hand off to the shared
 /// import pipeline. Returns `Ok(())` once the download has been handed to the
 /// pipeline (which then owns success/error reporting); returns `Err` only for
@@ -1408,6 +1482,7 @@ async fn run_url_import<R: Runtime>(
     provider: Option<String>,
     mode: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
+    auth_mode: super::sharepoint::AuthMode,
 ) -> Result<()> {
     use super::{sharepoint, url_import, ytdlp};
 
@@ -1450,13 +1525,30 @@ async fn run_url_import<R: Runtime>(
         super::sharepoint_sync::direct_sharepoint_media_url(&url)
     };
 
-    let media_path = if let Some(file_url) = direct_media {
+    // The URL the yt-dlp path works on. Normally the pasted link; when a
+    // direct download turns out to be blocked, the recording's player page.
+    let mut ytdlp_url = url.clone();
+    let mut direct_download = None;
+    // Cookies harvested by the direct branch, reused by the yt-dlp fallback so
+    // one import never signs the user in twice.
+    let mut prefetched_auth: Option<sharepoint::AuthCookies> = None;
+
+    if let Some(file_url) = direct_media.as_ref() {
         emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
         let host = file_url.host_str().unwrap_or_default().to_ascii_lowercase();
-        let auth = sharepoint::ensure_multi_host_auth(
+        // Sign in at the recording's own player page — the one URL the user
+        // is known to be able to open. A shared recording usually grants
+        // access to the file only: its site-collection root answers "you
+        // can't access this site" even to a fully signed-in user, which both
+        // parks the sign-in window on an error page and wedges session
+        // validation. FedAuth is host-scoped, so cookies minted here work for
+        // every URL on the host.
+        let auth_url = super::sharepoint_sync::player_page_url(file_url);
+        let auth = sharepoint::ensure_multi_host_auth_mode(
             &app,
-            &format!("https://{host}/"),
+            auth_url.as_str(),
             &[],
+            auth_mode,
             |msg| emit_progress(&app, &import_id, "downloading", 0, msg),
         )
         .await?;
@@ -1469,7 +1561,7 @@ async fn run_url_import<R: Runtime>(
             .filter(|c| !c.is_empty())
             .ok_or_else(|| anyhow!("SharePoint sign-in did not produce cookies for {host}"))?;
         let dl_result = super::sharepoint_sync::download_direct_file(
-            &file_url,
+            file_url,
             &super::sharepoint_sync::build_cookie_header(cookies),
             &work_dir,
             |pct| {
@@ -1485,21 +1577,59 @@ async fn run_url_import<R: Runtime>(
         )
         .await;
         match dl_result {
-            Ok(p) => p,
+            Ok(p) => direct_download = Some(p),
+            // View-only recording: SharePoint plays it but will not release
+            // the file. The player's manifest is the only remaining source of
+            // audio, so hand the player page to yt-dlp instead of giving up.
+            Err(e) if super::sharepoint_sync::is_download_blocked_error(&e.to_string()) => {
+                let _ = std::fs::remove_dir_all(&work_dir);
+                log::warn!(
+                    "SharePoint blocks downloading this recording; falling back to the player stream"
+                );
+                ytdlp_url = super::sharepoint_sync::player_page_url(file_url);
+                // FedAuth is host-scoped and the player page is on the same
+                // host we just signed in to, so hand those cookies straight
+                // to yt-dlp instead of opening a second sign-in window.
+                match sharepoint::auth_cookies_from_harvest(&app, &ytdlp_url, cookies.clone())
+                    .await
+                {
+                    Ok(a) => prefetched_auth = Some(a),
+                    Err(err) => log::warn!(
+                        "Could not reuse the direct-download session for yt-dlp \
+                         (will authenticate again): {err}"
+                    ),
+                }
+            }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&work_dir);
                 return Err(e);
             }
         }
+    }
+
+    let media_path = if let Some(path) = direct_download {
+        path
     } else {
         // Phase 1: authenticate. The engine is deliberately NOT held during
         // login or download so recording and other jobs remain usable
         // meanwhile.
-        emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
-        let auth = sharepoint::ensure_auth_cookies(&app, &url, |msg| {
-            emit_progress(&app, &import_id, "downloading", 0, msg);
-        })
-        .await?;
+        let auth = if let Some(a) = prefetched_auth.take() {
+            // The direct branch already signed in seconds ago on this host.
+            a
+        } else {
+            emit_progress(&app, &import_id, "downloading", 0, "Connecting to SharePoint…");
+            match sharepoint::ensure_auth_cookies_mode(&app, &ytdlp_url, auth_mode, |msg| {
+                emit_progress(&app, &import_id, "downloading", 0, msg);
+            })
+            .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&work_dir);
+                    return Err(e);
+                }
+            }
+        };
 
         if cancel.is_cancelled() {
             auth.cleanup();
@@ -1521,31 +1651,44 @@ async fn run_url_import<R: Runtime>(
         // meeting from it directly — no download, no Whisper, no engine guard.
         if is_transcript {
             let result =
-                run_transcript_import(&app, &import_id, &url, &title, &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
+                run_transcript_import(&app, &import_id, &ytdlp_url, &title, &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
                     .await;
             auth.cleanup();
             return result;
         }
 
-        // Phase 3: download into a dedicated working directory.
+        // Phase 3: download into a dedicated working directory. Progress is
+        // delivered through a channel and emitted from its own task: a Tauri
+        // emit can block (observed wedged after the auth window closed), and
+        // when it does it must sacrifice only UI updates — never the task
+        // draining yt-dlp's pipes (a full stdout pipe freezes the download).
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        let reporter = {
+            let app = app.clone();
+            let import_id = import_id.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(pct) = progress_rx.recv().await {
+                    emit_progress(
+                        &app,
+                        &import_id,
+                        "downloading",
+                        pct,
+                        &format!("Downloading recording… {pct}%"),
+                    );
+                }
+            })
+        };
         let dl_result = url_import::download_recording(
             &ytdlp_path,
             ffmpeg_path.as_deref(),
             &auth.cookies_txt,
-            &url,
+            &ytdlp_url,
             &work_dir,
-            |pct| {
-                emit_progress(
-                    &app,
-                    &import_id,
-                    "downloading",
-                    pct,
-                    &format!("Downloading recording… {pct}%"),
-                )
-            },
+            progress_tx,
             &cancel,
         )
         .await;
+        reporter.abort();
         auth.cleanup();
 
         match dl_result {
@@ -1740,6 +1883,8 @@ async fn run_transcript_import<R: Runtime>(
             "duration_seconds": duration_seconds,
         }),
     );
+    // Imported transcripts are immediately ready to summarize.
+    crate::pipeline::wake();
 
     Ok(())
 }

@@ -14,6 +14,20 @@ const isTauriRuntime = () => (
   '__TAURI_INTERNALS__' in window
 );
 
+/** Mirrors `PipelineSettings` in src-tauri/src/pipeline/settings.rs. */
+interface PipelineSettings {
+  enabled: boolean;
+  scan_interval_minutes: number;
+  idle_minutes: number;
+  grace_minutes: number;
+  summary_template_id: string;
+  summary_chunk_size: number;
+  summary_overlap: number;
+  max_attempts: number;
+  run_state: unknown;
+  last_scan_at: string | null;
+}
+
 export function PreferenceSettings() {
   const {
     notificationSettings,
@@ -32,6 +46,8 @@ export function PreferenceSettings() {
   const [obsidianFilenameTemplate, setObsidianFilenameTemplate] = useState("{date} {title}.md");
   const [obsidianAutoExport, setObsidianAutoExport] = useState(true);
   const [isSavingObsidianPath, setIsSavingObsidianPath] = useState(false);
+  const [pipelineSettings, setPipelineSettings] = useState<PipelineSettings | null>(null);
+  const [isSavingPipeline, setIsSavingPipeline] = useState(false);
   const hasTrackedViewRef = useRef(false);
 
   // Lazy load preferences on mount (only loads if not already cached)
@@ -59,6 +75,38 @@ export function PreferenceSettings() {
 
     loadObsidianSettings();
   }, []);
+
+  useEffect(() => {
+    const loadPipelineSettings = async () => {
+      if (!isTauriRuntime()) {
+        return;
+      }
+      try {
+        setPipelineSettings(await invoke<PipelineSettings>('pipeline_get_settings'));
+      } catch (error) {
+        console.error('Failed to load pipeline settings:', error);
+      }
+    };
+
+    loadPipelineSettings();
+  }, []);
+
+  const handleSavePipelineSettings = async () => {
+    if (!pipelineSettings) return;
+    setIsSavingPipeline(true);
+    try {
+      const saved = await invoke<PipelineSettings>('pipeline_set_settings', {
+        settingsUpdate: pipelineSettings,
+      });
+      setPipelineSettings(saved);
+      toast.success('Automatic pipeline settings saved');
+    } catch (error) {
+      console.error('Failed to save pipeline settings:', error);
+      toast.error('Failed to save automatic pipeline settings');
+    } finally {
+      setIsSavingPipeline(false);
+    }
+  };
 
   // Track preferences viewed analytics on every tab visit (once per mount)
   useEffect(() => {
@@ -455,6 +503,125 @@ export function PreferenceSettings() {
           </p>
         </div>
       </div>
+
+      {/* Automatic pipeline */}
+      {pipelineSettings && (
+        <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+          <h3 className="text-lg font-semibold mb-1">Automatic Pipeline</h3>
+          <p className="text-sm text-gray-600 mb-4">
+            Imports new SharePoint recordings, transcribes and summarizes them, and exports the
+            notes to Obsidian — running in the background while Meetily sits in the tray.
+          </p>
+
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="font-medium">Run automatically</div>
+                <div className="text-xs text-gray-600">
+                  Turn off to leave everything to the manual Process button.
+                </div>
+              </div>
+              <Switch
+                checked={pipelineSettings.enabled}
+                onCheckedChange={(checked) =>
+                  setPipelineSettings({ ...pipelineSettings, enabled: checked })
+                }
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="font-medium">Idle before transcribing (minutes)</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={pipelineSettings.idle_minutes}
+                  onChange={(event) =>
+                    setPipelineSettings({
+                      ...pipelineSettings,
+                      idle_minutes: Number(event.target.value),
+                    })
+                  }
+                  className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm"
+                />
+                <span className="text-xs text-gray-600">
+                  On-device transcription waits until the machine is unused this long, and always
+                  yields to a live recording.
+                </span>
+              </label>
+
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="font-medium">SharePoint scan every (minutes)</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={pipelineSettings.scan_interval_minutes}
+                  onChange={(event) =>
+                    setPipelineSettings({
+                      ...pipelineSettings,
+                      scan_interval_minutes: Number(event.target.value),
+                    })
+                  }
+                  className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm"
+                />
+                <span className="text-xs text-gray-600">
+                  Scans silently. If the session has expired you get a notification instead of a
+                  login popup.
+                </span>
+              </label>
+
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="font-medium">Summary template</span>
+                <input
+                  value={pipelineSettings.summary_template_id}
+                  onChange={(event) =>
+                    setPipelineSettings({
+                      ...pipelineSettings,
+                      summary_template_id: event.target.value,
+                    })
+                  }
+                  className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-mono"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="font-medium">Retries before giving up</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={pipelineSettings.max_attempts}
+                  onChange={(event) =>
+                    setPipelineSettings({
+                      ...pipelineSettings,
+                      max_attempts: Number(event.target.value),
+                    })
+                  }
+                  className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm"
+                />
+                <span className="text-xs text-gray-600">
+                  Only counts real failures — an unreachable summary endpoint retries indefinitely.
+                </span>
+              </label>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleSavePipelineSettings}
+                disabled={isSavingPipeline}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-60"
+              >
+                <Save className="w-4 h-4" />
+                Save
+              </button>
+              {pipelineSettings.last_scan_at && (
+                <span className="text-xs text-gray-500">
+                  Last scan: {new Date(pipelineSettings.last_scan_at).toLocaleString()}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Analytics Section */}
       <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">

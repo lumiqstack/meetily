@@ -51,6 +51,7 @@ pub mod anthropic;
 pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
+pub mod pipeline;
 pub mod state;
 pub mod summary;
 pub mod tray;
@@ -426,6 +427,9 @@ pub fn run() {
         .setup(|_app| {
             log::info!("Application setup complete");
 
+            // Clear import work dirs a crashed/killed previous process left behind.
+            audio::import::sweep_orphaned_work_dirs();
+
             // Initialize system tray
             if let Err(e) = tray::create_tray(_app.handle()) {
                 log::error!("Failed to create system tray: {}", e);
@@ -525,6 +529,12 @@ pub fn run() {
                 database::setup::initialize_database_on_startup(&_app.handle()).await
             })
             .expect("Failed to initialize database");
+
+            // Start the automatic meeting pipeline (scan → import → transcribe
+            // → summarize → export). It derives its work from the database on
+            // every tick, so it is safe to start before any of that work
+            // exists, and it idles cheaply when there is nothing to do.
+            pipeline::spawn_pipeline(_app.handle().clone());
 
             // Initialize bundled templates directory for dynamic template discovery
             log::info!("Initializing bundled templates directory...");
@@ -718,6 +728,13 @@ pub fn run() {
             obsidian::set_obsidian_settings,
             obsidian::open_obsidian_meetings_folder,
             obsidian::export_meeting_to_obsidian,
+            pipeline::commands::pipeline_get_status,
+            pipeline::commands::pipeline_get_settings,
+            pipeline::commands::pipeline_set_settings,
+            pipeline::commands::pipeline_pause,
+            pipeline::commands::pipeline_resume,
+            pipeline::commands::pipeline_process_now,
+            pipeline::commands::pipeline_sign_in_to_sharepoint,
             audio::recording_preferences::get_recording_preferences,
             audio::recording_preferences::set_recording_preferences,
             audio::recording_preferences::get_default_recordings_folder_path,
