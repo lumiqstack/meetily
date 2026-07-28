@@ -43,7 +43,13 @@ const AUTH_COOKIE_NAMES: &[&str] = &["fedauth", "edgeaccesscookie"];
 
 /// How long to wait for a silent (already-signed-in) session before showing
 /// the login window.
-const SILENT_TIMEOUT: Duration = Duration::from_secs(8);
+///
+/// The corporate SSO redirect chain takes ~10-13s to mint fresh FedAuth from
+/// the persisted profile (measured 2026-07-28: a shown window completed
+/// "interactively" in 5s with zero user input, and the sibling-host hop —
+/// which gets 20s — completed silently in 10s). At 8s the silent phase gave
+/// up moments before SSO finished, so every import prompted for sign-in.
+const SILENT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for the user to complete an interactive login.
 const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Silent-SSO hop to a sibling host (e.g. `tenant-my.sharepoint.com`) after
