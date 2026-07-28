@@ -1,15 +1,22 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 const STORE_FILE: &str = "obsidian_settings.json";
 const STORE_KEY: &str = "settings";
 const MEETINGS_FOLDER: &str = "Meetings";
-const DEFAULT_FILENAME_TEMPLATE: &str = "{date} {title}.md";
+/// New exports use `{short_id}` so two meetings sharing a date and title do
+/// not overwrite each other in the vault.
+const DEFAULT_FILENAME_TEMPLATE: &str = "{date} {title} {short_id}.md";
+/// The default template used before filename stability existed. Kept so
+/// pre-existing notes can be adopted (matched + reused) instead of being
+/// re-created under the new collision-safe name.
+const LEGACY_FILENAME_TEMPLATE: &str = "{date} {title}.md";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ObsidianSettings {
@@ -320,6 +327,84 @@ pub async fn open_obsidian_meetings_folder<R: Runtime>(app: AppHandle<R>) -> Res
     open_folder(&path).map_err(|e| e.to_string())
 }
 
+/// The database pool, if the app state is managed (it may not be during
+/// early startup or unit tests). Filename stability degrades gracefully to
+/// template rendering when the pool is unavailable.
+fn pool_of<R: Runtime>(app: &AppHandle<R>) -> Option<SqlitePool> {
+    app.try_state::<crate::state::AppState>()
+        .map(|state| state.db_manager.pool().clone())
+}
+
+async fn lookup_recorded_filename(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT filename FROM obsidian_exports WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn record_exported_filename(pool: &SqlitePool, meeting_id: &str, filename: &str) {
+    let exported_at = Utc::now().to_rfc3339();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO obsidian_exports (meeting_id, filename, exported_at) VALUES (?, ?, ?) \
+         ON CONFLICT(meeting_id) DO UPDATE SET filename = excluded.filename, exported_at = excluded.exported_at",
+    )
+    .bind(meeting_id)
+    .bind(filename)
+    .bind(exported_at)
+    .execute(pool)
+    .await
+    {
+        warn!(
+            "Obsidian export: failed to record filename for meeting {}: {}",
+            meeting_id, e
+        );
+    }
+}
+
+/// A note at `path` was written for `meeting_id` if its front matter carries
+/// the matching `meeting_id:` line (best-effort; only the header is scanned).
+fn note_belongs_to_meeting(path: &Path, meeting_id: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let needle = format!("meeting_id: \"{}\"", meeting_id);
+    content.lines().take(15).any(|line| line.contains(&needle))
+}
+
+/// Decide which filename to write this meeting to, preserving stability:
+/// 1. a filename already recorded for the meeting always wins;
+/// 2. otherwise adopt a pre-existing note (from before this table existed)
+///    whose front matter matches — legacy template first, then the current
+///    template — so earlier exports are not duplicated or renamed;
+/// 3. otherwise a fresh export uses the configured (collision-safe) template.
+/// Read-only: recording happens after a successful write.
+async fn resolve_export_filename(
+    pool: Option<&SqlitePool>,
+    settings: &ObsidianSettings,
+    meetings_dir: &Path,
+    meeting_id: &str,
+    title: &str,
+    created_at: &str,
+) -> String {
+    if let Some(pool) = pool {
+        if let Some(existing) = lookup_recorded_filename(pool, meeting_id).await {
+            return existing;
+        }
+    }
+
+    let current = render_filename_template(&settings.filename_template, meeting_id, title, created_at);
+    let legacy = render_filename_template(LEGACY_FILENAME_TEMPLATE, meeting_id, title, created_at);
+    for candidate in [&legacy, &current] {
+        if note_belongs_to_meeting(&meetings_dir.join(candidate), meeting_id) {
+            return candidate.clone();
+        }
+    }
+
+    current
+}
+
 /// Write a meeting note into the configured vault. Shared by the manual
 /// "Save to Obsidian" command and the automatic export after summary
 /// completion.
@@ -336,6 +421,7 @@ pub async fn export_meeting_note<R: Runtime>(
         .map_err(|e| e.to_string())?;
     let vault_path = settings
         .vault_path
+        .clone()
         .ok_or_else(|| "Set an Obsidian vault in Settings first".to_string())?;
 
     validate_vault_path(Path::new(&vault_path)).map_err(|e| e.to_string())?;
@@ -344,9 +430,17 @@ pub async fn export_meeting_note<R: Runtime>(
     std::fs::create_dir_all(&meetings_dir)
         .map_err(|e| format!("Failed to create Meetings folder: {}", e))?;
 
-    let filename =
-        render_filename_template(&settings.filename_template, meeting_id, title, created_at);
-    let file_path = meetings_dir.join(filename);
+    let pool = pool_of(app);
+    let filename = resolve_export_filename(
+        pool.as_ref(),
+        &settings,
+        &meetings_dir,
+        meeting_id,
+        title,
+        created_at,
+    )
+    .await;
+    let file_path = meetings_dir.join(&filename);
     let markdown = build_obsidian_markdown(
         meeting_id,
         title,
@@ -357,6 +451,10 @@ pub async fn export_meeting_note<R: Runtime>(
 
     std::fs::write(&file_path, markdown)
         .map_err(|e| format!("Failed to write Obsidian note: {}", e))?;
+
+    if let Some(pool) = pool.as_ref() {
+        record_exported_filename(pool, meeting_id, &filename).await;
+    }
 
     info!(
         "Exported meeting {} to Obsidian: {:?}",
@@ -427,6 +525,129 @@ mod tests {
             duration: None,
             speaker: speaker.map(|s| s.to_string()),
         }
+    }
+
+    async fn test_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations must apply to a fresh database");
+        pool
+    }
+
+    fn settings(template: &str) -> ObsidianSettings {
+        ObsidianSettings {
+            vault_path: Some("unused".to_string()),
+            filename_template: template.to_string(),
+            auto_export: true,
+        }
+    }
+
+    #[test]
+    fn default_template_disambiguates_same_date_and_title() {
+        // Two meetings, same date + title, must not collide.
+        let created = "2026-07-25T10:00:00Z";
+        let a = render_filename_template(DEFAULT_FILENAME_TEMPLATE, "aaaaaaaa-1111", "Standup", created);
+        let b = render_filename_template(DEFAULT_FILENAME_TEMPLATE, "bbbbbbbb-2222", "Standup", created);
+        assert_ne!(a, b);
+        assert!(a.contains("aaaaaaaa"));
+        assert!(b.contains("bbbbbbbb"));
+    }
+
+    #[tokio::test]
+    async fn recorded_filename_is_reused_even_after_title_changes() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let created = "2026-07-25T10:00:00Z";
+
+        let first = resolve_export_filename(
+            Some(&pool),
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            "meeting-123",
+            "Draft title",
+            created,
+        )
+        .await;
+        record_exported_filename(&pool, "meeting-123", &first).await;
+
+        // Re-summarization produces a new AI title; the note must not move.
+        let second = resolve_export_filename(
+            Some(&pool),
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            "meeting-123",
+            "Completely different final title",
+            created,
+        )
+        .await;
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn pre_existing_legacy_note_is_adopted_not_duplicated() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let created = "2026-07-25T10:00:00Z";
+
+        // A note written before the exports table existed, under the legacy
+        // `{date} {title}.md` name, carrying the meeting_id in front matter.
+        let legacy_name = render_filename_template(
+            LEGACY_FILENAME_TEMPLATE,
+            "meeting-xyz",
+            "Weekly Sync",
+            created,
+        );
+        std::fs::write(
+            dir.path().join(&legacy_name),
+            "---\nsource: meetily\nmeeting_id: \"meeting-xyz\"\n---\n\n# Weekly Sync\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_export_filename(
+            Some(&pool),
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            "meeting-xyz",
+            "Weekly Sync",
+            created,
+        )
+        .await;
+        assert_eq!(resolved, legacy_name);
+    }
+
+    #[tokio::test]
+    async fn unrelated_note_with_same_name_is_not_adopted() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let created = "2026-07-25T10:00:00Z";
+
+        // A same-named note belonging to a different meeting must be ignored,
+        // so the new export falls through to the collision-safe template.
+        let legacy_name =
+            render_filename_template(LEGACY_FILENAME_TEMPLATE, "meeting-a", "Weekly Sync", created);
+        std::fs::write(
+            dir.path().join(&legacy_name),
+            "---\nmeeting_id: \"some-other-meeting\"\n---\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_export_filename(
+            Some(&pool),
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            "meeting-a",
+            "Weekly Sync",
+            created,
+        )
+        .await;
+        assert_ne!(resolved, legacy_name);
+        assert!(resolved.contains("meeting-"));
     }
 
     #[test]

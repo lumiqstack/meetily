@@ -1,345 +1,171 @@
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { Loader2, Trash2 } from 'lucide-react';
+import { Loader2, Pause, Play, Trash2, LogIn } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ConfirmationModal } from '@/components/ConfirmationModel/confirmation-modal';
-import { useConfig } from '@/contexts/ConfigContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
-import { backgroundJobStore } from './BackgroundJobToast';
-import { summaryJobId } from '@/lib/background-jobs';
-import {
-  buildSummaryTranscriptPayload,
-  fetchAllTranscripts,
-  resolveSummaryLanguage,
-} from '@/lib/summary-payload';
 
-interface PendingMeetingResponse {
-  id: string;
+type PipelineStage = 'transcribe' | 'summarize';
+
+interface PendingSnapshotItem {
+  meeting_id: string;
   title: string;
+  stage: PipelineStage;
   created_at: string;
-  folder_path: string | null;
-  transcript_count: number;
-  summary_status: string | null;
+  attempts: number;
+  last_error: string | null;
+  suppressed: boolean;
+  eligible: boolean;
 }
 
-type PendingKind = 'transcription' | 'summary';
-
-interface PendingItem {
-  meetingId: string;
+interface CurrentItem {
+  meeting_id: string;
   title: string;
-  createdAt: string;
-  folderPath: string | null;
-  kind: PendingKind;
+  stage: string;
+  started_at: string;
 }
 
-const SUMMARY_POLL_INTERVAL_MS = 5000;
-const SUMMARY_POLL_MAX_ATTEMPTS = 200;
-/** Fallback cadence for detecting a finished retranscription if events are missed. */
-const RETRANSCRIPTION_FALLBACK_POLL_MS = 20000;
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-/**
- * Wait for a retranscription started by this panel to reach a terminal state.
- * Listeners are armed before the command is invoked, so completion can't be
- * missed; a slow poll of the backend job flag is kept as a safety net.
- */
-function waitForRetranscription(meetingId: string): {
-  promise: Promise<{ ok: boolean; error?: string }>;
-  cancel: () => void;
-} {
-  let settled = false;
-  const cleanupFns: Array<() => void> = [];
-  const cleanup = () => {
-    cleanupFns.splice(0).forEach((fn) => fn());
-  };
-
-  const promise = new Promise<{ ok: boolean; error?: string }>((resolve) => {
-    const settle = (ok: boolean, error?: string) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve({ ok, error });
-    };
-
-    listen<{ meeting_id: string }>('retranscription-complete', (event) => {
-      if (event.payload.meeting_id === meetingId) settle(true);
-    }).then((unlisten) => (settled ? unlisten() : cleanupFns.push(unlisten)));
-
-    listen<{ meeting_id: string; error: string }>('retranscription-error', (event) => {
-      if (event.payload.meeting_id === meetingId) settle(false, event.payload.error);
-    }).then((unlisten) => (settled ? unlisten() : cleanupFns.push(unlisten)));
-
-    const interval = setInterval(async () => {
-      try {
-        const inProgress = await invoke<boolean>('is_retranscription_in_progress_command');
-        if (inProgress) return;
-        // Job flag is down and no event arrived: infer the outcome from
-        // whether transcripts now exist.
-        const page = (await invoke('api_get_meeting_transcripts', {
-          meetingId,
-          limit: 1,
-          offset: 0,
-        })) as { total_count: number };
-        if (page.total_count > 0) {
-          settle(true);
-        } else {
-          settle(false, 'Transcription finished without producing any transcripts');
-        }
-      } catch {
-        // Keep waiting; the next tick or an event will settle it.
-      }
-    }, RETRANSCRIPTION_FALLBACK_POLL_MS);
-    cleanupFns.push(() => clearInterval(interval));
-  });
-
-  return {
-    promise,
-    cancel: () => {
-      settled = true;
-      cleanup();
-    },
-  };
+interface PipelineStatus {
+  state: 'running' | 'paused' | 'auth_required';
+  detail: string | null;
+  enabled: boolean;
+  current: CurrentItem | null;
+  pending: PendingSnapshotItem[];
+  last_scan_at: string | null;
 }
 
+const STAGE_LABEL: Record<PipelineStage, string> = {
+  transcribe: 'Needs transcript',
+  summarize: 'Needs summary',
+};
+
+const STAGE_BADGE: Record<PipelineStage, string> = {
+  transcribe: 'bg-blue-50 text-blue-700',
+  summarize: 'bg-amber-50 text-amber-700',
+};
+
 /**
- * Home-screen panel listing meetings with outstanding work — a recording
- * without a transcript, or a transcript without an AI summary. The user picks
- * any subset and Process runs them sequentially in the background, surfacing
- * progress through the shared background-jobs store. A meeting needing both
- * is fully processed in one go: transcription first, then summary.
+ * Home-screen view of the automatic pipeline: what still needs transcribing
+ * or summarizing, what it is working on right now, and why it is waiting.
+ *
+ * The processing itself lives in the Rust orchestrator
+ * (`src-tauri/src/pipeline`), which keeps running with the window closed —
+ * this panel only observes `pipeline-status` events and offers the manual
+ * overrides: process a meeting now (skipping the idle wait), pause/resume,
+ * sign in to SharePoint, and remove a meeting that keeps failing.
  */
 export function PendingWorkPanel() {
-  const { modelConfig, transcriptModelConfig } = useConfig();
   const { refetchMeetings } = useSidebar();
-  const [items, setItems] = useState<PendingItem[]>([]);
+  const [status, setStatus] = useState<PipelineStatus | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [failures, setFailures] = useState<Map<string, string>>(new Map());
-  const [deleteTarget, setDeleteTarget] = useState<PendingItem | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const processingRef = useRef(false);
-
-  const markFailed = useCallback((meetingId: string, message: string) => {
-    setFailures((prev) => new Map(prev).set(meetingId, message));
-  }, []);
-
-  const clearFailed = useCallback((meetingId: string) => {
-    setFailures((prev) => {
-      if (!prev.has(meetingId)) return prev;
-      const next = new Map(prev);
-      next.delete(meetingId);
-      return next;
-    });
-  }, []);
+  const [deleteTarget, setDeleteTarget] = useState<PendingSnapshotItem | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const pending = await invoke<PendingMeetingResponse[]>('api_get_pending_meetings');
-      const mapped: PendingItem[] = pending.map((m) => ({
-        meetingId: m.id,
-        title: m.title,
-        createdAt: m.created_at,
-        folderPath: m.folder_path,
-        kind: m.transcript_count === 0 ? 'transcription' : 'summary',
-      }));
-      setItems(mapped);
-      const valid = new Set(mapped.map((i) => i.meetingId));
-      setSelected((prev) => new Set([...prev].filter((id) => valid.has(id))));
-      setFailures((prev) => {
-        if (![...prev.keys()].some((id) => !valid.has(id))) return prev;
-        return new Map([...prev].filter(([id]) => valid.has(id)));
-      });
+      setStatus(await invoke<PipelineStatus>('pipeline_get_status'));
     } catch (error) {
-      console.warn('Failed to load pending meetings:', error);
+      console.error('Failed to read pipeline status:', error);
     }
   }, []);
 
+  // The orchestrator pushes a status event on every state change, so the
+  // panel never polls.
   useEffect(() => {
-    refresh();
-    // Retranscriptions finishing anywhere in the app (dialog, retry, this
-    // panel) resolve a pending item, so refresh the list.
-    const handleRetranscriptionComplete = () => {
-      refresh();
-    };
-    window.addEventListener(
-      'meetily-background-retranscription-complete',
-      handleRetranscriptionComplete
-    );
+    void refresh();
+    const unlisten = listen<PipelineStatus>('pipeline-status', (event) => {
+      setStatus(event.payload);
+    });
     return () => {
-      window.removeEventListener(
-        'meetily-background-retranscription-complete',
-        handleRetranscriptionComplete
-      );
+      void unlisten.then((fn) => fn());
     };
   }, [refresh]);
+
+  // A completed meeting leaves the pending list; keep the sidebar in step.
+  useEffect(() => {
+    if (!status) return;
+    setSelected((prev) => {
+      const alive = new Set(status.pending.map((item) => item.meeting_id));
+      const next = new Set([...prev].filter((id) => alive.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [status]);
+
+  const items = status?.pending ?? [];
+  const current = status?.current ?? null;
 
   const toggleItem = useCallback((meetingId: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(meetingId)) {
-        next.delete(meetingId);
-      } else {
-        next.add(meetingId);
-      }
+      next.has(meetingId) ? next.delete(meetingId) : next.add(meetingId);
       return next;
     });
   }, []);
 
-  const allSelected = items.length > 0 && items.every((i) => selected.has(i.meetingId));
+  const allSelected = items.length > 0 && items.every((i) => selected.has(i.meeting_id));
   const toggleAll = useCallback(() => {
-    setSelected(allSelected ? new Set() : new Set(items.map((i) => i.meetingId)));
+    setSelected(allSelected ? new Set() : new Set(items.map((i) => i.meeting_id)));
   }, [allSelected, items]);
 
-  const runTranscription = useCallback(
-    async (item: PendingItem): Promise<boolean> => {
-      if (!item.folderPath) {
-        backgroundJobStore.registerRetranscription(item.meetingId, item.title);
-        backgroundJobStore.applyError(item.meetingId, 'Meeting folder path not available');
-        markFailed(item.meetingId, 'Meeting folder path not available');
-        return false;
-      }
-
-      backgroundJobStore.registerRetranscription(item.meetingId, item.title);
-      const waiter = waitForRetranscription(item.meetingId);
-      try {
-        await invoke('start_retranscription_command', {
-          meetingId: item.meetingId,
-          meetingFolderPath: item.folderPath,
-          language: null,
-          model: transcriptModelConfig.model || null,
-          provider: transcriptModelConfig.provider || null,
-        });
-      } catch (err) {
-        waiter.cancel();
-        const message = typeof err === 'string' ? err : err instanceof Error ? err.message : String(err);
-        backgroundJobStore.applyError(item.meetingId, message);
-        markFailed(item.meetingId, message);
-        return false;
-      }
-      const result = await waiter.promise;
-      if (!result.ok) {
-        markFailed(item.meetingId, result.error ?? 'Transcription failed');
-      }
-      return result.ok;
-    },
-    [transcriptModelConfig, markFailed]
-  );
-
-  const runSummary = useCallback(
-    async (item: PendingItem): Promise<boolean> => {
-      const jobId = summaryJobId(item.meetingId);
-      backgroundJobStore.registerSummary(item.meetingId, item.title);
-      const fail = (message: string): false => {
-        backgroundJobStore.applyError(jobId, message);
-        markFailed(item.meetingId, message);
-        return false;
-      };
-      try {
-        const transcripts = await fetchAllTranscripts(item.meetingId);
-        if (!transcripts.length) {
-          throw new Error('No transcripts available for summary');
-        }
-        const payload = buildSummaryTranscriptPayload(transcripts);
-        const summaryLanguage = await resolveSummaryLanguage(
-          item.meetingId,
-          payload.transcriptTexts
-        );
-
-        backgroundJobStore.applyProgress(jobId, 5, 'Starting summary generation...');
-        await invoke('api_process_transcript', {
-          text: payload.transcriptText,
-          model: modelConfig.provider,
-          modelName: modelConfig.model,
-          meetingId: item.meetingId,
-          chunkSize: 40000,
-          overlap: 1000,
-          customPrompt: '',
-          templateId: 'standard_meeting',
-          summaryLanguage,
-        });
-
-        for (let attempt = 0; attempt < SUMMARY_POLL_MAX_ATTEMPTS; attempt++) {
-          await sleep(SUMMARY_POLL_INTERVAL_MS);
-          const result = (await invoke('api_get_summary', {
-            meetingId: item.meetingId,
-          })) as { status: string; error?: string | null };
-          const status = (result.status || '').toLowerCase();
-
-          if (status === 'completed') {
-            backgroundJobStore.applyProgress(jobId, 100, 'Summary ready');
-            backgroundJobStore.applyComplete(jobId);
-            return true;
-          }
-          if (status === 'failed' || status === 'error') {
-            return fail(result.error || 'Summary generation failed');
-          }
-          if (status === 'cancelled') {
-            return fail('Summary generation cancelled');
-          }
-          if (status === 'idle') {
-            return fail('Summary process not found');
-          }
-          backgroundJobStore.applyProgress(
-            jobId,
-            Math.min(90, 5 + attempt * 4),
-            'Generating summary...'
-          );
-        }
-        return fail('Timed out waiting for summary');
-      } catch (err) {
-        const message = typeof err === 'string' ? err : err instanceof Error ? err.message : String(err);
-        return fail(message);
-      }
-    },
-    [modelConfig, markFailed]
-  );
-
-  const handleProcess = useCallback(async () => {
-    if (processingRef.current) return;
-    const chosen = items.filter((i) => selected.has(i.meetingId));
-    if (!chosen.length) return;
-
-    processingRef.current = true;
-    setIsProcessing(true);
+  const handleProcessNow = useCallback(async () => {
+    const meetingIds = [...selected];
+    if (!meetingIds.length) return;
+    setBusy(true);
     try {
-      for (const item of chosen) {
-        clearFailed(item.meetingId);
-        if (item.kind === 'transcription') {
-          const transcribed = await runTranscription(item);
-          // One click fully processes the meeting: chain the summary once
-          // the fresh transcript exists.
-          if (transcribed) {
-            await runSummary(item);
-          }
-        } else {
-          await runSummary(item);
-        }
-        await refresh();
-      }
+      await invoke('pipeline_process_now', { meetingIds });
+      setSelected(new Set());
+      toast.success(
+        meetingIds.length === 1
+          ? 'Queued for processing now'
+          : `Queued ${meetingIds.length} meetings for processing now`
+      );
     } catch (error) {
-      console.error('Pending work processing failed:', error);
-      toast.error('Processing pending work failed', {
+      toast.error('Could not start processing', {
         description: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      processingRef.current = false;
-      setIsProcessing(false);
-      setSelected(new Set());
-      await refresh();
+      setBusy(false);
     }
-  }, [items, selected, runTranscription, runSummary, refresh, clearFailed]);
+  }, [selected]);
+
+  const handlePauseResume = useCallback(async () => {
+    if (!status) return;
+    setBusy(true);
+    try {
+      await invoke(status.state === 'paused' ? 'pipeline_resume' : 'pipeline_pause');
+    } catch (error) {
+      toast.error('Could not change the pipeline state', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, [status]);
+
+  const handleSignIn = useCallback(async () => {
+    setBusy(true);
+    try {
+      await invoke('pipeline_sign_in_to_sharepoint');
+      toast.success('Signed in to SharePoint — importing resumed');
+    } catch (error) {
+      toast.error('SharePoint sign-in failed', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   const handleDeleteConfirm = useCallback(async () => {
     if (!deleteTarget) return;
-    const { meetingId } = deleteTarget;
+    const meetingId = deleteTarget.meeting_id;
     setDeleteTarget(null);
     try {
       await invoke('api_delete_meeting', { meetingId });
-      clearFailed(meetingId);
       setSelected((prev) => {
         const next = new Set(prev);
         next.delete(meetingId);
@@ -353,11 +179,19 @@ export function PendingWorkPanel() {
         description: error instanceof Error ? error.message : String(error),
       });
     }
-  }, [deleteTarget, clearFailed, refresh, refetchMeetings]);
+  }, [deleteTarget, refresh, refetchMeetings]);
 
-  if (items.length === 0 && !isProcessing) {
+  // Nothing outstanding and nothing to report: stay out of the way.
+  if (!status || (items.length === 0 && !current && status.state === 'running')) {
     return null;
   }
+
+  const stateBanner =
+    status.state === 'auth_required'
+      ? status.detail ?? 'SharePoint sign-in needed'
+      : status.state === 'paused'
+        ? 'Pipeline paused — meetings stay in the list until you resume'
+        : null;
 
   return (
     <div className="flex justify-center px-4 pt-4">
@@ -366,65 +200,91 @@ export function PendingWorkPanel() {
           Pending work
         </p>
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-3">
+          {stateBanner && (
+            <div className="flex items-center justify-between gap-2 mb-2 px-2 py-1.5 rounded bg-amber-50 text-[12px] text-amber-800">
+              <span className="truncate">{stateBanner}</span>
+              {status.state === 'auth_required' && (
+                <Button size="sm" variant="outline" onClick={handleSignIn} disabled={busy}>
+                  <LogIn className="w-3.5 h-3.5" />
+                  Sign in
+                </Button>
+              )}
+            </div>
+          )}
+
+          {current && (
+            <div className="flex items-center gap-2 mb-2 px-2 py-1.5 rounded bg-gray-50 text-[12px] text-gray-700">
+              <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
+              <span className="truncate">
+                {current.stage === 'transcribe' ? 'Transcribing' : 'Summarizing'}{' '}
+                <span className="font-medium">{current.title}</span>
+              </span>
+            </div>
+          )}
+
           {items.length > 1 && (
             <label className="flex items-center gap-2 pb-2 mb-1 border-b border-gray-100 text-xs text-gray-500 cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={allSelected}
                 onChange={toggleAll}
-                disabled={isProcessing}
                 className="h-4 w-4 rounded border-gray-300 accent-gray-900"
               />
               Select all
             </label>
           )}
+
           <div className="space-y-1">
             {items.map((item) => {
-              const failure = failures.get(item.meetingId);
+              const isCurrent = current?.meeting_id === item.meeting_id;
               return (
                 <label
-                  key={item.meetingId}
+                  key={item.meeting_id}
                   className="flex items-center gap-2 py-1.5 cursor-pointer select-none"
                 >
                   <input
                     type="checkbox"
-                    checked={selected.has(item.meetingId)}
-                    onChange={() => toggleItem(item.meetingId)}
-                    disabled={isProcessing}
+                    checked={selected.has(item.meeting_id)}
+                    onChange={() => toggleItem(item.meeting_id)}
+                    disabled={isCurrent}
                     className="h-4 w-4 rounded border-gray-300 accent-gray-900"
                   />
                   <span className="flex-1 min-w-0">
-                    <span className="block text-sm text-gray-900 truncate">
-                      {item.title}
-                    </span>
-                    {failure && (
+                    <span className="block text-sm text-gray-900 truncate">{item.title}</span>
+                    {item.last_error && (
                       <span
                         className="block text-[11px] text-red-600 truncate"
-                        title={failure}
+                        title={item.last_error}
                       >
-                        {failure}
+                        {item.last_error}
                       </span>
                     )}
                   </span>
-                  {failure ? (
+
+                  {item.suppressed ? (
                     <span className="flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full bg-red-50 text-red-700">
                       Failed
                     </span>
+                  ) : item.last_error ? (
+                    <span
+                      className="flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full bg-orange-50 text-orange-700"
+                      title={`Attempt ${item.attempts} failed; will retry`}
+                    >
+                      Retrying
+                    </span>
                   ) : (
                     <span
-                      className={`flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full ${
-                        item.kind === 'transcription'
-                          ? 'bg-blue-50 text-blue-700'
-                          : 'bg-amber-50 text-amber-700'
-                      }`}
+                      className={`flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full ${STAGE_BADGE[item.stage]}`}
                     >
-                      {item.kind === 'transcription' ? 'Needs transcript' : 'Needs summary'}
+                      {STAGE_LABEL[item.stage]}
                     </span>
                   )}
+
                   <span className="flex-shrink-0 text-xs text-gray-400">
-                    {new Date(item.createdAt).toLocaleDateString()}
+                    {new Date(item.created_at).toLocaleDateString()}
                   </span>
-                  {failure && (
+
+                  {(item.suppressed || item.last_error) && (
                     <button
                       type="button"
                       onClick={(e) => {
@@ -432,7 +292,7 @@ export function PendingWorkPanel() {
                         e.stopPropagation();
                         setDeleteTarget(item);
                       }}
-                      disabled={isProcessing}
+                      disabled={isCurrent}
                       className="flex-shrink-0 p-1 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors disabled:opacity-50"
                       title="Remove meeting"
                     >
@@ -443,20 +303,23 @@ export function PendingWorkPanel() {
               );
             })}
           </div>
-          <div className="flex justify-end pt-2 mt-1 border-t border-gray-100">
-            <Button
-              size="sm"
-              onClick={handleProcess}
-              disabled={selected.size === 0 || isProcessing}
-            >
-              {isProcessing ? (
+
+          <div className="flex items-center justify-between pt-2 mt-1 border-t border-gray-100">
+            <Button size="sm" variant="ghost" onClick={handlePauseResume} disabled={busy}>
+              {status.state === 'paused' ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Processing...
+                  <Play className="w-4 h-4" />
+                  Resume
                 </>
               ) : (
-                `Process${selected.size > 0 ? ` (${selected.size})` : ''}`
+                <>
+                  <Pause className="w-4 h-4" />
+                  Pause
+                </>
               )}
+            </Button>
+            <Button size="sm" onClick={handleProcessNow} disabled={selected.size === 0 || busy}>
+              {`Process now${selected.size > 0 ? ` (${selected.size})` : ''}`}
             </Button>
           </div>
         </div>

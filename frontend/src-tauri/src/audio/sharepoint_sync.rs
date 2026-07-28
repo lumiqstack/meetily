@@ -39,6 +39,12 @@ pub struct SharePointRecording {
     pub size_bytes: Option<u64>,
 }
 
+/// [`derive_my_host`] for callers outside this module (the pipeline's
+/// sign-in command needs the same host list the scan authenticates).
+pub fn derive_my_host_public(host: &str) -> Option<String> {
+    derive_my_host(host)
+}
+
 /// `tenant.sharepoint.com` → `tenant-my.sharepoint.com`. Returns None when
 /// the host is already a -my host or not a *.sharepoint.com/us host.
 pub(crate) fn derive_my_host(host: &str) -> Option<String> {
@@ -248,15 +254,24 @@ pub(crate) fn file_url_key(file_url: &str) -> String {
 }
 
 /// The meeting title a file would get when imported (mirrors the frontend's
-/// `titleFromFileName`), lowercased for case-insensitive comparison against
-/// existing meeting titles.
-pub(crate) fn title_stem(file_name: &str) -> String {
+/// `titleFromFileName`): the file name without its extension.
+pub fn meeting_title_for(file_name: &str) -> String {
     let stem = match file_name.rfind('.') {
         Some(idx) if idx > 0 => &file_name[..idx],
         _ => file_name,
     };
     let stem = stem.trim();
-    if stem.is_empty() { file_name } else { stem }.to_lowercase()
+    if stem.is_empty() {
+        file_name.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// [`meeting_title_for`], lowercased for case-insensitive comparison against
+/// existing meeting titles.
+pub(crate) fn title_stem(file_name: &str) -> String {
+    meeting_title_for(file_name).to_lowercase()
 }
 
 /// Extensions we can hand to the audio import pipeline after downloading.
@@ -320,6 +335,234 @@ pub(crate) fn direct_sharepoint_media_url(raw: &str) -> Option<url::Url> {
     None
 }
 
+/// Marker embedded in the error when SharePoint answers but refuses to serve
+/// the file bytes — the "view-only" case, where playback is allowed and
+/// download is not. Callers match on it rather than on prose.
+pub(crate) const DOWNLOAD_BLOCKED_MARKER: &str = "sharepoint-download-blocked";
+
+/// Whether a download failed because SharePoint would not release the file,
+/// as opposed to a network, session, or not-found failure. Such a recording
+/// can still be captured from the player stream.
+pub(crate) fn is_download_blocked_error(error: &str) -> bool {
+    error.contains(DOWNLOAD_BLOCKED_MARKER)
+}
+
+/// The site collection a file lives in — `https://host/personal/<user>/`,
+/// `https://host/sites/<name>/`, or the host root for anything else.
+///
+/// Both auth and the `download.aspx` handler are site-scoped: a shared
+/// recording lives in someone else's site collection, so signing in at the
+/// host root is not enough to guarantee a session cookie that site accepts.
+pub(crate) fn site_collection_url(file_url: &url::Url) -> url::Url {
+    let segments: Vec<&str> = file_url
+        .path_segments()
+        .map(|s| s.collect())
+        .unwrap_or_default();
+    let managed = segments.first().map(|s| s.to_ascii_lowercase());
+    let path = match (managed.as_deref(), segments.get(1)) {
+        (Some("personal" | "sites" | "teams"), Some(name)) if !name.is_empty() => {
+            format!("/{}/{}/", segments[0], name)
+        }
+        _ => "/".to_string(),
+    };
+
+    let mut site = file_url.clone();
+    site.set_query(None);
+    site.set_fragment(None);
+    site.set_path(&path);
+    site
+}
+
+/// The Stream player page for a file, scoped to its own site collection —
+/// the URL shape yt-dlp's `SharePoint` extractor matches.
+///
+/// When SharePoint blocks the download but allows playback, the player's
+/// manifest is the only path to the audio, so this is what the yt-dlp
+/// fallback is pointed at. Built from the file URL rather than reusing a
+/// pasted link so it carries no `referrer=`/`nav=` query junk.
+pub(crate) fn player_page_url(file_url: &url::Url) -> String {
+    let site = site_collection_url(file_url);
+    let server_relative = percent_decode_component(file_url.path());
+    let encoded: String = url::form_urlencoded::byte_serialize(server_relative.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    format!("{site}_layouts/15/stream.aspx?id={encoded}")
+}
+
+/// URLs that may yield the bytes of a SharePoint media file, in preference
+/// order.
+///
+/// A plain GET on a media path is not reliable: SharePoint intercepts it and
+/// 302s into the Stream player page, which is HTML, not the file. The download
+/// switches below ask for the bytes explicitly, so they come first; the bare
+/// URL stays as a last resort because it does work on some libraries.
+pub(crate) fn download_url_candidates(file_url: &url::Url) -> Vec<url::Url> {
+    let mut with_switch = file_url.clone();
+    with_switch.query_pairs_mut().append_pair("download", "1");
+
+    let mut handler = site_collection_url(file_url);
+    handler.set_path(&format!("{}_layouts/15/download.aspx", handler.path()));
+    handler
+        .query_pairs_mut()
+        .append_pair("SourceUrl", file_url.as_str());
+
+    vec![with_switch, handler, file_url.clone()]
+}
+
+/// What a 3xx off a download request means. Only the first two are worth
+/// giving up over; the rest just mean this URL form was the wrong ask.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RedirectVerdict {
+    /// Bounced to a sign-in page: our cookies were not accepted.
+    Auth,
+    /// Signed in, but not allowed to read the file.
+    Denied,
+    /// Bounced into the web player or library UI — HTML, never bytes.
+    Viewer,
+    /// An ordinary hop, usually to a short-lived pre-authenticated storage URL.
+    Follow,
+}
+
+pub(crate) fn classify_redirect(location: &str) -> RedirectVerdict {
+    let loc = location.to_ascii_lowercase();
+    if loc.contains("accessdenied.aspx") {
+        return RedirectVerdict::Denied;
+    }
+    if loc.contains("login.microsoftonline.")
+        || loc.contains("login.microsoft.com")
+        || loc.contains("/_layouts/15/authenticate.aspx")
+        || loc.contains("/_forms/default.aspx")
+        || loc.contains("/adfs/ls")
+        || loc.contains("returnurl=")
+    {
+        return RedirectVerdict::Auth;
+    }
+    if loc.contains("stream.aspx")
+        || loc.contains("embed.aspx")
+        || loc.contains("onedrive.aspx")
+        || loc.contains("allitems.aspx")
+        || loc.contains("videoplayerpage.aspx")
+    {
+        return RedirectVerdict::Viewer;
+    }
+    RedirectVerdict::Follow
+}
+
+/// Host and path of a redirect target, for logs. The query is dropped: it can
+/// carry access tokens on storage-CDN hops.
+fn redirect_summary(url: &url::Url) -> String {
+    format!("{}{}", url.host_str().unwrap_or("<unknown>"), url.path())
+}
+
+/// Outcome of asking one candidate URL for the file bytes.
+enum FetchOutcome {
+    /// Headers say this is the file; the body is ready to stream.
+    Bytes(reqwest::Response),
+    /// This URL form did not work, but another might. Carries a log reason.
+    TryNext(String),
+    /// Signed in, but SharePoint refused to hand over the bytes. Downloads
+    /// can be blocked per-link, per-site, or by Conditional Access while
+    /// playback stays allowed. Other URL forms are still worth trying, but if
+    /// they all fail this is the reason worth reporting.
+    Denied(String),
+    /// No URL form will work — stop and tell the user why.
+    Fatal(anyhow::Error),
+}
+
+/// How many hops to follow before treating a redirect chain as a loop.
+const MAX_DOWNLOAD_HOPS: usize = 3;
+
+/// Ask one candidate URL for the file bytes, following benign redirects.
+async fn fetch_media_bytes(
+    client: &reqwest::Client,
+    candidate: &url::Url,
+    cookie_header: &str,
+) -> FetchOutcome {
+    let mut current = candidate.clone();
+    // Storage-CDN hops carry their own token in the URL; sending SharePoint
+    // cookies to another host is both useless and a needless disclosure.
+    let mut send_cookies = true;
+
+    for _ in 0..=MAX_DOWNLOAD_HOPS {
+        let mut request = client
+            .get(current.as_str())
+            .header("Accept", "*/*")
+            // Tells SharePoint we are not a browser, so an unusable session
+            // answers 401/403 instead of bouncing us to an HTML sign-in page.
+            .header("X-FORMS_BASED_AUTH_ACCEPTED", "f");
+        if send_cookies {
+            request = request.header("Cookie", cookie_header);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                return FetchOutcome::Fatal(
+                    anyhow!(e).context("The download request to SharePoint failed"),
+                )
+            }
+        };
+
+        let status = response.status();
+        if !status.is_redirection() {
+            if status == reqwest::StatusCode::FORBIDDEN {
+                return FetchOutcome::Denied(format!("{status}"));
+            }
+            if !status.is_success() {
+                return FetchOutcome::TryNext(format!("{status}"));
+            }
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if content_type.starts_with("text/html") {
+                return FetchOutcome::TryNext("answered with an HTML page".to_string());
+            }
+            return FetchOutcome::Bytes(response);
+        }
+
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let Some(location) = location else {
+            return FetchOutcome::TryNext(format!("{status} without a Location header"));
+        };
+        let Ok(next) = current.join(&location) else {
+            return FetchOutcome::TryNext(format!("{status} to an unparseable Location"));
+        };
+
+        match classify_redirect(next.as_str()) {
+            RedirectVerdict::Auth => {
+                return FetchOutcome::Fatal(anyhow!(
+                    "SharePoint sent the download to a sign-in page — the saved session was not accepted for this site. Sign in to SharePoint again and retry."
+                ))
+            }
+            RedirectVerdict::Denied => {
+                return FetchOutcome::Denied(format!(
+                    "{status} to {} (download refused)",
+                    redirect_summary(&next)
+                ))
+            }
+            RedirectVerdict::Viewer => {
+                return FetchOutcome::TryNext(format!(
+                    "{status} to the web player at {}",
+                    redirect_summary(&next)
+                ))
+            }
+            RedirectVerdict::Follow => {
+                send_cookies = next.host_str() == current.host_str();
+                current = next;
+            }
+        }
+    }
+
+    FetchOutcome::TryNext(format!("more than {MAX_DOWNLOAD_HOPS} redirects"))
+}
+
 /// Download a direct SharePoint file with the host's auth cookies, streaming
 /// to `work_dir` with percentage progress and cancellation.
 pub(crate) async fn download_direct_file<F: Fn(u32)>(
@@ -333,35 +576,49 @@ pub(crate) async fn download_direct_file<F: Fn(u32)>(
         .with_context(|| format!("Could not create work dir {}", work_dir.display()))?;
 
     let client = sp_client()?;
-    let mut response = client
-        .get(file_url.as_str())
-        .header("Cookie", cookie_header)
-        .send()
-        .await
-        .context("The download request to SharePoint failed")?;
+    let candidates = download_url_candidates(file_url);
+    let total_candidates = candidates.len();
+    let mut accepted = None;
+    let mut last_reason = None;
+    let mut denied = false;
 
-    let status = response.status();
-    if status.is_redirection() {
-        return Err(anyhow!(
-            "SharePoint redirected the download ({status}) — the sign-in was not accepted. Please try again."
-        ));
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let outcome = fetch_media_bytes(&client, candidate, cookie_header).await;
+        let reason = match outcome {
+            FetchOutcome::Bytes(response) => {
+                accepted = Some(response);
+                break;
+            }
+            FetchOutcome::Fatal(e) => return Err(e),
+            FetchOutcome::TryNext(reason) => reason,
+            FetchOutcome::Denied(reason) => {
+                denied = true;
+                reason
+            }
+        };
+        warn!(
+            "SharePoint download form {}/{total_candidates} ({}) rejected: {reason}",
+            idx + 1,
+            redirect_summary(candidate)
+        );
+        last_reason = Some(reason);
+        if cancel.is_cancelled() {
+            return Err(anyhow!("Import cancelled"));
+        }
     }
-    if !status.is_success() {
-        return Err(anyhow!(
-            "Could not download the recording: SharePoint returned {status}. It may be inaccessible, deleted, or require different permissions."
-        ));
-    }
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if content_type.starts_with("text/html") {
-        return Err(anyhow!(
-            "SharePoint answered with a sign-in page instead of the recording. Please try again."
-        ));
-    }
+
+    let mut response = accepted.ok_or_else(|| {
+        let reason = last_reason.unwrap_or_else(|| "no download URL was accepted".to_string());
+        if denied {
+            anyhow!(
+                "{DOWNLOAD_BLOCKED_MARKER}: SharePoint allows playing this recording but not downloading it ({reason}). Downloads can be blocked per share link, per site, or by a Teams recording policy."
+            )
+        } else {
+            anyhow!(
+                "Could not download the recording — SharePoint would not serve the file bytes ({reason}). It may be inaccessible, deleted, or need different permissions."
+            )
+        }
+    })?;
 
     let total = response.content_length();
     let raw_name = file_url
@@ -868,6 +1125,33 @@ fn save_sync_state<R: Runtime>(app: &AppHandle<R>, state: &SharePointSyncState) 
         .map_err(|e| anyhow!("Could not persist the sync store: {e}"))
 }
 
+/// Read the sync state (hub URL, watermark, imported ledger) from Rust —
+/// used by the automatic pipeline's scheduled scan.
+pub fn load_sync_state_public<R: Runtime>(app: &AppHandle<R>) -> SharePointSyncState {
+    load_sync_state(app)
+}
+
+/// Record a file as imported. The pipeline calls this only after the import
+/// actually landed, so a failed download is retried on the next scan.
+pub fn mark_imported_public<R: Runtime>(app: &AppHandle<R>, file_url: &str) {
+    let mut state = load_sync_state(app);
+    state
+        .imported
+        .insert(file_url.to_string(), chrono::Utc::now().to_rfc3339());
+    if let Err(e) = save_sync_state(app, &state) {
+        warn!("[sp-scan] could not record import of {file_url}: {e}");
+    }
+}
+
+/// Advance the "scanned up to" watermark.
+pub fn set_last_sync_date<R: Runtime>(app: &AppHandle<R>, iso: &str) {
+    let mut state = load_sync_state(app);
+    state.last_sync_date = Some(iso.to_string());
+    if let Err(e) = save_sync_state(app, &state) {
+        warn!("[sp-scan] could not persist last sync date: {e}");
+    }
+}
+
 #[tauri::command]
 pub async fn get_sharepoint_sync_state_command<R: Runtime>(
     app: AppHandle<R>,
@@ -974,6 +1258,26 @@ pub async fn sharepoint_scan_recordings_command<R: Runtime>(
     hub_url: String,
     since_iso: String,
 ) -> Result<SharePointScanResult, String> {
+    scan_recordings(
+        &app,
+        &hub_url,
+        &since_iso,
+        super::sharepoint::AuthMode::AllowInteractive,
+    )
+    .await
+}
+
+/// The scan itself, callable from the background pipeline with
+/// [`AuthMode::SilentOnly`] so an expired session never pops a login window.
+pub async fn scan_recordings<R: Runtime>(
+    app: &AppHandle<R>,
+    hub_url: &str,
+    since_iso: &str,
+    auth_mode: super::sharepoint::AuthMode,
+) -> Result<SharePointScanResult, String> {
+    let app = app.clone();
+    let hub_url = hub_url.to_string();
+    let since_iso = since_iso.to_string();
     let url = url::Url::parse(&hub_url).map_err(|e| format!("Invalid hub URL: {e}"))?;
     let root_host = url
         .host_str()
@@ -982,10 +1286,11 @@ pub async fn sharepoint_scan_recordings_command<R: Runtime>(
     let my_host = derive_my_host(&root_host)
         .ok_or("Could not derive the OneDrive host from the hub URL")?;
 
-    let auth = super::sharepoint::ensure_multi_host_auth(
+    let auth = super::sharepoint::ensure_multi_host_auth_mode(
         &app,
         &hub_url,
         &[my_host.clone()],
+        auth_mode,
         |msg| info!("[sp-scan] {msg}"),
     )
     .await
@@ -1368,6 +1673,121 @@ mod tests {
     #[test]
     fn search_parser_tolerates_empty_results() {
         assert!(parse_search_results(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn site_collection_url_finds_the_owning_site() {
+        let site = |raw: &str| site_collection_url(&url::Url::parse(raw).unwrap()).to_string();
+
+        // Someone else's OneDrive — the case that fails when we sign in at the
+        // host root instead.
+        assert_eq!(
+            site("https://t-my.sharepoint.com/personal/jpasquel_murex_com/Documents/Recordings/a.mp4"),
+            "https://t-my.sharepoint.com/personal/jpasquel_murex_com/"
+        );
+        assert_eq!(
+            site("https://t.sharepoint.com/sites/Events/Shared%20Documents/a.mp4?x=1"),
+            "https://t.sharepoint.com/sites/Events/"
+        );
+        assert_eq!(
+            site("https://t.sharepoint.com/teams/Eng/Recordings/a.mp4"),
+            "https://t.sharepoint.com/teams/Eng/"
+        );
+        // Root-hosted libraries have no managed path to peel off.
+        assert_eq!(
+            site("https://t.sharepoint.com/Shared%20Documents/a.mp4"),
+            "https://t.sharepoint.com/"
+        );
+    }
+
+    #[test]
+    fn download_candidates_ask_for_bytes_before_the_bare_url() {
+        // Non-ASCII in the name (Spanish recordings are titled "Grabación de
+        // la reunión") must survive into every candidate.
+        let file_url = url::Url::parse(
+            "https://t-my.sharepoint.com/personal/jpasquel_murex_com/Documents/Recordings/Copilot-Grabaci%C3%B3n.mp4",
+        )
+        .unwrap();
+        let candidates = download_url_candidates(&file_url);
+        assert_eq!(candidates.len(), 3);
+
+        assert_eq!(
+            candidates[0].as_str(),
+            "https://t-my.sharepoint.com/personal/jpasquel_murex_com/Documents/Recordings/Copilot-Grabaci%C3%B3n.mp4?download=1"
+        );
+        assert_eq!(
+            candidates[1].path(),
+            "/personal/jpasquel_murex_com/_layouts/15/download.aspx"
+        );
+        assert_eq!(
+            candidates[1]
+                .query_pairs()
+                .find(|(k, _)| k == "SourceUrl")
+                .map(|(_, v)| v.into_owned()),
+            Some(file_url.to_string())
+        );
+        assert_eq!(candidates[2], file_url);
+    }
+
+    #[test]
+    fn player_page_url_is_site_scoped_and_fully_encoded() {
+        // The shape yt-dlp's SharePoint extractor matches, rebuilt from the
+        // file URL so no referrer/nav junk from a pasted link rides along.
+        let file_url = url::Url::parse(
+            "https://t-my.sharepoint.com/personal/jpasquel_murex_com/Documents/Recordings/Copilot-Grabaci%C3%B3n.mp4",
+        )
+        .unwrap();
+        assert_eq!(
+            player_page_url(&file_url),
+            "https://t-my.sharepoint.com/personal/jpasquel_murex_com/_layouts/15/stream.aspx?\
+             id=%2Fpersonal%2Fjpasquel_murex_com%2FDocuments%2FRecordings%2FCopilot-Grabaci%C3%B3n.mp4"
+        );
+    }
+
+    #[test]
+    fn download_candidates_keep_an_existing_query() {
+        let file_url =
+            url::Url::parse("https://t.sharepoint.com/sites/E/R/a.mp4?csf=1&web=1").unwrap();
+        assert_eq!(
+            download_url_candidates(&file_url)[0].query(),
+            Some("csf=1&web=1&download=1")
+        );
+    }
+
+    #[test]
+    fn redirects_are_classified_by_target() {
+        use RedirectVerdict::*;
+        // The failure this ladder exists for: a plain GET on an .mp4 bounces
+        // into the Stream player, which is not an auth problem.
+        assert_eq!(
+            classify_redirect("https://t-my.sharepoint.com/personal/u/_layouts/15/stream.aspx?id=%2Fa.mp4"),
+            Viewer
+        );
+        assert_eq!(
+            classify_redirect("https://login.microsoftonline.com/common/oauth2/authorize?x=1"),
+            Auth
+        );
+        assert_eq!(
+            classify_redirect("https://t.sharepoint.com/_layouts/15/Authenticate.aspx?Source=%2Fa"),
+            Auth
+        );
+        assert_eq!(
+            classify_redirect("https://t.sharepoint.com/_layouts/15/AccessDenied.aspx?Source=%2Fa"),
+            Denied
+        );
+        // A short-lived storage URL is an ordinary hop we should follow.
+        assert_eq!(
+            classify_redirect("https://media.svc.ms/transform/videomanifest?token=abc"),
+            Follow
+        );
+    }
+
+    #[test]
+    fn redirect_summary_drops_the_query() {
+        assert_eq!(
+            redirect_summary(&url::Url::parse("https://media.svc.ms/v/x?token=secret").unwrap()),
+            "media.svc.ms/v/x"
+        );
     }
 
     #[test]

@@ -300,6 +300,9 @@ impl<R: Runtime> NotificationManager<R> {
             NotificationType::TranscriptionComplete => settings.notification_preferences.show_transcription_complete,
             NotificationType::MeetingReminder(_) => settings.notification_preferences.show_meeting_reminders,
             NotificationType::SystemError(_) => settings.notification_preferences.show_system_errors,
+            NotificationType::PipelineAuthRequired => {
+                settings.notification_preferences.show_pipeline_alerts
+            }
             NotificationType::Test => true, // Always show test notifications
         }
     }

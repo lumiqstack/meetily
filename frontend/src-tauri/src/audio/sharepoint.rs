@@ -12,6 +12,7 @@
 // session is reused and subsequent imports authenticate silently (the window
 // never has to be shown).
 
+use super::sharepoint_sync::{classify_redirect, RedirectVerdict};
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
 use std::path::PathBuf;
@@ -22,8 +23,23 @@ use url::Url;
 
 const AUTH_WINDOW_LABEL: &str = "meetily-sp-auth";
 
-/// Cookie names that indicate an authenticated SharePoint session.
-const AUTH_COOKIE_NAMES: &[&str] = &["fedauth", "rtfa", "edgeaccesscookie"];
+/// All auth flows share one webview window label, and every flow starts by
+/// closing any window that label still points at. Two concurrent flows (e.g. a
+/// background sync scan racing a user-initiated URL import) therefore destroy
+/// each other's window mid-poll, which surfaces as a `cookies_for_url` panic
+/// (`RecvError`: the webview died while servicing the cookie read). Serialize
+/// the flows instead — the loser waits, it does not kill the winner.
+static AUTH_FLOW_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// Cookie names that prove a *host-scoped* SharePoint session.
+///
+/// `rtFa` is deliberately absent. It is set domain-wide on `.sharepoint.com`,
+/// so it is already present the instant we touch any host in the tenant —
+/// before that host has minted its own FedAuth. Accepting it ends the poll
+/// early and hands out a cookie set that the host answers with 401s and
+/// sign-in redirects.
+const AUTH_COOKIE_NAMES: &[&str] = &["fedauth", "edgeaccesscookie"];
 
 /// How long to wait for a silent (already-signed-in) session before showing
 /// the login window.
@@ -34,6 +50,9 @@ const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(300);
 /// the primary host is signed in.
 const EXTRA_HOST_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(1200);
+/// While polling, re-probe an unchanged cookie set against the server at most
+/// this often (a fresh set is probed immediately).
+const VALIDATE_EVERY: Duration = Duration::from_secs(10);
 
 /// Result of an authentication attempt: the path to a Netscape `cookies.txt`
 /// the caller must delete when finished with it.
@@ -56,6 +75,25 @@ pub struct MultiHostAuth {
     pub host_cookies: std::collections::HashMap<String, Vec<Cookie<'static>>>,
 }
 
+/// Whether an expired session may interrupt the user with a login window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Show the sign-in window when the persisted session has expired.
+    AllowInteractive,
+    /// Never show UI: fail with [`AUTH_REQUIRED_MARKER`] instead, so
+    /// background work can ask the user at a time of their choosing.
+    SilentOnly,
+}
+
+/// Marker embedded in the error returned by a silent auth that needs the user
+/// to sign in. Callers match on it rather than on prose.
+pub const AUTH_REQUIRED_MARKER: &str = "sharepoint-auth-required";
+
+/// Whether an error came from a session that needs an interactive sign-in.
+pub fn is_auth_required_error(error: &str) -> bool {
+    error.contains(AUTH_REQUIRED_MARKER)
+}
+
 /// Like `ensure_auth_cookies`, but additionally visits `extra_hosts` with the
 /// same (hidden) webview session so their per-host auth cookies get minted —
 /// SSO normally completes these hops silently once the primary host is signed
@@ -67,12 +105,34 @@ pub async fn ensure_multi_host_auth<R: Runtime, F: Fn(&str)>(
     extra_hosts: &[String],
     on_status: F,
 ) -> Result<MultiHostAuth> {
+    ensure_multi_host_auth_mode(
+        app,
+        target_url,
+        extra_hosts,
+        AuthMode::AllowInteractive,
+        on_status,
+    )
+    .await
+}
+
+/// [`ensure_multi_host_auth`] with explicit control over whether the sign-in
+/// window may appear. Scheduled background scans use
+/// [`AuthMode::SilentOnly`] so a expired cookie never steals focus.
+pub async fn ensure_multi_host_auth_mode<R: Runtime, F: Fn(&str)>(
+    app: &AppHandle<R>,
+    target_url: &str,
+    extra_hosts: &[String],
+    mode: AuthMode,
+    on_status: F,
+) -> Result<MultiHostAuth> {
     let url = Url::parse(target_url).context("The SharePoint link is not a valid URL")?;
     if !is_sharepoint_host(&url) {
         return Err(anyhow!(
             "This link is not a SharePoint URL (expected a *.sharepoint.com host)."
         ));
     }
+
+    let _flow = AUTH_FLOW_LOCK.lock().await;
 
     if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
         let _ = existing.close();
@@ -105,6 +165,16 @@ pub async fn ensure_multi_host_auth<R: Runtime, F: Fn(&str)>(
         Some(cookies) => {
             info!("SharePoint session authenticated silently");
             cookies
+        }
+        None if mode == AuthMode::SilentOnly => {
+            // Background work must not pop a login window; report that a
+            // sign-in is needed and let the caller notify the user.
+            let _ = window.close();
+            debug!("Silent auth failed and interactive sign-in is not allowed here");
+            return Err(anyhow!(
+                "{AUTH_REQUIRED_MARKER}: SharePoint sign-in required for {}",
+                url.host_str().unwrap_or("SharePoint")
+            ));
         }
         None => {
             on_status("Waiting for you to sign in to SharePoint…");
@@ -151,7 +221,7 @@ pub async fn ensure_multi_host_auth<R: Runtime, F: Fn(&str)>(
             warn!("Could not navigate auth window to {host}: {e}");
             continue;
         }
-        match poll_for_fedauth(&window, &host_url, EXTRA_HOST_TIMEOUT).await {
+        match poll_for_auth(&window, &host_url, EXTRA_HOST_TIMEOUT).await {
             Ok(Some(cookies)) => {
                 info!("Authenticated silently on {host}");
                 host_cookies.insert(host, cookies);
@@ -175,12 +245,24 @@ pub async fn ensure_auth_cookies<R: Runtime, F: Fn(&str)>(
     target_url: &str,
     on_status: F,
 ) -> Result<AuthCookies> {
+    ensure_auth_cookies_mode(app, target_url, AuthMode::AllowInteractive, on_status).await
+}
+
+/// [`ensure_auth_cookies`] with explicit control over interactive sign-in.
+pub async fn ensure_auth_cookies_mode<R: Runtime, F: Fn(&str)>(
+    app: &AppHandle<R>,
+    target_url: &str,
+    mode: AuthMode,
+    on_status: F,
+) -> Result<AuthCookies> {
     let url = Url::parse(target_url).context("The recording link is not a valid URL")?;
     if !is_sharepoint_host(&url) {
         return Err(anyhow!(
             "This link is not a SharePoint/Stream recording URL (expected a *.sharepoint.com host)."
         ));
     }
+
+    let _flow = AUTH_FLOW_LOCK.lock().await;
 
     // Close any stale auth window from a previous attempt.
     if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
@@ -217,6 +299,15 @@ pub async fn ensure_auth_cookies<R: Runtime, F: Fn(&str)>(
         return write_cookies(app, &url, cookies).await;
     }
 
+    // Background callers stop here rather than interrupting the user.
+    if mode == AuthMode::SilentOnly {
+        let _ = window.close();
+        return Err(anyhow!(
+            "{AUTH_REQUIRED_MARKER}: SharePoint sign-in required for {}",
+            url.host_str().unwrap_or("SharePoint")
+        ));
+    }
+
     // Phase 2: interactive — show the window and let the user sign in.
     on_status("Waiting for you to sign in to SharePoint…");
     debug!("Silent auth failed; showing login window");
@@ -237,19 +328,74 @@ pub async fn ensure_auth_cookies<R: Runtime, F: Fn(&str)>(
     }
 }
 
-/// Poll the webview's cookie store until an auth cookie appears or `timeout`
-/// elapses. Cookie reads are done on a blocking thread because the webview
-/// runtime blocks the caller while it services the request on the main thread.
+/// Build a yt-dlp cookie file from cookies already harvested by a
+/// [`ensure_multi_host_auth_mode`] flow in the same import, so the fallback
+/// from a blocked direct download to the player stream does not run a second
+/// sign-in (each flow opens its own webview, and the fresh session is not
+/// always visible to the next one immediately — observed re-prompting the
+/// user 90 seconds after a successful login).
+pub async fn auth_cookies_from_harvest<R: Runtime>(
+    app: &AppHandle<R>,
+    target_url: &str,
+    cookies: Vec<Cookie<'static>>,
+) -> Result<AuthCookies> {
+    let url = Url::parse(target_url).context("The recording link is not a valid URL")?;
+    write_cookies(app, &url, cookies).await
+}
+
+/// Poll the webview's cookie store until an auth cookie appears **and the
+/// server still accepts it**, or `timeout` elapses. Cookie reads are done on a
+/// blocking thread because the webview runtime blocks the caller while it
+/// services the request on the main thread.
+///
+/// Presence alone is not enough: the persisted webview profile keeps FedAuth
+/// cookies long after the server has expired them, and a stale cookie passing
+/// the silent check means the sign-in window is never offered while every
+/// download bounces to login (observed 2026-07-27). Rejected sets are
+/// remembered by fingerprint so we only re-probe them occasionally — the
+/// webview may complete a silent SSO refresh behind our back at any time.
 async fn poll_for_auth<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     url: &Url,
     timeout: Duration,
 ) -> Result<Option<Vec<Cookie<'static>>>> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut rejected_fp = String::new();
+    let mut last_probe: Option<tokio::time::Instant> = None;
+    let mut read_failures: u32 = 0;
     loop {
-        let cookies = read_cookies(window, url).await?;
+        // A failed read is not fatal by itself: the webview can be mid-navigation
+        // (SSO redirects) and drop the request. Only give up when the reads fail
+        // repeatedly — that means the window itself is gone.
+        let cookies = match read_cookies(window, url).await {
+            Ok(c) => {
+                read_failures = 0;
+                c
+            }
+            Err(e) => {
+                read_failures += 1;
+                if read_failures == 1 {
+                    warn!("Cookie read failed (will keep polling): {e}");
+                }
+                if read_failures >= 5 {
+                    return Err(e.context("The SharePoint sign-in window is not responding"));
+                }
+                Vec::new()
+            }
+        };
         if has_auth_cookie(&cookies) {
-            return Ok(Some(cookies));
+            let fp = auth_fingerprint(&cookies);
+            let probe_due = last_probe
+                .map(|t| t.elapsed() >= VALIDATE_EVERY)
+                .unwrap_or(true);
+            if fp != rejected_fp || probe_due {
+                last_probe = Some(tokio::time::Instant::now());
+                if session_is_valid(url, &cookies).await {
+                    return Ok(Some(cookies));
+                }
+                debug!("SharePoint rejected the current cookie set; waiting for a fresh sign-in");
+                rejected_fp = fp;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
@@ -258,30 +404,62 @@ async fn poll_for_auth<R: Runtime>(
     }
 }
 
-/// Like `poll_for_auth`, but requires the host-scoped `FedAuth` cookie
-/// specifically. Domain-wide cookies (rtFa lives on `.sharepoint.com`)
-/// satisfy `has_auth_cookie` the moment we hop to a sibling host — before
-/// that host's own FedAuth is minted — and a cookie set without FedAuth
-/// gets 401s from that host's REST API.
-async fn poll_for_fedauth<R: Runtime>(
-    window: &tauri::WebviewWindow<R>,
-    url: &Url,
-    timeout: Duration,
-) -> Result<Option<Vec<Cookie<'static>>>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let cookies = read_cookies(window, url).await?;
-        if cookies
-            .iter()
-            .any(|c| c.name().eq_ignore_ascii_case("fedauth"))
-        {
-            return Ok(Some(cookies));
+/// Opaque fingerprint of the auth cookies, to notice when a sign-in mints new
+/// tokens. Compared, never logged.
+fn auth_fingerprint(cookies: &[Cookie<'static>]) -> String {
+    let mut parts: Vec<String> = cookies
+        .iter()
+        .filter(|c| AUTH_COOKIE_NAMES.contains(&c.name().to_ascii_lowercase().as_str()))
+        .map(|c| format!("{}={}", c.name(), c.value()))
+        .collect();
+    parts.sort();
+    parts.join(";")
+}
+
+/// Ask SharePoint whether this cookie set is still a live session. Only a
+/// sign-in bounce or a 401 counts as dead — a page, a viewer redirect, or even
+/// AccessDenied all prove the session itself is alive.
+async fn session_is_valid(url: &Url, cookies: &[Cookie<'static>]) -> bool {
+    let header = cookies
+        .iter()
+        .map(|c| format!("{}={}", c.name(), c.value()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return true, // can't probe — don't block the flow
+    };
+    let resp = match client
+        .get(url.clone())
+        .header(reqwest::header::COOKIE, header)
+        // Answer 401/403 instead of an HTML sign-in bounce where possible.
+        .header("X-FORMS_BASED_AUTH_ACCEPTED", "f")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Session validation probe failed ({e}); assuming the session is usable");
+            return true;
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return false;
     }
+    if status.is_redirection() {
+        let target = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        return !matches!(classify_redirect(target), RedirectVerdict::Auth);
+    }
+    true
 }
 
 /// Read cookies for `url` off the async worker (the runtime call is blocking).

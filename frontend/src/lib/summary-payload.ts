@@ -9,9 +9,12 @@ import {
 } from '@/lib/summary-language-preferences';
 
 /**
- * Shared helpers for kicking off AI summary generation. Extracted from
- * useSummaryGeneration so the home-screen PendingWorkPanel formats the
- * transcript payload and resolves language identically to meeting-details.
+ * Shared helpers for kicking off AI summary generation from the meeting
+ * details view.
+ *
+ * The automatic pipeline builds the same payload in Rust
+ * (`src-tauri/src/pipeline/summary_stage.rs::build_summary_transcript_text`);
+ * the two formats are kept identical and covered by a test there.
  */
 
 export async function resolveSummaryLanguage(

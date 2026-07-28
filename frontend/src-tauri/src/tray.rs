@@ -48,9 +48,69 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
             }
         }
         "check_updates" => check_updates_handler(app),
+        "pause_pipeline" => set_pipeline_paused(app, true),
+        "resume_pipeline" => set_pipeline_paused(app, false),
+        "pipeline_sign_in" => pipeline_sign_in_handler(app),
         "quit" => app.exit(0),
         _ => {}
     }
+}
+
+fn set_pipeline_paused<R: Runtime>(app: &AppHandle<R>, paused: bool) {
+    use crate::pipeline::settings::PipelineRunState;
+
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(pipeline) = crate::pipeline::handle() else {
+            return;
+        };
+        let state = if paused {
+            PipelineRunState::PausedByUser
+        } else {
+            PipelineRunState::Running
+        };
+        pipeline.set_run_state(state.clone()).await;
+        crate::pipeline::settings::save_run_state(&app_clone, &state).await;
+        if !paused {
+            pipeline.wake();
+        }
+        update_tray_menu_async(&app_clone).await;
+    });
+}
+
+/// The pipeline paused for an expired SharePoint session; the user asked to
+/// sign in from the tray, so showing the login window here is expected.
+fn pipeline_sign_in_handler<R: Runtime>(app: &AppHandle<R>) {
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let sync_state = crate::audio::sharepoint_sync::load_sync_state_public(&app_clone);
+        let Some(hub_url) = sync_state.hub_url.filter(|u| !u.trim().is_empty()) else {
+            log::warn!("Tray: no SharePoint hub URL configured");
+            return;
+        };
+        let extra_hosts: Vec<String> = url::Url::parse(&hub_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+            .and_then(|host| crate::audio::sharepoint_sync::derive_my_host_public(&host))
+            .into_iter()
+            .collect();
+
+        match crate::audio::sharepoint::ensure_multi_host_auth(
+            &app_clone,
+            &hub_url,
+            &extra_hosts,
+            |msg| log::info!("[pipeline] {msg}"),
+        )
+        .await
+        {
+            Ok(_) => {
+                crate::pipeline::scan_stage::clear_auth_required(&app_clone).await;
+                log::info!("Tray: SharePoint sign-in complete; pipeline resumed");
+            }
+            Err(e) => log::warn!("Tray: SharePoint sign-in failed: {}", e),
+        }
+        update_tray_menu_async(&app_clone).await;
+    });
 }
 fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
     focus_main_window(app);
@@ -379,6 +439,40 @@ fn build_menu<R: Runtime>(
                 );
             }
         }
+    }
+
+    // Automatic pipeline: status line plus the one action that state allows.
+    // Read without blocking — this runs on the UI thread.
+    if let Some(state) = crate::pipeline::handle().and_then(|p| p.run_state_hint()) {
+        let current = crate::pipeline::handle().and_then(|p| p.current_hint());
+
+        let status_label = match (&state, &current) {
+            (crate::pipeline::settings::PipelineRunState::PausedByUser, _) => {
+                "⏸ Pipeline paused".to_string()
+            }
+            (crate::pipeline::settings::PipelineRunState::AuthRequired { .. }, _) => {
+                "⚠ SharePoint sign-in needed".to_string()
+            }
+            (_, Some(item)) => format!("⚙ {}: {}", item.stage, item.title),
+            (_, None) => "✓ Pipeline idle".to_string(),
+        };
+
+        builder = builder
+            .item(&PredefinedMenuItem::separator(app)?)
+            .item(&MenuItemBuilder::new(status_label).enabled(false).build(app)?);
+
+        builder = match state {
+            crate::pipeline::settings::PipelineRunState::PausedByUser => builder.item(
+                &MenuItemBuilder::with_id("resume_pipeline", "▶ Resume Pipeline").build(app)?,
+            ),
+            crate::pipeline::settings::PipelineRunState::AuthRequired { .. } => builder.item(
+                &MenuItemBuilder::with_id("pipeline_sign_in", "Sign in to SharePoint…")
+                    .build(app)?,
+            ),
+            crate::pipeline::settings::PipelineRunState::Running => builder.item(
+                &MenuItemBuilder::with_id("pause_pipeline", "⏸ Pause Pipeline").build(app)?,
+            ),
+        };
     }
 
     builder

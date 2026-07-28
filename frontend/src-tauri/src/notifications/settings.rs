@@ -58,8 +58,18 @@ pub struct NotificationPreferences {
     /// Show system error notifications
     pub show_system_errors: bool,
 
+    /// Show automatic-pipeline alerts that need the user (e.g. an expired
+    /// SharePoint session blocking imports). Defaulted so settings files
+    /// written before this flag existed still load.
+    #[serde(default = "default_show_pipeline_alerts")]
+    pub show_pipeline_alerts: bool,
+
     /// Minutes before meeting to show reminder (0 = disabled)
     pub meeting_reminder_minutes: Vec<u64>,
+}
+
+fn default_show_pipeline_alerts() -> bool {
+    true
 }
 
 impl Default for NotificationSettings {
@@ -88,6 +98,7 @@ impl Default for NotificationPreferences {
             show_transcription_complete: true,
             show_meeting_reminders: true,
             show_system_errors: true,
+            show_pipeline_alerts: default_show_pipeline_alerts(),
             meeting_reminder_minutes: vec![15, 5], // 15 minutes and 5 minutes before
         }
     }
