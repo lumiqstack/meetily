@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { findPresetModelLabel } from '@/lib/remote-transcription-presets';
 
 export interface RawModelInfo {
   name: string;
@@ -17,6 +18,7 @@ export interface ModelOption {
 interface TranscriptModelConfig {
   provider?: string;
   model?: string;
+  baseUrl?: string | null;
 }
 
 /**
@@ -79,10 +81,11 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
 
     // Offer the configured remote endpoint as a model option
     if (transcriptModelConfig?.provider === 'openaiCompatible' && transcriptModelConfig?.model) {
+      const presetLabel = findPresetModelLabel(transcriptModelConfig.baseUrl, transcriptModelConfig.model);
       allModels.unshift({
         provider: 'openaiCompatible',
         name: transcriptModelConfig.model,
-        displayName: `🌐 Remote: ${transcriptModelConfig.model}`,
+        displayName: `🌐 Remote: ${presetLabel ?? transcriptModelConfig.model}`,
         size_mb: 0,
       });
     }
