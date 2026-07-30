@@ -9,6 +9,11 @@ import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import {
+    REMOTE_TRANSCRIPTION_PRESETS,
+    RemoteTranscriptionPreset,
+    matchPresetFromBaseUrl,
+} from '@/lib/remote-transcription-presets';
 
 
 export interface TranscriptModelProps {
@@ -25,6 +30,16 @@ export interface TranscriptSettingsProps {
     onModelSelect?: () => void;
 }
 
+// Fall back to the custom preset when the saved model isn't in the matched
+// preset's curated list (e.g. it was hand-typed before presets existed).
+function resolvePresetId(baseUrl?: string | null, model?: string): RemoteTranscriptionPreset['id'] {
+    const preset = matchPresetFromBaseUrl(baseUrl);
+    if (preset.id !== 'custom' && model && !preset.models.some((m) => m.id === model)) {
+        return 'custom';
+    }
+    return preset.id;
+}
+
 export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelConfig, onModelSelect }: TranscriptSettingsProps) {
     const { isRecording } = useRecordingState();
     const [apiKey, setApiKey] = useState<string | null>(transcriptModelConfig.apiKey || null);
@@ -35,6 +50,12 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [remoteBaseUrl, setRemoteBaseUrl] = useState<string>(transcriptModelConfig.baseUrl || '');
     const [remoteModel, setRemoteModel] = useState<string>(
         transcriptModelConfig.provider === 'openaiCompatible' ? transcriptModelConfig.model : ''
+    );
+    const [remotePresetId, setRemotePresetId] = useState<RemoteTranscriptionPreset['id']>(
+        resolvePresetId(
+            transcriptModelConfig.baseUrl,
+            transcriptModelConfig.provider === 'openaiCompatible' ? transcriptModelConfig.model : undefined
+        )
     );
     const [remoteSaveStatus, setRemoteSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
@@ -47,6 +68,10 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     useEffect(() => {
         if (transcriptModelConfig.baseUrl) {
             setRemoteBaseUrl(transcriptModelConfig.baseUrl);
+            setRemotePresetId(resolvePresetId(
+                transcriptModelConfig.baseUrl,
+                transcriptModelConfig.provider === 'openaiCompatible' ? transcriptModelConfig.model : undefined
+            ));
         }
         if (transcriptModelConfig.provider === 'openaiCompatible' && transcriptModelConfig.model) {
             setRemoteModel(transcriptModelConfig.model);
@@ -113,6 +138,25 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         // Close modal after selection
         if (onModelSelect) {
             onModelSelect();
+        }
+    };
+
+    const selectedRemotePreset = REMOTE_TRANSCRIPTION_PRESETS.find((p) => p.id === remotePresetId)
+        ?? REMOTE_TRANSCRIPTION_PRESETS[REMOTE_TRANSCRIPTION_PRESETS.length - 1];
+    const isCustomRemotePreset = selectedRemotePreset.id === 'custom';
+    const selectedRemoteModelNote = selectedRemotePreset.models.find((m) => m.id === remoteModel)?.note;
+
+    const handleRemotePresetChange = (value: string) => {
+        const preset = REMOTE_TRANSCRIPTION_PRESETS.find((p) => p.id === value);
+        if (!preset) return;
+        setRemotePresetId(preset.id);
+        if (preset.id === 'custom') {
+            // Keep whatever is in the fields — custom is free text.
+            return;
+        }
+        setRemoteBaseUrl(preset.baseUrl);
+        if (!preset.models.some((m) => m.id === remoteModel)) {
+            setRemoteModel(preset.models[0]?.id ?? '');
         }
     };
 
@@ -273,6 +317,27 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         <div className="mt-6 space-y-4 rounded-md border border-gray-200 bg-white px-4 py-4">
                             <div>
                                 <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Service
+                                </Label>
+                                <Select value={remotePresetId} onValueChange={handleRemotePresetChange}>
+                                    <SelectTrigger className='focus:ring-1 focus:ring-blue-500 focus:border-blue-500'>
+                                        <SelectValue placeholder="Select service" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        {REMOTE_TRANSCRIPTION_PRESETS.map((preset) => (
+                                            <SelectItem key={preset.id} value={preset.id}>{preset.label}</SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                                {!isCustomRemotePreset && (
+                                    <p className="text-xs text-gray-500 mt-1">
+                                        Curated models for file transcription that outperform the local whisper-large-v3-turbo baseline.
+                                    </p>
+                                )}
+                            </div>
+
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
                                     Server Base URL
                                 </Label>
                                 <Input
@@ -281,24 +346,45 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     value={remoteBaseUrl}
                                     onChange={(e) => setRemoteBaseUrl(e.target.value)}
                                     placeholder="http://127.0.0.1:8000/v1"
+                                    disabled={!isCustomRemotePreset}
                                 />
-                                <p className="text-xs text-gray-500 mt-1">
-                                    Any server exposing the OpenAI audio transcriptions API (oMLX, LiteLLM, vLLM, OpenAI, ...).
-                                    Audio is sent to {'{base}'}/audio/transcriptions.
-                                </p>
+                                {isCustomRemotePreset && (
+                                    <p className="text-xs text-gray-500 mt-1">
+                                        Any server exposing the OpenAI audio transcriptions API (oMLX, LiteLLM, vLLM, OpenAI, ...).
+                                        Audio is sent to {'{base}'}/audio/transcriptions.
+                                    </p>
+                                )}
                             </div>
 
                             <div>
                                 <Label className="block text-sm font-medium text-gray-700 mb-1">
                                     Model
                                 </Label>
-                                <Input
-                                    type="text"
-                                    className="focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-                                    value={remoteModel}
-                                    onChange={(e) => setRemoteModel(e.target.value)}
-                                    placeholder="whisper-1"
-                                />
+                                {isCustomRemotePreset ? (
+                                    <Input
+                                        type="text"
+                                        className="focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                        value={remoteModel}
+                                        onChange={(e) => setRemoteModel(e.target.value)}
+                                        placeholder="whisper-1"
+                                    />
+                                ) : (
+                                    <>
+                                        <Select value={remoteModel} onValueChange={setRemoteModel}>
+                                            <SelectTrigger className='focus:ring-1 focus:ring-blue-500 focus:border-blue-500'>
+                                                <SelectValue placeholder="Select model" />
+                                            </SelectTrigger>
+                                            <SelectContent>
+                                                {selectedRemotePreset.models.map((m) => (
+                                                    <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>
+                                                ))}
+                                            </SelectContent>
+                                        </Select>
+                                        {selectedRemoteModelNote && (
+                                            <p className="text-xs text-gray-500 mt-1">{selectedRemoteModelNote}</p>
+                                        )}
+                                    </>
+                                )}
                             </div>
 
                             <div>
