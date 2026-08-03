@@ -480,18 +480,17 @@ const Sidebar: React.FC = () => {
             <TooltipTrigger asChild>
               <button
                 onClick={handleRecordingToggle}
-                disabled={isRecording}
-                className={`p-2 ${isRecording ? 'bg-red-500 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-full transition-colors duration-150 shadow-sm`}
+                className="p-2 bg-red-500 hover:bg-red-600 rounded-full transition-colors duration-150 shadow-sm"
               >
                 {isRecording ? (
-                  <Square className="w-5 h-5 text-white" />
+                  <Square className="w-5 h-5 text-white animate-pulse" />
                 ) : (
                   <Mic className="w-5 h-5 text-white" />
                 )}
               </button>
             </TooltipTrigger>
             <TooltipContent side="right">
-              <p>{isRecording ? "Recording in progress..." : "Start Recording"}</p>
+              <p>{isRecording ? "Stop Recording" : "Start Recording"}</p>
             </TooltipContent>
           </Tooltip>
 
@@ -781,13 +780,12 @@ const Sidebar: React.FC = () => {
           <div className="flex-shrink-0 p-2 border-t border-gray-100">
             <button
               onClick={handleRecordingToggle}
-              disabled={isRecording}
-              className={`w-full flex items-center justify-center px-3 py-2 text-sm font-medium text-white ${isRecording ? 'bg-red-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-lg transition-colors shadow-sm`}
+              className="w-full flex items-center justify-center px-3 py-2 text-sm font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-colors shadow-sm"
             >
               {isRecording ? (
                 <>
-                  <Square className="w-4 h-4 mr-2" />
-                  <span>Recording in progress...</span>
+                  <Square className="w-4 h-4 mr-2 animate-pulse" />
+                  <span>Stop Recording</span>
                 </>
               ) : (
                 <>
