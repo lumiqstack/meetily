@@ -282,15 +282,33 @@ pub fn update_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 pub fn set_tray_state<R: Runtime>(app: &AppHandle<R>, state: RecordingState) {
     log::info!("Tray: Setting intermediate state: {:?}", state);
     // During recording state transitions, we assume recording is allowed (we're already recording)
-    if let Ok(menu) = build_menu(app, state, true) {
-        if let Some(tray) = app.tray_by_id("main-tray") {
-            let result = tray.set_menu(Some(menu));
-            log::info!("Tray: Intermediate state menu update result: {:?}", result);
-        } else {
-            log::warn!("Tray: Could not find tray with id 'main-tray'");
+    apply_tray_menu(app, state, true);
+}
+
+/// Build the menu and install it on the tray, always on the main thread.
+///
+/// muda's menu objects hold non-atomic `Rc`s internally; creating, cloning, or
+/// dropping them off the main thread races the refcounts against the UI thread
+/// and corrupts the heap (observed as intermittent 0xc0000374/0xc000001d
+/// crashes on Windows). `run_on_main_thread` executes inline when already on
+/// the main thread, so main-thread callers are unaffected.
+fn apply_tray_menu<R: Runtime>(app: &AppHandle<R>, state: RecordingState, can_record: bool) {
+    let app = app.clone();
+    let dispatched = app.clone().run_on_main_thread(move || {
+        match build_menu(&app, state, can_record) {
+            Ok(menu) => {
+                if let Some(tray) = app.tray_by_id("main-tray") {
+                    let result = tray.set_menu(Some(menu));
+                    log::info!("Tray: Menu update result: {:?}", result);
+                } else {
+                    log::warn!("Tray: Could not find tray with id 'main-tray'");
+                }
+            }
+            Err(e) => log::error!("Tray: Failed to build menu: {}", e),
         }
-    } else {
-        log::error!("Tray: Failed to build menu for intermediate state");
+    });
+    if let Err(e) = dispatched {
+        log::error!("Tray: Failed to dispatch menu update to main thread: {}", e);
     }
 }
 
@@ -361,16 +379,7 @@ pub async fn update_tray_menu_async<R: Runtime>(app: &AppHandle<R>) {
     let can_record = check_can_record(app).await;
     log::info!("Tray: can_record: {}", can_record);
 
-    if let Ok(menu) = build_menu(app, recording_state, can_record) {
-        if let Some(tray) = app.tray_by_id("main-tray") {
-            let result = tray.set_menu(Some(menu));
-            log::info!("Tray: Menu update result: {:?}", result);
-        } else {
-            log::warn!("Tray: Could not find tray with id 'main-tray'");
-        }
-    } else {
-        log::error!("Tray: Failed to build menu");
-    }
+    apply_tray_menu(app, recording_state, can_record);
 }
 
 fn build_menu<R: Runtime>(
