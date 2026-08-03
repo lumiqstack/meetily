@@ -201,6 +201,32 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     await stopRecordingAction();
   }, [isRecording, isStarting, isStopping, stopRecordingAction, onStopInitiated]);
 
+  // Listen for stop trigger from sidebar when already on home page
+  useEffect(() => {
+    const handleSidebarStop = () => {
+      console.log('Stop requested from sidebar');
+      handleStopRecording();
+    };
+
+    window.addEventListener('stop-recording-from-sidebar', handleSidebarStop);
+
+    return () => {
+      window.removeEventListener('stop-recording-from-sidebar', handleSidebarStop);
+    };
+  }, [handleStopRecording]);
+
+  // Check for autoStopRecording flag set by the sidebar when stop was requested
+  // from another page (sidebar navigates home first so the full stop flow can run)
+  useEffect(() => {
+    if (sessionStorage.getItem('autoStopRecording') !== 'true') return;
+
+    sessionStorage.removeItem('autoStopRecording');
+    if (isRecording) {
+      console.log('Auto-stopping recording after navigation from sidebar');
+      handleStopRecording();
+    }
+  }, [isRecording, handleStopRecording]);
+
   const handlePauseRecording = useCallback(async () => {
     if (!isRecording || isPaused || isPausing) return;
 

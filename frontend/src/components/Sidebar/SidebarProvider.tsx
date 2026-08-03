@@ -159,6 +159,19 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
       // Track recording initiation from sidebar
       Analytics.trackButtonClick('start_recording', 'sidebar');
+    } else {
+      // Recording in progress - request a stop. The full stop flow (stop_recording
+      // command, transcript flush, save, navigation) lives in the Home components.
+      if (pathname === '/') {
+        console.log('Triggering recording stop from sidebar (already on home page)');
+        window.dispatchEvent(new CustomEvent('stop-recording-from-sidebar'));
+      } else {
+        console.log('Navigating to home page with auto-stop flag');
+        sessionStorage.setItem('autoStopRecording', 'true');
+        router.push('/');
+      }
+
+      Analytics.trackButtonClick('stop_recording', 'sidebar');
     }
     // The actual recording start/stop is handled in the Home component
   };
