@@ -1565,13 +1565,9 @@ async fn run_url_import<R: Runtime>(
             &super::sharepoint_sync::build_cookie_header(cookies),
             &work_dir,
             |pct| {
-                emit_progress(
-                    &app,
-                    &import_id,
-                    "downloading",
-                    pct,
-                    &format!("Downloading recording… {pct}%"),
-                )
+                // The percentage travels in its own field; UIs render it next
+                // to the message, so embedding it here would double it up.
+                emit_progress(&app, &import_id, "downloading", pct, "Downloading recording…")
             },
             &cancel,
         )
@@ -1668,13 +1664,7 @@ async fn run_url_import<R: Runtime>(
             let import_id = import_id.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(pct) = progress_rx.recv().await {
-                    emit_progress(
-                        &app,
-                        &import_id,
-                        "downloading",
-                        pct,
-                        &format!("Downloading recording… {pct}%"),
-                    );
+                    emit_progress(&app, &import_id, "downloading", pct, "Downloading recording…");
                 }
             })
         };

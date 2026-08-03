@@ -177,7 +177,6 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
         </div>
       ),
       duration: 15000,
-      position: 'bottom-right',
     });
 
     console.log('[TeamsMeetingDetection] Start prompt payload:', payload);
@@ -231,7 +230,6 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
         </div>
       ),
       duration: 15000,
-      position: 'bottom-right',
     });
 
     console.log('[TeamsMeetingDetection] Stop prompt payload:', payload);

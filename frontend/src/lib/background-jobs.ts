@@ -84,6 +84,45 @@ export function cleanupDelayMs(status: BackgroundJobStatus): number {
 }
 
 /**
+ * Tracks whether an in-flow surface (currently the Home screen's job panel) is
+ * on screen showing the same job cards the toasts would. While one is claimed
+ * the floating toasts stay quiet, so a job is never drawn twice at once.
+ */
+export class InlineSurfaceRegistry {
+  private claims = 0;
+  private listeners = new Set<() => void>();
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  isVisible(): boolean {
+    return this.claims > 0;
+  }
+
+  /** Claim on mount; call the returned release on unmount. */
+  claim(): () => void {
+    this.claims += 1;
+    this.notify();
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.claims -= 1;
+      this.notify();
+    };
+  }
+
+  private notify(): void {
+    this.listeners.forEach((listener) => listener());
+  }
+}
+
+/**
  * Tracks remote import/retranscription jobs that continue after their dialog
  * closes. Pure state machine — no Tauri or React dependencies — so the toast
  * UI stays declarative glue.

@@ -41,7 +41,6 @@ export function showUpdateNotification(updateInfo: UpdateInfo, onUpdateClick?: (
     </div>,
     {
       duration: 10000,
-      position: 'bottom-center',
     }
   );
 }

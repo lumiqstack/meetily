@@ -282,7 +282,22 @@ export default function RootLayout({
           </RecordingStateProvider>
         </AnalyticsProvider>
 
-        <Toaster position="bottom-center" richColors closeButton />
+        {/* Single notification corner for the whole app. Individual toasts
+            must not override `position` — the top corners collide with the
+            window controls and the page action bars, and the bottom centre is
+            occupied by the recording controls and status overlays.
+            `expand` keeps long-lived job cards from stacking on top of each
+            other; `visibleToasts` leaves room for a couple of concurrent jobs
+            plus a transient message. */}
+        <Toaster
+          position="bottom-right"
+          expand
+          visibleToasts={5}
+          gap={10}
+          offset={16}
+          richColors
+          closeButton
+        />
       </body>
     </html>
   )

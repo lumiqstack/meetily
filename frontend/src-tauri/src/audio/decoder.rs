@@ -212,10 +212,7 @@ fn chunked_resample_with_progress(
                     progress_pct
                 );
             }
-            callback(
-                progress_pct as u32,
-                &format!("Resampling audio: {:.0}%", progress_pct),
-            );
+            callback(progress_pct as u32, "Resampling audio");
         }
     }
 
@@ -538,7 +535,7 @@ pub fn decode_audio_file_with_progress(
                     let current_progress = ((all_samples.len() as f64 / expected as f64) * 100.0) as u32;
                     if current_progress >= last_progress + 10 && current_progress <= 100 {
                         last_progress = current_progress;
-                        callback(current_progress, &format!("Decoding audio: {}%", current_progress));
+                        callback(current_progress, "Decoding audio");
                     }
                 }
             }

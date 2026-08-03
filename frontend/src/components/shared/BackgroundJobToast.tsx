@@ -8,6 +8,7 @@ import { Check, FileAudio, FileText, X } from 'lucide-react';
 import {
   BackgroundJob,
   BackgroundJobStore,
+  InlineSurfaceRegistry,
   InterruptedJobInfo,
   cleanupDelayMs,
   toastDurationMs,
@@ -22,6 +23,9 @@ import type { ImportError, ImportProgress, ImportResult } from '@/hooks/useImpor
 // dialog closes. Dialogs announce jobs via the window custom events below;
 // everything else (progress, completion, cancel) flows through this store.
 export const backgroundJobStore = new BackgroundJobStore();
+
+/** Claimed by in-flow job surfaces so the toasts can stand down. */
+export const inlineJobSurfaces = new InlineSurfaceRegistry();
 
 interface BackgroundImportStartedDetail {
   importId: string;
@@ -432,8 +436,21 @@ export function BackgroundJobToastProvider() {
     });
   }, [jobs]);
 
-  // Render one toast per job; re-calling toast.custom with the same id updates it in place.
+  // Render one toast per job; re-calling toast.custom with the same id updates
+  // it in place. Skipped entirely while an in-flow surface (the Home screen
+  // panel) is already showing the same cards, so no job appears twice.
+  const inlineSurfaceVisible = useSyncExternalStore(
+    useCallback((listener) => inlineJobSurfaces.subscribe(listener), []),
+    () => inlineJobSurfaces.isVisible(),
+    () => false
+  );
+
   useEffect(() => {
+    if (inlineSurfaceVisible) {
+      jobs.forEach((job) => toast.dismiss(`bg-job-${job.id}`));
+      return;
+    }
+
     jobs.forEach((job) => {
       toast.custom(
         () => (
@@ -446,12 +463,11 @@ export function BackgroundJobToastProvider() {
         ),
         {
           id: `bg-job-${job.id}`,
-          position: 'top-right',
           duration: toastDurationMs(job.status),
         }
       );
     });
-  }, [jobs, handleCancel, handleRetry, handleDismiss]);
+  }, [jobs, inlineSurfaceVisible, handleCancel, handleRetry, handleDismiss]);
 
   return null;
 }
