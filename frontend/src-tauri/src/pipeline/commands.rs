@@ -57,7 +57,8 @@ pub async fn pipeline_resume(app: AppHandle) -> Result<(), String> {
 }
 
 /// Process the given meetings now: clears their retry state and lets them
-/// skip the grace window and the idle gate (but never a live recording).
+/// skip the grace window, the idle gate, and a user pause (but never a live
+/// recording).
 #[tauri::command]
 pub async fn pipeline_process_now(
     app: AppHandle,

@@ -41,9 +41,10 @@ impl PipelineRunState {
         }
     }
 
-    /// Local stages (transcribe, summarize, export) may run. Only an explicit
-    /// user pause stops those — an expired SharePoint session says nothing
-    /// about work already downloaded.
+    /// Automatic local stages (transcribe, summarize, export) may run. Only
+    /// an explicit user pause stops those — an expired SharePoint session
+    /// says nothing about work already downloaded. Meetings the user queued
+    /// with "Process now" bypass even the pause (see the orchestrator loop).
     pub fn allows_local_work(&self) -> bool {
         !matches!(self, Self::PausedByUser)
     }

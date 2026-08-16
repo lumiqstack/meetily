@@ -50,6 +50,9 @@ pub struct PendingSnapshotItem {
     pub suppressed: bool,
     /// False while the meeting is inside its grace window or backing off.
     pub eligible: bool,
+    /// True when the user clicked "Process now": runs next, even while the
+    /// pipeline is paused.
+    pub queued: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,7 +112,8 @@ pub async fn snapshot(
                 attempts: row.map(|r| r.attempts).unwrap_or(0),
                 last_error: row.and_then(|r| r.last_error.clone()),
                 suppressed: row.map(|r| r.suppressed()).unwrap_or(false),
-                eligible: is_forced || (past_grace && retry_ok),
+                eligible: is_eligible(is_forced, past_grace, retry_ok),
+                queued: is_forced,
             }
         })
         .collect()
@@ -162,6 +166,24 @@ async fn local_work_allowed(config: &PipelineSettings, forced: bool) -> Result<(
         return Err("the machine is in use");
     }
     Ok(())
+}
+
+/// Whether a pending meeting may be attempted at all right now, before the
+/// run state is consulted.
+///
+/// "Process now" skips the grace window, but not the retry backoff: it calls
+/// `meta::reset` first, so a freshly forced meeting has no backoff to skip.
+/// Keeping the backoff matters because the force flag survives a transient
+/// failure — without it a meeting whose summariser is down would retry every
+/// tick forever, and queued meetings ignore the pause, so nothing could stop it.
+fn is_eligible(is_forced: bool, past_grace: bool, retry_ok: bool) -> bool {
+    (is_forced || past_grace) && retry_ok
+}
+
+/// Whether the loop may pick this meeting up right now. A user pause stops
+/// automatic work, but "Process now" (queued) meetings run even while paused.
+fn ready_to_process(item: &PendingSnapshotItem, allows_local_work: bool) -> bool {
+    item.eligible && (allows_local_work || item.queued)
 }
 
 fn should_scan(config: &PipelineSettings, now: DateTime<Utc>) -> bool {
@@ -351,9 +373,13 @@ pub async fn run(app: AppHandle) {
         }
 
         // 2. Advance one meeting through its next stage.
-        if state.allows_local_work() {
+        {
+            let allows_local = state.allows_local_work();
             let pending = snapshot(&pool, &config).await;
-            if let Some(item) = pending.into_iter().find(|item| item.eligible) {
+            if let Some(item) = pending
+                .into_iter()
+                .find(|item| ready_to_process(item, allows_local))
+            {
                 if process_one(&app, &pool, &config, &item).await {
                     did_work = true;
                 }
@@ -389,6 +415,55 @@ mod tests {
     fn meetings_without_transcripts_transcribe_first() {
         assert_eq!(stage_for(&meeting(0)), Stage::Transcribe);
         assert_eq!(stage_for(&meeting(12)), Stage::Summarize);
+    }
+
+    fn snapshot_item(eligible: bool, queued: bool) -> PendingSnapshotItem {
+        PendingSnapshotItem {
+            meeting_id: "m".to_string(),
+            title: "t".to_string(),
+            stage: Stage::Summarize,
+            created_at: Utc::now().to_rfc3339(),
+            attempts: 0,
+            last_error: None,
+            suppressed: false,
+            eligible,
+            queued,
+        }
+    }
+
+    #[test]
+    fn forcing_a_meeting_skips_the_grace_window_but_not_its_backoff() {
+        // "Process now" resets retry state, so the first attempt runs at once
+        // even for a meeting still inside its grace window.
+        assert!(is_eligible(true, false, true));
+        // A meeting nobody forced still waits out the grace window.
+        assert!(!is_eligible(false, false, true));
+        // ...and still waits out its retry backoff.
+        assert!(!is_eligible(false, true, false));
+        // A forced meeting that just failed transiently must wait out the
+        // backoff too. Otherwise it is retried every tick forever, and since
+        // queued meetings now bypass the pause, the user cannot stop it.
+        assert!(!is_eligible(true, true, false));
+    }
+
+    #[test]
+    fn pausing_stops_a_forced_meeting_that_keeps_failing() {
+        // The runaway scenario: user hits "Process now", the summariser is
+        // unreachable, every attempt fails transiently so the force flag is
+        // never cleared. Once it is backing off, a pause must hold it.
+        let backing_off = snapshot_item(is_eligible(true, true, false), true);
+        assert!(!ready_to_process(&backing_off, false));
+    }
+
+    #[test]
+    fn a_pause_stops_automatic_work_but_not_queued_meetings() {
+        // Running: any eligible meeting goes.
+        assert!(ready_to_process(&snapshot_item(true, false), true));
+        // Paused: only meetings the user queued with "Process now".
+        assert!(!ready_to_process(&snapshot_item(true, false), false));
+        assert!(ready_to_process(&snapshot_item(true, true), false));
+        // Never a meeting that is not eligible.
+        assert!(!ready_to_process(&snapshot_item(false, true), false));
     }
 
     #[test]

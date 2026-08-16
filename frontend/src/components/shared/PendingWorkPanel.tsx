@@ -20,6 +20,8 @@ interface PendingSnapshotItem {
   last_error: string | null;
   suppressed: boolean;
   eligible: boolean;
+  /** The user clicked "Process now": runs next, even while paused. */
+  queued: boolean;
 }
 
 interface CurrentItem {
@@ -38,6 +40,14 @@ interface PipelineStatus {
   last_scan_at: string | null;
 }
 
+/** Payload of `retranscription-progress` (audio/retranscription.rs). */
+interface TranscriptionProgress {
+  meeting_id: string;
+  stage: string;
+  progress_percentage: number;
+  message: string;
+}
+
 const STAGE_LABEL: Record<PipelineStage, string> = {
   transcribe: 'Needs transcript',
   summarize: 'Needs summary',
@@ -54,9 +64,10 @@ const STAGE_BADGE: Record<PipelineStage, string> = {
  *
  * The processing itself lives in the Rust orchestrator
  * (`src-tauri/src/pipeline`), which keeps running with the window closed —
- * this panel only observes `pipeline-status` events and offers the manual
- * overrides: process a meeting now (skipping the idle wait), pause/resume,
- * sign in to SharePoint, and remove a meeting that keeps failing.
+ * this panel only observes `pipeline-status` and `retranscription-progress`
+ * events and offers the manual overrides: process a meeting now (skipping
+ * the idle wait and a pause), pause/resume, sign in to SharePoint, and
+ * remove a meeting that keeps failing.
  */
 export function PendingWorkPanel() {
   const { refetchMeetings } = useSidebar();
@@ -64,6 +75,7 @@ export function PendingWorkPanel() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleteTarget, setDeleteTarget] = useState<PendingSnapshotItem | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<TranscriptionProgress | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -85,6 +97,23 @@ export function PendingWorkPanel() {
     };
   }, [refresh]);
 
+  // Live percentage for the transcription in flight (also fired by
+  // user-initiated retranscriptions; rendering filters to the current item).
+  useEffect(() => {
+    const unlisten = listen<TranscriptionProgress>('retranscription-progress', (event) => {
+      setProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Drop stale progress once the pipeline moves off that meeting.
+  useEffect(() => {
+    const activeId = status?.current?.meeting_id ?? null;
+    setProgress((prev) => (prev && prev.meeting_id === activeId ? prev : null));
+  }, [status]);
+
   // A completed meeting leaves the pending list; keep the sidebar in step.
   useEffect(() => {
     if (!status) return;
@@ -97,6 +126,9 @@ export function PendingWorkPanel() {
 
   const items = status?.pending ?? [];
   const current = status?.current ?? null;
+  // List order is the order the loop picks work up in, so the index among
+  // queued items is an honest queue position.
+  const queuedIds = items.filter((i) => i.queued).map((i) => i.meeting_id);
 
   const toggleItem = useCallback((meetingId: string) => {
     setSelected((prev) => {
@@ -120,8 +152,11 @@ export function PendingWorkPanel() {
       setSelected(new Set());
       toast.success(
         meetingIds.length === 1
-          ? 'Queued for processing now'
-          : `Queued ${meetingIds.length} meetings for processing now`
+          ? 'Processing now'
+          : `Processing ${meetingIds.length} meetings now`,
+        status?.state === 'paused'
+          ? { description: 'The pipeline stays paused for other meetings' }
+          : undefined
       );
     } catch (error) {
       toast.error('Could not start processing', {
@@ -130,7 +165,7 @@ export function PendingWorkPanel() {
     } finally {
       setBusy(false);
     }
-  }, [selected]);
+  }, [selected, status]);
 
   const handlePauseResume = useCallback(async () => {
     if (!status) return;
@@ -190,7 +225,7 @@ export function PendingWorkPanel() {
     status.state === 'auth_required'
       ? status.detail ?? 'SharePoint sign-in needed'
       : status.state === 'paused'
-        ? 'Pipeline paused — meetings stay in the list until you resume'
+        ? 'Pipeline paused — only meetings you queue with Process now will run'
         : null;
 
   return (
@@ -212,16 +247,6 @@ export function PendingWorkPanel() {
             </div>
           )}
 
-          {current && (
-            <div className="flex items-center gap-2 mb-2 px-2 py-1.5 rounded bg-gray-50 text-[12px] text-gray-700">
-              <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />
-              <span className="truncate">
-                {current.stage === 'transcribe' ? 'Transcribing' : 'Summarizing'}{' '}
-                <span className="font-medium">{current.title}</span>
-              </span>
-            </div>
-          )}
-
           {items.length > 1 && (
             <label className="flex items-center gap-2 pb-2 mb-1 border-b border-gray-100 text-xs text-gray-500 cursor-pointer select-none">
               <input
@@ -237,6 +262,8 @@ export function PendingWorkPanel() {
           <div className="space-y-1">
             {items.map((item) => {
               const isCurrent = current?.meeting_id === item.meeting_id;
+              const rowProgress =
+                isCurrent && progress?.meeting_id === item.meeting_id ? progress : null;
               return (
                 <label
                   key={item.meeting_id}
@@ -251,7 +278,27 @@ export function PendingWorkPanel() {
                   />
                   <span className="flex-1 min-w-0">
                     <span className="block text-sm text-gray-900 truncate">{item.title}</span>
-                    {item.last_error && (
+                    {rowProgress && (
+                      <span className="flex items-center gap-2 mt-1">
+                        <span className="flex-1 h-1 rounded-full bg-gray-200 overflow-hidden">
+                          <span
+                            className="block h-full bg-blue-500 transition-all duration-300"
+                            style={{
+                              width: `${Math.min(rowProgress.progress_percentage, 100)}%`,
+                            }}
+                          />
+                        </span>
+                        <span className="flex-shrink-0 text-[11px] text-gray-500 tabular-nums">
+                          {rowProgress.progress_percentage}%
+                        </span>
+                      </span>
+                    )}
+                    {rowProgress && (
+                      <span className="block text-[11px] text-gray-500 truncate">
+                        {rowProgress.message}
+                      </span>
+                    )}
+                    {!isCurrent && item.last_error && (
                       <span
                         className="block text-[11px] text-red-600 truncate"
                         title={item.last_error}
@@ -261,7 +308,12 @@ export function PendingWorkPanel() {
                     )}
                   </span>
 
-                  {item.suppressed ? (
+                  {isCurrent ? (
+                    <span className="flex-shrink-0 flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-blue-50 text-blue-700">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      {current?.stage === 'transcribe' ? 'Transcribing' : 'Summarizing'}
+                    </span>
+                  ) : item.suppressed ? (
                     <span className="flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full bg-red-50 text-red-700">
                       Failed
                     </span>
@@ -271,6 +323,15 @@ export function PendingWorkPanel() {
                       title={`Attempt ${item.attempts} failed; will retry`}
                     >
                       Retrying
+                    </span>
+                  ) : item.queued ? (
+                    <span
+                      className="flex-shrink-0 text-[11px] font-medium px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700"
+                      title="Queued with Process now — runs next, even while paused"
+                    >
+                      {queuedIds.length > 1
+                        ? `Queued #${queuedIds.indexOf(item.meeting_id) + 1}`
+                        : 'Queued'}
                     </span>
                   ) : (
                     <span
