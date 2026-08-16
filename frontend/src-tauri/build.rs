@@ -2,6 +2,10 @@
 mod ffmpeg;
 
 fn main() {
+    // Stamp build identity into the binary so logs and crash reports say which
+    // source revision is actually running.
+    emit_build_identity();
+
     // GPU Acceleration Detection and Build Guidance
     detect_and_report_gpu_capabilities();
 
@@ -19,6 +23,54 @@ fn main() {
     ffmpeg::ensure_ffmpeg_binary();
 
     tauri_build::build()
+}
+
+/// Records the source revision and wall-clock time of this build as compile-time
+/// env vars, so a running binary can state which code it was built from.
+///
+/// Diagnosing the 2026-08-12/13/14 crashes hinged on whether the running
+/// `meetily.exe` predated the tray fix, and the only way to answer it was
+/// reading the PE header timestamp out of a crash dump. The startup banner in
+/// `main.rs` answers it from the log instead.
+///
+/// Deliberately no `cargo:rerun-if-changed`: emitting one would switch this
+/// script from "re-run when any package file changed" to "re-run only for the
+/// listed paths", which would also gate the FFmpeg download below. The default
+/// covers the normal edit-then-build flow. A commit that touches no source
+/// leaves the previous values in place, which still describe the code in the
+/// binary correctly.
+fn emit_build_identity() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&manifest_dir)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    };
+
+    let mut sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    // Uncommitted changes mean the binary does not correspond exactly to `sha`.
+    if git(&["status", "--porcelain", "--untracked-files=no"]).is_some() {
+        sha.push_str("-dirty");
+    }
+
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
+
+    println!("cargo:rustc-env=MEETILY_GIT_SHA={sha}");
+    println!("cargo:rustc-env=MEETILY_BUILD_EPOCH={epoch}");
+    println!("cargo:rustc-env=MEETILY_BUILD_PROFILE={profile}");
 }
 
 /// Detects GPU acceleration capabilities and provides build guidance
