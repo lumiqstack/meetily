@@ -284,8 +284,13 @@ impl RecordingSaver {
                     }
                     let saver = saver
                         .ok_or_else(|| anyhow::anyhow!("Incremental saver not available while accumulating"))?;
-                    let mut guard = saver.lock().await;
-                    guard.add_chunk(chunk)
+                    // Every ~30s of audio this synchronously spawns ffmpeg and
+                    // pipes the whole checkpoint through it, so it runs on a
+                    // blocking thread rather than parking an async worker for
+                    // the length of an AAC encode.
+                    tokio::task::spawn_blocking(move || saver.blocking_lock().add_chunk(chunk))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Incremental saver task failed to join: {}", e))?
                 }
             })
             .await;
