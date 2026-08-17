@@ -75,6 +75,8 @@ node_modules/
 experiments/
 .cursor/
 target/
+# Scratch cargo target dirs (CARGO_TARGET_DIR overrides, side-by-side builds)
+target-*/
 
 frontend/src-tauri/binaries/
 .gstack/
