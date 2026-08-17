@@ -3,6 +3,7 @@
 
 use crate::database::models::PendingMeetingModel;
 use crate::database::repositories::meeting::MeetingsRepository;
+use crate::database::repositories::setting::SettingsRepository;
 use crate::pipeline::settings::{self, PipelineRunState, PipelineSettings};
 use crate::pipeline::transcribe_stage;
 use crate::pipeline::{
@@ -156,6 +157,17 @@ pub async fn emit_status(app: &AppHandle) {
     crate::tray::update_tray_menu(app);
 }
 
+/// Whether a summary provider runs inference on this machine.
+///
+/// Unknown providers are treated as local: the only consequence is deferring
+/// the job until the recording ends, which is the safe way to be wrong.
+fn is_local_summary_provider(provider: &str) -> bool {
+    !matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "openai" | "claude" | "groq" | "openrouter"
+    )
+}
+
 /// Whether a local (on-device engine) job may start right now.
 async fn local_work_allowed(config: &PipelineSettings, forced: bool) -> Result<(), &'static str> {
     if crate::audio::recording_commands::is_recording().await {
@@ -259,6 +271,27 @@ async fn process_one(
             .await
         }
         Stage::Summarize => {
+            // A local summariser (Ollama / on-device sidecar) competes with the
+            // recording for CPU, so it waits for the same conditions as local
+            // transcription. Hosted providers are network-bound and exempt.
+            let summary_provider = SettingsRepository::get_model_config(pool)
+                .await
+                .ok()
+                .flatten()
+                .map(|c| c.provider)
+                .unwrap_or_default();
+
+            if is_local_summary_provider(&summary_provider) {
+                if let Err(reason) = local_work_allowed(config, forced).await {
+                    log::debug!(
+                        "[pipeline] deferring summary of {}: {}",
+                        item.meeting_id,
+                        reason
+                    );
+                    return false;
+                }
+            }
+
             pipeline
                 .set_current(Some(CurrentItem {
                     meeting_id: item.meeting_id.clone(),
