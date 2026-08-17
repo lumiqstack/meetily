@@ -7,6 +7,17 @@ const resolveFromTiptapPm = (pkg) =>
 const nextConfig = {
   reactStrictMode: false, // Disabled for BlockNote compatibility
   output: 'export',
+
+  // Strip chatty logging from release builds. There are ~400 console calls in
+  // this app, many on per-poll and per-transcript paths, and each one is a real
+  // string format plus a WebView2 IPC hop. error/warn are kept so genuine
+  // failures still surface in DevTools.
+  compiler: {
+    removeConsole: {
+      exclude: ['error', 'warn'],
+    },
+  },
+
   images: {
     unoptimized: true,
   },

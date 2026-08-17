@@ -77,11 +77,20 @@ module.exports = {
   				to: {
   					height: '0'
   				}
+  			},
+  			'recording-bar': {
+  				'0%, 100%': {
+  					height: '10px'
+  				},
+  				'50%': {
+  					height: '28px'
+  				}
   			}
   		},
   		animation: {
   			'accordion-down': 'accordion-down 0.2s ease-out',
-  			'accordion-up': 'accordion-up 0.2s ease-out'
+  			'accordion-up': 'accordion-up 0.2s ease-out',
+  			'recording-bar': 'recording-bar 1.1s ease-in-out infinite'
   		}
   	}
   },
