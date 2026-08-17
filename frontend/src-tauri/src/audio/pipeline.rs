@@ -20,6 +20,11 @@ struct AudioMixerRingBuffer {
     system_buffer: VecDeque<f32>,
     window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
     max_buffer_size: usize,  // Safety limit (e.g., 100ms)
+    /// Counts `add_samples` calls so diagnostics can be rate-limited. An
+    /// overflow persists across many calls, and logging it on each one turns a
+    /// stream hiccup into a ~200 lines/second write storm that makes the
+    /// underlying stall worse.
+    add_calls: u64,
 }
 
 impl AudioMixerRingBuffer {
@@ -43,18 +48,18 @@ impl AudioMixerRingBuffer {
             system_buffer: VecDeque::with_capacity(max_buffer_size),
             window_size_samples,
             max_buffer_size,
+            add_calls: 0,
         }
     }
 
     fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
+        self.add_calls += 1;
+        let should_report = self.add_calls % 200 == 0;
+
         // Log buffer health periodically for diagnostics
-        static mut SAMPLE_COUNTER: u64 = 0;
-        unsafe {
-            SAMPLE_COUNTER += 1;
-            if SAMPLE_COUNTER % 200 == 0 {
-                debug!("📊 Ring buffer status: mic={} samples, sys={} samples (max={})",
-                       self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
-            }
+        if should_report {
+            debug!("📊 Ring buffer status: mic={} samples, sys={} samples (max={})",
+                   self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
         }
 
         match device_type {
@@ -64,15 +69,17 @@ impl AudioMixerRingBuffer {
 
         // CRITICAL FIX: Add warnings before dropping samples
         // This helps diagnose timing issues in production
-        if self.mic_buffer.len() > self.max_buffer_size {
-            warn!("⚠️ Microphone buffer overflow: {} > {} samples, dropping oldest {} samples",
-                  self.mic_buffer.len(), self.max_buffer_size,
-                  self.mic_buffer.len() - self.max_buffer_size);
-        }
-        if self.system_buffer.len() > self.max_buffer_size {
-            error!("🔴 SYSTEM AUDIO BUFFER OVERFLOW: {} > {} samples, dropping {} samples - THIS CAUSES DISTORTION!",
-                  self.system_buffer.len(), self.max_buffer_size,
-                  self.system_buffer.len() - self.max_buffer_size);
+        if should_report {
+            if self.mic_buffer.len() > self.max_buffer_size {
+                warn!("⚠️ Microphone buffer overflow: {} > {} samples, dropping oldest {} samples",
+                      self.mic_buffer.len(), self.max_buffer_size,
+                      self.mic_buffer.len() - self.max_buffer_size);
+            }
+            if self.system_buffer.len() > self.max_buffer_size {
+                error!("🔴 SYSTEM AUDIO BUFFER OVERFLOW: {} > {} samples, dropping {} samples - THIS CAUSES DISTORTION!",
+                      self.system_buffer.len(), self.max_buffer_size,
+                      self.system_buffer.len() - self.max_buffer_size);
+            }
         }
 
         // Safety: prevent buffer overflow (keep only last 200ms)
@@ -405,8 +412,16 @@ impl AudioCapture {
         // Buffering handles variable chunk sizes (320, 512, 1024, etc.) by accumulating to fixed 512-sample chunks
         const TARGET_SAMPLE_RATE: u32 = 48000;
         if self.needs_resampling {
+            // The counter only advances at the end of this callback, so this is
+            // the same id the logging block below reads.
+            let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
+            let will_log_resampling = chunk_id % 100 == 0;
+
             let before_len = mono_data.len();
-            let before_rms = if !mono_data.is_empty() {
+            // Sum-of-squares over the whole buffer, on the realtime thread, for
+            // a diagnostic printed once every 100 chunks — so only pay for it
+            // on the chunks that actually log.
+            let before_rms = if will_log_resampling && !mono_data.is_empty() {
                 (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt()
             } else {
                 0.0
@@ -473,8 +488,7 @@ impl AudioCapture {
             }
 
             // Log resampling only occasionally to avoid spam
-            let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
-            if chunk_id % 100 == 0 && has_resampled_output {
+            if will_log_resampling && has_resampled_output {
                 let after_len = mono_data.len();
                 let after_rms = if !mono_data.is_empty() {
                     (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt()
@@ -641,7 +655,9 @@ impl AudioCapture {
             };
             self.state.report_error(error);
         } else {
-            debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
+            // ~200 calls/second on the realtime audio thread; compiled out of
+            // release builds entirely.
+            perf_trace!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
         }
     }
 
@@ -682,7 +698,11 @@ pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
     state: Arc<RecordingState>,
-    vad_processor: ContinuousVadProcessor,
+    /// `None` when realtime transcription is off. VAD is only useful for
+    /// producing transcription segments, and Silero runs a neural inference per
+    /// 30ms frame — so with transcription disabled we skip building it at all
+    /// rather than feed a channel whose receiver has already been dropped.
+    vad_processor: Option<ContinuousVadProcessor>,
     sample_rate: u32,
     chunk_id_counter: u64,
     // Performance optimization: reduce logging frequency
@@ -712,6 +732,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        vad_enabled: bool,
     ) -> Self {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
@@ -731,15 +752,20 @@ impl AudioPipeline {
 
         let redemption_time = if cfg!(target_os = "macos") { 400 } else { 400 };
 
-        let vad_processor = match ContinuousVadProcessor::new(sample_rate, redemption_time) {
-            Ok(processor) => {
-                info!("VAD-driven pipeline: VAD segments will be sent directly to Whisper (no time-based accumulation)");
-                processor
+        let vad_processor = if vad_enabled {
+            match ContinuousVadProcessor::new(sample_rate, redemption_time) {
+                Ok(processor) => {
+                    info!("VAD-driven pipeline: VAD segments will be sent directly to Whisper (no time-based accumulation)");
+                    Some(processor)
+                }
+                Err(e) => {
+                    error!("Failed to create VAD processor: {}", e);
+                    panic!("VAD processor creation failed: {}", e);
+                }
             }
-            Err(e) => {
-                error!("Failed to create VAD processor: {}", e);
-                panic!("VAD processor creation failed: {}", e);
-            }
+        } else {
+            info!("Realtime transcription disabled: skipping VAD, speaker attribution, and segment dispatch (recording/mixing unaffected)");
+            None
         };
 
         // Initialize professional audio mixing components
@@ -759,8 +785,11 @@ impl AudioPipeline {
             // Performance optimization: reduce logging frequency
             last_summary_time: std::time::Instant::now(),
             processed_chunks: 0,
-            // Initialize metrics batcher for smart batching
-            metrics_batcher: Some(AudioMetricsBatcher::new()),
+            // Disabled: the batcher costs a full-buffer pass, an Instant::now()
+            // and an unbounded-channel send on every chunk (~200/s), and the
+            // summaries it accumulates have no reader — get_summaries() and
+            // clear_summaries() are never called. Re-enable alongside a consumer.
+            metrics_batcher: None,
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
@@ -779,12 +808,12 @@ impl AudioPipeline {
         // Previous bug: Loop checked `while self.state.is_recording()` which caused early exit when
         // stop_recording() was called, losing flush signals and remaining chunks in the pipeline
         loop {
-            // Receive audio chunks with timeout
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50), // Shorter timeout for responsiveness
-                self.receiver.recv()
-            ).await {
-                Ok(Some(chunk)) => {
+            // Block until the next chunk. There is no periodic work to do here —
+            // VAD drives all segmentation — so the previous 50ms timeout only
+            // armed and cancelled a timer per chunk (~200/s) and woke this task
+            // 20x/s through silence.
+            match self.receiver.recv().await {
+                Some(chunk) => {
                     // PERFORMANCE: Check for flush signal (special chunk with ID >= u64::MAX - 10)
                     // Multiple flush signals may be sent to ensure processing
                     if chunk.chunk_id >= u64::MAX - 10 {
@@ -829,18 +858,25 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
-                            // Speaker attribution: decide the window's dominant
-                            // source while mic and system are still separate.
-                            let window_label = self.window_labeler.label(&mic_window, &sys_window);
+                            // Speaker attribution only labels transcript segments,
+                            // so it costs two RMS passes we can skip when there
+                            // will be no transcripts.
+                            let window_label = if self.vad_processor.is_some() {
+                                Some(self.window_labeler.label(&mic_window, &sys_window))
+                            } else {
+                                None
+                            };
 
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
                             // Weight the window's label by its (mixed) energy so
                             // loud speech outvotes quiet crosstalk per segment.
-                            let window_energy: f32 =
-                                mixed_clean.iter().map(|s| s * s).sum();
-                            self.segment_aggregator.add(window_label, window_energy);
+                            if let Some(window_label) = window_label {
+                                let window_energy: f32 =
+                                    mixed_clean.iter().map(|s| s * s).sum();
+                                self.segment_aggregator.add(window_label, window_energy);
+                            }
 
                             // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
                             // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
@@ -848,9 +884,17 @@ impl AudioPipeline {
                             // Previous 2x gain was causing excessive limiting/distortion
                             let mixed_with_gain = mixed_clean;
 
-                            // STEP 3: Send mixed audio for transcription (VAD + Whisper)
-                            match self.vad_processor.process_audio(&mixed_with_gain) {
-                                Ok(speech_segments) => {
+                            // STEP 3: Send mixed audio for transcription (VAD + Whisper).
+                            // Skipped entirely when realtime transcription is off.
+                            // `map` ends the borrow of `self.vad_processor` before
+                            // the body touches `self.segment_aggregator`.
+                            let vad_result = self
+                                .vad_processor
+                                .as_mut()
+                                .map(|vad| vad.process_audio(&mixed_with_gain));
+
+                            match vad_result {
+                                Some(Ok(speech_segments)) => {
                                     // One label per emission batch: the windows
                                     // accumulated since the last VAD segment(s)
                                     // back everything emitted now. (VAD segment
@@ -888,15 +932,19 @@ impl AudioPipeline {
                                         }
                                     }
                                 }
-                                Err(e) => {
+                                Some(Err(e)) => {
                                     warn!("⚠️ VAD error: {}", e);
                                 }
+                                // Realtime transcription disabled — no VAD.
+                                None => {}
                             }
 
-                            // STEP 4: Send mixed audio for recording (WAV file)
+                            // STEP 4: Send mixed audio for recording (WAV file).
+                            // Last use of the window, so move it instead of
+                            // cloning another 115 KB per window.
                             if let Some(ref sender) = self.recording_sender_for_mixed {
                                 let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
+                                    data: mixed_with_gain,
                                     sample_rate: self.sample_rate,
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
@@ -908,13 +956,9 @@ impl AudioPipeline {
                         }
                     }
                 }
-                Ok(None) => {
+                None => {
                     info!("Audio pipeline: sender closed after processing {} chunks", self.processed_chunks);
                     break;
-                }
-                Err(_) => {
-                    // Timeout - just continue, VAD handles all segmentation
-                    continue;
                 }
             }
         }
@@ -929,8 +973,14 @@ impl AudioPipeline {
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
 
-        // Flush any remaining audio from VAD processor and send segments to transcription
-        match self.vad_processor.flush() {
+        // Flush any remaining audio from VAD processor and send segments to
+        // transcription. No VAD means no pending segments to flush.
+        let flushed = self.vad_processor.as_mut().map(|vad| vad.flush());
+        let Some(flushed) = flushed else {
+            return Ok(());
+        };
+
+        match flushed {
             Ok(final_segments) => {
                 let batch_source = if final_segments.is_empty() {
                     None
@@ -1001,6 +1051,7 @@ impl AudioPipelineManager {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        vad_enabled: bool,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
@@ -1024,6 +1075,7 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
+            vad_enabled,
         );
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio

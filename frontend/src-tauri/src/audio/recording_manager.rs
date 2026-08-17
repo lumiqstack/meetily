@@ -60,13 +60,19 @@ impl RecordingManager {
     /// * `microphone_device` - Optional microphone device to use
     /// * `system_device` - Optional system audio device to use
     /// * `auto_save` - Whether to save audio checkpoints (true) or just transcripts/metadata (false)
+    /// * `realtime_transcription_enabled` - When false the pipeline skips VAD and
+    ///   speaker attribution entirely; mixing and recording are unaffected.
     pub async fn start_recording(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,
         system_device: Option<Arc<AudioDevice>>,
         auto_save: bool,
+        realtime_transcription_enabled: bool,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
-        info!("Starting recording manager (auto_save: {})", auto_save);
+        info!(
+            "Starting recording manager (auto_save: {}, realtime_transcription: {})",
+            auto_save, realtime_transcription_enabled
+        );
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
@@ -116,6 +122,7 @@ impl RecordingManager {
             mic_kind,
             sys_name,
             sys_kind,
+            realtime_transcription_enabled,
         )?;
 
         // Give the pipeline a moment to fully initialize before starting streams
@@ -167,7 +174,11 @@ impl RecordingManager {
     ///
     /// User still hears audio via Bluetooth (playback), but recording captures
     /// via stable wired path for best quality.
-    pub async fn start_recording_with_defaults_and_auto_save(&mut self, auto_save: bool) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
+    pub async fn start_recording_with_defaults_and_auto_save(
+        &mut self,
+        auto_save: bool,
+        realtime_transcription_enabled: bool,
+    ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         #[cfg(target_os = "macos")]
         {
             info!("🎙️ [macOS] Starting recording with smart device selection (Bluetooth override enabled)");
@@ -186,7 +197,7 @@ impl RecordingManager {
             }
 
             // Start recording with selected devices and auto_save setting
-            self.start_recording(microphone_device, system_device, auto_save).await
+            self.start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled).await
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -221,7 +232,7 @@ impl RecordingManager {
                 return Err(anyhow::anyhow!("No microphone device available"));
             }
 
-            self.start_recording(microphone_device, system_device, auto_save).await
+            self.start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled).await
         }
     }
 

@@ -200,11 +200,28 @@ impl RecordingSaver {
 
                     // Only process audio chunks if auto_save is enabled
                     if save_audio {
-                        // Add chunk to incremental saver
+                        // Add chunk to incremental saver.
+                        //
+                        // Every ~30s of audio this synchronously spawns ffmpeg
+                        // and pipes the whole checkpoint through it, so it runs
+                        // on a blocking thread rather than parking an async
+                        // worker for the length of an AAC encode.
                         if let Some(saver_arc) = &incremental_saver_arc {
-                            let mut saver_guard = saver_arc.lock().await;
-                            if let Err(e) = saver_guard.add_chunk(chunk) {
-                                error!("Failed to add chunk to incremental saver: {}", e);
+                            let saver_arc = saver_arc.clone();
+                            let joined = tokio::task::spawn_blocking(move || {
+                                let mut saver_guard = saver_arc.blocking_lock();
+                                saver_guard.add_chunk(chunk)
+                            })
+                            .await;
+
+                            match joined {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    error!("Failed to add chunk to incremental saver: {}", e);
+                                }
+                                Err(e) => {
+                                    error!("Incremental saver task failed to join: {}", e);
+                                }
                             }
                         } else {
                             error!("Incremental saver not available while accumulating");

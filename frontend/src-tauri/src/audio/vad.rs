@@ -26,6 +26,9 @@ pub struct ContinuousVadProcessor {
     speech_start_sample: usize,
     // State tracking for smart logging
     last_logged_state: bool,
+    /// Buffer size at which the "speech buffer is large" warning last fired, so
+    /// it reports growth instead of repeating on every chunk.
+    last_large_buffer_warn: usize,
 }
 
 impl ContinuousVadProcessor {
@@ -79,6 +82,7 @@ impl ContinuousVadProcessor {
             speech_start_sample: 0,
             // Initialize state tracking
             last_logged_state: false,
+            last_large_buffer_warn: 0,
         })
     }
 
@@ -129,10 +133,27 @@ impl ContinuousVadProcessor {
         let filter_size = (self.sample_rate as f64 / (cutoff_freq * self.sample_rate as f64)) as usize;
         let filter_size = std::cmp::max(1, std::cmp::min(filter_size, 5)); // Limit filter size
         
-        for i in 0..samples.len() {
-            let start = if i >= filter_size { i - filter_size } else { 0 };
-            let end = std::cmp::min(i + filter_size + 1, samples.len());
-            let sum: f32 = samples[start..end].iter().sum();
+        // Sliding-window sum. Both window edges advance monotonically with `i`,
+        // so the whole filter is O(n) instead of re-summing up to 2*filter_size+1
+        // samples per output (~144k redundant adds per 600ms window before).
+        let n = samples.len();
+        let mut window_start = 0usize;
+        let mut window_end = 0usize; // exclusive
+        let mut sum = 0.0f32;
+
+        for i in 0..n {
+            let start = i.saturating_sub(filter_size);
+            let end = std::cmp::min(i + filter_size + 1, n);
+
+            while window_end < end {
+                sum += samples[window_end];
+                window_end += 1;
+            }
+            while window_start < start {
+                sum -= samples[window_start];
+                window_start += 1;
+            }
+
             filtered_samples.push(sum / (end - start) as f32);
         }
 
@@ -198,6 +219,7 @@ impl ContinuousVadProcessor {
 
             self.speech_segments.push_back(segment);
             self.current_speech.clear();
+            self.last_large_buffer_warn = 0;
             self.in_speech = false;
         }
 
@@ -210,10 +232,20 @@ impl ContinuousVadProcessor {
     }
 
     fn process_chunk(&mut self, chunk: &[f32]) -> Result<()> {
-        // Track accumulated speech buffer size to detect memory issues
+        // Track accumulated speech buffer size to detect memory issues.
+        //
+        // The buffer stays over the threshold for the rest of a long utterance,
+        // so this must report on *growth*, not on every chunk — otherwise one
+        // long segment emits a warning per 30ms frame, and `warn!` is never
+        // filtered and writes to the log file synchronously.
+        const LARGE_SPEECH_BUFFER: usize = 1_000_000; // ~62s at 16kHz
+        const WARN_GROWTH_STEP: usize = 16_000 * 30;  // re-warn every 30s of growth
+
         let current_speech_size = self.current_speech.len();
-        if current_speech_size > 1_000_000 {
-            // More than ~62 seconds of accumulated speech at 16kHz
+        if current_speech_size > LARGE_SPEECH_BUFFER
+            && current_speech_size >= self.last_large_buffer_warn.saturating_add(WARN_GROWTH_STEP)
+        {
+            self.last_large_buffer_warn = current_speech_size;
             warn!("VAD: Accumulated speech buffer is large: {} samples ({:.1}s) - possible memory issue",
                   current_speech_size, current_speech_size as f64 / 16000.0);
         }
@@ -239,6 +271,7 @@ impl ContinuousVadProcessor {
                     // Use 16000 (VAD processing rate) since processed_samples counts 16kHz samples
                     self.speech_start_sample = self.processed_samples + (timestamp_ms * 16000 / 1000);
                     self.current_speech.clear();
+                    self.last_large_buffer_warn = 0;
                 }
                 VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
                     // Only log if we were previously in speech state
@@ -270,6 +303,7 @@ impl ContinuousVadProcessor {
                     }
 
                     self.current_speech.clear();
+                    self.last_large_buffer_warn = 0;
                 }
             }
         }

@@ -128,7 +128,13 @@ impl TruePeakLimiter {
             self.gain_reduction[self.current_position] = 1.0;
         }
 
-        let output_position = (self.current_position + 1) % self.lookahead_samples;
+        // Wrap with a compare instead of `%`: this runs 48,000 times a second
+        // on the realtime audio thread, and an integer division per sample is
+        // the most expensive thing in the loop.
+        let mut output_position = self.current_position + 1;
+        if output_position >= self.lookahead_samples {
+            output_position = 0;
+        }
         let output_sample = self.buffer[output_position] * self.gain_reduction[output_position];
 
         self.current_position = output_position;
@@ -150,6 +156,8 @@ pub struct LoudnessNormalizer {
     gain_linear: f32,
     loudness_buffer: Vec<f32>,
     true_peak_limit: f32,
+    /// Analysis chunks seen since the last `loudness_global()` call.
+    chunks_since_gain_update: u32,
 }
 
 impl LoudnessNormalizer {
@@ -162,7 +170,10 @@ impl LoudnessNormalizer {
         const TRUE_PEAK_LIMIT: f64 = -1.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
 
-        let ebur128 = ebur128::EbuR128::new(channels, sample_rate, ebur128::Mode::I | ebur128::Mode::TRUE_PEAK)
+        // Mode::I only. TRUE_PEAK makes ebur128 oversample every frame
+        // internally, and nothing here ever reads `true_peak()` — peak control
+        // is done by the separate TruePeakLimiter below.
+        let ebur128 = ebur128::EbuR128::new(channels, sample_rate, ebur128::Mode::I)
             .map_err(|e| anyhow::anyhow!("Failed to create EBU R128 normalizer: {}", e))?;
 
         let true_peak_limit = 10_f32.powf(TRUE_PEAK_LIMIT as f32 / 20.0);
@@ -171,8 +182,9 @@ impl LoudnessNormalizer {
             ebur128,
             limiter: TruePeakLimiter::new(sample_rate),
             gain_linear: 1.0,
-            loudness_buffer: Vec::with_capacity(ANALYZE_CHUNK_SIZE),
+            loudness_buffer: Vec::with_capacity(ANALYZE_CHUNK_SIZE * 2),
             true_peak_limit,
+            chunks_since_gain_update: 0,
         })
     }
 
@@ -190,23 +202,33 @@ impl LoudnessNormalizer {
 
         const TARGET_LUFS: f64 = -23.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
+        // `loudness_global()` integrates the whole gated histogram. The gain it
+        // produces is a slow-moving normalization target, so recomputing it on
+        // every 512-sample chunk (~94x/s) is wasted work; ~2x/s tracks it just
+        // as well.
+        const GAIN_UPDATE_EVERY_CHUNKS: u32 = 48;
 
         let mut normalized_samples = Vec::with_capacity(samples.len());
 
-        for &sample in samples {
-            // Accumulate samples for loudness analysis
-            self.loudness_buffer.push(sample);
+        for block in samples.chunks(ANALYZE_CHUNK_SIZE) {
+            // Accumulate samples for loudness analysis in bulk rather than
+            // pushing one at a time.
+            self.loudness_buffer.extend_from_slice(block);
 
-            // Analyze loudness every 512 samples
             if self.loudness_buffer.len() >= ANALYZE_CHUNK_SIZE {
                 if let Err(e) = self.ebur128.add_frames_f32(&self.loudness_buffer) {
                     warn!("Failed to add frames to EBU R128: {}", e);
                 } else {
-                    // Update gain based on cumulative loudness
-                    if let Ok(current_lufs) = self.ebur128.loudness_global() {
-                        if current_lufs.is_finite() && current_lufs < 0.0 {
-                            let gain_db = TARGET_LUFS - current_lufs;
-                            self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
+                    self.chunks_since_gain_update += 1;
+                    if self.chunks_since_gain_update >= GAIN_UPDATE_EVERY_CHUNKS {
+                        self.chunks_since_gain_update = 0;
+
+                        // Update gain based on cumulative loudness
+                        if let Ok(current_lufs) = self.ebur128.loudness_global() {
+                            if current_lufs.is_finite() && current_lufs < 0.0 {
+                                let gain_db = TARGET_LUFS - current_lufs;
+                                self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
+                            }
                         }
                     }
                 }
@@ -214,10 +236,11 @@ impl LoudnessNormalizer {
             }
 
             // Apply gain and true peak limiting
-            let amplified = sample * self.gain_linear;
-            let limited = self.limiter.process(amplified, self.true_peak_limit);
-
-            normalized_samples.push(limited);
+            let gain = self.gain_linear;
+            let limit = self.true_peak_limit;
+            for &sample in block {
+                normalized_samples.push(self.limiter.process(sample * gain, limit));
+            }
         }
 
         normalized_samples

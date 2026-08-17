@@ -165,8 +165,16 @@ impl AudioDeviceMonitor {
         event_sender: mpsc::UnboundedSender<DeviceEvent>,
         stop_signal: Arc<tokio::sync::Notify>,
     ) {
-        let mut last_device_list = Vec::new();
-        let check_interval = Duration::from_secs(2); // Poll every 2 seconds
+        let mut last_device_list: Vec<super::devices::AudioDevice> = Vec::new();
+
+        // Each poll is a full WASAPI enumeration (two passes, plus a property
+        // store open per endpoint), so the steady-state rate is deliberately
+        // slow — a disconnect is rare and costs at most STEADY_INTERVAL to
+        // notice. Once something *is* missing we drop to PROBE_INTERVAL so the
+        // consecutive-miss thresholds still resolve quickly.
+        const STEADY_INTERVAL: Duration = Duration::from_secs(10);
+        const PROBE_INTERVAL: Duration = Duration::from_secs(2);
+        let mut check_interval = STEADY_INTERVAL;
 
         loop {
             // Check for stop signal with timeout
@@ -195,7 +203,6 @@ impl AudioDeviceMonitor {
                        last_device_list.len(), current_devices.len());
                 let _ = event_sender.send(DeviceEvent::DeviceListChanged);
             }
-            last_device_list = current_devices.clone();
 
             // Check each monitored device
             for monitored in &mut monitored_devices {
@@ -236,17 +243,16 @@ impl AudioDeviceMonitor {
                 }
             }
 
-            // Adjust check interval based on device states
-            // If any device is missing, check more frequently
+            last_device_list = current_devices;
+
+            // Poll faster only while a device is actually missing, so the
+            // disconnect/reconnect thresholds resolve promptly.
             let has_missing = monitored_devices.iter().any(|d| d.consecutive_missing > 0);
-            let next_interval = if has_missing {
-                Duration::from_secs(2) // Fast polling when device missing
-            } else {
-                Duration::from_secs(5) // Slower polling when all devices present
-            };
+            let next_interval = if has_missing { PROBE_INTERVAL } else { STEADY_INTERVAL };
 
             if next_interval != check_interval {
                 debug!("Adjusting monitor interval to {:?}", next_interval);
+                check_interval = next_interval;
             }
         }
     }
