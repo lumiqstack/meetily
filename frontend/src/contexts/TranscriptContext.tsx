@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo, ReactNode, MutableRefObject } from 'react';
 import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
@@ -516,7 +516,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, [currentMeetingId]);
 
-  const value: TranscriptContextType = {
+  // Memoized: this provider consumes useRecordingState(), so without this the
+  // 500ms recording-state poll allocated a new context value on every tick and
+  // re-rendered every useTranscripts() consumer.
+  const value: TranscriptContextType = useMemo(() => ({
     transcripts,
     transcriptsRef,
     addTranscript,
@@ -528,7 +531,19 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,
-  };
+  }), [
+    transcripts,
+    transcriptsRef,
+    addTranscript,
+    copyTranscript,
+    flushBuffer,
+    transcriptContainerRef,
+    meetingTitle,
+    setMeetingTitle,
+    clearTranscripts,
+    currentMeetingId,
+    markMeetingAsSaved,
+  ]);
 
   return (
     <TranscriptContext.Provider value={value}>

@@ -70,34 +70,62 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // NEW: Status setter with logging
+  // Stable identity: reads previous status from the setState updater instead of
+  // closing over `state`, so the context value doesn't churn on every poll.
   const setStatus = useCallback((status: RecordingStatus, message?: string) => {
-    console.log(`[RecordingState] Status: ${state.status} → ${status}`, message || '');
-
-    setState(prev => ({
-      ...prev,
-      status,
-      statusMessage: message,
-    }));
-  }, [state.status, state.isRecording, state.isPaused]);
+    setState(prev => {
+      if (prev.status === status && prev.statusMessage === message) {
+        return prev;
+      }
+      console.log(`[RecordingState] Status: ${prev.status} → ${status}`, message || '');
+      return { ...prev, status, statusMessage: message };
+    });
+  }, []);
 
   /**
    * Sync recording state with backend
    * Called on mount (fixes refresh desync) and periodically while recording
+   *
+   * This runs twice a second from a provider near the root of the tree, so it
+   * must return the *same* state object when nothing changed. Allocating a new
+   * object unconditionally makes every consumer of this context re-render at
+   * 2Hz for the entire recording.
    */
   const syncWithBackend = async () => {
     try {
       const backendState = await recordingService.getRecordingState();
 
-      setState(prev => ({
-        ...prev,
-        isRecording: backendState.is_recording,
-        isPaused: backendState.is_paused,
-        isActive: backendState.is_active,
-        recordingDuration: backendState.recording_duration,
-        activeDuration: backendState.active_duration,
-      }));
+      // The backend reports durations as raw f64 seconds, so they differ on
+      // every poll. Truncate to whole seconds — the only consumer
+      // (RecordingStatusBar) floors them anyway — so the comparison below can
+      // actually bail out, and the tree wakes at most once a second.
+      const recordingDuration = backendState.recording_duration === null
+        ? null
+        : Math.floor(backendState.recording_duration);
+      const activeDuration = backendState.active_duration === null
+        ? null
+        : Math.floor(backendState.active_duration);
 
-      console.log('[RecordingStateContext] Synced with backend:', backendState);
+      setState(prev => {
+        if (
+          prev.isRecording === backendState.is_recording &&
+          prev.isPaused === backendState.is_paused &&
+          prev.isActive === backendState.is_active &&
+          prev.recordingDuration === recordingDuration &&
+          prev.activeDuration === activeDuration
+        ) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          isRecording: backendState.is_recording,
+          isPaused: backendState.is_paused,
+          isActive: backendState.is_active,
+          recordingDuration,
+          activeDuration,
+        };
+      });
     } catch (error) {
       console.error('[RecordingStateContext] Failed to sync with backend:', error);
       // Don't update state on error - keep current state

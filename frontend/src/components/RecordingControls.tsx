@@ -13,7 +13,6 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 
 interface RecordingControlsProps {
   isRecording: boolean;
-  barHeights: string[];
   onRecordingStop: (callApi?: boolean) => void;
   onRecordingStart: () => void;
   onTranscriptReceived: (summary: SummaryResponse) => void;
@@ -30,7 +29,6 @@ interface RecordingControlsProps {
 
 export const RecordingControls: React.FC<RecordingControlsProps> = ({
   isRecording,
-  barHeights,
   onRecordingStop,
   onRecordingStart,
   onTranscriptReceived,
@@ -497,15 +495,21 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                     </>
                   )}
 
+                  {/* Decorative level bars. Animated in CSS rather than from a
+                      React timer — this sits inside the recording page, so a
+                      state-driven animation re-rendered the whole tree several
+                      times a second for the entire recording. */}
                   <div className="flex items-center space-x-1 mx-4">
-                    {barHeights.map((height, index) => (
+                    {[0, 1, 2].map((index) => (
                       <div
                         key={index}
-                        className={`w-1 rounded-full transition-all duration-200 ${isPaused ? 'bg-orange-500' : 'bg-red-500'
-                          }`}
+                        className={`w-1 rounded-full ${isPaused ? 'bg-orange-500' : 'bg-red-500'} ${
+                          isRecording && !isPaused ? 'animate-recording-bar' : 'transition-all duration-200'
+                        }`}
                         style={{
-                          height: isRecording && !isPaused ? height : '4px',
+                          height: isRecording && !isPaused ? undefined : '4px',
                           opacity: isPaused ? 0.6 : 1,
+                          animationDelay: isRecording && !isPaused ? `${index * 180}ms` : undefined,
                         }}
                       />
                     ))}

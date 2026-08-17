@@ -125,9 +125,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   ];
 
 
-  const toggleCollapse = () => {
-    setIsCollapsed(!isCollapsed);
-  };
+  const toggleCollapse = React.useCallback(() => {
+    setIsCollapsed(prev => !prev);
+  }, []);
 
   // Update current meeting when on home page
   useEffect(() => {
@@ -143,7 +143,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   }, [meetings]);
 
   // Function to handle recording toggle from sidebar
-  const handleRecordingToggle = () => {
+  const handleRecordingToggle = React.useCallback(() => {
     if (!isRecording) {
       // Check if already on home page
       if (pathname === '/') {
@@ -174,10 +174,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       Analytics.trackButtonClick('stop_recording', 'sidebar');
     }
     // The actual recording start/stop is handled in the Home component
-  };
+  }, [isRecording, pathname, router]);
 
   // Function to search through meeting transcripts
-  const searchTranscripts = async (query: string) => {
+  const searchTranscripts = React.useCallback(async (query: string) => {
     if (!query.trim()) {
       setSearchResults([]);
       return;
@@ -195,7 +195,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setIsSearching(false);
     }
-  };
+  }, []);
 
   // Summary polling management
   const startSummaryPolling = React.useCallback((
@@ -302,31 +302,57 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
 
 
-  return (
-    <SidebarContext.Provider value={{
-      currentMeeting,
-      setCurrentMeeting,
-      sidebarItems,
-      isCollapsed,
-      toggleCollapse,
-      meetings,
-      setMeetings,
-      isMeetingActive,
-      setIsMeetingActive,
-      handleRecordingToggle,
-      searchTranscripts,
-      searchResults,
-      isSearching,
-      setServerAddress,
-      serverAddress,
-      transcriptServerAddress,
-      setTranscriptServerAddress,
-      activeSummaryPolls,
-      startSummaryPolling,
-      stopSummaryPolling,
-      refetchMeetings: fetchMeetings,
+  // Memoized: this provider consumes useRecordingState(), so an inline object
+  // literal here re-rendered every useSidebar() consumer on each 500ms
+  // recording-state poll.
+  const value = React.useMemo(() => ({
+    currentMeeting,
+    setCurrentMeeting,
+    sidebarItems,
+    isCollapsed,
+    toggleCollapse,
+    meetings,
+    setMeetings,
+    isMeetingActive,
+    setIsMeetingActive,
+    handleRecordingToggle,
+    searchTranscripts,
+    searchResults,
+    isSearching,
+    setServerAddress,
+    serverAddress,
+    transcriptServerAddress,
+    setTranscriptServerAddress,
+    activeSummaryPolls,
+    startSummaryPolling,
+    stopSummaryPolling,
+    refetchMeetings: fetchMeetings,
+  }), [
+    currentMeeting,
+    setCurrentMeeting,
+    sidebarItems,
+    isCollapsed,
+    toggleCollapse,
+    meetings,
+    setMeetings,
+    isMeetingActive,
+    setIsMeetingActive,
+    handleRecordingToggle,
+    searchTranscripts,
+    searchResults,
+    isSearching,
+    setServerAddress,
+    serverAddress,
+    transcriptServerAddress,
+    setTranscriptServerAddress,
+    activeSummaryPolls,
+    startSummaryPolling,
+    stopSummaryPolling,
+    fetchMeetings,
+  ]);
 
-    }}>
+  return (
+    <SidebarContext.Provider value={value}>
       {children}
     </SidebarContext.Provider>
   );

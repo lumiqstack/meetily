@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { RecordingControls } from '@/components/RecordingControls';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -25,7 +25,6 @@ import { useRouter } from 'next/navigation';
 export default function Home() {
   // Local page state (not moved to contexts)
   const [isRecording, setIsRecordingState] = useState(false);
-  const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
 
   // Use contexts for state management
@@ -186,21 +185,24 @@ export default function Home() {
     }
   };
 
-  useEffect(() => {
-    if (recordingState.isRecording) {
-      const interval = setInterval(() => {
-        setBarHeights(prev => {
-          const newHeights = [...prev];
-          newHeights[0] = Math.random() * 20 + 10 + 'px';
-          newHeights[1] = Math.random() * 20 + 10 + 'px';
-          newHeights[2] = Math.random() * 20 + 10 + 'px';
-          return newHeights;
-        });
-      }, 300);
+  // The recording level bars animate in CSS (see RecordingControls). They used
+  // to be driven from here by a 300ms setInterval of random values, which
+  // re-rendered this whole page — and every child — 3.3 times a second for the
+  // length of the recording.
 
-      return () => clearInterval(interval);
-    }
-  }, [recordingState.isRecording]);
+  // Stable callback identities. RecordingControls registers Tauri event
+  // listeners in an effect keyed on these props, so a fresh arrow per render
+  // meant tearing down and re-registering listeners over IPC on every render.
+  const handleStopFromControls = useCallback(
+    (callApi = true) => handleRecordingStop(callApi),
+    [handleRecordingStop]
+  );
+  const handleStopInitiated = useCallback(() => setIsStopping(true), [setIsStopping]);
+  const handleTranscriptReceived = useCallback(() => { }, []);
+  const handleTranscriptionError = useCallback(
+    (message: string) => showModal('errorAlert', message),
+    [showModal]
+  );
 
   // Computed values using global status
   const isProcessingStop = status === RecordingStatus.PROCESSING_TRANSCRIPTS || isProcessing;
@@ -250,14 +252,11 @@ export default function Home() {
                   <div className="bg-white rounded-full shadow-lg flex items-center">
                     <RecordingControls
                       isRecording={recordingState.isRecording}
-                      onRecordingStop={(callApi = true) => handleRecordingStop(callApi)}
+                      onRecordingStop={handleStopFromControls}
                       onRecordingStart={handleRecordingStart}
-                      onTranscriptReceived={() => { }} // Not actually used by RecordingControls
-                      onStopInitiated={() => setIsStopping(true)}
-                      barHeights={barHeights}
-                      onTranscriptionError={(message) => {
-                        showModal('errorAlert', message);
-                      }}
+                      onTranscriptReceived={handleTranscriptReceived} // Not actually used by RecordingControls
+                      onStopInitiated={handleStopInitiated}
+                      onTranscriptionError={handleTranscriptionError}
                       isRecordingDisabled={isRecordingDisabled}
                       isParentProcessing={isProcessingStop}
                       selectedDevices={selectedDevices}
