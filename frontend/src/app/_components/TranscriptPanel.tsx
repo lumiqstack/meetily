@@ -53,9 +53,10 @@ export function TranscriptPanel({
   );
 
   return (
-    <div ref={transcriptContainerRef} className="w-full border-r border-gray-200 bg-white flex flex-col overflow-y-auto">
-      {/* Title area - Sticky header */}
-      <div className="sticky top-0 z-10 bg-white p-4 border-gray-200">
+    <div ref={transcriptContainerRef} className="w-full border-r border-gray-200 bg-white flex flex-col overflow-hidden">
+      {/* Title area - the transcript list below owns the only scroller, so this
+          stays put without needing to be sticky */}
+      <div className="flex-shrink-0 bg-white p-4 border-gray-200">
         <div className="flex flex-col space-y-3">
           <div className="flex  flex-col space-y-2">
             <div className="flex justify-center  items-center space-x-2">
@@ -94,7 +95,7 @@ export function TranscriptPanel({
 
       {/* Permission Warning - Not needed on Linux */}
       {!isRecording && !isChecking && !isLinux && (
-        <div className="flex justify-center px-4 pt-4">
+        <div className="flex-shrink-0 flex justify-center px-4 pt-4">
           <PermissionWarning
             hasMicrophone={hasMicrophone}
             hasSystemAudio={hasSystemAudio}
@@ -104,22 +105,27 @@ export function TranscriptPanel({
         </div>
       )}
 
-      {/* Transcript content */}
-      <div className="pb-20">
-        <div className="flex justify-center">
-          <div className="w-2/3 max-w-[750px]">
-            <VirtualizedTranscriptView
-              segments={segments}
-              isRecording={isRecording}
-              isPaused={isPaused}
-              isProcessing={isProcessingStop}
-              isStopping={isStopping}
-              enableStreaming={isRecording}
-              showConfidence={true}
-            />
-          </div>
+      {/* Transcript content - the inner wrapper must have a bounded height or
+          the virtualizer inside it renders every row */}
+      <div className="flex flex-1 min-h-0 justify-center">
+        <div className="w-2/3 max-w-[750px] overflow-hidden">
+          <VirtualizedTranscriptView
+            segments={segments}
+            isRecording={isRecording}
+            isPaused={isPaused}
+            isProcessing={isProcessingStop}
+            isStopping={isStopping}
+            enableStreaming={isRecording}
+            showConfidence={true}
+          />
         </div>
+      </div>
 
+      {/* Capped so a long pending list can't squeeze the transcript out;
+          pb-20 keeps the floating recording controls off the content. Both
+          panels render null when they have nothing, so the region collapses
+          rather than reserving its padding against an empty box. */}
+      <div className="flex-shrink-0 max-h-[40%] overflow-y-auto pb-20 empty:hidden">
         {/* Background remote imports/retranscriptions in progress */}
         <BackgroundJobsPanel />
 

@@ -1,4 +1,4 @@
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 const NEW_TEAMS_PROCESS_NAME: &str = "ms-teams.exe";
 
@@ -20,13 +20,20 @@ impl TeamsProcessDetector {
     }
 
     pub fn detect(&mut self) -> TeamsProcessSnapshot {
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        // Names come from the process enumeration itself, so nothing beyond the
+        // empty refresh kind is needed — and skipping `exe` in particular avoids
+        // opening a handle to every process on the machine every 15 seconds.
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::new(),
+        );
 
         detect_teams_process_from_names(
             self.system
                 .processes()
                 .iter()
-                .map(|(pid, process)| (pid.as_u32(), process.name().to_string_lossy().to_string())),
+                .filter_map(|(pid, process)| Some((pid.as_u32(), process.name().to_str()?))),
         )
     }
 }

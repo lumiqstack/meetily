@@ -38,6 +38,16 @@ pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), Strin
         app.manage(AppState { db_manager });
         info!("Database initialized successfully");
 
+        // Second half of the storage migration: meetings store an absolute
+        // folder_path, so moving the recordings tree without repointing these
+        // would break playback and retranscription for every existing meeting.
+        // No-op unless a relocation actually moved recordings.
+        match crate::storage::migrate::rewrite_db_paths(&pool).await {
+            Ok(0) => {}
+            Ok(n) => info!("Repointed {} meeting folder path(s) after storage migration", n),
+            Err(e) => log::error!("Failed to repoint meeting folder paths: {:#}", e),
+        }
+
         // Detect background jobs a previous process died under: mark them so
         // the frontend can offer retry/dismiss, and clean up orphaned import
         // folders. Best-effort — a reconcile failure must not block startup.

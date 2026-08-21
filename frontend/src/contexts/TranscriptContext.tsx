@@ -35,51 +35,15 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Refs for transcript management
   const transcriptsRef = useRef<Transcript[]>(transcripts);
-  const isUserAtBottomRef = useRef<boolean>(true);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  // Sequence IDs already merged into `transcripts`; kept across flushes so a
+  // flush doesn't have to rescan the whole list to dedupe.
+  const seenSequenceIdsRef = useRef<Set<number>>(new Set());
   const finalFlushRef = useRef<(() => void) | null>(null);
 
   // Keep ref updated with current transcripts
   useEffect(() => {
     transcriptsRef.current = transcripts;
-  }, [transcripts]);
-
-  // Smart auto-scroll: Track user scroll position
-  useEffect(() => {
-    const handleScroll = () => {
-      const container = transcriptContainerRef.current;
-      if (!container) return;
-
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const isAtBottom = scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
-      isUserAtBottomRef.current = isAtBottom;
-    };
-
-    const container = transcriptContainerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll);
-      return () => container.removeEventListener('scroll', handleScroll);
-    }
-  }, []);
-
-  // Auto-scroll when transcripts change (only if user is at bottom)
-  useEffect(() => {
-    // Only auto-scroll if user was at the bottom before new content
-    if (isUserAtBottomRef.current && transcriptContainerRef.current) {
-      // Wait for Framer Motion animation to complete (150ms) before scrolling
-      // This ensures scrollHeight includes the full rendered height of the new transcript
-      const scrollTimeout = setTimeout(() => {
-        const container = transcriptContainerRef.current;
-        if (container) {
-          container.scrollTo({
-            top: container.scrollHeight,
-            behavior: 'smooth'
-          });
-        }
-      }, 150); // Match Framer Motion transition duration
-
-      return () => clearTimeout(scrollTimeout);
-    }
   }, [transcripts]);
 
   // Initialize IndexedDB and listen for recording-started/stopped events
@@ -229,13 +193,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       }
 
       // Sort both stale and recent transcripts by chunk_start_time, then by sequence_id
-      const sortTranscripts = (transcripts: Transcript[]) => {
-        return transcripts.sort((a, b) => {
-          const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
-          if (chunkTimeDiff !== 0) return chunkTimeDiff;
-          return (a.sequence_id || 0) - (b.sequence_id || 0);
-        });
+      const compareTranscripts = (a: Transcript, b: Transcript) => {
+        const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
+        if (chunkTimeDiff !== 0) return chunkTimeDiff;
+        return (a.sequence_id || 0) - (b.sequence_id || 0);
       };
+
+      const sortTranscripts = (transcripts: Transcript[]) => transcripts.sort(compareTranscripts);
 
       const sortedStaleTranscripts = sortTranscripts(staleTranscripts);
       const sortedRecentTranscripts = sortTranscripts(recentTranscripts);
@@ -244,33 +208,35 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       const allNewTranscripts = [...sortedTranscripts, ...sortedRecentTranscripts, ...sortedStaleTranscripts, ...sortedForceFlushTranscripts];
 
       if (allNewTranscripts.length > 0) {
-        setTranscripts(prev => {
-          // Create a set of existing sequence_ids for deduplication
-          const existingSequenceIds = new Set(prev.map(t => t.sequence_id).filter(id => id !== undefined));
+        const existingSequenceIds = seenSequenceIdsRef.current;
 
-          // Filter out any new transcripts that already exist
-          const uniqueNewTranscripts = allNewTranscripts.filter(transcript =>
-            transcript.sequence_id !== undefined && !existingSequenceIds.has(transcript.sequence_id)
-          );
+        // Transcripts without a sequence_id are dropped, as they always were
+        const uniqueNewTranscripts = allNewTranscripts.filter(transcript =>
+          transcript.sequence_id !== undefined && !existingSequenceIds.has(transcript.sequence_id)
+        );
 
-          // Only combine if we have unique new transcripts
-          if (uniqueNewTranscripts.length === 0) {
-            console.log('No unique transcripts to add - all were duplicates');
-            return prev; // No new unique transcripts to add
-          }
-
+        if (uniqueNewTranscripts.length === 0) {
+          console.log('No unique transcripts to add - all were duplicates');
+        } else {
           console.log(`Adding ${uniqueNewTranscripts.length} unique transcripts out of ${allNewTranscripts.length} received`);
 
-          // Merge with existing transcripts, maintaining chronological order
-          const combined = [...prev, ...uniqueNewTranscripts];
+          for (const transcript of uniqueNewTranscripts) {
+            existingSequenceIds.add(transcript.sequence_id!);
+          }
 
-          // Sort by chunk_start_time first, then by sequence_id
-          return combined.sort((a, b) => {
-            const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
-            if (chunkTimeDiff !== 0) return chunkTimeDiff;
-            return (a.sequence_id || 0) - (b.sequence_id || 0);
+          // The existing list is already in order, so only the batch needs sorting
+          sortTranscripts(uniqueNewTranscripts);
+          setTranscripts(prev => {
+            const merged = prev.concat(uniqueNewTranscripts);
+            // A stale transcript can flush in a later batch than a newer one,
+            // which would land it out of order. Re-sort only when that happens,
+            // so the ordinary in-order case stays linear.
+            const last = prev[prev.length - 1];
+            return !last || compareTranscripts(last, uniqueNewTranscripts[0]) <= 0
+              ? merged
+              : merged.sort(compareTranscripts);
           });
-        });
+        }
 
         // Log the processing summary
         const logMessage = forceFlush
@@ -388,6 +354,11 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             speaker: segment.speaker ?? null,
           }));
 
+          seenSequenceIdsRef.current = new Set(
+            formattedTranscripts
+              .map(t => t.sequence_id)
+              .filter((id): id is number => id !== undefined)
+          );
           setTranscripts(formattedTranscripts);
           console.log('[Reload Sync] ✅ Transcript history synced successfully');
 
@@ -429,6 +400,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       duration: update.duration,
       speaker: update.speaker ?? null,
     };
+
+    seenSequenceIdsRef.current.add(newTranscript.sequence_id!);
 
     setTranscripts(prev => {
       console.log('📊 Current transcripts count before update:', prev.length);
@@ -489,6 +462,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Clear transcripts (used when starting new recording)
   const clearTranscripts = useCallback(() => {
+    seenSequenceIdsRef.current = new Set();
     setTranscripts([]);
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);

@@ -280,7 +280,9 @@ impl RecordingManager {
             transcription_sender,
             0, // Ignored - using dynamic sizing internally
             48000, // 48kHz sample rate
-            Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
+            // Pre-mixed audio destination. Withheld when auto-save is off so the
+            // pipeline skips mixing; the saver's drain then ends immediately.
+            auto_save.then_some(recording_sender),
             mic_name,
             mic_kind,
             sys_name,
@@ -555,6 +557,12 @@ impl RecordingManager {
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.recording_saver.set_meeting_name(name);
+    }
+
+    /// Set the base folder meeting directories are created under (from the
+    /// `save_folder` recording preference).
+    pub fn set_save_folder(&mut self, folder: Option<std::path::PathBuf>) {
+        self.recording_saver.set_save_folder(folder);
     }
 
     /// Add a structured transcript segment to be saved later

@@ -134,6 +134,9 @@ async fn await_accumulation(
 pub struct RecordingSaver {
     incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
     meeting_folder: Option<PathBuf>,
+    /// Base folder for meeting directories, from the user's `save_folder`
+    /// preference. `None` falls back to the default under the data root.
+    save_folder: Option<PathBuf>,
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
@@ -147,6 +150,7 @@ impl RecordingSaver {
         Self {
             incremental_saver: None,
             meeting_folder: None,
+            save_folder: None,
             meeting_name: None,
             metadata: None,
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
@@ -158,6 +162,15 @@ impl RecordingSaver {
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.meeting_name = name;
+    }
+
+    /// Set the base folder meeting directories are created under.
+    ///
+    /// Comes from the `save_folder` recording preference. Without this the
+    /// saver always used the default folder, so picking a location in Settings
+    /// had no effect on where recordings actually landed.
+    pub fn set_save_folder(&mut self, folder: Option<PathBuf>) {
+        self.save_folder = folder;
     }
 
     /// Set device information in metadata
@@ -224,7 +237,11 @@ impl RecordingSaver {
     /// audio checkpoints, or transcripts + metadata — so a failure here must
     /// stop the recording from starting rather than surface only at Stop.
     pub fn prepare_storage(&mut self, auto_save: bool) -> Result<()> {
-        let base_folder = super::recording_preferences::get_default_recordings_folder();
+        // User's chosen folder, falling back to the default under the data root
+        let base_folder = self
+            .save_folder
+            .clone()
+            .unwrap_or_else(super::recording_preferences::get_default_recordings_folder);
         self.prepare_storage_in(&base_folder, auto_save)
     }
 
@@ -240,7 +257,7 @@ impl RecordingSaver {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No meeting name was set for the recording"))?;
         // Without auto_save the folder still holds transcripts/metadata, but
-        // no .checkpoints directory or audio writer is created.
+        // no audio encoder is started.
         self.initialize_meeting_folder(base_folder, &name, auto_save)
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -251,7 +268,7 @@ impl RecordingSaver {
             })?;
         info!(
             "Successfully initialized meeting folder ({})",
-            if auto_save { "with checkpoints" } else { "transcripts only" }
+            if auto_save { "with audio encoder" } else { "transcripts only" }
         );
         Ok(())
     }
@@ -260,7 +277,7 @@ impl RecordingSaver {
     /// with [`prepare_storage`](Self::prepare_storage).
     ///
     /// # Arguments
-    /// * `auto_save` - If true, audio chunks go to the checkpoint writer. If false, they are discarded.
+    /// * `auto_save` - If true, audio chunks go to the audio encoder. If false, they are discarded.
     pub fn start_accumulation(
         &mut self,
         auto_save: bool,
@@ -284,13 +301,10 @@ impl RecordingSaver {
                     }
                     let saver = saver
                         .ok_or_else(|| anyhow::anyhow!("Incremental saver not available while accumulating"))?;
-                    // Every ~30s of audio this synchronously spawns ffmpeg and
-                    // pipes the whole checkpoint through it, so it runs on a
-                    // blocking thread rather than parking an async worker for
-                    // the length of an AAC encode.
-                    tokio::task::spawn_blocking(move || saver.blocking_lock().add_chunk(chunk))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Incremental saver task failed to join: {}", e))?
+                    // add_chunk just hands the buffer to the encoder's writer
+                    // thread; the encode happens in ffmpeg, off this runtime.
+                    let mut guard = saver.lock().await;
+                    guard.add_chunk(chunk)
                 }
             })
             .await;
@@ -303,23 +317,23 @@ impl RecordingSaver {
     ///
     /// # Arguments
     /// * `meeting_name` - Name of the meeting
-    /// * `create_checkpoints` - Whether to create .checkpoints/ directory and IncrementalAudioSaver
+    /// * `save_audio` - Whether to start an audio encoder for this meeting
     fn initialize_meeting_folder(
         &mut self,
         base_folder: &PathBuf,
         meeting_name: &str,
-        create_checkpoints: bool,
+        save_audio: bool,
     ) -> Result<()> {
-        // Create meeting folder structure (with or without .checkpoints/ subdirectory)
-        let meeting_folder = create_meeting_folder(base_folder, meeting_name, create_checkpoints)?;
+        // No .checkpoints/ any more: the encoder writes audio.mp4 directly and
+        // that file is already crash-recoverable (fragmented MP4).
+        let meeting_folder = create_meeting_folder(base_folder, meeting_name, false)?;
 
-        // Only initialize incremental saver if checkpoints are needed (auto_save is true)
-        if create_checkpoints {
+        if save_audio {
             let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000)?;
             self.incremental_saver = Some(Arc::new(AsyncMutex::new(incremental_saver)));
-            info!("✅ Incremental audio saver initialized for meeting: {}", meeting_name);
+            info!("✅ Audio encoder started for meeting: {}", meeting_name);
         } else {
-            info!("⚠️  Skipped incremental audio saver (auto-save disabled)");
+            info!("⚠️  Skipped audio encoder (auto-save disabled)");
         }
 
         // Create initial metadata
@@ -334,7 +348,7 @@ impl RecordingSaver {
                 microphone: None,  // Could be enhanced to store actual device names
                 system_audio: None,
             },
-            audio_file: if create_checkpoints { "audio.mp4".to_string() } else { "".to_string() },
+            audio_file: if save_audio { "audio.mp4".to_string() } else { "".to_string() },
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
@@ -416,17 +430,15 @@ impl RecordingSaver {
         Ok(())
     }
 
-    // in frontend/src-tauri/src/audio/recording_saver.rs
+    /// (whole seconds of audio committed, sample rate). Reported to the UI; the
+    /// first field used to be a checkpoint count, which no longer exists.
     pub fn get_stats(&self) -> (usize, u32) {
         if let Some(ref saver) = self.incremental_saver {
             if let Ok(guard) = saver.try_lock() {
-                (guard.get_checkpoint_count() as usize, 48000)
-            } else {
-                (0, 48000)
+                return (guard.duration_seconds() as usize, 48000);
             }
-        } else {
-            (0, 48000)
         }
+        (0, 48000)
     }
 
     /// Stop and save using incremental saving approach
@@ -815,12 +827,14 @@ mod storage_tests {
     }
 
     #[test]
-    fn audio_mode_creates_checkpoint_writer() {
+    fn audio_mode_starts_the_streaming_encoder() {
         let dir = tempfile::tempdir().unwrap();
         let mut saver = named_saver();
         saver.prepare_storage_in(&dir.path().to_path_buf(), true).unwrap();
-        assert!(saver.meeting_folder.clone().unwrap().join(".checkpoints").is_dir());
         assert!(saver.incremental_saver.is_some());
+        // The encoder writes a crash-recoverable audio.mp4 directly; the
+        // .checkpoints/ directory is only read for meetings from older builds.
+        assert!(!saver.meeting_folder.clone().unwrap().join(".checkpoints").exists());
     }
 
     #[test]

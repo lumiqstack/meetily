@@ -43,8 +43,8 @@ pub struct SystemMonitor {
 impl SystemMonitor {
     pub fn new() -> Self {
         info!("Initializing system monitor");
-        let mut system = System::new_all();
-        system.refresh_all();
+        // `System::new_all()` already refreshes everything it loads.
+        let system = System::new_all();
 
         Self {
             system: Arc::new(RwLock::new(system)),

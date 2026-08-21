@@ -195,9 +195,18 @@ impl LoudnessNormalizer {
     ///
     /// Target: -23 LUFS (professional broadcast standard for speech/dialog)
     /// Applies sample-by-sample with 10ms lookahead limiter to prevent clipping
+    /// Allocating wrapper for offline callers. The realtime capture path uses
+    /// [`normalize_in_place`](Self::normalize_in_place).
     pub fn normalize_loudness(&mut self, samples: &[f32]) -> Vec<f32> {
+        let mut out = samples.to_vec();
+        self.normalize_in_place(&mut out);
+        out
+    }
+
+    /// Same normalization, applied in place — no allocation per audio callback.
+    pub fn normalize_in_place(&mut self, samples: &mut [f32]) {
         if samples.is_empty() {
-            return Vec::new();
+            return;
         }
 
         const TARGET_LUFS: f64 = -23.0;
@@ -208,9 +217,7 @@ impl LoudnessNormalizer {
         // as well.
         const GAIN_UPDATE_EVERY_CHUNKS: u32 = 48;
 
-        let mut normalized_samples = Vec::with_capacity(samples.len());
-
-        for block in samples.chunks(ANALYZE_CHUNK_SIZE) {
+        for block in samples.chunks_mut(ANALYZE_CHUNK_SIZE) {
             // Accumulate samples for loudness analysis in bulk rather than
             // pushing one at a time.
             self.loudness_buffer.extend_from_slice(block);
@@ -238,12 +245,10 @@ impl LoudnessNormalizer {
             // Apply gain and true peak limiting
             let gain = self.gain_linear;
             let limit = self.true_peak_limit;
-            for &sample in block {
-                normalized_samples.push(self.limiter.process(sample * gain, limit));
+            for sample in block.iter_mut() {
+                *sample = self.limiter.process(*sample * gain, limit);
             }
         }
-
-        normalized_samples
     }
 }
 
@@ -401,21 +406,27 @@ impl HighPassFilter {
 
     /// Apply high-pass filter to audio samples
     /// Uses first-order IIR (Infinite Impulse Response) filter
+    ///
+    /// Allocating wrapper for offline callers (decoder, import). The realtime
+    /// capture path uses [`process_in_place`](Self::process_in_place).
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
-        let mut output = Vec::with_capacity(samples.len());
+        let mut output = samples.to_vec();
+        self.process_in_place(&mut output);
+        output
+    }
 
-        for &sample in samples {
+    /// Same filter, applied in place — no allocation per audio callback.
+    pub fn process_in_place(&mut self, samples: &mut [f32]) {
+        for sample in samples.iter_mut() {
             // First-order high-pass IIR filter formula:
             // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
-            let filtered = self.alpha * (self.prev_output + sample - self.prev_input);
+            let filtered = self.alpha * (self.prev_output + *sample - self.prev_input);
 
-            self.prev_input = sample;
+            self.prev_input = *sample;
             self.prev_output = filtered;
 
-            output.push(filtered);
+            *sample = filtered;
         }
-
-        output
     }
 
     /// Reset filter state (call when starting new recording)
@@ -499,27 +510,36 @@ pub fn average_noise_spectrum(audio: &[f32]) -> f32 {
 }
 
 pub fn audio_to_mono(audio: &[f32], channels: u16) -> Vec<f32> {
-    let mut mono_samples = Vec::with_capacity(audio.len() / channels as usize);
+    let mut mono_samples = Vec::with_capacity(audio.len() / channels.max(1) as usize);
+    audio_to_mono_into(audio, channels, &mut mono_samples);
+    mono_samples
+}
+
+/// Downmix into a caller-owned buffer, which the realtime capture path reuses
+/// across callbacks instead of allocating one per chunk. `out` is cleared first.
+pub fn audio_to_mono_into(audio: &[f32], channels: u16, out: &mut Vec<f32>) {
+    out.clear();
+
+    if channels <= 1 {
+        out.extend_from_slice(audio);
+        return;
+    }
+
+    out.reserve(audio.len() / channels as usize);
 
     // For microphone arrays (> 2 channels), only use first 2 channels
     // Many microphone arrays have auxiliary channels for beam-forming/noise cancellation
     // that can contain anti-phase signals. Averaging all channels can cause destructive
     // interference resulting in near-zero output.
     let effective_channels = if channels > 2 { 2 } else { channels };
+    let scale = 1.0 / effective_channels as f32;
 
     // Iterate over the audio slice in chunks, each containing `channels` samples
     for chunk in audio.chunks(channels as usize) {
         // Sum only the first effective_channels (typically 1-2 for mic arrays)
         let sum: f32 = chunk.iter().take(effective_channels as usize).sum();
-
-        // Calculate the average mono sample using effective channel count
-        let mono_sample = sum / effective_channels as f32;
-
-        // Store the computed mono sample
-        mono_samples.push(mono_sample);
+        out.push(sum * scale);
     }
-
-    mono_samples
 }
 
 /// High-quality audio resampling with adaptive parameters based on sample rate ratio
