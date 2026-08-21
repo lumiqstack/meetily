@@ -167,7 +167,7 @@ pub async fn generate_with_copilot_cli(
     let binary = resolve_copilot_binary(binary_path)?;
 
     let prompt_file =
-        std::env::temp_dir().join(format!("meetily-copilot-{}.md", uuid::Uuid::new_v4()));
+        crate::storage::tmp_dir().join(format!("meetily-copilot-{}.md", uuid::Uuid::new_v4()));
     let prompt_body = format!("{}\n\n{}", system_prompt, user_prompt);
     write_prompt_file(&prompt_file, &prompt_body)
         .map_err(|e| format!("Failed to write Copilot CLI prompt file: {}", e))?;
@@ -218,7 +218,7 @@ async fn run_copilot(
         .arg("--disable-builtin-mcps")
         .arg("--log-level")
         .arg("none")
-        .current_dir(std::env::temp_dir())
+        .current_dir(crate::storage::tmp_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

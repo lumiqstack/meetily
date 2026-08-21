@@ -57,6 +57,10 @@ export function useAutoScroll({
     const isProgrammaticScrollRef = useRef(false);
     // Track previous segment count to detect new segments
     const prevSegmentCountRef = useRef(segments.length);
+    // Where the viewport was as of the last scroll event, i.e. before the newest
+    // segment was appended - measuring after it renders counts its own height
+    // against the threshold and stops following on long segments
+    const wasNearBottomRef = useRef(true);
 
     /**
      * Check if the user is scrolled near the bottom
@@ -75,6 +79,7 @@ export function useAutoScroll({
             isProgrammaticScrollRef.current = true;
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
             userScrolledRef.current = false;
+            wasNearBottomRef.current = true;
             setAutoScroll(true);
 
             // Reset the flag after a small delay to account for scroll event propagation
@@ -92,6 +97,8 @@ export function useAutoScroll({
         let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
         const handleScroll = () => {
+            wasNearBottomRef.current = isNearBottom();
+
             // Skip if this is a programmatic scroll
             if (isProgrammaticScrollRef.current) {
                 return;
@@ -142,12 +149,11 @@ export function useAutoScroll({
         // Update the ref for next comparison
         prevSegmentCountRef.current = segmentCount;
 
-        // Only scroll if new segments arrived AND user is currently at bottom
-        // Check isNearBottom() immediately to avoid race conditions with the debounced scroll handler
+        // Only scroll if new segments arrived AND user was at the bottom
         if (hasNewSegments && autoScrollRef.current && isRecording && !isPaused && segmentCount > 0) {
-            // Check if user is at bottom RIGHT NOW before scrolling
-            const isCurrentlyAtBottom = isNearBottom();
-            if (!isCurrentlyAtBottom) {
+            // The debounced scroll handler may not have run yet, so use the
+            // position it last saw rather than trusting `autoScroll` alone
+            if (!wasNearBottomRef.current) {
                 // User has scrolled up - don't auto-scroll
                 return;
             }
@@ -174,7 +180,7 @@ export function useAutoScroll({
                 isProgrammaticScrollRef.current = false;
             }, 150);
         }
-    }, [segments.length, isRecording, isPaused, useVirtualization, virtualizer, scrollRef, isNearBottom, disableAutoScroll]);
+    }, [segments.length, isRecording, isPaused, useVirtualization, virtualizer, scrollRef, disableAutoScroll]);
 
     // Auto-scroll to active segment (when clicking on search results, etc.)
     useEffect(() => {

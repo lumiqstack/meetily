@@ -1,9 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { TranscriptSegmentData } from '@/types';
 
-const INTERVAL_MS = 15; // Character reveal interval
+// Each tick is a setState that re-renders every visible segment, so reveal in
+// bigger steps rather than more often; DURATION_MS still sets the wall clock.
+const INTERVAL_MS = 100; // Character reveal interval
 const DURATION_MS = 800; // Total streaming duration
 const INITIAL_CHARS = 5; // Show first N characters immediately
+const MIN_CHARS_PER_TICK = 12; // Floor, so short segments don't crawl for the full duration
 
 interface StreamingSegment {
   id: string;
@@ -67,7 +70,7 @@ export function useTranscriptStreaming(
       // Calculate how many characters to reveal per tick
       const totalTicks = Math.floor(DURATION_MS / INTERVAL_MS);
       const remainingChars = fullText.length - INITIAL_CHARS;
-      const charsPerTick = Math.max(2, Math.ceil(remainingChars / totalTicks));
+      const charsPerTick = Math.max(MIN_CHARS_PER_TICK, Math.ceil(remainingChars / totalTicks));
 
       let charIndex = INITIAL_CHARS;
 

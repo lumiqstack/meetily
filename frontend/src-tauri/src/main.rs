@@ -6,8 +6,14 @@
 use log;
 
 fn main() {
+    // Must precede open_log_file(): the log belongs under the configured data
+    // root like everything else, and this runs before a Tauri AppHandle exists.
+    app_lib::storage::init_standalone();
+
     if std::env::var_os("RUST_LOG").is_none() {
-        std::env::set_var("RUST_LOG", "info");
+        // `ort` narrates ~19 lines per ONNX Runtime session at info; the longer
+        // directive wins over the bare default, so everything else stays at info.
+        std::env::set_var("RUST_LOG", "info,ort=warn");
     }
 
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default());
@@ -26,6 +32,20 @@ fn main() {
     // Async logger will be initialized lazily when first needed (after Tauri runtime starts)
     log::info!("Starting application...");
     log::info!("{}", build_banner());
+
+    // The main window's WebView2 profile (~86 MB of cache, and growing) is the
+    // last thing still landing on the system drive. Tauri leaves `dataDirectory`
+    // unset, so wry passes an empty path and the runtime falls back to this
+    // environment variable — but only if it is set before the first webview is
+    // created, which rules out doing this from `setup()`.
+    #[cfg(windows)]
+    if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+        if let Some(dir) = app_lib::storage::migrate::relocate_webview2_profile() {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir);
+            log::info!("WebView2 user data folder: {}", dir.display());
+        }
+    }
+
     app_lib::run();
 }
 
@@ -99,12 +119,12 @@ fn install_panic_hook() {
     }));
 }
 
-/// Open (rotating at 5 MB) the release log file, e.g.
-/// `%LOCALAPPDATA%\com.meetily.ai\logs\meetily.log` on Windows.
+/// Open (rotating at 5 MB) the release log file under the configured data root,
+/// e.g. `D:\codex\meetily-data\logs\meetily.log`. Defaults to
+/// `%APPDATA%\com.meetily.ai\logs\meetily.log` when no root is configured.
 #[cfg(not(debug_assertions))]
 fn open_log_file() -> Option<std::fs::File> {
-    let base = dirs_base()?;
-    let dir = base.join("com.meetily.ai").join("logs");
+    let dir = app_lib::storage::logs_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("meetily.log");
     const MAX_LEN: u64 = 5 * 1024 * 1024;
@@ -116,16 +136,4 @@ fn open_log_file() -> Option<std::fs::File> {
         .append(true)
         .open(&path)
         .ok()
-}
-
-#[cfg(not(debug_assertions))]
-fn dirs_base() -> Option<std::path::PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-    }
 }

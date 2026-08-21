@@ -1,7 +1,10 @@
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{migrate::MigrateDatabase, Result, Row, Sqlite, SqlitePool, Transaction};
 use std::fs;
 use std::path::Path;
-use tauri::Manager;
+use std::time::Duration;
 
 const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION: i64 = 20260618000000;
 const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION: &str =
@@ -34,7 +37,22 @@ impl DatabaseManager {
             }
         }
 
-        let pool = SqlitePool::connect(tauri_db_path).await?;
+        // The file is created above, so `create_if_missing` stays off: a path
+        // that is still absent here is a real error, not a fresh install.
+        // `synchronous = NORMAL` is only durable under WAL, so the two are set
+        // together.
+        let connect_options = SqliteConnectOptions::new()
+            .filename(tauri_db_path)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(15));
+
+        // SQLite takes one writer at a time; extra connections queue on the
+        // write lock instead of adding throughput.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(connect_options)
+            .await?;
 
         Self::reconcile_orphaned_cloud_transcript_provider_migration(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
@@ -47,15 +65,9 @@ impl DatabaseManager {
     // after they can just delete the existing .sqlite file and then copy the existing .db file to
     // the current app dir, So the system detects legacy db and copy it and starts with that data
     // (Newly created .sqlite with the copied content from .db)
-    pub async fn new_from_app_handle(app_handle: &tauri::AppHandle) -> Result<Self> {
-        // Resolve the app's data directory
-        let app_data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .expect("failed to get app data dir");
-        if !app_data_dir.exists() {
-            fs::create_dir_all(&app_data_dir).map_err(|e| sqlx::Error::Io(e))?;
-        }
+    pub async fn new_from_app_handle(_app_handle: &tauri::AppHandle) -> Result<Self> {
+        // Resolve the configured data root (falls back to app_data_dir)
+        let app_data_dir = crate::storage::db_dir();
 
         // Define database paths
         let tauri_db_path = app_data_dir
@@ -124,13 +136,8 @@ impl DatabaseManager {
     }
 
     /// Check if this is the first launch (sqlite database doesn't exist yet)
-    pub async fn is_first_launch(app_handle: &tauri::AppHandle) -> Result<bool> {
-        let app_data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .expect("failed to get app data dir");
-
-        let tauri_db_path = app_data_dir.join("meeting_minutes.sqlite");
+    pub async fn is_first_launch(_app_handle: &tauri::AppHandle) -> Result<bool> {
+        let tauri_db_path = crate::storage::db_dir().join("meeting_minutes.sqlite");
 
         Ok(!tauri_db_path.exists())
     }
@@ -140,16 +147,9 @@ impl DatabaseManager {
         app_handle: &tauri::AppHandle,
         legacy_db_path: &str,
     ) -> Result<Self> {
-        let app_data_dir = app_handle
-            .path()
-            .app_data_dir()
-            .expect("failed to get app data dir");
+        let app_data_dir = crate::storage::db_dir();
 
-        if !app_data_dir.exists() {
-            fs::create_dir_all(&app_data_dir).map_err(|e| sqlx::Error::Io(e))?;
-        }
-
-        // Copy legacy database to app data directory as meeting_minutes.db
+        // Copy legacy database to the data root as meeting_minutes.db
         let target_legacy_path = app_data_dir.join("meeting_minutes.db");
         log::info!(
             "Copying legacy database from {} to {}",

@@ -53,6 +53,7 @@ pub mod openrouter;
 pub mod parakeet_engine;
 pub mod pipeline;
 pub mod state;
+pub mod storage;
 pub mod summary;
 pub mod tray;
 pub mod utils;
@@ -427,6 +428,21 @@ pub fn run() {
         .setup(|_app| {
             log::info!("Application setup complete");
 
+            // Resolve the data root before anything touches disk. main() already
+            // did this via init_standalone(), so this only matters if the Tauri
+            // app_data_dir disagrees with the env-derived one.
+            storage::init(_app.handle());
+
+            // Move any pre-existing data into the configured root. Deliberately
+            // synchronous and ahead of the models directory and the database:
+            // both would otherwise create fresh empty state at the new location
+            // while the real data still sat at the old one. A cross-drive move
+            // of several GB takes a while on first run; it is resumable, and it
+            // happens exactly once.
+            if let Err(e) = storage::migrate::run_files(_app.handle()) {
+                log::error!("Storage migration failed: {:#}", e);
+            }
+
             // Clear import work dirs a crashed/killed previous process left behind.
             audio::import::sweep_orphaned_work_dirs();
 
@@ -740,6 +756,8 @@ pub fn run() {
             audio::recording_preferences::get_default_recordings_folder_path,
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::select_recording_folder,
+            audio::recording_preferences::get_data_root,
+            audio::recording_preferences::select_data_root,
             audio::recording_preferences::get_available_audio_backends,
             audio::recording_preferences::get_current_audio_backend,
             audio::recording_preferences::set_audio_backend,

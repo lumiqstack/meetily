@@ -57,7 +57,7 @@ fn is_url_download_active(import_id: &str) -> bool {
 /// every import id is a fresh UUID, so a directory from an earlier process can
 /// never be picked up again.
 pub fn sweep_orphaned_work_dirs() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = std::fs::read_dir(crate::storage::tmp_dir()) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1512,7 +1512,7 @@ async fn run_url_import<R: Runtime>(
     )
     .await;
 
-    let work_dir = std::env::temp_dir().join(format!("meetily-url-{}", import_id));
+    let work_dir = crate::storage::tmp_dir().join(format!("meetily-url-{}", import_id));
 
     // Direct-download path: URLs pointing straight at a media file on a
     // SharePoint host (the sync scan's file URLs, or a stream.aspx link
@@ -1739,7 +1739,7 @@ async fn run_transcript_import<R: Runtime>(
 ) -> Result<()> {
     emit_progress(app, import_id, "downloading", 10, "Fetching Teams transcript…");
 
-    let work_dir = std::env::temp_dir().join(format!("meetily-vtt-{}", import_id));
+    let work_dir = crate::storage::tmp_dir().join(format!("meetily-vtt-{}", import_id));
     let vtt_path = match super::url_import::fetch_transcript(
         ytdlp_path,
         ffmpeg_path,

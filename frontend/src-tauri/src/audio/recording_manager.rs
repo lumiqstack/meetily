@@ -77,9 +77,9 @@ impl RecordingManager {
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
-        // Pipeline will mix mic + system audio professionally and send to this channel
-        // Pass auto_save to control whether audio checkpoints are created
+        // Create recording sender for pre-mixed audio from pipeline. Pipeline
+        // mixes mic + system audio and sends it here. `None` when auto-save is
+        // off, which lets the pipeline skip mixing entirely.
         let recording_sender = self.recording_saver.start_accumulation(auto_save);
 
         // Start recording state first
@@ -117,7 +117,7 @@ impl RecordingManager {
             transcription_sender,
             0, // Ignored - using dynamic sizing internally
             48000, // 48kHz sample rate
-            Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
+            recording_sender, // Pre-mixed audio destination; None when auto-save is off
             mic_name,
             mic_kind,
             sys_name,
@@ -443,6 +443,12 @@ impl RecordingManager {
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.recording_saver.set_meeting_name(name);
+    }
+
+    /// Set the base folder meeting directories are created under (from the
+    /// `save_folder` recording preference).
+    pub fn set_save_folder(&mut self, folder: Option<std::path::PathBuf>) {
+        self.recording_saver.set_save_folder(folder);
     }
 
     /// Add a structured transcript segment to be saved later

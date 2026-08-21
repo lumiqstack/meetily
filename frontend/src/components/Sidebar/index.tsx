@@ -320,7 +320,7 @@ const Sidebar: React.FC = () => {
         })
         .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
     }
-  }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
+  }, [sidebarItems, searchQuery, searchResults]);
 
 
   const handleDelete = async (itemId: string) => {
@@ -549,10 +549,16 @@ const Sidebar: React.FC = () => {
     );
   };
 
+  // renderItem asks for a snippet once per meeting, so index the results
+  const searchResultsById = useMemo(
+    () => new Map(searchResults.map(result => [result.id, result] as const)),
+    [searchResults]
+  );
+
   // Find matching transcript snippet for a meeting item
   const findMatchingSnippet = (itemId: string) => {
     if (!searchQuery.trim() || !searchResults.length) return null;
-    return searchResults.find(result => result.id === itemId);
+    return searchResultsById.get(itemId);
   };
 
   const renderItem = (item: SidebarItem, depth = 0) => {

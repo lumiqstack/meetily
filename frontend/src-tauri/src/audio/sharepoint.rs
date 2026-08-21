@@ -140,12 +140,7 @@ pub async fn ensure_multi_host_auth_mode<R: Runtime, F: Fn(&str)>(
 
     let _flow = AUTH_FLOW_LOCK.lock().await;
 
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| anyhow!("Could not resolve app data dir: {e}"))?
-        .join("sp-webview");
-    std::fs::create_dir_all(&data_dir).ok();
+    let data_dir = crate::storage::webview_dir();
 
     on_status("Connecting to SharePoint…");
 
@@ -255,12 +250,7 @@ pub async fn ensure_auth_cookies_mode<R: Runtime, F: Fn(&str)>(
 
     let _flow = AUTH_FLOW_LOCK.lock().await;
 
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| anyhow!("Could not resolve app data dir: {e}"))?
-        .join("sp-webview");
-    std::fs::create_dir_all(&data_dir).ok();
+    let data_dir = crate::storage::webview_dir();
 
     on_status("Connecting to SharePoint…");
 
@@ -511,7 +501,7 @@ fn is_sharepoint_host(url: &Url) -> bool {
 
 /// Write the harvested cookies as a Netscape `cookies.txt` for yt-dlp.
 async fn write_cookies<R: Runtime>(
-    app: &AppHandle<R>,
+    _app: &AppHandle<R>,
     url: &Url,
     cookies: Vec<Cookie<'static>>,
 ) -> Result<AuthCookies> {
@@ -544,12 +534,7 @@ async fn write_cookies<R: Runtime>(
         warn!("SharePoint auth produced no cookies; download will likely fail");
     }
 
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| anyhow!("Could not resolve app data dir: {e}"))?
-        .join("tmp");
-    tokio::fs::create_dir_all(&dir).await.ok();
+    let dir = crate::storage::tmp_dir();
     let path = dir.join(format!("sp-cookies-{}.txt", uuid::Uuid::new_v4()));
     tokio::fs::write(&path, out)
         .await
@@ -563,11 +548,8 @@ async fn write_cookies<R: Runtime>(
 /// `AuthCookies::cleanup` when the import finishes — but a crash mid-import
 /// skips that, so startup sweeps the whole directory. No import can be
 /// running this early, so every `sp-cookies-*.txt` here is stale.
-pub fn sweep_stale_cookie_files<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    let Ok(data_dir) = app.path().app_data_dir() else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(data_dir.join("tmp")) else {
+pub fn sweep_stale_cookie_files<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {
+    let Ok(entries) = std::fs::read_dir(crate::storage::tmp_dir()) else {
         return; // No tmp dir yet — nothing to sweep.
     };
     for entry in entries.flatten() {

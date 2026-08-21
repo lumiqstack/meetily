@@ -1,11 +1,10 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use anyhow::Result;
 
 use super::devices::AudioDevice;
-use super::buffer_pool::AudioBufferPool;
 
 /// Device type for audio chunks
 #[derive(Debug, Clone, PartialEq)]
@@ -111,9 +110,6 @@ pub struct RecordingState {
     // Audio pipeline
     audio_sender: Mutex<Option<mpsc::UnboundedSender<AudioChunk>>>,
 
-    // Memory optimization
-    buffer_pool: AudioBufferPool,
-
     // Error handling
     error_count: AtomicU32,
     recoverable_error_count: AtomicU32,
@@ -122,13 +118,26 @@ pub struct RecordingState {
 
     // Statistics
     stats: Mutex<RecordingStats>,
+    /// Counted on the realtime audio thread (~100 chunks/s per device), so it
+    /// lives outside `stats` — taking that mutex per chunk on a realtime thread
+    /// is a priority-inversion risk for a number nothing reads synchronously.
+    chunks_processed: AtomicU64,
 
     // Recording start time for accurate timestamps
     recording_start: Mutex<Option<Instant>>,
+    /// Lock-free mirror of `recording_start` for the audio callback, which
+    /// timestamps every chunk. Nanoseconds since `epoch`; `u64::MAX` = not
+    /// recording. An `Instant` is not atomic, hence the offset-from-epoch form.
+    recording_start_nanos: AtomicU64,
+    /// Fixed reference point for `recording_start_nanos`.
+    epoch: Instant,
     // Pause time tracking
     pause_start: Mutex<Option<Instant>>,
     total_pause_duration: Mutex<std::time::Duration>,
 }
+
+/// Sentinel for `recording_start_nanos` meaning "not recording".
+const NOT_RECORDING: u64 = u64::MAX;
 
 impl RecordingState {
     pub fn new() -> Arc<Self> {
@@ -140,13 +149,15 @@ impl RecordingState {
             system_device: Mutex::new(None),
             disconnected_device: Mutex::new(None),
             audio_sender: Mutex::new(None),
-            buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
             stats: Mutex::new(RecordingStats::default()),
+            chunks_processed: AtomicU64::new(0),
             recording_start: Mutex::new(None),
+            recording_start_nanos: AtomicU64::new(NOT_RECORDING),
+            epoch: Instant::now(),
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
         })
@@ -155,7 +166,13 @@ impl RecordingState {
     // Recording control
     pub fn start_recording(&self) -> Result<()> {
         self.is_recording.store(true, Ordering::SeqCst);
-        *self.recording_start.lock().unwrap() = Some(Instant::now());
+        let now = Instant::now();
+        *self.recording_start.lock().unwrap() = Some(now);
+        self.recording_start_nanos.store(
+            now.duration_since(self.epoch).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        self.chunks_processed.store(0, Ordering::Relaxed);
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
         *self.last_error.lock().unwrap() = None;
@@ -275,10 +292,10 @@ impl RecordingState {
         if let Some(sender) = self.audio_sender.lock().unwrap().as_ref() {
             sender.send(chunk).map_err(|_| anyhow::anyhow!("Failed to send audio chunk"))?;
 
-            // Update statistics
-            let mut stats = self.stats.lock().unwrap();
-            stats.chunks_processed += 1;
-            stats.last_activity = Some(Instant::now());
+            // Counter only: the stats mutex and an Instant::now() per chunk used
+            // to run here, on the realtime audio thread, for a `last_activity`
+            // field no caller reads. get_stats() folds this back in.
+            self.chunks_processed.fetch_add(1, Ordering::Relaxed);
             Ok(())
         } else {
             // Return an error when no sender is available (pipeline not ready)
@@ -349,14 +366,23 @@ impl RecordingState {
 
     // Statistics
     pub fn get_stats(&self) -> RecordingStats {
-        self.stats.lock().unwrap().clone()
+        let mut stats = self.stats.lock().unwrap().clone();
+        stats.chunks_processed = self.chunks_processed.load(Ordering::Relaxed);
+        stats
     }
 
+    /// Wall-clock seconds since recording started.
+    ///
+    /// Called once per audio callback to timestamp chunks (~200/s across both
+    /// devices), so it reads an atomic rather than taking the `recording_start`
+    /// mutex on a realtime thread.
     pub fn get_recording_duration(&self) -> Option<f64> {
-        self.recording_start
-            .lock()
-            .unwrap()
-            .map(|start| start.elapsed().as_secs_f64())
+        let start = self.recording_start_nanos.load(Ordering::Relaxed);
+        if start == NOT_RECORDING {
+            return None;
+        }
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        Some(now.saturating_sub(start) as f64 / 1_000_000_000.0)
     }
 
     pub fn get_active_recording_duration(&self) -> Option<f64> {
@@ -391,11 +417,6 @@ impl RecordingState {
         }
     }
 
-    // Memory management
-    pub fn get_buffer_pool(&self) -> AudioBufferPool {
-        self.buffer_pool.clone()
-    }
-
     // Cleanup
     pub fn cleanup(&self) {
         self.stop_recording();
@@ -407,14 +428,14 @@ impl RecordingState {
         *self.last_error.lock().unwrap() = None;
         *self.error_callback.lock().unwrap() = None;
         *self.stats.lock().unwrap() = RecordingStats::default();
+        self.chunks_processed.store(0, Ordering::Relaxed);
         *self.recording_start.lock().unwrap() = None;
+        self.recording_start_nanos
+            .store(NOT_RECORDING, Ordering::Relaxed);
         *self.pause_start.lock().unwrap() = None;
         *self.total_pause_duration.lock().unwrap() = std::time::Duration::ZERO;
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
-
-        // Clear buffer pool to free memory
-        self.buffer_pool.clear();
     }
 }
 
@@ -428,13 +449,15 @@ impl Default for RecordingState {
             system_device: Mutex::new(None),
             disconnected_device: Mutex::new(None),
             audio_sender: Mutex::new(None),
-            buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
             stats: Mutex::new(RecordingStats::default()),
+            chunks_processed: AtomicU64::new(0),
             recording_start: Mutex::new(None),
+            recording_start_nanos: AtomicU64::new(NOT_RECORDING),
+            epoch: Instant::now(),
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
         }

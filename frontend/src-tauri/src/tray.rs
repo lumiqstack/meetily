@@ -123,14 +123,7 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             log::info!("Tray toggle: Stopping recording...");
 
             // Generate save path (same as RecordingControls.tsx)
-            let data_dir = match app_clone.path().app_data_dir() {
-                Ok(dir) => dir,
-                Err(e) => {
-                    log::error!("Failed to get app data dir: {}", e);
-                    update_tray_menu_async(&app_clone).await;
-                    return;
-                }
-            };
+            let data_dir = crate::storage::root();
 
             let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
             let save_path = data_dir.join(format!("recording-{}.wav", timestamp));
@@ -219,14 +212,7 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
         log::info!("Tray: Stopping recording...");
 
         // Generate save path (same as RecordingControls.tsx)
-        let data_dir = match app_clone.path().app_data_dir() {
-            Ok(dir) => dir,
-            Err(e) => {
-                log::error!("Failed to get app data dir: {}", e);
-                update_tray_menu_async(&app_clone).await;
-                return;
-            }
-        };
+        let data_dir = crate::storage::root();
 
         let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
         let save_path = data_dir.join(format!("recording-{}.wav", timestamp));
@@ -298,8 +284,10 @@ fn apply_tray_menu<R: Runtime>(app: &AppHandle<R>, state: RecordingState, can_re
         match build_menu(&app, state, can_record) {
             Ok(menu) => {
                 if let Some(tray) = app.tray_by_id("main-tray") {
-                    let result = tray.set_menu(Some(menu));
-                    log::info!("Tray: Menu update result: {:?}", result);
+                    match tray.set_menu(Some(menu)) {
+                        Ok(()) => log::debug!("Tray: Menu update result: Ok(())"),
+                        Err(e) => log::error!("Tray: Menu update failed: {}", e),
+                    }
                 } else {
                     log::warn!("Tray: Could not find tray with id 'main-tray'");
                 }
@@ -315,25 +303,25 @@ fn apply_tray_menu<R: Runtime>(app: &AppHandle<R>, state: RecordingState, can_re
 async fn get_current_recording_state() -> RecordingState {
     // Check if currently recording
     let is_recording = crate::audio::recording_commands::is_recording().await;
-    log::info!(
+    log::debug!(
         "Tray: get_current_recording_state - is_recording: {}",
         is_recording
     );
 
     if !is_recording {
-        log::info!("Tray: Recording state is Stopped");
+        log::debug!("Tray: Recording state is Stopped");
         return RecordingState::Stopped;
     }
 
     // Check if paused
     let is_paused = crate::audio::recording_commands::is_recording_paused().await;
-    log::info!("Tray: is_paused: {}", is_paused);
+    log::debug!("Tray: is_paused: {}", is_paused);
 
     if is_paused {
-        log::info!("Tray: Recording state is Paused");
+        log::debug!("Tray: Recording state is Paused");
         RecordingState::Paused
     } else {
-        log::info!("Tray: Recording state is Recording");
+        log::debug!("Tray: Recording state is Recording");
         RecordingState::Recording
     }
 }
@@ -369,15 +357,15 @@ async fn check_can_record<R: Runtime>(app: &AppHandle<R>) -> bool {
 }
 
 pub async fn update_tray_menu_async<R: Runtime>(app: &AppHandle<R>) {
-    log::info!("Tray: update_tray_menu_async called");
+    log::debug!("Tray: update_tray_menu_async called");
     // Get the current recording state
     let recording_state = get_current_recording_state().await;
-    log::info!("Tray: Current recording state: {:?}", recording_state);
+    log::debug!("Tray: Current recording state: {:?}", recording_state);
 
     // Determine if recording should be allowed
     // Only block recording during incomplete onboarding when no transcription model is ready
     let can_record = check_can_record(app).await;
-    log::info!("Tray: can_record: {}", can_record);
+    log::debug!("Tray: can_record: {}", can_record);
 
     apply_tray_menu(app, recording_state, can_record);
 }

@@ -54,6 +54,9 @@ export function usePaginatedTranscripts({
     const [error, setError] = useState<string | null>(null);
 
     const offsetRef = useRef(0);
+    // Transcript ids already loaded; kept across pages so appending one doesn't
+    // have to rescan everything loaded so far.
+    const loadedIdsRef = useRef<Set<string>>(new Set());
     const loadedMeetingIdRef = useRef<string | null>(null);
     const isLoadingRef = useRef(false);
     const lastLoadTimeRef = useRef(0); // Debounce protection
@@ -68,6 +71,7 @@ export function usePaginatedTranscripts({
         setHasMore(false);
         setError(null);
         offsetRef.current = 0;
+        loadedIdsRef.current = new Set();
     }, []);
 
     // Load meeting metadata
@@ -107,16 +111,17 @@ export function usePaginatedTranscripts({
             const newTranscripts = response.transcripts;
 
             if (append) {
-                setTranscripts(prev => {
-                    // Deduplicate by id
-                    const existingIds = new Set(prev.map(t => t.id));
-                    const uniqueNew = newTranscripts.filter(t => !existingIds.has(t.id));
-                    // Sort by audio_start_time
-                    return [...prev, ...uniqueNew].sort((a, b) =>
-                        (a.audio_start_time ?? 0) - (b.audio_start_time ?? 0)
-                    );
-                });
+                // Deduplicate by id
+                const existingIds = loadedIdsRef.current;
+                const uniqueNew = newTranscripts.filter(t => !existingIds.has(t.id));
+                if (uniqueNew.length > 0) {
+                    uniqueNew.forEach(t => existingIds.add(t.id));
+                    // Pages arrive in order, so only the new page needs sorting
+                    uniqueNew.sort((a, b) => (a.audio_start_time ?? 0) - (b.audio_start_time ?? 0));
+                    setTranscripts(prev => prev.concat(uniqueNew));
+                }
             } else {
+                loadedIdsRef.current = new Set(newTranscripts.map(t => t.id));
                 setTranscripts(newTranscripts);
             }
 

@@ -116,11 +116,7 @@ impl WhisperEngine {
             } else {
                 // Production mode fallback (shouldn't reach here, caller should provide path)
                 log::warn!("WhisperEngine: No models directory provided, using fallback path");
-                dirs::data_dir()
-                    .or_else(|| dirs::home_dir())
-                    .ok_or_else(|| anyhow!("Could not find system data directory"))?
-                    .join("Meetily")
-                    .join("models")
+                crate::storage::models_dir()
             }
         };
         

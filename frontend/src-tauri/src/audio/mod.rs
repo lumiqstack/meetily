@@ -24,7 +24,8 @@ pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;
 pub mod recording_saver;
-pub mod incremental_saver;  // NEW: Incremental audio saving with checkpoints
+pub mod incremental_saver;  // Streams meeting audio to audio.mp4 as it arrives
+pub mod stream_encoder;     // Long-lived ffmpeg encoder behind incremental_saver
 pub mod level_monitor;
 pub mod simple_level_monitor;
 pub mod buffer_pool;

@@ -84,13 +84,8 @@ pub async fn detect_legacy_database(selected_path: String) -> Result<Option<Stri
 
 /// Check for legacy database in the default app data directory
 #[tauri::command]
-pub async fn check_default_legacy_database(app: AppHandle) -> Result<Option<String>, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-
-    let legacy_db = app_data_dir.join("meeting_minutes.db");
+pub async fn check_default_legacy_database(_app: AppHandle) -> Result<Option<String>, String> {
+    let legacy_db = crate::storage::db_dir().join("meeting_minutes.db");
     info!("Checking for default legacy database at: {:?}", legacy_db);
 
     if legacy_db.exists() && legacy_db.is_file() {
@@ -225,30 +220,14 @@ pub async fn initialize_fresh_database(app: AppHandle) -> Result<(), String> {
 
 /// Get the database directory path
 #[tauri::command]
-pub async fn get_database_directory(app: AppHandle) -> Result<String, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-
-    Ok(app_data_dir.to_string_lossy().to_string())
+pub async fn get_database_directory(_app: AppHandle) -> Result<String, String> {
+    Ok(crate::storage::db_dir().to_string_lossy().to_string())
 }
 
 /// Open the database folder in the system file explorer
 #[tauri::command]
-pub async fn open_database_folder(app: AppHandle) -> Result<(), String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-
-    // Ensure directory exists before trying to open it
-    if !app_data_dir.exists() {
-        std::fs::create_dir_all(&app_data_dir)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    let folder_path = app_data_dir.to_string_lossy().to_string();
+pub async fn open_database_folder(_app: AppHandle) -> Result<(), String> {
+    let folder_path = crate::storage::db_dir().to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
     {

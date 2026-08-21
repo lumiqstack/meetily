@@ -11,11 +11,11 @@
 // in the app data dir, and finally download the latest release into that
 // cache as a last resort.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use log::{debug, info};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Runtime};
 use tokio::io::AsyncWriteExt;
 use which::which;
 
@@ -78,14 +78,9 @@ fn find_existing<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     None
 }
 
-/// `<app_data_dir>/bin/yt-dlp[.exe]`
-fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| anyhow!("Could not resolve app data dir: {e}"))?
-        .join("bin");
-    Ok(dir.join(EXECUTABLE_NAME))
+/// `<data_root>/bin/yt-dlp[.exe]`
+fn cache_path<R: Runtime>(_app: &AppHandle<R>) -> Result<PathBuf> {
+    Ok(crate::storage::bin_dir().join(EXECUTABLE_NAME))
 }
 
 async fn download_ytdlp(dest: &Path) -> Result<()> {

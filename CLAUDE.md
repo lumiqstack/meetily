@@ -196,7 +196,7 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 
 **Ring Buffer Mixing** (pipeline.rs):
 - Mic and system audio arrive asynchronously at different rates
-- Ring buffer accumulates samples until both streams have aligned windows (50ms)
+- Ring buffer accumulates samples until both streams have aligned windows (600ms; buffers are capped at 8 windows, ~4.8s). Several comments and log lines in `pipeline.rs` still say 50ms — `window_ms` is the authority.
 - Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
 - Uses `VecDeque` for efficient windowed processing
 
@@ -343,8 +343,8 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 
 ### Audio Processing
 - Use `perf_debug!()` / `perf_trace!()` for hot-path logging (zero cost in release)
-- Batch audio metrics using `AudioMetricsBatcher` (pipeline.rs)
-- Pre-allocate buffers with `AudioBufferPool` (buffer_pool.rs)
+- `AudioMetricsBatcher` (batch_processor.rs) is wired into the pipeline but left disabled (`metrics_batcher: None`) — it costs a buffer pass and a channel send per chunk and nothing consumes its summaries. Only re-enable it together with a reader.
+- `AudioBufferPool` / `PooledBuffer` (buffer_pool.rs) are currently unused outside their own tests, and `get_buffer()` takes a `std::sync::Mutex` — do not call them from an audio callback. Pre-size buffers with `Vec::with_capacity` instead.
 - VAD filtering reduces Whisper load by ~70% (only processes speech)
 
 ### Whisper Transcription
@@ -356,8 +356,8 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 
 ### Frontend Performance
 - React state updates batched via Sidebar context
-- Transcript rendering virtualized for large meetings
-- Audio level monitoring throttled to 60fps
+- Transcript rendering uses `VirtualizedTranscriptView`, but virtualization only pays off when the scroll element has a bounded height. If its height comes from content (no `h-full` chain to a sized ancestor, or an ancestor that scrolls instead), the viewport grows with the list and every row renders — the component gives no warning when this happens.
+- Audio level monitoring throttled to 10 Hz (`level_monitor.rs`, 100ms interval)
 
 ## Important Constraints and Gotchas
 

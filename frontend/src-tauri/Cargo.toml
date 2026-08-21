@@ -125,6 +125,10 @@ dashmap = "6.1.0"
 # Directories
 dirs = "5.0.1"
 
+# Verifying copies during the one-time storage migration (already in the tree
+# transitively, so this costs no extra build time)
+sha2 = "0.10"
+
 # Additional dependencies for notification system
 url = "2.5.0"
 
@@ -222,6 +226,9 @@ memory-stats = "1.0"
 strsim = "0.10.0"
 futures = "0.3.31"
 tracing-subscriber = "0.3.16"
+
+# NOTE: [profile.*] lives in the workspace root Cargo.toml. Cargo ignores
+# profiles declared in a non-root member and only warns about it.
 
 [patch.crates-io]
 cpal = { git = "https://github.com/RustAudio/cpal", rev = "51c3b43" }

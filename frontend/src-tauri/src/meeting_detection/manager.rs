@@ -214,16 +214,7 @@ impl MeetingDetectionManager {
 }
 
 fn settings_path() -> Result<PathBuf> {
-    let mut path =
-        dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
-    path.push("meetily");
-    path.push("meeting_detection.json");
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    Ok(path)
+    Ok(crate::storage::config_dir().join("meeting_detection.json"))
 }
 
 async fn load_settings() -> Result<MeetingDetectionSettings> {

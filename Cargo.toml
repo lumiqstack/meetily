@@ -10,6 +10,19 @@ members = [
 edition = "2021"
 rust-version = "1.77"
 
+# Cargo's release defaults (codegen-units = 16, no LTO) leave real throughput on
+# the table in the per-sample audio DSP, which runs continuously for the length
+# of every recording. Costs noticeably longer link times.
+#
+# panic stays "unwind": the panic hook in frontend/src-tauri/src/main.rs that
+# logs crashes to the release log only runs during an unwind.
+#
+# Must be here rather than in frontend/src-tauri/Cargo.toml — Cargo ignores
+# profiles declared in a non-root workspace member.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # Shared dependencies that can be inherited by workspace members
 [workspace.dependencies]
 anyhow = "1.0"

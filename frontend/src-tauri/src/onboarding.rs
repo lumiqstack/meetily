@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
-use log::{info, warn, error};
+use log::{debug, info, warn, error};
 use anyhow::Result;
 
 use crate::state::AppState;
@@ -59,8 +59,8 @@ pub async fn load_onboarding_status<R: Runtime>(
     let status = if let Some(value) = store.get("status") {
         match serde_json::from_value::<OnboardingStatus>(value.clone()) {
             Ok(s) => {
-                info!("Loaded onboarding status from store - Step: {}, Completed: {}",
-                      s.current_step, s.completed);
+                debug!("Loaded onboarding status from store - Step: {}, Completed: {}",
+                       s.current_step, s.completed);
                 s
             }
             Err(e) => {

@@ -3,7 +3,6 @@ use anyhow::{Result, anyhow};
 use log::info as log_info;
 use std::path::PathBuf;
 use tauri::{AppHandle, Runtime};
-use dirs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationSettings {
@@ -123,16 +122,7 @@ impl<R: Runtime> ConsentManager<R> {
 
     /// Get the path where notification settings are stored
     fn get_settings_path() -> Result<PathBuf> {
-        let mut path = dirs::config_dir()
-            .ok_or_else(|| anyhow!("Could not find config directory"))?;
-
-        path.push("meetily");
-        path.push("notifications.json");
-
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let path = crate::storage::config_dir().join("notifications.json");
 
         Ok(path)
     }

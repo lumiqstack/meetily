@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Switch } from '@/components/ui/switch';
-import { FolderOpen } from 'lucide-react';
+import { FolderOpen, HardDrive, Pencil } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
 import Analytics from '@/lib/analytics';
@@ -29,6 +29,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showRecordingNotification, setShowRecordingNotification] = useState(true);
+  const [dataRoot, setDataRoot] = useState<string>('');
 
   // Load recording preferences on component mount
   useEffect(() => {
@@ -52,6 +53,48 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
     loadPreferences();
   }, []);
+
+  // Where models, the database, logs, and scratch space live
+  useEffect(() => {
+    invoke<string>('get_data_root')
+      .then(setDataRoot)
+      .catch(error => console.error('Failed to load data root:', error));
+  }, []);
+
+  const handleChangeFolder = async () => {
+    try {
+      const picked = await invoke<string | null>('select_recording_folder');
+      if (!picked) return; // user cancelled
+
+      setPreferences(prev => ({ ...prev, save_folder: picked }));
+      toast.success('Recordings folder updated', { description: picked });
+      await Analytics.track('recordings_folder_changed', {});
+    } catch (error) {
+      console.error('Failed to change recordings folder:', error);
+      toast.error('Could not change recordings folder', {
+        description: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
+
+  const handleChangeDataRoot = async () => {
+    try {
+      const picked = await invoke<string | null>('select_data_root');
+      if (!picked) return; // user cancelled
+
+      setDataRoot(picked);
+      toast.success('App data location updated', {
+        description: `Restart Meetily to move your data to ${picked}.`,
+        duration: 10000
+      });
+      await Analytics.track('data_root_changed', {});
+    } catch (error) {
+      console.error('Failed to change data root:', error);
+      toast.error('Could not change app data location', {
+        description: error instanceof Error ? error.message : String(error)
+      });
+    }
+  };
 
   // Load recording notification preference
   useEffect(() => {
@@ -184,13 +227,23 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
             <div className="text-sm text-gray-600 mb-3 break-all">
               {preferences.save_folder || 'Default folder'}
             </div>
-            <button
-              onClick={handleOpenFolder}
-              className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-50 transition-colors"
-            >
-              <FolderOpen className="w-4 h-4" />
-              Open Folder
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleOpenFolder}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors"
+              >
+                <FolderOpen className="w-4 h-4" />
+                Open Folder
+              </button>
+              <button
+                onClick={handleChangeFolder}
+                disabled={saving}
+                className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-50"
+              >
+                <Pencil className="w-4 h-4" />
+                Change…
+              </button>
+            </div>
           </div>
 
           <div className="p-4 border rounded-lg bg-blue-50">
@@ -212,6 +265,30 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           </div>
         </div>
       )}
+
+      {/* App data location — models, database, logs, scratch space. Shown
+          regardless of auto-save: the transcription models alone can be several
+          gigabytes, and moving them off the system drive is the point. */}
+      <div className="p-4 border rounded-lg bg-gray-50">
+        <div className="flex items-center gap-2 font-medium mb-2">
+          <HardDrive className="w-4 h-4" />
+          App Data Location
+        </div>
+        <div className="text-sm text-gray-600 mb-1 break-all">
+          {dataRoot || 'Loading…'}
+        </div>
+        <div className="text-xs text-gray-500 mb-3">
+          Transcription models, the meetings database, logs, and temporary import files.
+          Changing this moves your existing data on the next launch.
+        </div>
+        <button
+          onClick={handleChangeDataRoot}
+          className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors"
+        >
+          <Pencil className="w-4 h-4" />
+          Change…
+        </button>
+      </div>
 
       {/* Recording Notification Toggle */}
       <div className="flex items-center justify-between p-4 border rounded-lg">

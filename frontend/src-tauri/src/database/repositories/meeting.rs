@@ -6,12 +6,44 @@ use tracing::{error, info};
 
 pub struct MeetingsRepository;
 
+/// The columns of `transcripts` that [`MeetingsRepository::get_meeting`]
+/// actually consumes; the summary/action_items/key_points TEXT columns are
+/// left on disk.
+#[derive(sqlx::FromRow)]
+struct MeetingTranscriptRow {
+    id: String,
+    transcript: String,
+    timestamp: String,
+    audio_start_time: Option<f64>,
+    audio_end_time: Option<f64>,
+    duration: Option<f64>,
+    speaker: Option<String>,
+}
+
+/// Named so `pending_meetings_query_uses_the_transcripts_index` can plan the
+/// same text the pipeline tick runs.
+const PENDING_MEETINGS_SQL: &str = r#"
+    SELECT m.id, m.title, m.created_at, m.folder_path,
+           CASE WHEN EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id)
+                THEN 1 ELSE 0 END AS transcript_count,
+           sp.status AS summary_status
+    FROM meetings m
+    LEFT JOIN summary_processes sp ON sp.meeting_id = m.id
+    WHERE (m.folder_path IS NOT NULL AND m.folder_path <> ''
+           AND NOT EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id))
+       OR (EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id)
+           AND (sp.status IS NULL OR sp.status IN ('failed', 'cancelled')))
+    ORDER BY m.created_at DESC
+"#;
+
 impl MeetingsRepository {
     pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingModel>, sqlx::Error> {
-        let meetings =
-            sqlx::query_as::<_, MeetingModel>("SELECT * FROM meetings ORDER BY created_at DESC")
-                .fetch_all(pool)
-                .await?;
+        let meetings = sqlx::query_as::<_, MeetingModel>(
+            "SELECT id, title, created_at, updated_at, folder_path
+             FROM meetings ORDER BY created_at DESC",
+        )
+        .fetch_all(pool)
+        .await?;
         Ok(meetings)
     }
 
@@ -19,26 +51,17 @@ impl MeetingsRepository {
     /// (pending transcription), or transcripts but no completed/in-flight
     /// summary (pending AI summary). In-flight `PENDING` summaries are
     /// excluded so callers never offer to duplicate a running job.
+    ///
+    /// `transcript_count` is a 0/1 presence flag, not a row count — every
+    /// caller only compares it against zero, and EXISTS lets the
+    /// `idx_transcripts_meeting_id` lookup stop at the first matching row
+    /// instead of aggregating the whole table.
     pub async fn get_pending_meetings(
         pool: &SqlitePool,
     ) -> Result<Vec<PendingMeetingModel>, sqlx::Error> {
-        let pending = sqlx::query_as::<_, PendingMeetingModel>(
-            r#"
-            SELECT m.id, m.title, m.created_at, m.folder_path,
-                   COALESCE(t.cnt, 0) AS transcript_count,
-                   sp.status AS summary_status
-            FROM meetings m
-            LEFT JOIN (
-                SELECT meeting_id, COUNT(*) AS cnt FROM transcripts GROUP BY meeting_id
-            ) t ON t.meeting_id = m.id
-            LEFT JOIN summary_processes sp ON sp.meeting_id = m.id
-            WHERE (m.folder_path IS NOT NULL AND m.folder_path <> '' AND COALESCE(t.cnt, 0) = 0)
-               OR (COALESCE(t.cnt, 0) > 0 AND (sp.status IS NULL OR sp.status IN ('failed', 'cancelled')))
-            ORDER BY m.created_at DESC
-            "#,
-        )
-        .fetch_all(pool)
-        .await?;
+        let pending = sqlx::query_as::<_, PendingMeetingModel>(PENDING_MEETINGS_SQL)
+            .fetch_all(pool)
+            .await?;
         Ok(pending)
     }
 
@@ -101,11 +124,13 @@ impl MeetingsRepository {
 
         if let Some(meeting) = meeting {
             // Get all transcripts for this meeting
-            let transcripts =
-                sqlx::query_as::<_, Transcript>("SELECT * FROM transcripts WHERE meeting_id = ?")
-                    .bind(meeting_id)
-                    .fetch_all(&mut *transaction)
-                    .await?;
+            let transcripts = sqlx::query_as::<_, MeetingTranscriptRow>(
+                "SELECT id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker
+                 FROM transcripts WHERE meeting_id = ?",
+            )
+            .bind(meeting_id)
+            .fetch_all(&mut *transaction)
+            .await?;
 
             transaction.commit().await?;
 
@@ -332,11 +357,18 @@ mod tests {
     }
 
     async fn insert_transcript(pool: &SqlitePool, meeting_id: &str) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_ROW: AtomicUsize = AtomicUsize::new(0);
+
         sqlx::query(
             "INSERT INTO transcripts (id, meeting_id, transcript, timestamp)
              VALUES (?, ?, 'hello', '2026-07-24T10:00:00Z')",
         )
-        .bind(format!("t-{}", meeting_id))
+        .bind(format!(
+            "t-{}-{}",
+            meeting_id,
+            NEXT_ROW.fetch_add(1, Ordering::Relaxed)
+        ))
         .bind(meeting_id)
         .execute(pool)
         .await
@@ -367,7 +399,9 @@ mod tests {
         insert_transcript(&pool, "needs-summary").await;
 
         // Transcripts with a failed summary -> pending summary (retry).
+        // Two rows: transcript_count must stay a 0/1 flag, not become 2.
         insert_meeting(&pool, "failed-summary", Some("C:/rec/b")).await;
+        insert_transcript(&pool, "failed-summary").await;
         insert_transcript(&pool, "failed-summary").await;
         insert_summary_process(&pool, "failed-summary", "failed").await;
 
@@ -392,10 +426,44 @@ mod tests {
         let by_id = |id: &str| pending.iter().find(|p| p.id == id).unwrap();
         assert_eq!(by_id("needs-transcript").transcript_count, 0);
         assert_eq!(by_id("needs-summary").transcript_count, 1);
+        assert_eq!(by_id("failed-summary").transcript_count, 1);
         assert_eq!(by_id("needs-summary").summary_status, None);
         assert_eq!(
             by_id("failed-summary").summary_status.as_deref(),
             Some("failed")
+        );
+    }
+
+    /// The derived table this query replaced aggregated all of `transcripts` on
+    /// every pipeline tick, which showed up in the field as `sqlx` slow-statement
+    /// warnings of 2-40s. Asserting the plan keeps it from silently regressing.
+    #[tokio::test]
+    async fn pending_meetings_query_uses_the_transcripts_index() {
+        use sqlx::Row;
+
+        let pool = test_pool().await;
+        insert_meeting(&pool, "m1", Some("C:/rec/a")).await;
+        insert_meeting(&pool, "m2", None).await;
+        insert_transcript(&pool, "m2").await;
+
+        let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {}", PENDING_MEETINGS_SQL))
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_transcripts_meeting_id")),
+            "transcripts lookup should use the index; plan was:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN t")),
+            "transcripts is still being scanned; plan was:\n{}",
+            plan.join("\n")
         );
     }
 }
