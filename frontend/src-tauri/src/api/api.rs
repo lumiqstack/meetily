@@ -964,9 +964,48 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
     }
 }
 
+/// Follow a user-initiated title change into the Obsidian vault, returning the
+/// note's new vault-relative path when it actually moved.
+///
+/// Entirely best-effort: a missing vault, a locked file, or a note the user
+/// deleted must never turn a successful rename into an error toast.
+async fn rename_obsidian_note<R: Runtime>(
+    app: &AppHandle<R>,
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    title: &str,
+) -> Option<String> {
+    // `created_at` drives the `{date}` token in the filename template.
+    let created_at = match MeetingsRepository::get_meeting_metadata(pool, meeting_id).await {
+        Ok(Some(meeting)) => meeting.created_at.0.to_rfc3339(),
+        Ok(None) => return None,
+        Err(e) => {
+            log_warn!(
+                "Obsidian rename: failed to load meeting {}: {}",
+                meeting_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    match crate::obsidian::rename_meeting_note(app, pool, meeting_id, title, &created_at).await {
+        Ok(Some(result)) => Some(result.relative_path),
+        Ok(None) => None,
+        Err(e) => {
+            log_warn!(
+                "Obsidian rename failed for meeting {} (title change still saved): {}",
+                meeting_id,
+                e
+            );
+            None
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn api_save_meeting_title<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
     title: String,
@@ -981,7 +1020,11 @@ pub async fn api_save_meeting_title<R: Runtime>(
     match MeetingsRepository::update_meeting_title(pool, &meeting_id, &title).await {
         Ok(true) => {
             log_info!("Successfully saved meeting title");
-            Ok(serde_json::json!({"message": "Meeting title saved successfully"}))
+            let obsidian_note = rename_obsidian_note(&app, pool, &meeting_id, &title).await;
+            Ok(serde_json::json!({
+                "message": "Meeting title saved successfully",
+                "obsidian_note": obsidian_note,
+            }))
         }
         Ok(false) => {
             log_error!("No meeting found with id {}", meeting_id);

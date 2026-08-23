@@ -405,6 +405,161 @@ async fn resolve_export_filename(
     current
 }
 
+/// Replace the note's first `# ` heading — the one `build_obsidian_markdown`
+/// writes directly under the front matter — leaving front matter and the
+/// `## Summary` / `## Transcript` section headings alone. Returns the input
+/// unchanged when no H1 is present.
+///
+/// Splices in place rather than rebuilding from `lines()` so the rest of the
+/// note, line endings and trailing newline included, stays byte-identical and
+/// the user's vault sees a one-line diff.
+fn replace_note_heading(content: &str, new_title: &str) -> String {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        if text.starts_with("# ") {
+            let mut out = String::with_capacity(content.len() + new_title.len());
+            out.push_str(&content[..offset]);
+            out.push_str("# ");
+            out.push_str(new_title.trim());
+            out.push_str(&line[text.len()..]); // original line ending, verbatim
+            out.push_str(&content[offset + line.len()..]);
+            return out;
+        }
+        offset += line.len();
+    }
+    content.to_string()
+}
+
+/// Move a meeting's already-exported note to the filename its new title
+/// renders to, and refresh the heading inside. Returns the new filename, or
+/// `None` when there was nothing to do.
+///
+/// This is the deliberate escape hatch from the filename pinning enforced by
+/// [`resolve_export_filename`]: the pin exists so AI re-summarization cannot
+/// shuffle notes around, but a rename the user asked for should move the file.
+async fn rename_exported_note(
+    pool: &SqlitePool,
+    settings: &ObsidianSettings,
+    meetings_dir: &Path,
+    meeting_id: &str,
+    new_title: &str,
+    created_at: &str,
+) -> Result<Option<String>> {
+    // Never exported: nothing to move, and the first export will render the
+    // new title on its own.
+    let Some(old_filename) = lookup_recorded_filename(pool, meeting_id).await else {
+        return Ok(None);
+    };
+
+    let new_filename = render_filename_template(
+        &settings.filename_template,
+        meeting_id,
+        new_title,
+        created_at,
+    );
+
+    let old_path = meetings_dir.join(&old_filename);
+    if !old_path.is_file() {
+        // Moved or deleted from inside Obsidian. A rename must not resurrect
+        // a note the user got rid of.
+        warn!(
+            "Obsidian rename: note {:?} for meeting {} is missing; leaving it alone",
+            old_path, meeting_id
+        );
+        return Ok(None);
+    }
+
+    let new_path = meetings_dir.join(&new_filename);
+    let target_is_free = new_path == old_path
+        || !new_path.exists()
+        || note_belongs_to_meeting(&new_path, meeting_id);
+
+    if !target_is_free {
+        warn!(
+            "Obsidian rename: {:?} already belongs to another meeting; keeping {} at its current name",
+            new_path, meeting_id
+        );
+    }
+
+    let moved = target_is_free && new_path != old_path;
+    if moved {
+        std::fs::rename(&old_path, &new_path)
+            .map_err(|e| anyhow!("Failed to rename Obsidian note: {}", e))?;
+    }
+
+    // Refresh the H1 so the note body matches its new title, whether or not
+    // the file itself moved.
+    let written_path = if moved { &new_path } else { &old_path };
+    match std::fs::read_to_string(written_path) {
+        Ok(content) => {
+            let updated = replace_note_heading(&content, new_title);
+            if updated != content {
+                if let Err(e) = std::fs::write(written_path, updated) {
+                    warn!(
+                        "Obsidian rename: failed to refresh heading in {:?}: {}",
+                        written_path, e
+                    );
+                }
+            }
+        }
+        Err(e) => warn!(
+            "Obsidian rename: failed to read {:?} to refresh its heading: {}",
+            written_path, e
+        ),
+    }
+
+    if !moved {
+        return Ok(None);
+    }
+
+    // Re-pin to the new name so later re-summarizations stay anchored here.
+    record_exported_filename(pool, meeting_id, &new_filename).await;
+    info!(
+        "Obsidian rename: meeting {} moved from {:?} to {:?}",
+        meeting_id, old_filename, new_filename
+    );
+
+    Ok(Some(new_filename))
+}
+
+/// Rename a meeting's vault note to follow a user-edited title. Best-effort:
+/// returns `Ok(None)` when there is no vault, no prior export, or nothing to
+/// move. Callers should treat errors as non-fatal — a vault problem must not
+/// fail the title change itself.
+pub async fn rename_meeting_note<R: Runtime>(
+    app: &AppHandle<R>,
+    pool: &SqlitePool,
+    meeting_id: &str,
+    new_title: &str,
+    created_at: &str,
+) -> Result<Option<ObsidianExportResult>> {
+    let settings = load_obsidian_settings(app).await?;
+    let Some(vault_path) = settings.vault_path.clone() else {
+        return Ok(None);
+    };
+    validate_vault_path(Path::new(&vault_path))?;
+
+    let meetings_dir = meetings_path(&vault_path);
+    let renamed = rename_exported_note(
+        pool,
+        &settings,
+        &meetings_dir,
+        meeting_id,
+        new_title,
+        created_at,
+    )
+    .await?;
+
+    Ok(renamed.map(|filename| {
+        let file_path = meetings_dir.join(&filename);
+        ObsidianExportResult {
+            file_path: file_path.to_string_lossy().to_string(),
+            relative_path: format!("{}/{}", MEETINGS_FOLDER, filename),
+        }
+    }))
+}
+
 /// Write a meeting note into the configured vault. Shared by the manual
 /// "Save to Obsidian" command and the automatic export after summary
 /// completion.
@@ -559,6 +714,171 @@ mod tests {
         assert!(b.contains("bbbbbbbb"));
     }
 
+    /// A note as `export_meeting_note` would have written it.
+    fn write_note(dir: &Path, filename: &str, meeting_id: &str, title: &str) {
+        std::fs::write(
+            dir.join(filename),
+            format!(
+                "---\nsource: meetily\nmeeting_id: \"{}\"\n---\n\n# {}\n\n## Summary\n\n# not the title\n",
+                meeting_id, title
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replace_note_heading_leaves_section_headings_alone() {
+        let content =
+            "---\nmeeting_id: \"x\"\n---\n\n# Old Title\n\n## Summary\n\n# not the title\n";
+        let updated = replace_note_heading(content, "New Title");
+        assert!(updated.contains("# New Title"));
+        assert!(!updated.contains("# Old Title"));
+        // Only the first H1 moves; sections and later stray H1s are untouched.
+        assert!(updated.contains("## Summary"));
+        assert!(updated.contains("# not the title"));
+        assert!(updated.contains("meeting_id: \"x\""));
+        // Everything but the heading line is byte-identical, trailing newline
+        // included, so the vault sees a one-line diff.
+        assert_eq!(
+            updated.replace("# New Title", "# Old Title"),
+            content,
+            "only the heading line may change"
+        );
+    }
+
+    #[test]
+    fn replace_note_heading_preserves_crlf_and_missing_h1() {
+        assert_eq!(
+            replace_note_heading("---\r\nid: x\r\n---\r\n\r\n# Old\r\n\r\nbody\r\n", "New"),
+            "---\r\nid: x\r\n---\r\n\r\n# New\r\n\r\nbody\r\n"
+        );
+        // A note the user rewrote by hand without an H1 must not be mangled.
+        let no_heading = "---\nid: x\n---\n\nplain body\n";
+        assert_eq!(replace_note_heading(no_heading, "New"), no_heading);
+    }
+
+    #[tokio::test]
+    async fn user_rename_moves_note_and_updates_heading() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let created = "2026-07-25T10:00:00Z";
+        let settings = settings(DEFAULT_FILENAME_TEMPLATE);
+
+        let original =
+            render_filename_template(DEFAULT_FILENAME_TEMPLATE, "meeting-123", "Draft", created);
+        write_note(dir.path(), &original, "meeting-123", "Draft");
+        record_exported_filename(&pool, "meeting-123", &original).await;
+
+        let renamed = rename_exported_note(
+            &pool,
+            &settings,
+            dir.path(),
+            "meeting-123",
+            "Client Kickoff",
+            created,
+        )
+        .await
+        .unwrap()
+        .expect("a title change must move the note");
+
+        assert!(renamed.contains("Client Kickoff"));
+        assert!(!dir.path().join(&original).exists(), "old note must be gone");
+
+        let content = std::fs::read_to_string(dir.path().join(&renamed)).unwrap();
+        assert!(content.contains("# Client Kickoff"));
+        assert!(!content.contains("# Draft"));
+        // Front matter must survive so the note stays attributable.
+        assert!(content.contains("meeting_id: \"meeting-123\""));
+
+        // The pin now tracks the new name, so later re-exports stay here.
+        assert_eq!(
+            lookup_recorded_filename(&pool, "meeting-123").await,
+            Some(renamed)
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_is_noop_when_never_exported() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let renamed = rename_exported_note(
+            &pool,
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            "never-exported",
+            "Some Title",
+            "2026-07-25T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(renamed, None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rename_is_noop_when_file_missing() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Recorded, but the user deleted the note from inside Obsidian.
+        record_exported_filename(&pool, "meeting-gone", "2026-07-25 Draft meeting-.md").await;
+
+        let renamed = rename_exported_note(
+            &pool,
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            "meeting-gone",
+            "Revived Title",
+            "2026-07-25T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(renamed, None);
+        // Crucially: a rename must never recreate a deleted note.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_clobber_another_meetings_note() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let created = "2026-07-25T10:00:00Z";
+        let settings = settings(DEFAULT_FILENAME_TEMPLATE);
+
+        let original =
+            render_filename_template(DEFAULT_FILENAME_TEMPLATE, "meeting-a", "Draft", created);
+        write_note(dir.path(), &original, "meeting-a", "Draft");
+        record_exported_filename(&pool, "meeting-a", &original).await;
+
+        // Someone else's note already occupies the name we'd rename into.
+        let taken =
+            render_filename_template(DEFAULT_FILENAME_TEMPLATE, "meeting-a", "Standup", created);
+        write_note(dir.path(), &taken, "meeting-b", "Standup");
+        let taken_before = std::fs::read_to_string(dir.path().join(&taken)).unwrap();
+
+        let renamed =
+            rename_exported_note(&pool, &settings, dir.path(), "meeting-a", "Standup", created)
+                .await
+                .unwrap();
+
+        assert_eq!(renamed, None, "must not report a move it did not make");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&taken)).unwrap(),
+            taken_before,
+            "the other meeting's note must survive byte-for-byte"
+        );
+        // Ours stays put, but its heading still catches up to the new title.
+        let ours = std::fs::read_to_string(dir.path().join(&original)).unwrap();
+        assert!(ours.contains("# Standup"));
+        assert_eq!(
+            lookup_recorded_filename(&pool, "meeting-a").await,
+            Some(original)
+        );
+    }
+
     #[tokio::test]
     async fn recorded_filename_is_reused_even_after_title_changes() {
         let pool = test_pool().await;
@@ -577,6 +897,8 @@ mod tests {
         record_exported_filename(&pool, "meeting-123", &first).await;
 
         // Re-summarization produces a new AI title; the note must not move.
+        // A rename the *user* asked for goes through `rename_exported_note`
+        // instead, which is the only sanctioned way past this pin.
         let second = resolve_export_filename(
             Some(&pool),
             &settings(DEFAULT_FILENAME_TEMPLATE),
