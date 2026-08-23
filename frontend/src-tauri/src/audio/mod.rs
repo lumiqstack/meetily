@@ -25,6 +25,7 @@ pub mod recording_commands;
 pub mod recording_preferences;
 pub mod recording_saver;
 pub mod incremental_saver;  // Streams meeting audio to audio.mp4 as it arrives
+pub mod pcm_stream;         // Bounded ffmpeg decoder: the read-side twin of stream_encoder
 pub mod stream_encoder;     // Long-lived ffmpeg encoder behind incremental_saver
 pub mod level_monitor;
 pub mod simple_level_monitor;
