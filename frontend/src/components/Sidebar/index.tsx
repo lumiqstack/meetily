@@ -391,7 +391,7 @@ const Sidebar: React.FC = () => {
     }
 
     try {
-      await invoke('api_save_meeting_title', {
+      const result = await invoke<{ obsidian_note?: string | null }>('api_save_meeting_title', {
         meetingId: meetingId,
         title: newTitle,
       });
@@ -410,7 +410,15 @@ const Sidebar: React.FC = () => {
       // Track the edit
       Analytics.trackButtonClick('edit_meeting_title', 'sidebar');
 
-      toast.success("Meeting title updated successfully");
+      // The vault note is renamed outside Obsidian, so Obsidian will not
+      // rewrite [[wiki-links]] that point at the old filename.
+      if (result?.obsidian_note) {
+        toast.success("Meeting title updated successfully", {
+          description: `Obsidian note renamed to ${result.obsidian_note}. Links to its old name won't follow.`,
+        });
+      } else {
+        toast.success("Meeting title updated successfully");
+      }
 
       // Close modal and reset state
       setEditModalState({ isOpen: false, meetingId: null, currentTitle: '' });
