@@ -90,6 +90,76 @@ pub async fn record_success(pool: &SqlitePool, meeting_id: &str) {
     }
 }
 
+/// Placeholder [`begin_attempt`] leaves in `last_error` until the outcome is
+/// known. Its presence tells [`record_failure`] the attempt has already been
+/// counted, and it is what the user sees if the process never got that far.
+const ATTEMPT_IN_FLIGHT: &str = "attempt started — the process exited before it finished";
+
+async fn write_meta(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    attempts: i64,
+    stage: &str,
+    error: &str,
+    next_retry_at: &str,
+    suppressed: i64,
+) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO pipeline_meta (meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(meeting_id) DO UPDATE SET \
+            attempts = excluded.attempts, last_stage = excluded.last_stage, \
+            last_error = excluded.last_error, next_retry_at = excluded.next_retry_at, \
+            suppressed = excluded.suppressed, updated_at = excluded.updated_at",
+    )
+    .bind(meeting_id)
+    .bind(attempts)
+    .bind(stage)
+    .bind(error)
+    .bind(next_retry_at)
+    .bind(suppressed)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    {
+        log::warn!("Failed to write pipeline retry state for {}: {}", meeting_id, e);
+    }
+}
+
+/// Count an attempt before the stage runs, and return its number.
+///
+/// `record_failure` only runs if the stage returns. A stage that takes the whole
+/// process down with it never reaches that call, so `attempts` stayed at zero
+/// and the derived work list offered the same meeting again on the very next
+/// tick — indefinitely. One 10.8-hour recording was retried eight times across
+/// two days that way, aborting the app every time. Claiming the attempt up front
+/// makes a crash cost an attempt like any other failure, so the backoff ladder
+/// and `max_attempts` apply to it.
+pub async fn begin_attempt(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    stage: &str,
+    max_attempts: i64,
+) -> i64 {
+    let previous = load(pool, meeting_id).await.map(|r| r.attempts).unwrap_or(0);
+    let attempts = previous + 1;
+    let next_retry_at = (Utc::now() + backoff_for(attempts)).to_rfc3339();
+    let suppressed = i64::from(attempts >= max_attempts);
+
+    write_meta(
+        pool,
+        meeting_id,
+        attempts,
+        stage,
+        ATTEMPT_IN_FLIGHT,
+        &next_retry_at,
+        suppressed,
+    )
+    .await;
+
+    attempts
+}
+
 /// Record a failed attempt and schedule the next one.
 ///
 /// `retryable` marks transient conditions (endpoint unreachable, engine busy,
@@ -105,33 +175,31 @@ pub async fn record_failure(
     retryable: bool,
     max_attempts: i64,
 ) {
-    let previous = load(pool, meeting_id).await.map(|r| r.attempts).unwrap_or(0);
-    let attempts = previous + 1;
+    let existing = load(pool, meeting_id).await;
+    // A stage that ran through `begin_attempt` is already counted; anything else
+    // (a pre-flight rejection, say) is counted here.
+    let in_flight = existing
+        .as_ref()
+        .and_then(|r| r.last_error.as_deref())
+        == Some(ATTEMPT_IN_FLIGHT);
+    let previous = existing.map(|r| r.attempts).unwrap_or(0);
+    let attempts = if in_flight { previous.max(1) } else { previous + 1 };
+
     let next_retry_at = (Utc::now() + backoff_for(attempts)).to_rfc3339();
     let suppressed = if retryable { 0 } else { i64::from(attempts >= max_attempts) };
     // Keep stored errors bounded; some provider errors embed whole payloads.
     let error: String = error.chars().take(500).collect();
 
-    if let Err(e) = sqlx::query(
-        "INSERT INTO pipeline_meta (meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(meeting_id) DO UPDATE SET \
-            attempts = excluded.attempts, last_stage = excluded.last_stage, \
-            last_error = excluded.last_error, next_retry_at = excluded.next_retry_at, \
-            suppressed = excluded.suppressed, updated_at = excluded.updated_at",
+    write_meta(
+        pool,
+        meeting_id,
+        attempts,
+        stage,
+        &error,
+        &next_retry_at,
+        suppressed,
     )
-    .bind(meeting_id)
-    .bind(attempts)
-    .bind(stage)
-    .bind(&error)
-    .bind(&next_retry_at)
-    .bind(suppressed)
-    .bind(Utc::now().to_rfc3339())
-    .execute(pool)
-    .await
-    {
-        log::warn!("Failed to record pipeline failure for {}: {}", meeting_id, e);
-    }
+    .await;
 }
 
 /// Forget a meeting's failures entirely (manual "process now" / retry).
@@ -160,6 +228,50 @@ mod tests {
     async fn unknown_meeting_has_no_retry_state() {
         let pool = test_pool().await;
         assert!(load(&pool, "never-seen").await.is_none());
+    }
+
+    /// The bug this exists to prevent: a stage that aborts the process never
+    /// reaches `record_failure`, so the meeting was offered again every tick
+    /// forever. Three crashed attempts must suppress just like three reported
+    /// failures.
+    #[tokio::test]
+    async fn crashed_attempts_still_count_towards_the_limit() {
+        let pool = test_pool().await;
+        for _ in 0..3 {
+            // No matching record_failure: this is what a crash looks like.
+            begin_attempt(&pool, "m-crash", "transcribe", 3).await;
+        }
+        let row = load(&pool, "m-crash").await.unwrap();
+        assert_eq!(row.attempts, 3);
+        assert!(row.suppressed(), "a crash loop must eventually stop");
+        assert!(!row.eligible_at(Utc::now() + Duration::days(365)));
+    }
+
+    #[tokio::test]
+    async fn a_begun_attempt_that_reports_failure_counts_once() {
+        let pool = test_pool().await;
+        begin_attempt(&pool, "m-once", "transcribe", 3).await;
+        record_failure(&pool, "m-once", "transcribe", "boom", false, 3).await;
+
+        let row = load(&pool, "m-once").await.unwrap();
+        assert_eq!(row.attempts, 1, "begin + fail is one attempt, not two");
+        assert_eq!(row.last_error.as_deref(), Some("boom"));
+        assert!(!row.suppressed());
+    }
+
+    /// Transient failures never give up, even after a crash counted an attempt.
+    #[tokio::test]
+    async fn a_transient_failure_clears_crash_suppression() {
+        let pool = test_pool().await;
+        for _ in 0..3 {
+            begin_attempt(&pool, "m-transient", "summarize", 3).await;
+        }
+        assert!(load(&pool, "m-transient").await.unwrap().suppressed());
+
+        begin_attempt(&pool, "m-transient", "summarize", 3).await;
+        record_failure(&pool, "m-transient", "summarize", "connection refused", true, 3).await;
+
+        assert!(!load(&pool, "m-transient").await.unwrap().suppressed());
     }
 
     #[tokio::test]

@@ -16,11 +16,17 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use super::audio_processing::{audio_to_mono, resample, resample_audio};
+use super::audio_processing::{audio_to_mono, resample};
 use super::ffmpeg::find_ffmpeg_path;
 
 /// Extensions requiring ffmpeg pre-conversion (Symphonia lacks these demuxers/codecs)
 const FFMPEG_ONLY_EXTENSIONS: &[&str] = &["mkv", "webm", "wma"];
+
+/// Ceiling on the capacity taken from a container's frame count, in samples
+/// (2^31 ≈ 8 GiB of `f32`, ~12.4 hours of 48 kHz mono). Past this the header is
+/// more likely wrong than the file is long, and reserving on a bad hint would
+/// itself be the allocation that fails.
+const MAX_RESERVE_SAMPLES: usize = 2_147_483_648;
 
 /// Progress callback for long-running operations
 /// Returns current progress (0-100) and a message
@@ -45,22 +51,36 @@ impl DecodedAudio {
     /// Performs mono conversion, normalization, and resampling. Large files
     /// (>5 min at 48kHz) use chunked sinc resampling to keep memory bounded
     /// while preserving audio quality for downstream VAD and transcription.
-    pub fn to_whisper_format(&self) -> Vec<f32> {
-        self.to_whisper_format_with_progress(None)
+    pub fn into_whisper_format(self) -> Result<Vec<f32>> {
+        self.into_whisper_format_with_progress(None)
     }
 
-    /// Convert decoded audio to Whisper format with optional progress callback
-    pub fn to_whisper_format_with_progress(&self, progress_callback: Option<ProgressCallback>) -> Vec<f32> {
+    /// Convert decoded audio to Whisper format with optional progress callback.
+    ///
+    /// Takes `self` by value so mono input can hand its buffer straight through.
+    /// A 10.8-hour recording is ~7.5 GB of `f32`; copying it here is what
+    /// exhausted the allocator and aborted the process.
+    pub fn into_whisper_format_with_progress(
+        self,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Result<Vec<f32>> {
+        let Self {
+            samples,
+            sample_rate,
+            channels,
+            duration_seconds: _,
+        } = self;
+
         // Step 1: Convert to mono if needed
-        let mono_samples = if self.channels > 1 {
+        let mono_samples = if channels > 1 {
             info!(
                 "Converting {} channels to mono ({} samples)",
-                self.channels,
-                self.samples.len()
+                channels,
+                samples.len()
             );
-            audio_to_mono(&self.samples, self.channels)
+            audio_to_mono(&samples, channels)
         } else {
-            self.samples.clone()
+            samples
         };
 
         // Step 1.5: Normalize samples to valid range (-1.0 to 1.0)
@@ -69,7 +89,7 @@ impl DecodedAudio {
 
         // Step 2: Resample to 16kHz if needed
         const WHISPER_SAMPLE_RATE: u32 = 16000;
-        if self.sample_rate != WHISPER_SAMPLE_RATE {
+        if sample_rate != WHISPER_SAMPLE_RATE {
             // Large files are processed in chunks through the sinc resampler
             // to keep memory bounded while preserving audio quality.
             // Linear interpolation (fast_resample) was removed because it lacks
@@ -81,18 +101,22 @@ impl DecodedAudio {
                 info!(
                     "Chunked sinc resampling {} samples from {}Hz to {}Hz (large file mode)",
                     mono_samples.len(),
-                    self.sample_rate,
+                    sample_rate,
                     WHISPER_SAMPLE_RATE
                 );
-                chunked_resample_with_progress(&mono_samples, self.sample_rate, WHISPER_SAMPLE_RATE, progress_callback)
+                chunked_resample_with_progress(&mono_samples, sample_rate, WHISPER_SAMPLE_RATE, progress_callback)?
             } else {
                 info!(
                     "Resampling {} samples from {}Hz to {}Hz",
                     mono_samples.len(),
-                    self.sample_rate,
+                    sample_rate,
                     WHISPER_SAMPLE_RATE
                 );
-                resample_audio(&mono_samples, self.sample_rate, WHISPER_SAMPLE_RATE)
+                // `resample`, not `resample_audio`: the latter returns the input
+                // untouched when it fails, which hands 48 kHz samples to code that
+                // believes they are 16 kHz — 3x wrong timestamps and garbled text,
+                // reported only as a debug line.
+                resample(&mono_samples, sample_rate, WHISPER_SAMPLE_RATE)?
             };
 
             // Clamp after resampling: the sinc resampler can overshoot
@@ -101,9 +125,9 @@ impl DecodedAudio {
             for s in &mut resampled {
                 *s = s.clamp(-1.0, 1.0);
             }
-            resampled
+            Ok(resampled)
         } else {
-            mono_samples
+            Ok(mono_samples)
         }
     }
 }
@@ -111,7 +135,7 @@ impl DecodedAudio {
 /// Resample large audio files in fixed-size chunks through the sinc resampler.
 ///
 /// Processes `input` in 60-second chunks using the high-quality sinc resampler
-/// from [`resample_audio`], concatenating the results. This avoids the memory
+/// from [`resample`], concatenating the results. This avoids the memory
 /// spike of resampling the entire file at once while preserving anti-aliasing
 /// quality that is critical for downstream VAD accuracy.
 ///
@@ -122,15 +146,18 @@ impl DecodedAudio {
 /// at chunk boundaries. Each chunk's [`resample`] call is independent and
 /// CPU-bound, making this ideal for data parallelism.
 ///
-/// Falls back to [`resample_audio`] (single-pass sinc) if any chunk fails.
+/// A chunk failure is fatal. The previous behaviour — retrying the whole input
+/// single-pass — needed more memory than the chunked path it was rescuing, so on
+/// the files where it triggered it could only turn a recoverable error into an
+/// allocation abort.
 fn chunked_resample_with_progress(
     input: &[f32],
     from_rate: u32,
     to_rate: u32,
     progress_callback: Option<ProgressCallback>,
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     if input.is_empty() || from_rate == to_rate {
-        return input.to_vec();
+        return Ok(input.to_vec());
     }
 
     // 60 seconds of audio at the source sample rate per chunk
@@ -157,62 +184,48 @@ fn chunked_resample_with_progress(
         input.len()
     );
 
-    // Resample all chunks in parallel — each is independent and CPU-bound
-    let resampled_chunks: Vec<Result<Vec<f32>>> = chunk_ranges
-        .par_iter()
-        .map(|&(chunk_start, chunk_end)| {
-            let chunk = &input[chunk_start..chunk_end];
-            resample(chunk, from_rate, to_rate)
-        })
-        .collect();
-
-    // Merge sequentially with cross-fade (order-dependent, must be serial)
+    // Resample a thread-pool's worth of chunks at a time and merge each batch
+    // before starting the next. Collecting all of them first held a second full
+    // copy of the output — 2.49 GB on a 10.8-hour file — before a single byte
+    // was merged.
     let mut output = Vec::with_capacity(estimated_output);
-    for (chunk_idx, result) in resampled_chunks.into_iter().enumerate() {
-        match result {
-            Ok(resampled) => {
-                if chunk_idx == 0 {
-                    output.extend_from_slice(&resampled);
-                } else {
-                    // Cross-fade the overlap region with the tail of the previous output
-                    let fade_len = overlap_output.min(resampled.len()).min(output.len());
-                    if fade_len > 0 {
-                        let out_start = output.len() - fade_len;
-                        for i in 0..fade_len {
-                            let t = i as f32 / fade_len as f32;
-                            output[out_start + i] =
-                                output[out_start + i] * (1.0 - t) + resampled[i] * t;
-                        }
-                        if fade_len < resampled.len() {
-                            output.extend_from_slice(&resampled[fade_len..]);
-                        }
-                    } else {
-                        output.extend_from_slice(&resampled);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Resampling failed on chunk {}/{}: {}, falling back to single-pass sinc resampler",
+    let batch_size = rayon::current_num_threads().max(1);
+    let mut chunk_idx = 0usize;
+
+    for batch in chunk_ranges.chunks(batch_size) {
+        let resampled_batch: Vec<Result<Vec<f32>>> = batch
+            .par_iter()
+            .map(|&(chunk_start, chunk_end)| {
+                let chunk = &input[chunk_start..chunk_end];
+                resample(chunk, from_rate, to_rate)
+            })
+            .collect();
+
+        // Merge sequentially with cross-fade (order-dependent, must be serial)
+        for result in resampled_batch {
+            let resampled = result.map_err(|e| {
+                anyhow!(
+                    "Resampling failed on chunk {}/{}: {}",
                     chunk_idx + 1,
                     total_chunks,
                     e
-                );
-                return resample_audio(input, from_rate, to_rate);
-            }
-        }
+                )
+            })?;
 
-        if let Some(callback) = &progress_callback {
-            let progress_pct = ((chunk_idx + 1) as f64 / total_chunks as f64) * 100.0;
-            if (chunk_idx + 1) % 10 == 0 || chunk_idx + 1 == total_chunks {
-                info!(
-                    "Resampling progress: {}/{} chunks ({:.0}%)",
-                    chunk_idx + 1,
-                    total_chunks,
-                    progress_pct
-                );
+            let fade = if chunk_idx == 0 { 0 } else { overlap_output };
+            append_with_crossfade(&mut output, &resampled, fade);
+            chunk_idx += 1;
+
+            if let Some(callback) = &progress_callback {
+                let progress_pct = (chunk_idx as f64 / total_chunks as f64) * 100.0;
+                if chunk_idx % 10 == 0 || chunk_idx == total_chunks {
+                    info!(
+                        "Resampling progress: {}/{} chunks ({:.0}%)",
+                        chunk_idx, total_chunks, progress_pct
+                    );
+                }
+                callback(progress_pct as u32, "Resampling audio");
             }
-            callback(progress_pct as u32, "Resampling audio");
         }
     }
 
@@ -221,7 +234,24 @@ fn chunked_resample_with_progress(
         input.len(),
         output.len()
     );
-    output
+    Ok(output)
+}
+
+/// Append `resampled` to `output`, cross-fading the first `fade` samples over
+/// `output`'s tail so chunk boundaries don't click. `fade == 0` appends plainly.
+fn append_with_crossfade(output: &mut Vec<f32>, resampled: &[f32], fade: usize) {
+    let fade_len = fade.min(resampled.len()).min(output.len());
+    if fade_len == 0 {
+        output.extend_from_slice(resampled);
+        return;
+    }
+
+    let out_start = output.len() - fade_len;
+    for i in 0..fade_len {
+        let t = i as f32 / fade_len as f32;
+        output[out_start + i] = output[out_start + i] * (1.0 - t) + resampled[i] * t;
+    }
+    output.extend_from_slice(&resampled[fade_len..]);
 }
 
 /// Normalize audio samples to the valid range (-1.0 to 1.0)
@@ -472,15 +502,22 @@ pub fn decode_audio_file_with_progress(
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| anyhow!("Failed to create decoder: {}", e))?;
 
-    // Decode all packets
-    let mut all_samples: Vec<f32> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
-
     // Calculate expected samples for progress tracking
     let expected_duration = track.codec_params.n_frames
         .map(|frames| frames as f64 / sample_rate as f64);
     let expected_samples = expected_duration
         .map(|dur| (dur * sample_rate as f64 * channels as f64) as usize);
+
+    // Decode all packets. Reserving up front matters more than it looks: growing
+    // by doubling has to hold the old and new buffers at once, so a multi-hour
+    // recording needs ~1.5x its final size in one contiguous instant. That
+    // transient is what aborted the process on a 10.8-hour file. A container
+    // header can lie, so the hint is capped rather than trusted outright.
+    let mut all_samples: Vec<f32> = match expected_samples {
+        Some(n) if n > 0 => Vec::with_capacity(n.min(MAX_RESERVE_SAMPLES)),
+        _ => Vec::new(),
+    };
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     let mut last_progress = 0u32;
 
@@ -588,8 +625,28 @@ mod tests {
             duration_seconds: 0.0001875,
         };
 
-        let result = audio.to_whisper_format();
+        let result = audio.into_whisper_format().unwrap();
         assert_eq!(result.len(), 3);
+    }
+
+    /// The mono buffer must be handed through, not copied. On a 10.8-hour
+    /// recording the copy was 7.5 GB and aborted the process, so this asserts on
+    /// the allocation identity rather than just the contents.
+    #[test]
+    fn mono_16k_conversion_reuses_the_input_allocation() {
+        let samples = vec![0.1f32; 4096];
+        let original_ptr = samples.as_ptr();
+
+        let result = DecodedAudio {
+            samples,
+            sample_rate: 16000,
+            channels: 1,
+            duration_seconds: 4096.0 / 16000.0,
+        }
+        .into_whisper_format()
+        .unwrap();
+
+        assert_eq!(result.as_ptr(), original_ptr, "mono samples were copied");
     }
 
     #[test]
@@ -602,7 +659,7 @@ mod tests {
             duration_seconds: 0.000125,
         };
 
-        let result = audio.to_whisper_format();
+        let result = audio.into_whisper_format().unwrap();
         assert_eq!(result.len(), 2); // Should be mono now
         // Average of (0.2, 0.4) = 0.3 and (0.6, 0.8) = 0.7
         assert!((result[0] - 0.3).abs() < 0.001);
@@ -621,7 +678,7 @@ mod tests {
             duration_seconds: 4800.0 / 48000.0,
         };
 
-        let result = audio.to_whisper_format();
+        let result = audio.into_whisper_format().unwrap();
         // Output length should be approximately input_len / 3 (16000/48000 ratio)
         // 4800 / 3 = 1600
         assert!(!result.is_empty(), "Result should not be empty");
@@ -632,7 +689,7 @@ mod tests {
     #[test]
     fn test_chunked_resample_same_rate() {
         let input = vec![0.1, 0.2, 0.3, 0.4, 0.5];
-        let result = chunked_resample_with_progress(&input, 16000, 16000, None);
+        let result = chunked_resample_with_progress(&input, 16000, 16000, None).unwrap();
         assert_eq!(result.len(), input.len());
         for (i, &sample) in result.iter().enumerate() {
             assert!((sample - input[i]).abs() < 0.001);
@@ -642,7 +699,7 @@ mod tests {
     #[test]
     fn test_chunked_resample_empty_input() {
         let input: Vec<f32> = vec![];
-        let result = chunked_resample_with_progress(&input, 48000, 16000, None);
+        let result = chunked_resample_with_progress(&input, 48000, 16000, None).unwrap();
         assert!(result.is_empty());
     }
 
@@ -650,7 +707,7 @@ mod tests {
     fn test_chunked_resample_downsamples_correctly() {
         // 48kHz to 16kHz = 3x downsampling with a 2-second signal
         let input: Vec<f32> = (0..96000).map(|i| (i as f32 / 96000.0)).collect();
-        let result = chunked_resample_with_progress(&input, 48000, 16000, None);
+        let result = chunked_resample_with_progress(&input, 48000, 16000, None).unwrap();
 
         // Output should be approximately 1/3 the length
         let expected_len = 96000.0 * (16000.0 / 48000.0);
@@ -668,7 +725,7 @@ mod tests {
         let input: Vec<f32> = (0..44100)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin())
             .collect();
-        let result = chunked_resample_with_progress(&input, 44100, 16000, None);
+        let result = chunked_resample_with_progress(&input, 44100, 16000, None).unwrap();
 
         for sample in &result {
             assert!(
@@ -686,8 +743,8 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 48000.0).sin() * 0.5)
             .collect();
 
-        let single_pass = resample_audio(&input, 48000, 16000);
-        let chunked = chunked_resample_with_progress(&input, 48000, 16000, None);
+        let single_pass = resample(&input, 48000, 16000).unwrap();
+        let chunked = chunked_resample_with_progress(&input, 48000, 16000, None).unwrap();
 
         // Lengths should be very close
         let len_diff = (single_pass.len() as i64 - chunked.len() as i64).unsigned_abs();
@@ -754,7 +811,7 @@ mod tests {
             duration_seconds: 1000.0 / 48000.0,
         };
 
-        let result = audio.to_whisper_format();
+        let result = audio.into_whisper_format().unwrap();
         // Should complete without error and produce valid output
         assert!(!result.is_empty());
         assert!(result.len() < 1000); // Downsampled

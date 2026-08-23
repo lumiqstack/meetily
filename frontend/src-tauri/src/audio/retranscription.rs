@@ -270,12 +270,28 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    // Convert to 16kHz mono format (CPU-intensive, run in blocking task)
+    // Convert to 16kHz mono format (CPU-intensive, run in blocking task).
+    // Resampling a long recording takes minutes; without a callback this stage
+    // reports nothing and the log goes silent for its whole duration.
+    let app_for_resample = app.clone();
+    let meeting_id_for_resample = meeting_id.clone();
+    let resample_progress = Box::new(move |progress: u32, msg: &str| {
+        // 15% -> 20% overall, matching the surrounding emit_progress calls
+        let overall = 15 + ((progress as f32 * 0.05) as u32);
+        emit_progress(
+            &app_for_resample,
+            &meeting_id_for_resample,
+            "decoding",
+            overall,
+            msg,
+        );
+    });
+
     let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format()
+        decoded.into_whisper_format_with_progress(Some(resample_progress))
     })
     .await
-    .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
+    .map_err(|e| anyhow!("Resample task panicked: {}", e))??;
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
 
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");

@@ -262,6 +262,17 @@ async fn process_one(
                 .await;
             emit_status(app).await;
 
+            // Counted before the stage runs: transcription is the stage that can
+            // take the process down with it, and an uncounted attempt repeats
+            // forever.
+            meta::begin_attempt(
+                pool,
+                &item.meeting_id,
+                Stage::Transcribe.as_str(),
+                config.max_attempts,
+            )
+            .await;
+
             transcribe_stage::run_transcribe_stage(
                 app,
                 &item.meeting_id,
@@ -301,6 +312,14 @@ async fn process_one(
                 }))
                 .await;
             emit_status(app).await;
+
+            meta::begin_attempt(
+                pool,
+                &item.meeting_id,
+                Stage::Summarize.as_str(),
+                config.max_attempts,
+            )
+            .await;
 
             summary_stage::run_summary_stage(app, pool, &item.meeting_id, config).await
         }
