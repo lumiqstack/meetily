@@ -28,6 +28,16 @@ interface PipelineSettings {
   last_scan_at: string | null;
 }
 
+/** Mirrors `ObsidianSettingsView` in src-tauri/src/obsidian.rs. */
+interface ObsidianSettingsView {
+  vault_path: string | null;
+  filename_template: string;
+  auto_export: boolean;
+  /** Applied when `filename_template` is empty. Shown as the placeholder so
+   *  this component never hardcodes a template of its own. */
+  default_filename_template: string;
+}
+
 export function PreferenceSettings() {
   const {
     notificationSettings,
@@ -43,7 +53,11 @@ export function PreferenceSettings() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [previousNotificationsEnabled, setPreviousNotificationsEnabled] = useState<boolean | null>(null);
   const [obsidianVaultPath, setObsidianVaultPath] = useState("");
-  const [obsidianFilenameTemplate, setObsidianFilenameTemplate] = useState("{date} {title}.md");
+  // Empty means "use the backend default". Never seed a template literal here:
+  // this field used to default to the pre-{short_id} template and write it back
+  // on save, silently downgrading users to collision-prone filenames.
+  const [obsidianFilenameTemplate, setObsidianFilenameTemplate] = useState("");
+  const [obsidianDefaultTemplate, setObsidianDefaultTemplate] = useState("");
   const [obsidianAutoExport, setObsidianAutoExport] = useState(true);
   const [isSavingObsidianPath, setIsSavingObsidianPath] = useState(false);
   const [pipelineSettings, setPipelineSettings] = useState<PipelineSettings | null>(null);
@@ -64,9 +78,10 @@ export function PreferenceSettings() {
       }
 
       try {
-        const settings = await invoke<{ vault_path?: string | null; filename_template?: string; auto_export?: boolean }>('get_obsidian_settings');
+        const settings = await invoke<ObsidianSettingsView>('get_obsidian_settings');
         setObsidianVaultPath(settings.vault_path || "");
-        setObsidianFilenameTemplate(settings.filename_template || "{date} {title}.md");
+        setObsidianFilenameTemplate(settings.filename_template ?? "");
+        setObsidianDefaultTemplate(settings.default_filename_template ?? "");
         setObsidianAutoExport(settings.auto_export ?? true);
       } catch (error) {
         console.error('Failed to load Obsidian settings:', error);
@@ -222,13 +237,15 @@ export function PreferenceSettings() {
     setIsSavingObsidianPath(true);
 
     try {
-      const settings = await invoke<{ vault_path?: string | null; filename_template?: string; auto_export?: boolean }>('set_obsidian_settings', {
+      const settings = await invoke<ObsidianSettingsView>('set_obsidian_settings', {
         vaultPath: obsidianVaultPath.trim() || null,
-        filenameTemplate: obsidianFilenameTemplate.trim() || "{date} {title}.md",
+        // null, not a literal — the backend owns what an empty template means.
+        filenameTemplate: obsidianFilenameTemplate.trim() || null,
         autoExport: obsidianAutoExport,
       });
       setObsidianVaultPath(settings.vault_path || "");
-      setObsidianFilenameTemplate(settings.filename_template || "{date} {title}.md");
+      setObsidianFilenameTemplate(settings.filename_template ?? "");
+      setObsidianDefaultTemplate(settings.default_filename_template ?? "");
       setObsidianAutoExport(settings.auto_export ?? true);
       toast.success('Obsidian vault saved');
       await Analytics.track('obsidian_vault_path_saved', {
@@ -451,11 +468,12 @@ export function PreferenceSettings() {
               <input
                 value={obsidianFilenameTemplate}
                 onChange={(event) => setObsidianFilenameTemplate(event.target.value)}
-                placeholder="{date} {title}.md"
+                placeholder={obsidianDefaultTemplate}
                 className="min-w-0 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-mono text-gray-900"
               />
               <div className="text-xs text-gray-600">
-                Filename placeholders: {"{date}"}, {"{title}"}, {"{id}"}, {"{short_id}"}
+                Filename placeholders: {"{date}"}, {"{title}"}, {"{id}"}, {"{short_id}"}.
+                {obsidianDefaultTemplate && ` Leave empty to use ${obsidianDefaultTemplate}. Including {short_id} keeps two meetings with the same date and title from overwriting each other.`}
               </div>
               <label className="flex items-center gap-2 text-sm text-gray-900 cursor-pointer select-none">
                 <input

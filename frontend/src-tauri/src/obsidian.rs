@@ -46,6 +46,32 @@ fn default_auto_export() -> bool {
     true
 }
 
+/// What the settings UI receives: the stored settings plus the template the
+/// backend applies when `filename_template` is left empty.
+///
+/// The default is sent rather than hardcoded in the UI because the two drifted
+/// once already — the panel defaulted to the pre-`{short_id}` template and
+/// silently wrote it back on save, downgrading users to collision-prone
+/// filenames. Keeping one source of truth is what stops that recurring.
+#[derive(Debug, Serialize)]
+pub struct ObsidianSettingsView {
+    pub vault_path: Option<String>,
+    pub filename_template: String,
+    pub auto_export: bool,
+    pub default_filename_template: String,
+}
+
+impl From<ObsidianSettings> for ObsidianSettingsView {
+    fn from(settings: ObsidianSettings) -> Self {
+        Self {
+            vault_path: settings.vault_path,
+            filename_template: settings.filename_template,
+            auto_export: settings.auto_export,
+            default_filename_template: default_filename_template(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ObsidianExportResult {
     pub file_path: String,
@@ -251,9 +277,10 @@ pub fn format_transcript_markdown(segments: &[crate::database::models::Transcrip
 #[tauri::command]
 pub async fn get_obsidian_settings<R: Runtime>(
     app: AppHandle<R>,
-) -> Result<ObsidianSettings, String> {
+) -> Result<ObsidianSettingsView, String> {
     load_obsidian_settings(&app)
         .await
+        .map(Into::into)
         .map_err(|e| e.to_string())
 }
 
@@ -261,7 +288,7 @@ pub async fn get_obsidian_settings<R: Runtime>(
 pub async fn set_obsidian_vault_path<R: Runtime>(
     app: AppHandle<R>,
     vault_path: Option<String>,
-) -> Result<ObsidianSettings, String> {
+) -> Result<ObsidianSettingsView, String> {
     let normalized_path = vault_path
         .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty());
@@ -278,7 +305,7 @@ pub async fn set_obsidian_vault_path<R: Runtime>(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(settings)
+    Ok(settings.into())
 }
 
 #[tauri::command]
@@ -287,7 +314,7 @@ pub async fn set_obsidian_settings<R: Runtime>(
     vault_path: Option<String>,
     filename_template: Option<String>,
     auto_export: Option<bool>,
-) -> Result<ObsidianSettings, String> {
+) -> Result<ObsidianSettingsView, String> {
     let normalized_path = vault_path
         .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty());
@@ -308,7 +335,7 @@ pub async fn set_obsidian_settings<R: Runtime>(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(settings)
+    Ok(settings.into())
 }
 
 #[tauri::command]
@@ -701,6 +728,29 @@ mod tests {
             filename_template: template.to_string(),
             auto_export: true,
         }
+    }
+
+    #[test]
+    fn cleared_template_falls_back_to_the_collision_safe_default() {
+        // The settings panel sends `None` for an empty field instead of a
+        // hardcoded literal, so this fallback is the only thing deciding what
+        // a cleared template becomes. It must not be the legacy template.
+        for cleared in [None, Some(String::new()), Some("   ".to_string())] {
+            assert_eq!(
+                normalize_filename_template(cleared),
+                DEFAULT_FILENAME_TEMPLATE
+            );
+        }
+        assert_ne!(DEFAULT_FILENAME_TEMPLATE, LEGACY_FILENAME_TEMPLATE);
+    }
+
+    #[test]
+    fn settings_view_carries_the_default_for_the_ui() {
+        // The UI shows this as its placeholder rather than duplicating the
+        // constant, which is how the two drifted last time.
+        let view = ObsidianSettingsView::from(settings("{title}.md"));
+        assert_eq!(view.filename_template, "{title}.md");
+        assert_eq!(view.default_filename_template, DEFAULT_FILENAME_TEMPLATE);
     }
 
     #[test]
