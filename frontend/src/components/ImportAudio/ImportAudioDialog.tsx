@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { isRemoteTranscriptionProvider } from '@/lib/transcription-providers';
 import {
   Upload,
   Globe,
@@ -260,7 +261,7 @@ export function ImportAudioDialog({
     return availableModels.find((m) => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
   const isParakeetModel = selectedModel?.provider === 'parakeet';
-  const isRemoteModel = selectedModel?.provider === 'openaiCompatible';
+  const isRemoteModel = isRemoteTranscriptionProvider(selectedModel?.provider);
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {

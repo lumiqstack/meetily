@@ -649,12 +649,20 @@ pub async fn api_get_transcript_config<R: Runtime>(
             match SettingsRepository::get_transcript_api_key(pool, &config.provider).await {
                 Ok(api_key) => {
                     log_info!("Successfully retrieved transcript config and API key.");
+                    // Each remote provider stores its endpoint in its own
+                    // column; surface the one matching the active provider.
+                    let base_url = match config.provider.as_str() {
+                        crate::config::PROVIDER_GEMINI_TRANSCRIBE => {
+                            config.gemini_transcribe_base_url
+                        }
+                        _ => config.openai_compatible_base_url,
+                    };
                     Ok(Some(TranscriptConfig {
                         provider: config.provider,
                         model: config.model,
                         realtime_transcription_enabled: config.realtime_transcription_enabled,
                         api_key,
-                        base_url: config.openai_compatible_base_url,
+                        base_url,
                     }))
                 }
                 Err(e) => {
@@ -737,7 +745,9 @@ pub async fn api_save_transcript_config<R: Runtime>(
     if let Some(url) = base_url {
         if !url.is_empty() {
             log_info!("Base URL provided, saving for transcript provider...");
-            if let Err(e) = SettingsRepository::save_transcript_base_url(pool, &url).await {
+            if let Err(e) =
+                SettingsRepository::save_transcript_base_url(pool, &provider, &url).await
+            {
                 log_error!("Failed to save transcript base URL: {}", e);
                 return Err(e.to_string());
             }

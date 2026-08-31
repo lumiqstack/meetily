@@ -60,6 +60,27 @@ export class TranscriptService {
   }
 
   /**
+   * Listen for interim (replaceable) captions from a streaming provider.
+   *
+   * Separate from `transcript-update` on purpose: the Rust persistence
+   * listener stores every `transcript-update` it receives, so interims must
+   * not travel on that event. An empty `text` clears the caption.
+   *
+   * @param callback - Function to call when a caption arrives
+   * @returns Promise that resolves to unlisten function
+   */
+  async onTranscriptInterim(
+    callback: (caption: { text: string; language_code?: string | null }) => void
+  ): Promise<UnlistenFn> {
+    return listen<{ text: string; language_code?: string | null }>(
+      'transcript-interim',
+      (event) => {
+        callback(event.payload);
+      }
+    );
+  }
+
+  /**
    * Listen for transcription-complete event
    * @param callback - Function to call when transcription processing is complete
    * @returns Promise that resolves to unlisten function

@@ -13,6 +13,7 @@ import { applyPinnedSummaryLanguageToMeeting } from '@/lib/summary-language-pref
 import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
 import { useConfig } from '@/contexts/ConfigContext';
 import { toast } from 'sonner';
+import { BATCH_CAPABLE_PROVIDERS } from '@/lib/transcription-providers';
 
 interface AudioRecoveryStatus {
   status: string; // "success" | "partial" | "failed" | "none"
@@ -189,11 +190,10 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         // Kick off background re-transcription of the recovered audio.
         // Failure here is non-fatal: the audio and meeting are already saved
         // and the user can retranscribe manually from the meeting page.
-        const BATCH_PROVIDERS = new Set(['localWhisper', 'whisper', 'parakeet', 'openaiCompatible']);
         let retranscriptionStarted = false;
         let retranscriptionSkippedReason: string | undefined;
 
-        if (!BATCH_PROVIDERS.has(transcriptModelConfig.provider)) {
+        if (!BATCH_CAPABLE_PROVIDERS.has(transcriptModelConfig.provider)) {
           retranscriptionSkippedReason = `Provider "${transcriptModelConfig.provider}" cannot re-transcribe saved audio. Open the meeting and use "Retranscribe" to pick a supported model.`;
         } else {
           const isParakeet = transcriptModelConfig.provider === 'parakeet';

@@ -23,6 +23,29 @@ pub fn reset_speech_detected_flag() {
     info!("🔍 SPEECH_DETECTED_EMITTED reset to: {}", SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst));
 }
 
+/// Next transcript sequence id.
+///
+/// Shared with the Gemini Live session so that both transcription paths draw
+/// from one counter — the frontend orders and dedupes by this value.
+pub(crate) fn next_sequence_id() -> u64 {
+    SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Emit `speech-detected` the first time speech is seen in a session.
+pub(crate) fn emit_speech_detected_once<R: Runtime>(app: &AppHandle<R>) {
+    if SPEECH_DETECTED_EMITTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    match app.emit(
+        "speech-detected",
+        serde_json::json!({ "message": "Speech activity detected" }),
+    ) {
+        Ok(_) => info!("🎤 ✅ First speech detected - successfully emitted speech-detected event"),
+        Err(e) => error!("🎤 ❌ Failed to emit speech-detected event: {}", e),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TranscriptUpdate {
     pub text: String,
@@ -52,6 +75,33 @@ pub fn start_transcription_task<R: Runtime>(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
+
+        // Gemini Live is a streaming session, not a chunk-at-a-time engine: it
+        // consumes the continuous mixed stream and pushes interim/final events
+        // back. It bypasses the worker pool entirely.
+        if super::engine::is_gemini_live_configured(&app).await {
+            match super::hermes_live_session::LiveSessionConfig::from_saved_settings(&app).await {
+                Ok(config) => {
+                    super::hermes_live_session::start_live_transcription_task(
+                        app.clone(),
+                        transcription_receiver,
+                        config,
+                    )
+                    .await
+                    .ok();
+                    return;
+                }
+                Err(e) => {
+                    error!("Failed to configure Gemini Live transcription: {}", e);
+                    let _ = app.emit("transcription-error", serde_json::json!({
+                        "error": e,
+                        "userMessage": format!("Live transcription is not configured: {}", e),
+                        "actionable": true
+                    }));
+                    return;
+                }
+            }
+        }
 
         // Initialize transcription engine (Whisper or Parakeet based on config)
         let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
@@ -189,23 +239,10 @@ pub fn start_transcription_task<R: Runtime>(
 
                                         // Emit speech-detected event for frontend UX (only on first detection per session)
                                         // This is lightweight and provides better user feedback
-                                        let current_flag = SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst);
-                                        info!("🔍 Checking speech-detected flag: current={}, will_emit={}", current_flag, !current_flag);
-
-                                        if !current_flag {
-                                            SPEECH_DETECTED_EMITTED.store(true, Ordering::SeqCst);
-                                            match app_clone.emit("speech-detected", serde_json::json!({
-                                                "message": "Speech activity detected"
-                                            })) {
-                                                Ok(_) => info!("🎤 ✅ First speech detected - successfully emitted speech-detected event"),
-                                                Err(e) => error!("🎤 ❌ Failed to emit speech-detected event: {}", e),
-                                            }
-                                        } else {
-                                            info!("🔍 Speech already detected in this session, not re-emitting");
-                                        }
+                                        emit_speech_detected_once(&app_clone);
 
                                         // Generate sequence ID and calculate timestamps FIRST
-                                        let sequence_id = SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                        let sequence_id = next_sequence_id();
                                         let audio_start_time = chunk_timestamp; // Already in seconds from recording start
                                         let audio_end_time = chunk_timestamp + chunk_duration;
 
@@ -587,7 +624,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
 }
 
 /// Format current timestamp (wall-clock time)
-fn format_current_timestamp() -> String {
+pub(crate) fn format_current_timestamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

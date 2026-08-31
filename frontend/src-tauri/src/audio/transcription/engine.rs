@@ -161,14 +161,79 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
             info!("✅ OpenAI-compatible endpoint config valid: {}", base_url);
             Ok(())
         }
+        "geminiTranscribe" => {
+            info!("🔍 Validating Gemini transcription config...");
+            let base_url = config.base_url.as_deref().unwrap_or("").trim();
+            if base_url.is_empty() {
+                return Err(
+                    "Gemini transcription endpoint is not configured. Set the proxy base URL in transcript settings.".to_string(),
+                );
+            }
+            if config.api_key.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(
+                    "Gemini transcription requires the proxy bearer token. Set it in transcript settings.".to_string(),
+                );
+            }
+
+            // Validate both transports up front: a recording that starts fine
+            // and then cannot open the live socket is a much worse failure.
+            super::hermes_endpoints::resolve_rest_endpoint(base_url)?;
+            super::hermes_endpoints::resolve_live_endpoint(base_url)?;
+
+            info!("✅ Gemini transcription config valid: {}", base_url);
+            Ok(())
+        }
         other => {
             warn!("❌ Unsupported transcription provider for local recording: {}", other);
             Err(format!(
-                "Provider '{}' is not supported for local transcription. Please select 'localWhisper', 'parakeet', or 'openaiCompatible'.",
+                "Provider '{}' is not supported for local transcription. Please select 'localWhisper', 'parakeet', 'openaiCompatible', or 'geminiTranscribe'.",
                 other
             ))
         }
     }
+}
+
+/// Construct the remote provider for a batch job (import, retranscription,
+/// recovery), given the provider id the frontend selected.
+///
+/// Batch work always goes over REST, including for Gemini — the Live
+/// WebSocket is only for an in-progress recording.
+pub async fn build_remote_provider<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: &str,
+    model: Option<String>,
+) -> Result<Box<dyn TranscriptionProvider>, String> {
+    match provider {
+        crate::config::PROVIDER_GEMINI_TRANSCRIBE => {
+            let provider =
+                super::gemini_transcribe_provider::GeminiTranscribeProvider::from_saved_settings(
+                    app, model,
+                )
+                .await?;
+            Ok(Box::new(provider))
+        }
+        crate::config::PROVIDER_OPENAI_COMPATIBLE => {
+            let provider =
+                super::openai_compatible_provider::OpenAICompatibleProvider::from_saved_settings(
+                    app, model,
+                )
+                .await?;
+            Ok(Box::new(provider))
+        }
+        other => Err(format!(
+            "Provider '{}' is not a remote transcription provider.",
+            other
+        )),
+    }
+}
+
+/// Whether live recording should stream to the Gemini Live WebSocket rather
+/// than run the chunk-at-a-time worker pool.
+pub async fn is_gemini_live_configured<R: Runtime>(app: &AppHandle<R>) -> bool {
+    matches!(
+        crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None).await,
+        Ok(Some(config)) if config.provider == crate::config::PROVIDER_GEMINI_TRANSCRIBE
+    )
 }
 
 /// Get or initialize the appropriate transcription engine based on provider configuration
@@ -258,6 +323,17 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 config.model.clone(),
                 config.api_key.clone(),
             )?;
+            Ok(TranscriptionEngine::Provider(Arc::new(provider)))
+        }
+        // Batch path only. Live recording never reaches here: the worker task
+        // hands the stream to hermes_live_session before building an engine.
+        "geminiTranscribe" => {
+            info!("✨ Initializing Gemini batch transcription provider");
+            let provider =
+                super::gemini_transcribe_provider::GeminiTranscribeProvider::from_saved_settings(
+                    app, None,
+                )
+                .await?;
             Ok(TranscriptionEngine::Provider(Arc::new(provider)))
         }
         "localWhisper" | _ => {

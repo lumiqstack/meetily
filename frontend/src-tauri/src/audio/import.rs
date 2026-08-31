@@ -396,7 +396,7 @@ pub async fn start_import<R: Runtime>(
     provider: Option<String>,
 ) -> Result<ImportResult> {
     let import_id = format!("import-{}", Uuid::new_v4());
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = IMPORT_JOBS
         .acquire(import_id.clone(), use_remote)
         .map_err(|e| anyhow!(e))?;
@@ -430,7 +430,7 @@ async fn start_import_with_guard<R: Runtime>(
     _guard: JobGuard<'static>,
 ) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
     // Journal the job so a crash mid-import is detected (and its orphaned
     // folder cleaned up) on the next launch. See job_persistence.rs.
@@ -528,7 +528,7 @@ async fn run_import<R: Runtime>(
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
     emit_progress(&app, &import_id, "copying", 5, "Creating meeting folder...");
 
@@ -733,8 +733,9 @@ async fn run_import<R: Runtime>(
     };
     let remote_provider = if use_remote && total_segments > 0 {
         Some(
-            crate::audio::transcription::OpenAICompatibleProvider::from_saved_settings(
+            crate::audio::transcription::engine::build_remote_provider(
                 &app,
+                provider.as_deref().unwrap_or_default(),
                 model.clone(),
             )
             .await
@@ -806,7 +807,6 @@ async fn run_import<R: Runtime>(
 
         // Transcribe
         let (text, conf) = if use_remote {
-            use crate::audio::transcription::TranscriptionProvider;
             let engine = remote_provider.as_ref().unwrap();
             let result = engine
                 .transcribe(segment.samples.clone(), language.clone())
@@ -1293,7 +1293,7 @@ pub async fn start_import_audio_command<R: Runtime>(
     provider: Option<String>,
 ) -> Result<ImportStarted, String> {
     let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = IMPORT_JOBS.acquire(import_id.clone(), use_remote)?;
 
     let import_id_for_task = import_id.clone();
@@ -1692,7 +1692,7 @@ async fn run_url_import<R: Runtime>(
 
     // Phase 4: claim the shared engine guard now (after the long download) and
     // hand off to the normal pipeline, which journals + emits its own events.
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = match IMPORT_JOBS.acquire(import_id.clone(), use_remote) {
         Ok(g) => g,
         Err(e) => {

@@ -1,4 +1,5 @@
 import { BackgroundJobStore } from './background-jobs';
+import { isRemoteTranscriptionProvider } from './transcription-providers';
 
 /**
  * Drives a batch of file imports through the single-import backend command,
@@ -15,7 +16,6 @@ import { BackgroundJobStore } from './background-jobs';
  * app dies — only started imports are journaled for crash recovery.
  */
 
-const REMOTE_PROVIDER = 'openaiCompatible';
 const MAX_ACTIVE_REMOTE = 3; // Mirrors MAX_CONCURRENT_REMOTE_JOBS in Rust.
 const MAX_ACTIVE_LOCAL = 1; // Local engine is single-holder.
 
@@ -57,7 +57,7 @@ function defaultIdGenerator(): string {
  * would fight over that single window.
  */
 function usesRemotePool(item: QueuedItem): boolean {
-  return item.options.provider === REMOTE_PROVIDER && !item.url;
+  return isRemoteTranscriptionProvider(item.options.provider) && !item.url;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

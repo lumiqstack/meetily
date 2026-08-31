@@ -68,6 +68,7 @@ impl RecordingManager {
         system_device: Option<Arc<AudioDevice>>,
         auto_save: bool,
         realtime_transcription_enabled: bool,
+        streaming_live: bool,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         info!(
             "Starting recording manager (auto_save: {}, realtime_transcription: {})",
@@ -123,6 +124,7 @@ impl RecordingManager {
             sys_name,
             sys_kind,
             realtime_transcription_enabled,
+            streaming_live,
         )?;
 
         // Give the pipeline a moment to fully initialize before starting streams
@@ -178,6 +180,7 @@ impl RecordingManager {
         &mut self,
         auto_save: bool,
         realtime_transcription_enabled: bool,
+        streaming_live: bool,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         #[cfg(target_os = "macos")]
         {
@@ -197,7 +200,7 @@ impl RecordingManager {
             }
 
             // Start recording with selected devices and auto_save setting
-            self.start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled).await
+            self.start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled, streaming_live).await
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -232,7 +235,7 @@ impl RecordingManager {
                 return Err(anyhow::anyhow!("No microphone device available"));
             }
 
-            self.start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled).await
+            self.start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled, streaming_live).await
         }
     }
 

@@ -697,6 +697,13 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    /// Continuous mixed audio for a streaming transcription provider (Gemini
+    /// Live). Deliberately fed from the mixed stream rather than the VAD
+    /// segments: a streaming recognizer runs its own endpointing and needs
+    /// unbroken audio, and silence-stripped segments would delay every interim
+    /// caption until after the utterance had already finished. `None` for
+    /// every non-streaming provider.
+    live_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
     // Me/Others speaker attribution: label each pre-mix window by dominant
     // source, aggregate across the windows behind each VAD segment.
     window_labeler: super::source_attribution::WindowLabeler,
@@ -781,6 +788,7 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            live_sender_for_mixed: None,       // Will be set by manager
             window_labeler: super::source_attribution::WindowLabeler::new(),
             segment_aggregator: super::source_attribution::SegmentAggregator::new(),
             mic_window: Vec::new(),
@@ -839,10 +847,18 @@ impl AudioPipeline {
                         self.last_summary_time = std::time::Instant::now();
                     }
 
-                    // Nobody downstream: no VAD to feed and no encoder to write
-                    // to. Mixing here would be pure heat — drop the samples and
-                    // keep draining so the capture threads never block.
-                    if self.vad_processor.is_none() && self.recording_sender_for_mixed.is_none() {
+                    // Nobody downstream: no VAD to feed, no encoder to write to,
+                    // and no live stream to send. Mixing here would be pure heat
+                    // — drop the samples and keep draining so the capture
+                    // threads never block.
+                    //
+                    // The live sender must be part of this test: with Gemini
+                    // Live the VAD processor is deliberately absent, so omitting
+                    // it here would skip mixing entirely and stream silence.
+                    if self.vad_processor.is_none()
+                        && self.recording_sender_for_mixed.is_none()
+                        && self.live_sender_for_mixed.is_none()
+                    {
                         continue;
                     }
 
@@ -941,6 +957,26 @@ impl AudioPipeline {
                                 }
                                 // Realtime transcription disabled — no VAD.
                                 None => {}
+                            }
+
+                            // STEP 3b: Send the continuous mixed window to a
+                            // streaming transcription provider. Read by
+                            // reference — STEP 4 still needs to move the buffer
+                            // — and resampled by the live session, which owns
+                            // the wire format.
+                            if let Some(ref sender) = self.live_sender_for_mixed {
+                                let live_chunk = AudioChunk {
+                                    data: mixed_with_gain.clone(),
+                                    sample_rate: self.sample_rate,
+                                    timestamp: chunk.timestamp,
+                                    chunk_id: self.chunk_id_counter,
+                                    device_type: DeviceType::Microphone,  // Mixed audio
+                                    // Mixed audio has no trustworthy per-window
+                                    // attribution, and the streaming provider
+                                    // does not use one.
+                                    dominant_source: None,
+                                };
+                                let _ = sender.send(live_chunk);
                             }
 
                             // STEP 4: Send mixed audio to the encoder.
@@ -1065,6 +1101,7 @@ impl AudioPipelineManager {
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
         vad_enabled: bool,
+        streaming_live: bool,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
@@ -1077,10 +1114,15 @@ impl AudioPipelineManager {
         // Set sender in state for audio captures to use
         state.set_audio_sender(audio_sender.clone());
 
+        // A streaming provider runs its own endpointing on continuous audio, so
+        // local VAD is both unnecessary and harmful (it would strip the silence
+        // the recognizer uses to detect utterance boundaries).
+        let vad_enabled = vad_enabled && !streaming_live;
+
         // Create and start pipeline with device information for adaptive mixing
         let mut pipeline = AudioPipeline::new(
             audio_receiver,
-            transcription_sender,
+            transcription_sender.clone(),
             state.clone(),
             target_chunk_duration_ms,
             sample_rate,
@@ -1094,6 +1136,14 @@ impl AudioPipelineManager {
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings
         pipeline.recording_sender_for_mixed = recording_sender;
+
+        // In streaming mode the transcription channel carries the continuous
+        // mixed stream instead of VAD segments; the consumer
+        // (start_transcription_task) branches on the same configuration.
+        if streaming_live {
+            info!("🔊 Streaming transcription: feeding continuous mixed audio to the live session (VAD bypassed)");
+            pipeline.live_sender_for_mixed = Some(transcription_sender);
+        }
 
         let handle = tokio::spawn(async move {
             pipeline.run().await

@@ -11,6 +11,71 @@ pub const DEFAULT_WHISPER_MODEL: &str = "large-v3-turbo";
 /// This is the quantized version optimized for speed.
 pub const DEFAULT_PARAKEET_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
 
+// ============================================================================
+// TRANSCRIPTION PROVIDER IDENTIFIERS
+// ============================================================================
+//
+// These string ids are the contract between the frontend settings UI, the
+// `transcript_settings.provider` column, and the Rust engine selection.
+
+/// On-device Whisper.
+pub const PROVIDER_LOCAL_WHISPER: &str = "localWhisper";
+
+/// On-device Parakeet.
+pub const PROVIDER_PARAKEET: &str = "parakeet";
+
+/// Any server speaking the OpenAI `/v1/audio/transcriptions` API.
+pub const PROVIDER_OPENAI_COMPATIBLE: &str = "openaiCompatible";
+
+/// Gemini transcription reached through the hermes proxy. Batch work goes to
+/// `{base}/v1/transcriptions`; live recording streams over `{base}/v1/live`.
+pub const PROVIDER_GEMINI_TRANSCRIBE: &str = "geminiTranscribe";
+
+/// Model used for batch (import / retranscription / recovery) Gemini requests.
+pub const GEMINI_BATCH_MODEL: &str = "gemini-3.5-transcribe";
+
+/// Model used for the Gemini Live WebSocket session.
+pub const GEMINI_LIVE_MODEL: &str = "gemini-3.5-transcribe-live";
+
+/// Whether a provider runs off-device.
+///
+/// Remote providers never touch the shared `WHISPER_ENGINE` /
+/// `PARAKEET_ENGINE` singletons, so they are exempt from the local engine
+/// coordinator, from idle gating, and from recording preemption. Every place
+/// that decides "is this job remote?" must go through this function — a missed
+/// call site makes a remote job contend for an engine it never uses.
+pub fn is_remote_transcription_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        PROVIDER_OPENAI_COMPATIBLE | PROVIDER_GEMINI_TRANSCRIBE
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_providers_are_recognized() {
+        assert!(is_remote_transcription_provider(PROVIDER_OPENAI_COMPATIBLE));
+        assert!(is_remote_transcription_provider(PROVIDER_GEMINI_TRANSCRIBE));
+    }
+
+    #[test]
+    fn local_engines_are_not_remote() {
+        assert!(!is_remote_transcription_provider(PROVIDER_LOCAL_WHISPER));
+        assert!(!is_remote_transcription_provider(PROVIDER_PARAKEET));
+    }
+
+    #[test]
+    fn unknown_provider_is_not_remote() {
+        // Defaulting an unrecognized provider to "local" is the safe side of
+        // the error: it claims the engine guard rather than skipping it.
+        assert!(!is_remote_transcription_provider(""));
+        assert!(!is_remote_transcription_provider("deepgram"));
+    }
+}
+
 /// Whisper model catalog with metadata for all supported models.
 /// Used by both WhisperEngine::discover_models() and discover_models_standalone().
 ///

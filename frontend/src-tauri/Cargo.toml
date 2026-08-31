@@ -118,6 +118,11 @@ async-trait = "0.1"  # Trait abstraction for async methods
 
 reqwest = { version = "0.11", features = ["blocking", "multipart", "json", "stream"] }
 
+# Gemini Live WebSocket transport (hermes gateway).
+# native-tls matches reqwest 0.11's default backend (schannel on Windows), so
+# this does not link a second TLS stack into the binary.
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+
 # crossbeam
 crossbeam = "0.8.4"
 dashmap = "6.1.0"

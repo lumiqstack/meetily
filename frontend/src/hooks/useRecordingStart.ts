@@ -105,6 +105,22 @@ export function useRecordingStart(
       return false;
     }
 
+    if (provider === 'geminiTranscribe') {
+      // Both the base URL and the proxy bearer token are required: the live
+      // WebSocket sends the token on the upgrade, so a missing one fails the
+      // connection rather than degrading.
+      if (config.baseUrl?.trim() && config.apiKey?.trim()) {
+        return true;
+      }
+      toast.error('Gemini transcription not configured', {
+        description: 'Set the proxy base URL and bearer token in transcript settings, or turn off realtime transcription to record without it.',
+        duration: 5000,
+      });
+      showModal?.('modelSelector', 'Transcription model setup required');
+      Analytics.trackButtonClick('start_recording_blocked_missing', analyticsSource);
+      return false;
+    }
+
     if (provider === 'localWhisper') {
       try {
         await invoke('whisper_init');

@@ -17,12 +17,15 @@ import {
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai' | 'openaiCompatible';
+    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai' | 'openaiCompatible' | 'geminiTranscribe';
     model: string;
     apiKey?: string | null;
     baseUrl?: string | null;
     realtimeTranscriptionEnabled: boolean;
 }
+
+/// Batch model id; the live session uses gemini-3.5-transcribe-live server-side.
+const GEMINI_BATCH_MODEL = 'gemini-3.5-transcribe';
 
 export interface TranscriptSettingsProps {
     transcriptModelConfig: TranscriptModelProps;
@@ -58,6 +61,10 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         )
     );
     const [remoteSaveStatus, setRemoteSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+    const [geminiBaseUrl, setGeminiBaseUrl] = useState<string>(
+        transcriptModelConfig.provider === 'geminiTranscribe' ? (transcriptModelConfig.baseUrl || '') : ''
+    );
+    const [geminiSaveStatus, setGeminiSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
@@ -83,6 +90,13 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             setApiKey(null);
         }
     }, [transcriptModelConfig.provider]);
+
+    // Keep the Gemini base URL in sync when the saved config loads.
+    useEffect(() => {
+        if (transcriptModelConfig.provider === 'geminiTranscribe' && transcriptModelConfig.baseUrl) {
+            setGeminiBaseUrl(transcriptModelConfig.baseUrl);
+        }
+    }, [transcriptModelConfig.provider, transcriptModelConfig.baseUrl]);
 
     const fetchApiKey = async (provider: string) => {
         try {
@@ -194,6 +208,40 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const handleSaveGeminiConfig = async () => {
+        const baseUrl = geminiBaseUrl.trim();
+        const token = (apiKey || '').trim();
+        if (!baseUrl || !token) {
+            setGeminiSaveStatus('error');
+            return;
+        }
+
+        setGeminiSaveStatus('saving');
+        const updatedConfig: TranscriptModelProps = {
+            ...transcriptModelConfig,
+            provider: 'geminiTranscribe',
+            model: GEMINI_BATCH_MODEL,
+            baseUrl,
+            apiKey: token,
+        };
+
+        try {
+            await invoke('api_save_transcript_config', {
+                provider: 'geminiTranscribe',
+                model: GEMINI_BATCH_MODEL,
+                realtimeTranscriptionEnabled: transcriptModelConfig.realtimeTranscriptionEnabled ?? false,
+                apiKey: token,
+                baseUrl,
+            });
+            setTranscriptModelConfig(updatedConfig);
+            setGeminiSaveStatus('saved');
+            setTimeout(() => setGeminiSaveStatus('idle'), 2000);
+        } catch (err) {
+            console.error('Failed to save Gemini transcription config:', err);
+            setGeminiSaveStatus('error');
+        }
+    };
+
     const handleRealtimeToggle = async (checked: boolean) => {
         const updatedConfig = {
             ...transcriptModelConfig,
@@ -264,6 +312,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
                                     <SelectItem value="openaiCompatible">🌐 Remote (OpenAI-compatible)</SelectItem>
+                                    <SelectItem value="geminiTranscribe">✨ Gemini (via proxy — live streaming)</SelectItem>
                                     {/* <SelectItem value="deepgram">☁️ Deepgram (Backup)</SelectItem>
                                     <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
                                     <SelectItem value="groq">☁️ Groq</SelectItem>
@@ -271,7 +320,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectContent>
                             </Select>
 
-                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && uiProvider !== 'openaiCompatible' && (
+                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && uiProvider !== 'openaiCompatible' && uiProvider !== 'geminiTranscribe' && (
                                 <Select
                                     value={transcriptModelConfig.model}
                                     onValueChange={(value) => {
@@ -435,6 +484,79 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         </div>
                     )}
 
+
+                    {uiProvider === 'geminiTranscribe' && (
+                        <div className="mt-6 space-y-4 rounded-md border border-gray-200 bg-white px-4 py-4">
+                            <p className="text-xs text-gray-500">
+                                Audio is sent to your proxy, which holds the Google credential — no Google API key is
+                                stored on this machine. Live recording streams over a WebSocket for interim captions;
+                                imports and re-transcription use the batch endpoint.
+                            </p>
+
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Proxy Base URL
+                                </Label>
+                                <Input
+                                    type="text"
+                                    className="focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                    value={geminiBaseUrl}
+                                    onChange={(e) => setGeminiBaseUrl(e.target.value)}
+                                    placeholder="https://your-host.ts.net/google-transcribe"
+                                />
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Include the gateway path. Batch requests go to {'{base}'}/v1/transcriptions and live
+                                    audio to {'{base}'}/v1/live.
+                                </p>
+                            </div>
+
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Proxy Bearer Token
+                                </Label>
+                                <div className="relative">
+                                    <Input
+                                        type={showApiKey ? 'text' : 'password'}
+                                        className="pr-12 focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                                        value={apiKey || ''}
+                                        onChange={(e) => setApiKey(e.target.value)}
+                                        placeholder="Token your proxy expects"
+                                    />
+                                    <div className="absolute inset-y-0 right-0 pr-1 flex items-center">
+                                        <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="icon"
+                                            onClick={() => setShowApiKey(!showApiKey)}
+                                        >
+                                            {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                        </Button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-3">
+                                <Button
+                                    type="button"
+                                    onClick={handleSaveGeminiConfig}
+                                    disabled={isRecording || geminiSaveStatus === 'saving' || !geminiBaseUrl.trim() || !(apiKey || '').trim()}
+                                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                                >
+                                    {geminiSaveStatus === 'saving' ? 'Saving...' : 'Save Gemini Settings'}
+                                </Button>
+                                {geminiSaveStatus === 'saved' && (
+                                    <span className="text-sm text-green-600">Saved</span>
+                                )}
+                                {geminiSaveStatus === 'error' && (
+                                    <span className="text-sm text-red-600">
+                                        {!geminiBaseUrl.trim() || !(apiKey || '').trim()
+                                            ? 'Base URL and bearer token are required'
+                                            : 'Failed to save settings'}
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+                    )}
 
                     {requiresApiKey && (
                         <div>

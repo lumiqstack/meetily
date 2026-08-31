@@ -5,6 +5,7 @@
 // gateways, etc.). Audio is WAV-encoded in memory and sent as multipart form
 // data, mirroring the official OpenAI Whisper API contract.
 
+use super::pcm::encode_wav_pcm16;
 use super::provider::{TranscriptionError, TranscriptionProvider, TranscriptResult};
 use async_trait::async_trait;
 use log::{info, warn};
@@ -41,34 +42,6 @@ pub fn resolve_transcriptions_endpoint(base_url: &str) -> String {
     }
 }
 
-/// Encode 16kHz mono f32 samples as a 16-bit PCM WAV file in memory.
-fn encode_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let num_samples = samples.len() as u32;
-    let data_size = num_samples * 2; // 16-bit mono
-    let byte_rate = sample_rate * 2;
-
-    let mut wav = Vec::with_capacity(44 + data_size as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_size.to_le_bytes());
-
-    for &sample in samples {
-        let clamped = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-        wav.extend_from_slice(&clamped.to_le_bytes());
-    }
-
-    wav
-}
 
 impl OpenAICompatibleProvider {
     pub fn new(base_url: &str, model: String, api_key: Option<String>) -> Result<Self, String> {

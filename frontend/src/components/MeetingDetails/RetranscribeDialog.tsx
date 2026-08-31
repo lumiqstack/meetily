@@ -16,6 +16,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../ui/select';
+import { isRemoteTranscriptionProvider } from '@/lib/transcription-providers';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
@@ -93,7 +94,7 @@ export function RetranscribeDialog({
     return availableModels.find(m => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
   const isParakeetModel = selectedModelDetails?.provider === 'parakeet';
-  const isRemoteModel = selectedModelDetails?.provider === 'openaiCompatible';
+  const isRemoteModel = isRemoteTranscriptionProvider(selectedModelDetails?.provider);
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {

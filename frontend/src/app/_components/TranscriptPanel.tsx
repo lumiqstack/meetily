@@ -33,7 +33,7 @@ export function TranscriptPanel({
   showModal
 }: TranscriptPanelProps) {
   // Contexts
-  const { transcripts, transcriptContainerRef, copyTranscript } = useTranscripts();
+  const { transcripts, transcriptContainerRef, copyTranscript, liveCaption } = useTranscripts();
   const { transcriptModelConfig } = useConfig();
   const { isRecording, isPaused } = useRecordingState();
   const { checkPermissions, isChecking, hasSystemAudio, hasMicrophone } = usePermissionCheck();
@@ -108,7 +108,7 @@ export function TranscriptPanel({
       {/* Transcript content - the inner wrapper must have a bounded height or
           the virtualizer inside it renders every row */}
       <div className="flex flex-1 min-h-0 justify-center">
-        <div className="w-2/3 max-w-[750px] overflow-hidden">
+        <div className="w-2/3 max-w-[750px] overflow-hidden flex flex-col">
           <VirtualizedTranscriptView
             segments={segments}
             isRecording={isRecording}
@@ -118,6 +118,18 @@ export function TranscriptPanel({
             enableStreaming={isRecording}
             showConfidence={true}
           />
+          {/* Live hypothesis from a streaming provider. Rendered outside the
+              virtualized list because it is replaced in place and never
+              persisted — putting it in `segments` would break that list's
+              sequence-id ordering and dedupe. */}
+          {isRecording && liveCaption && (
+            <p
+              aria-live="polite"
+              className="flex-shrink-0 px-2 py-2 text-sm italic text-gray-400"
+            >
+              {liveCaption}
+            </p>
+          )}
         </div>
       </div>
 

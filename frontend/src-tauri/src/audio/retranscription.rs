@@ -93,7 +93,7 @@ pub async fn start_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = RETRANSCRIPTION_JOBS
         .acquire(meeting_id.clone(), use_remote)
         .map_err(|e| anyhow!(e))?;
@@ -120,7 +120,7 @@ async fn start_retranscription_with_guard<R: Runtime>(
     _guard: JobGuard<'static>,
 ) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
     // Journal the job so a crash mid-retranscription is reported on the next
     // launch. The folder is a pre-existing meeting and is never cleaned up.
@@ -234,7 +234,7 @@ async fn run_retranscription<R: Runtime>(
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
     info!(
         "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}",
@@ -380,8 +380,9 @@ async fn run_retranscription<R: Runtime>(
     };
     let remote_provider = if use_remote {
         Some(
-            crate::audio::transcription::OpenAICompatibleProvider::from_saved_settings(
+            crate::audio::transcription::engine::build_remote_provider(
                 &app,
+                provider.as_deref().unwrap_or_default(),
                 model.clone(),
             )
             .await
@@ -450,7 +451,6 @@ async fn run_retranscription<R: Runtime>(
 
         // Transcribe this segment
         let (text, conf) = if use_remote {
-            use crate::audio::transcription::TranscriptionProvider;
             let engine = remote_provider.as_ref().unwrap();
             let result = engine
                 .transcribe(segment.samples.clone(), language.clone())
@@ -873,7 +873,7 @@ pub async fn start_retranscription_command<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
 ) -> Result<RetranscriptionStarted, String> {
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = RETRANSCRIPTION_JOBS.acquire(meeting_id.clone(), use_remote)?;
 
     // Clone values for the spawned task
