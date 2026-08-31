@@ -235,6 +235,7 @@ impl RecordingManager {
         system_device: Option<Arc<AudioDevice>>,
         auto_save: bool,
         realtime_transcription_enabled: bool,
+        streaming_live: bool,
     ) -> std::result::Result<mpsc::UnboundedReceiver<AudioChunk>, RecordingStartError> {
         info!(
             "Starting recording manager (auto_save: {}, realtime_transcription: {})",
@@ -288,6 +289,7 @@ impl RecordingManager {
             sys_name,
             sys_kind,
             realtime_transcription_enabled,
+            streaming_live,
         ) {
             self.state.stop_recording();
             self.recording_saver.discard_after_failed_start().await;

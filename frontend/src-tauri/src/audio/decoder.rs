@@ -650,7 +650,7 @@ mod tests {
         );
 
         // The 16 kHz conversion must preserve the real duration as well.
-        let whisper_samples = decoded.to_whisper_format();
+        let whisper_samples = decoded.into_whisper_format().unwrap();
         let duration_16k = whisper_samples.len() as f64 / 16000.0;
         assert!(
             (duration_16k - 5.16).abs() < 0.5,

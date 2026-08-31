@@ -394,12 +394,16 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let _start_guard = StartingGuard::acquire()?;
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    // Gemini Live streams to the gateway and never loads a local model, so it
+    // takes neither the engine claim nor the VAD path.
+    let streaming_live = realtime_transcription_enabled
+        && transcription::engine::is_gemini_live_configured(&app).await;
     // Realtime transcription shares the global Whisper/Parakeet engines with
     // local imports/retranscriptions, so claim them for the whole recording
     // (see audio/engine_coordinator.rs). Held as an RAII value so any failed
     // start below releases it; parked once the recording is actually running
     // and released in stop_recording.
-    let engine_claim = if realtime_transcription_enabled {
+    let engine_claim = if realtime_transcription_enabled && !streaming_live {
         // A background pipeline transcription holds the engine at a lower
         // priority than the user starting a meeting: ask it to stop first.
         // User-started jobs are untouched and still fail the claim below.
@@ -496,7 +500,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
-        .start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled)
+        .start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled, streaming_live)
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
@@ -614,12 +618,16 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let _start_guard = StartingGuard::acquire()?;
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    // Gemini Live streams to the gateway and never loads a local model, so it
+    // takes neither the engine claim nor the VAD path.
+    let streaming_live = realtime_transcription_enabled
+        && transcription::engine::is_gemini_live_configured(&app).await;
     // Realtime transcription shares the global Whisper/Parakeet engines with
     // local imports/retranscriptions, so claim them for the whole recording
     // (see audio/engine_coordinator.rs). Held as an RAII value so any failed
     // start below releases it; parked once the recording is actually running
     // and released in stop_recording.
-    let engine_claim = if realtime_transcription_enabled {
+    let engine_claim = if realtime_transcription_enabled && !streaming_live {
         // A background pipeline transcription holds the engine at a lower
         // priority than the user starting a meeting: ask it to stop first.
         // User-started jobs are untouched and still fail the claim below.
@@ -712,7 +720,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Start recording with specified devices and auto_save setting
     let transcription_receiver = manager
-        .start_recording(mic_device, system_device, auto_save, realtime_transcription_enabled)
+        .start_recording(mic_device, system_device, auto_save, realtime_transcription_enabled, streaming_live)
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 

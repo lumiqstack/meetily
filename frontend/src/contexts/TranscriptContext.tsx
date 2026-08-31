@@ -21,6 +21,16 @@ interface TranscriptContextType {
   clearTranscripts: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
+  /**
+   * In-progress hypothesis from a streaming provider (Gemini Live), replaced
+   * on every update and cleared when the matching final arrives.
+   *
+   * Deliberately kept out of `transcripts`: that list is ordered and deduped
+   * by `sequence_id` and is what gets persisted, so a caption that changes
+   * text under a stable id would either be dropped as a duplicate or saved as
+   * a partial segment. Empty string means "no caption right now".
+   */
+  liveCaption: string;
 }
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
@@ -29,6 +39,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
   const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
+  const [liveCaption, setLiveCaption] = useState('');
 
   // Recording state context - provides backend-synced state
   const recordingState = useRecordingState();
@@ -285,6 +296,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             speaker: update.speaker ?? null,
           };
 
+          // A final supersedes whatever caption was on screen.
+          setLiveCaption('');
+
           // Add to buffer
           transcriptBuffer.set(update.sequence_id, newTranscript);
           console.log(`✅ MAIN LISTENER: Buffered transcript with sequence_id ${update.sequence_id}. Buffer size: ${transcriptBuffer.size}, Last processed: ${lastProcessedSequence}`);
@@ -313,6 +327,17 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     setupListener();
     console.log('Started enhanced listener setup');
 
+    // Interim captions from a streaming provider. Separate event from
+    // `transcript-update` so they never reach the persistence listener in the
+    // Rust layer, which stores every update it sees.
+    let unlistenInterim: (() => void) | undefined;
+    transcriptService
+      .onTranscriptInterim((caption) => setLiveCaption(caption.text))
+      .then((unlisten) => {
+        unlistenInterim = unlisten;
+      })
+      .catch((error) => console.error('Failed to set up interim caption listener:', error));
+
     return () => {
       console.log('🧹 CLEANUP: Cleaning up MAIN transcript listener...');
       if (processingTimer) {
@@ -322,6 +347,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       if (unlistenFn) {
         unlistenFn();
         console.log('🧹 CLEANUP: MAIN transcript listener cleaned up');
+      }
+      if (unlistenInterim) {
+        unlistenInterim();
       }
     };
   }, [currentMeetingId]); // Add currentMeetingId dependency
@@ -464,6 +492,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const clearTranscripts = useCallback(() => {
     seenSequenceIdsRef.current = new Set();
     setTranscripts([]);
+    setLiveCaption('');
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -505,6 +534,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,
+    liveCaption,
   }), [
     transcripts,
     transcriptsRef,
@@ -517,6 +547,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,
+    liveCaption,
   ]);
 
   return (

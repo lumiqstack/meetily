@@ -20,7 +20,9 @@ impl TranscriptConfig {
     /// Remote transcription does not use the shared local engines, so it is
     /// exempt from idle gating and recording preemption.
     pub fn is_remote(&self) -> bool {
-        self.provider.as_deref() == Some("openaiCompatible")
+        self.provider
+            .as_deref()
+            .is_some_and(crate::config::is_remote_transcription_provider)
     }
 }
 
@@ -105,22 +107,23 @@ pub async fn run_transcribe_stage<R: Runtime>(
 mod tests {
     use super::*;
 
+    fn config_for(provider: Option<&str>) -> TranscriptConfig {
+        TranscriptConfig {
+            provider: provider.map(str::to_string),
+            model: None,
+        }
+    }
+
     #[test]
-    fn only_openai_compatible_counts_as_remote() {
-        let remote = TranscriptConfig {
-            provider: Some("openaiCompatible".to_string()),
-            model: None,
-        };
-        let local = TranscriptConfig {
-            provider: Some("localWhisper".to_string()),
-            model: None,
-        };
-        let unset = TranscriptConfig {
-            provider: None,
-            model: None,
-        };
-        assert!(remote.is_remote());
-        assert!(!local.is_remote());
-        assert!(!unset.is_remote());
+    fn every_remote_provider_counts_as_remote() {
+        assert!(config_for(Some("openaiCompatible")).is_remote());
+        assert!(config_for(Some("geminiTranscribe")).is_remote());
+    }
+
+    #[test]
+    fn local_engines_and_unset_do_not_count_as_remote() {
+        assert!(!config_for(Some("localWhisper")).is_remote());
+        assert!(!config_for(Some("parakeet")).is_remote());
+        assert!(!config_for(None).is_remote());
     }
 }
