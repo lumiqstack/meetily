@@ -108,9 +108,11 @@ impl GeminiTranscribeProvider {
 
 /// Pull the transcript out of the gateway response.
 ///
-/// The gateway contract is not pinned down yet, so accept the common spellings
-/// and fail loudly with the body otherwise — a schema mismatch must be
-/// obvious, not silently transcribe every segment as empty.
+/// Verified against the live gateway: it answers
+/// `{"text": "...", "model": "gemini-3.5-transcribe"}`. `transcript` is
+/// accepted as a fallback spelling, and anything else fails loudly with the
+/// body — a schema drift must be obvious, not silently transcribe every
+/// segment as empty.
 fn extract_transcript(body: &str) -> Result<String, TranscriptionError> {
     let parsed: serde_json::Value = serde_json::from_str(body).map_err(|e| {
         TranscriptionError::EngineFailed(format!(
@@ -245,6 +247,18 @@ mod tests {
         assert_eq!(
             extract_transcript(r#"{"transcript":"hello"}"#).unwrap(),
             "hello"
+        );
+    }
+
+    /// Exactly the body the live gateway returned during smoke testing.
+    #[test]
+    fn parses_the_real_gateway_response() {
+        assert_eq!(
+            extract_transcript(
+                r#"{"text":"The quarterly review meeting will start at 9:15 on Tuesday.","model":"gemini-3.5-transcribe"}"#
+            )
+            .unwrap(),
+            "The quarterly review meeting will start at 9:15 on Tuesday."
         );
     }
 

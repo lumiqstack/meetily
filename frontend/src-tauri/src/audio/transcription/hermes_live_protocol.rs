@@ -91,6 +91,12 @@ pub enum ServerMessage {
     },
 
     /// A replaceable hypothesis. Displayed as a live caption, never persisted.
+    ///
+    /// Observed against the live gateway: `text` is **cumulative**, not a
+    /// delta — each interim carries the whole utterance so far ("The", "The
+    /// quarterly", "The quarterly review", ...), and the last one equals the
+    /// following final. Consumers must therefore *replace* the caption on each
+    /// event, never append.
     #[serde(rename = "transcript.interim")]
     TranscriptInterim {
         text: String,
