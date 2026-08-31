@@ -225,6 +225,24 @@ async fn is_realtime_transcription_enabled<R: Runtime>(app: &AppHandle<R>) -> bo
     }
 }
 
+/// Unregister the `transcript-update` listener, if one is registered.
+///
+/// Idempotent and safe on any path. Registration and teardown are not
+/// symmetric in practice — a recording can fail to stop cleanly — so this is
+/// called both before registering a new listener and on every exit from
+/// `stop_recording`.
+///
+/// Clearing the stored id *without* unlistening is the trap here: the handler
+/// stays live for the rest of the process, and the next recording registers a
+/// second one beside it, so every segment gets persisted twice.
+fn remove_transcript_listener<R: Runtime>(app: &AppHandle<R>) {
+    use tauri::Listener;
+    if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
+        app.unlisten(listener_id);
+        info!("✅ Transcript-update listener removed");
+    }
+}
+
 // ============================================================================
 // DEVICE RESOLUTION
 // ============================================================================
@@ -529,6 +547,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
 
     REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
+    // A previous recording that failed to stop cleanly can leave its listener
+    // registered. Clear it before adding another, so a bad stop degrades into
+    // one extra event dispatch rather than permanently doubled transcripts.
+    remove_transcript_listener(&app);
     if realtime_transcription_enabled {
         let task_handle =
             transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -573,6 +595,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     } else {
         drop(transcription_receiver);
         *TRANSCRIPTION_TASK.lock().unwrap() = None;
+        // The listener was already cleared above, via remove_transcript_listener.
     }
 
     // Emit success event
@@ -749,6 +772,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
 
     REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
+    // A previous recording that failed to stop cleanly can leave its listener
+    // registered. Clear it before adding another, so a bad stop degrades into
+    // one extra event dispatch rather than permanently doubled transcripts.
+    remove_transcript_listener(&app);
     if realtime_transcription_enabled {
         let task_handle =
             transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -793,6 +820,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     } else {
         drop(transcription_receiver);
         *TRANSCRIPTION_TASK.lock().unwrap() = None;
+        // The listener was already cleared above, via remove_transcript_listener.
     }
 
     // Emit success event
@@ -879,6 +907,8 @@ pub async fn stop_recording<R: Runtime>(
         }
         Err(e) => {
             error!("❌ Failed to stop audio streams: {}", e);
+            // Bailing out early must not leave the listener registered.
+            remove_transcript_listener(&app);
             return Err(format!("Failed to stop audio streams: {}", e)); // _stopping_guard clears on return
         }
     }
@@ -956,14 +986,10 @@ pub async fn stop_recording<R: Runtime>(
     // for that tail; Gemini Live likewise emits whatever the gateway returns
     // between `stop` and `session.finished`. Unlistening before the drain
     // silently dropped those closing segments from the recording manager's
-    // history, which is what reload-sync and crash recovery read back.
-    {
-        use tauri::Listener;
-        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
-            app.unlisten(listener_id);
-            info!("✅ Transcript-update listener removed");
-        }
-    }
+    // history, which is what reload-sync and crash recovery read back. The
+    // frontend listener is separate and always saw them, so the saved meeting
+    // was intact and the loss was invisible.
+    remove_transcript_listener(&app);
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(
