@@ -650,16 +650,6 @@ pub async fn stop_recording<R: Runtime>(
         }
     }
 
-    // Step 1.5: Clean up transcript listener to release microphone
-    // Unlisten transcript-update event to prevent lingering references
-    {
-        use tauri::Listener;
-        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
-            app.unlisten(listener_id);
-            info!("✅ Transcript-update listener removed");
-        }
-    }
-
     // Step 2: Signal transcription workers to finish processing ALL queued chunks
     if realtime_transcription_was_active {
         let _ = app.emit(
@@ -728,6 +718,24 @@ pub async fn stop_recording<R: Runtime>(
         progress_task.abort();
     } else {
         info!("ℹ️ No transcription task found to wait for");
+    }
+
+    // Step 2.5: Remove the transcript listener only now that the drain is done.
+    //
+    // It has to outlive the wait above. Stopping the streams force-flushes the
+    // pipeline, and the transcription task goes on emitting `transcript-update`
+    // for that tail; Gemini Live likewise emits whatever the gateway returns
+    // between `stop` and `session.finished`. Unlistening before the drain
+    // silently dropped those closing segments from the recording manager's
+    // history, which is what reload-sync and crash recovery read back. The
+    // frontend listener is separate and always saw them, so the saved meeting
+    // was intact and the loss was invisible.
+    {
+        use tauri::Listener;
+        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
+            app.unlisten(listener_id);
+            info!("✅ Transcript-update listener removed");
+        }
     }
 
     if realtime_transcription_was_active {
