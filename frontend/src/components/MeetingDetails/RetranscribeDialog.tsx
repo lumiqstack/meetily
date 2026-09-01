@@ -64,6 +64,7 @@ export function RetranscribeDialog({
   const [progress, setProgress] = useState<RetranscriptionProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
+  const [diarization, setDiarization] = useState(false);
 
   // Use centralized model fetching hook
   const {
@@ -95,6 +96,7 @@ export function RetranscribeDialog({
   }, [selectedModelKey, availableModels]);
   const isParakeetModel = selectedModelDetails?.provider === 'parakeet';
   const isRemoteModel = isRemoteTranscriptionProvider(selectedModelDetails?.provider);
+  const isGeminiModel = selectedModelDetails?.provider === 'geminiTranscribe';
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {
@@ -222,6 +224,7 @@ export function RetranscribeDialog({
         language: languageToSend,
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
+        diarization: isGeminiModel ? diarization : false,
       });
 
       if (isRemoteModel) {
@@ -352,6 +355,30 @@ export function RetranscribeDialog({
                 </p>
               </div>
             )
+          )}
+
+          {!isProcessing && !error && isGeminiModel && (
+            <div className="space-y-2 rounded-md border border-gray-200 px-3 py-3">
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={diarization}
+                  onChange={(e) => setDiarization(e.target.checked)}
+                />
+                <span>
+                  <span className="text-sm font-medium">Identify speakers</span>
+                  <span className="block text-xs text-muted-foreground">
+                    Labels each segment with a speaker. Speaker numbering may restart partway
+                    through recordings longer than 30 minutes.
+                  </span>
+                </span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                The whole recording is uploaded in one request (two if it is longer than 30
+                minutes), rather than one request per segment.
+              </p>
+            </div>
           )}
 
           {!isProcessing && !error && availableModels.length > 0 && (

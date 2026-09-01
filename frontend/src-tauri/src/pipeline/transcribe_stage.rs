@@ -71,6 +71,9 @@ pub async fn run_transcribe_stage<R: Runtime>(
         None,
         config.model.clone(),
         config.provider.clone(),
+        // The automatic pipeline does not ask for diarization; the user opts
+        // into it per job from the retranscribe dialog.
+        false,
     )
     .await;
 
@@ -87,6 +90,20 @@ pub async fn run_transcribe_stage<R: Runtime>(
             Ok(())
         }
         Err(e) => {
+            // Gemini batch failures carry their own type, so quota, timeouts,
+            // transport drops and 5xx are classified structurally rather than
+            // by matching on message text.
+            if let Some(batch) =
+                e.downcast_ref::<crate::audio::transcription::gemini_batch::GeminiBatchError>()
+            {
+                let message = batch.to_string();
+                return if batch.is_transient() || batch.is_cancellation() {
+                    Err(StageError::transient(message))
+                } else {
+                    Err(StageError::hard(message))
+                };
+            }
+
             let message = e.to_string();
             // Cancellation is how the pipeline yields the engine to a live
             // recording, and engine contention means "someone else is using

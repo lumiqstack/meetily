@@ -209,6 +209,8 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
               language,
               model: transcriptModelConfig.model || null,
               provider: transcriptModelConfig.provider,
+              // Recovery is unattended, so it does not opt into diarization.
+              diarization: false,
             });
             retranscriptionStarted = true;
           } catch (error) {
