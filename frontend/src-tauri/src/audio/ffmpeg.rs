@@ -36,7 +36,69 @@ pub fn find_ffprobe_path() -> Option<PathBuf> {
 /// Strict, unlike the best-effort probe used for crash recovery: the Gemini
 /// batch planner sizes uploads from this, and a silent 0 would plan a single
 /// empty chunk and burn a request on nothing.
+///
+/// Falls back to ffmpeg when ffprobe is unavailable. That is the normal case,
+/// not an edge case: the app bundles only `ffmpeg.exe`, so requiring ffprobe
+/// would fail every batch job on a stock install.
 pub fn probe_duration_ms(path: &std::path::Path) -> Result<u64, String> {
+    match probe_duration_ms_via_ffprobe(path) {
+        Ok(ms) => Ok(ms),
+        Err(ffprobe_error) => probe_duration_ms_via_ffmpeg(path).map_err(|ffmpeg_error| {
+            format!("{} (ffprobe: {})", ffmpeg_error, ffprobe_error)
+        }),
+    }
+}
+
+/// Parse the `Duration: HH:MM:SS.cc` line ffmpeg writes to stderr.
+///
+/// Split out so it is testable without invoking ffmpeg.
+pub(crate) fn parse_ffmpeg_duration_ms(stderr: &str) -> Option<u64> {
+    let after = stderr.split("Duration:").nth(1)?.trim_start();
+    let field = after.split(',').next()?.trim();
+    if field.starts_with("N/A") {
+        return None;
+    }
+
+    let mut parts = field.split(':');
+    let hours: u64 = parts.next()?.trim().parse().ok()?;
+    let minutes: u64 = parts.next()?.trim().parse().ok()?;
+    let seconds: f64 = parts.next()?.trim().parse().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+
+    Some((hours * 3_600_000) + (minutes * 60_000) + (seconds * 1000.0).round() as u64)
+}
+
+fn probe_duration_ms_via_ffmpeg(path: &std::path::Path) -> Result<u64, String> {
+    let ffmpeg = find_ffmpeg_path().ok_or("ffmpeg not found")?;
+
+    // `ffmpeg -i FILE` with no output prints the container header to stderr and
+    // exits non-zero ("At least one output file must be specified"). That exit
+    // status is expected, so only the parsed duration decides success.
+    let mut command = std::process::Command::new(ffmpeg);
+    command.arg("-hide_banner").arg("-i").arg(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("could not run ffmpeg: {}", e))?;
+
+    parse_ffmpeg_duration_ms(&String::from_utf8_lossy(&output.stderr)).ok_or_else(|| {
+        format!(
+            "ffmpeg reported no duration for {}",
+            path.display()
+        )
+    })
+}
+
+fn probe_duration_ms_via_ffprobe(path: &std::path::Path) -> Result<u64, String> {
     let ffprobe = find_ffprobe_path().ok_or("ffprobe not found next to ffmpeg")?;
 
     let mut command = std::process::Command::new(ffprobe);
@@ -290,4 +352,77 @@ fn get_ffmpeg_install_dir() -> Result<PathBuf, anyhow::Error> {
 fn get_ffmpeg_install_dir() -> Result<PathBuf, anyhow::Error> {
     // Your existing logic for other platforms
     sidecar_dir().map_err(|e| anyhow::anyhow!(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real ffmpeg stderr for a 4m19.2s recording.
+    const SAMPLE: &str = r#"Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'audio.mp4':
+  Metadata:
+    major_brand     : isom
+  Duration: 00:04:19.20, start: 0.000000, bitrate: 192 kb/s
+  Stream #0:0[0x1](und): Audio: aac (LC), 48000 Hz, mono, fltp, 192 kb/s
+At least one output file must be specified"#;
+
+    #[test]
+    fn parses_the_duration_ffmpeg_prints_to_stderr() {
+        // 4*60 + 19.2 = 259.2s
+        assert_eq!(parse_ffmpeg_duration_ms(SAMPLE), Some(259_200));
+    }
+
+    #[test]
+    fn parses_hours() {
+        let text = "  Duration: 01:30:00.00, start: 0.000000, bitrate: 64 kb/s";
+        assert_eq!(parse_ffmpeg_duration_ms(text), Some(90 * 60 * 1000));
+    }
+
+    #[test]
+    fn parses_zero_and_sub_second_durations() {
+        assert_eq!(
+            parse_ffmpeg_duration_ms("Duration: 00:00:00.50, start: 0"),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_missing_durations() {
+        // A silent 0 here would plan one empty chunk and spend a request on
+        // nothing, so "no duration" must stay an error rather than a default.
+        assert_eq!(parse_ffmpeg_duration_ms("Duration: N/A, start: 0"), None);
+        assert_eq!(parse_ffmpeg_duration_ms("no duration line here"), None);
+        assert_eq!(parse_ffmpeg_duration_ms("Duration: garbage,"), None);
+        assert_eq!(parse_ffmpeg_duration_ms(""), None);
+    }
+
+    /// The batch planner depends on this working with only `ffmpeg.exe`
+    /// present — the app does not bundle ffprobe, so a probe that required it
+    /// would fail every Gemini job on a stock install.
+    #[test]
+    fn probes_a_real_file_without_requiring_ffprobe() {
+        let Some(ffmpeg) = find_ffmpeg_path() else {
+            eprintln!("skipping: ffmpeg not available in this environment");
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("probe-test.wav");
+
+        // 2 seconds of silence, encoded by ffmpeg itself.
+        let status = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono", "-t", "2"])
+            .arg(&wav)
+            .status()
+            .expect("ffmpeg should run");
+        assert!(status.success(), "could not build the fixture");
+
+        let measured = probe_duration_ms(&wav).expect("duration must be readable");
+        assert!(
+            (measured as i64 - 2000).abs() < 150,
+            "expected ~2000ms, got {}",
+            measured
+        );
+    }
 }
