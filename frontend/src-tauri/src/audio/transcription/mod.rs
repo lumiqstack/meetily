@@ -14,6 +14,7 @@ pub mod pcm;
 
 // Gemini transcription through the hermes proxy: batch over REST, live over
 // a WebSocket. Both transports derive from one configured base URL.
+pub mod gemini_batch;
 pub mod gemini_transcribe_provider;
 pub mod hermes_endpoints;
 pub mod hermes_live_protocol;

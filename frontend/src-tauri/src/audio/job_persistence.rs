@@ -39,6 +39,14 @@ pub struct PersistedJob {
     pub language: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// Gemini annotation options. Persisted so a job resumed after a crash
+    /// comes back with the settings the user chose, not defaults: silently
+    /// retrying an authoritative pass without word timestamps would replace a
+    /// segmented transcript with one hour-long blob.
+    pub diarization: bool,
+    #[sqlx(rename = "wordTimestamps")]
+    #[serde(rename = "wordTimestamps")]
+    pub word_timestamps: bool,
     /// RFC3339 timestamp of when the job started.
     pub created_at: String,
 }
@@ -53,15 +61,15 @@ pub struct ReconcileOutcome {
 }
 
 const JOB_COLUMNS: &str =
-    "id, kind, title, source_path, source_url, mode, folder_path, meeting_id, language, model, provider, created_at";
+    "id, kind, title, source_path, source_url, mode, folder_path, meeting_id, language, model, provider, diarization, wordTimestamps, created_at";
 
 /// Record a job that is about to start. Called right after the in-memory
 /// registry accepts the job.
 pub async fn record_job_started(pool: &SqlitePool, job: &PersistedJob) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT OR REPLACE INTO background_jobs \
-         (id, kind, title, source_path, source_url, mode, folder_path, meeting_id, language, model, provider, interrupted, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+         (id, kind, title, source_path, source_url, mode, folder_path, meeting_id, language, model, provider, diarization, wordTimestamps, interrupted, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
     )
     .bind(&job.id)
     .bind(&job.kind)
@@ -74,6 +82,8 @@ pub async fn record_job_started(pool: &SqlitePool, job: &PersistedJob) -> Result
     .bind(&job.language)
     .bind(&job.model)
     .bind(&job.provider)
+    .bind(job.diarization)
+    .bind(job.word_timestamps)
     .bind(&job.created_at)
     .execute(pool)
     .await?;
@@ -307,6 +317,8 @@ mod tests {
             language: Some("en".to_string()),
             model: Some("large-v3".to_string()),
             provider: Some("openaiCompatible".to_string()),
+            diarization: false,
+            word_timestamps: false,
             created_at: "2026-07-16T10:00:00Z".to_string(),
         }
     }
@@ -369,6 +381,8 @@ mod tests {
             language: None,
             model: None,
             provider: None,
+            diarization: true,
+            word_timestamps: true,
             created_at: "2026-07-16T11:00:00Z".to_string(),
         }
     }

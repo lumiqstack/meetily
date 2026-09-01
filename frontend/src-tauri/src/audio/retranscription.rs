@@ -2,7 +2,10 @@
 
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{
+    create_transcript_segments, create_transcript_segments_with_speakers, split_segment_at_silence,
+    write_transcripts_json,
+};
 use super::constants::AUDIO_EXTENSIONS;
 use super::job_registry::{JobGuard, JobRegistry};
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
@@ -92,6 +95,7 @@ pub async fn start_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarization: bool,
 ) -> Result<RetranscriptionResult> {
     let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = RETRANSCRIPTION_JOBS
@@ -105,6 +109,7 @@ pub async fn start_retranscription<R: Runtime>(
         language,
         model,
         provider,
+        diarization,
         guard,
     )
     .await
@@ -117,6 +122,7 @@ async fn start_retranscription_with_guard<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarization: bool,
     _guard: JobGuard<'static>,
 ) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -143,12 +149,16 @@ async fn start_retranscription_with_guard<R: Runtime>(
             language: language.clone(),
             model: model.clone(),
             provider: provider.clone(),
+            diarization,
+            // The authoritative pass always requests word timestamps, so a
+            // resumed job must too.
+            word_timestamps: true,
             created_at: chrono::Utc::now().to_rfc3339(),
         },
     )
     .await;
 
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
+    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, diarization).await;
 
     // Unload the engine after the batch job (success, failure, or cancellation).
     // Remote transcription loads no local model, so there is nothing to unload.
@@ -228,6 +238,7 @@ async fn run_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarization: bool,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
@@ -240,6 +251,22 @@ async fn run_retranscription<R: Runtime>(
         "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}",
         meeting_id, language, model, provider
     );
+
+    // Gemini has its own batch strategy: it uploads the recording whole rather
+    // than issuing one request per VAD segment, so it skips decode, resample
+    // and VAD entirely. Sending 25s segments would exhaust the 100/day quota
+    // after ~41 minutes of audio.
+    if provider.as_deref() == Some(crate::config::PROVIDER_GEMINI_TRANSCRIBE) {
+        return run_gemini_retranscription(
+            app,
+            meeting_id,
+            folder_path,
+            audio_path,
+            language,
+            diarization,
+        )
+        .await;
+    }
 
     // Emit progress: decoding
     emit_progress(&app, &meeting_id, "decoding", 5, "Decoding audio file...");
@@ -505,10 +532,134 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
-
     // Create transcript segments with proper timestamps from VAD
     let segments = create_transcript_segments(&all_transcripts);
+
+    persist_retranscription(
+        &app,
+        &meeting_id,
+        &folder_path,
+        &audio_path,
+        duration_seconds,
+        segments,
+        language,
+    )
+    .await
+}
+
+/// Post-meeting Gemini pass: upload the recording whole (or in the fewest long
+/// chunks) instead of one request per VAD segment.
+///
+/// `word_timestamps` is an invariant here, not a toggle — it is what produces
+/// real recording-relative segments and click-to-seek. That also means this
+/// path can never replace an existing Live transcript with a single
+/// undifferentiated blob: an unannotated result cannot reach a meeting that
+/// already has segments, because this path never requests one.
+async fn run_gemini_retranscription<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    folder_path: PathBuf,
+    audio_path: PathBuf,
+    language: Option<String>,
+    diarization: bool,
+) -> Result<RetranscriptionResult> {
+    use crate::audio::transcription::gemini_batch::{self, GeminiBatchOptions};
+
+    let options = GeminiBatchOptions::authoritative(diarization, language.clone());
+
+    emit_progress(&app, &meeting_id, "preparing", 10, "Preparing audio for upload...");
+
+    let duration_ms = crate::audio::ffmpeg::probe_duration_ms(&audio_path)
+        .map_err(|e| anyhow!("Could not read the recording's duration: {}", e))?;
+    let duration_seconds = duration_ms as f64 / 1000.0;
+
+    let provider =
+        crate::audio::transcription::GeminiTranscribeProvider::from_saved_settings(&app, None)
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+    // Bridge the existing cooperative cancel registry onto a token, so an
+    // in-flight ffmpeg transcode or a multi-minute upload is interrupted
+    // rather than merely checked between chunks.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watcher = {
+        let cancel = cancel.clone();
+        let meeting_id = meeting_id.clone();
+        tokio::spawn(async move {
+            while !cancel.is_cancelled() {
+                if is_retranscription_cancelled(&meeting_id) {
+                    cancel.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+    };
+
+    let result = {
+        let app = app.clone();
+        let meeting_id = meeting_id.clone();
+        let mut on_progress = |index: usize, total: usize, stage: &str| {
+            // Same 25..80 band the per-segment loop used.
+            let fraction = index as f32 / total.max(1) as f32;
+            let percentage = 25 + (fraction * 55.0) as u32;
+            let message = match stage {
+                "preparing" => format!("Preparing chunk {} of {}...", index + 1, total),
+                _ => format!("Transcribing chunk {} of {}...", index + 1, total),
+            };
+            emit_progress(&app, &meeting_id, stage, percentage, &message);
+        };
+
+        gemini_batch::run_batch(
+            &provider,
+            &audio_path,
+            duration_ms,
+            &options,
+            &cancel,
+            &mut on_progress,
+        )
+        .await
+    };
+
+    watcher.abort();
+
+    // `anyhow::Error::new` keeps the concrete type, so transcribe_stage can
+    // classify by downcast instead of matching on the message.
+    let segments = result.map_err(anyhow::Error::new)?;
+
+    let transcript_segments = create_transcript_segments_with_speakers(
+        segments
+            .into_iter()
+            .map(|s| (s.text, s.start_ms, s.end_ms, s.speaker)),
+    );
+
+    persist_retranscription(
+        &app,
+        &meeting_id,
+        &folder_path,
+        &audio_path,
+        duration_seconds,
+        transcript_segments,
+        language,
+    )
+    .await
+}
+
+/// Replace a meeting's transcripts and write the sidecar files.
+///
+/// Shared by the local VAD path and the Gemini batch path so both get the same
+/// atomic delete+insert: a failed pass rolls back and the previous transcript —
+/// including a Live one — survives untouched.
+async fn persist_retranscription<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    folder_path: &Path,
+    audio_path: &Path,
+    duration_seconds: f64,
+    segments: Vec<crate::api::TranscriptSegment>,
+    language: Option<String>,
+) -> Result<RetranscriptionResult> {
+    emit_progress(app, meeting_id, "saving", 80, "Saving transcripts...");
 
     // Save to database
     let app_state = app
@@ -523,23 +674,26 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
 
     sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
-        .bind(&meeting_id)
+        .bind(meeting_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
     for segment in &segments {
+        // `speaker` was missing here while import.rs bound it, so retranscribing
+        // a diarized or VTT-imported meeting silently nulled its attribution.
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
-        .bind(&meeting_id)
+        .bind(meeting_id)
         .bind(&segment.text)
         .bind(&segment.timestamp)
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -555,9 +709,9 @@ async fn run_retranscription<R: Runtime>(
     );
 
     // Write updated transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
+    emit_progress(app, meeting_id, "saving", 90, "Writing transcript files...");
 
-    if let Err(e) = write_transcripts_json(&folder_path, &segments) {
+    if let Err(e) = write_transcripts_json(folder_path, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
     }
 
@@ -569,18 +723,18 @@ async fn run_retranscription<R: Runtime>(
         .to_string();
 
     if let Err(e) = write_retranscription_metadata(
-        &folder_path,
-        &meeting_id,
+        folder_path,
+        meeting_id,
         duration_seconds,
         &audio_filename,
     ) {
         warn!("Failed to update metadata.json: {}", e);
     }
 
-    emit_progress(&app, &meeting_id, "complete", 100, "Retranscription complete");
+    emit_progress(app, meeting_id, "complete", 100, "Retranscription complete");
 
     Ok(RetranscriptionResult {
-        meeting_id,
+        meeting_id: meeting_id.to_string(),
         segments_count: segments.len(),
         duration_seconds,
         language,
@@ -872,6 +1026,7 @@ pub async fn start_retranscription_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarization: Option<bool>,
 ) -> Result<RetranscriptionStarted, String> {
     let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = RETRANSCRIPTION_JOBS.acquire(meeting_id.clone(), use_remote)?;
@@ -888,6 +1043,7 @@ pub async fn start_retranscription_command<R: Runtime>(
             language,
             model,
             provider,
+            diarization.unwrap_or(false),
             guard,
         )
         .await;

@@ -113,7 +113,9 @@ thiserror = "2.0.16"                # Error handling for Parakeet
 
 # Async
 tokio = { version = "1.32.0", features = ["full", "tracing"] }
-tokio-util = "0.7"  # Utilities for tokio including CancellationToken
+# CancellationToken, plus `codec` for FramedRead so batch uploads stream from
+# disk instead of buffering a ~29 MB chunk in memory.
+tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"  # Trait abstraction for async methods
 
 reqwest = { version = "0.11", features = ["blocking", "multipart", "json", "stream"] }
@@ -224,6 +226,9 @@ whisper-rs = { version = "0.13.2", features = ["raw-api"] }
 futures-channel = "0.3.31"
 
 [dev-dependencies]
+# Contract tests for the Gemini batch gateway: asserts the exact multipart
+# fields and status->error mapping without spending real quota.
+wiremock = "0.6"
 tempfile = "3.3.0"
 infer = "0.15"
 criterion = { version = "0.5.1", features = ["async_tokio"] }

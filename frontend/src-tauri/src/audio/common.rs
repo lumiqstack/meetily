@@ -54,9 +54,25 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
 /// Create transcript segments from transcription results.
 /// Each tuple is (text, start_ms, end_ms) from VAD timestamps.
 pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> Vec<TranscriptSegment> {
+    create_transcript_segments_with_speakers(
+        transcripts
+            .iter()
+            .map(|(text, start, end)| (text.clone(), *start, *end, None)),
+    )
+}
+
+/// Same, but preserving a speaker label per segment.
+///
+/// The local VAD pipeline has no per-segment attribution, but Gemini
+/// diarization does — and a variant that always wrote `speaker: None` was
+/// silently discarding it.
+pub(crate) fn create_transcript_segments_with_speakers<I>(transcripts: I) -> Vec<TranscriptSegment>
+where
+    I: IntoIterator<Item = (String, f64, f64, Option<String>)>,
+{
     transcripts
-        .iter()
-        .map(|(text, start_ms, end_ms)| {
+        .into_iter()
+        .map(|(text, start_ms, end_ms, speaker)| {
             let start_seconds = start_ms / 1000.0;
             let end_seconds = end_ms / 1000.0;
             let duration = end_seconds - start_seconds;
@@ -68,7 +84,7 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> 
                 audio_start_time: Some(start_seconds),
                 audio_end_time: Some(end_seconds),
                 duration: Some(duration),
-                speaker: None,
+                speaker,
             }
         })
         .collect()
@@ -91,6 +107,7 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
                 "audio_start_time": s.audio_start_time,
                 "audio_end_time": s.audio_end_time,
                 "duration": s.duration,
+                "speaker": s.speaker,
                 "sequence_id": i
             })
         }).collect::<Vec<_>>()

@@ -18,7 +18,10 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{
+    create_transcript_segments, create_transcript_segments_with_speakers, split_segment_at_silence,
+    write_transcripts_json,
+};
 use super::constants::AUDIO_EXTENSIONS;
 use super::job_registry::{JobGuard, JobRegistry};
 use super::recording_preferences::get_default_recordings_folder;
@@ -448,6 +451,10 @@ async fn start_import_with_guard<R: Runtime>(
             language: language.clone(),
             model: model.clone(),
             provider: provider.clone(),
+            // Imports and recovery run unannotated: one long segment per
+            // upload, the cheapest option against the daily quota.
+            diarization: false,
+            word_timestamps: false,
             created_at: chrono::Utc::now().to_rfc3339(),
         },
     )
@@ -576,6 +583,23 @@ async fn run_import<R: Runtime>(
         // Cleanup: remove the meeting folder
         let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
+    }
+
+    // Gemini uploads the file whole rather than one request per VAD segment,
+    // so it skips decode, resample and VAD entirely. Imports run unannotated
+    // by default: one long segment per upload, the cheapest option against the
+    // 100 requests/day quota.
+    if provider.as_deref() == Some(crate::config::PROVIDER_GEMINI_TRANSCRIBE) {
+        return run_gemini_import(
+            app,
+            import_id,
+            title,
+            meeting_folder,
+            dest_path,
+            dest_filename,
+            language,
+        )
+        .await;
     }
 
     emit_progress(&app, &import_id, "decoding", 15, "Decoding audio file...");
@@ -861,10 +885,150 @@ async fn run_import<R: Runtime>(
         return Err(anyhow!("Import cancelled"));
     }
 
-    emit_progress(&app, &import_id, "saving", 85, "Creating meeting...");
-
     // Create transcript segments
     let segments = create_transcript_segments(&all_transcripts);
+
+    finish_import(
+        &app,
+        import_id,
+        title,
+        &meeting_folder,
+        &dest_filename,
+        duration_seconds,
+        segments,
+    )
+    .await
+}
+
+/// Import via a whole-file Gemini upload.
+///
+/// Unannotated by design: the caller gets one long segment per upload rather
+/// than manufactured interior timestamps, and it costs a single request for an
+/// hour of audio instead of ~144.
+#[allow(clippy::too_many_arguments)]
+async fn run_gemini_import<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: String,
+    title: String,
+    meeting_folder: PathBuf,
+    audio_path: PathBuf,
+    dest_filename: String,
+    language: Option<String>,
+) -> Result<ImportResult> {
+    use crate::audio::transcription::gemini_batch::{self, GeminiBatchOptions};
+
+    let options = GeminiBatchOptions::unannotated(language);
+
+    emit_progress(&app, &import_id, "preparing", 15, "Preparing audio for upload...");
+
+    let cleanup = |e: anyhow::Error| -> anyhow::Error {
+        // Match the cancellation paths, which remove the half-built folder.
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+        e
+    };
+
+    let duration_ms = match crate::audio::ffmpeg::probe_duration_ms(&audio_path) {
+        Ok(ms) => ms,
+        Err(e) => {
+            return Err(cleanup(anyhow!(
+                "Could not read the audio file's duration: {}",
+                e
+            )))
+        }
+    };
+    let duration_seconds = duration_ms as f64 / 1000.0;
+
+    let provider =
+        match crate::audio::transcription::GeminiTranscribeProvider::from_saved_settings(&app, None)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return Err(cleanup(anyhow!(e))),
+        };
+
+    // Bridge the cooperative cancel registry onto a token so an in-flight
+    // transcode or upload is interrupted, not merely checked between chunks.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watcher = {
+        let cancel = cancel.clone();
+        let import_id = import_id.clone();
+        tokio::spawn(async move {
+            while !cancel.is_cancelled() {
+                if is_import_cancelled(&import_id) {
+                    cancel.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+    };
+
+    let result = {
+        let app = app.clone();
+        let import_id = import_id.clone();
+        let mut on_progress = |index: usize, total: usize, stage: &str| {
+            // Same 30..80 band the per-segment loop used.
+            let fraction = index as f32 / total.max(1) as f32;
+            let percentage = 30 + (fraction * 50.0) as u32;
+            let message = match stage {
+                "preparing" => format!("Preparing chunk {} of {}...", index + 1, total),
+                _ => format!("Transcribing chunk {} of {}...", index + 1, total),
+            };
+            emit_progress(&app, &import_id, stage, percentage, &message);
+        };
+
+        gemini_batch::run_batch(
+            &provider,
+            &audio_path,
+            duration_ms,
+            &options,
+            &cancel,
+            &mut on_progress,
+        )
+        .await
+    };
+
+    watcher.abort();
+
+    // `anyhow::Error::new` preserves the concrete type for downcast-based
+    // classification in the pipeline stage.
+    let batch_segments = match result {
+        Ok(segments) => segments,
+        Err(e) => return Err(cleanup(anyhow::Error::new(e))),
+    };
+
+    let segments = create_transcript_segments_with_speakers(
+        batch_segments
+            .into_iter()
+            .map(|s| (s.text, s.start_ms, s.end_ms, s.speaker)),
+    );
+
+    finish_import(
+        &app,
+        import_id,
+        title,
+        &meeting_folder,
+        &dest_filename,
+        duration_seconds,
+        segments,
+    )
+    .await
+}
+
+/// Create the meeting, store its transcripts and write the sidecar files.
+///
+/// Shared by the local VAD path and the Gemini batch path so both produce an
+/// identical meeting, differing only in how the segments were obtained.
+async fn finish_import<R: Runtime>(
+    app: &AppHandle<R>,
+    import_id: String,
+    title: String,
+    meeting_folder: &Path,
+    dest_filename: &str,
+    duration_seconds: f64,
+    segments: Vec<crate::api::TranscriptSegment>,
+) -> Result<ImportResult> {
+    emit_progress(app, &import_id, "saving", 85, "Creating meeting...");
 
     // Save to database
     let app_state = app
@@ -880,24 +1044,24 @@ async fn run_import<R: Runtime>(
     .await?;
 
     // Write transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, &import_id, "saving", 90, "Writing transcript files...");
+    emit_progress(app, &import_id, "saving", 90, "Writing transcript files...");
 
-    if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
+    if let Err(e) = write_transcripts_json(meeting_folder, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
     }
 
     if let Err(e) = write_import_metadata(
-        &meeting_folder,
+        meeting_folder,
         &meeting_id,
         &title,
         duration_seconds,
-        &dest_filename,
+        dest_filename,
         "import",
     ) {
         warn!("Failed to write metadata.json: {}", e);
     }
 
-    emit_progress(&app, &import_id, "complete", 100, "Import complete");
+    emit_progress(app, &import_id, "complete", 100, "Import complete");
 
     Ok(ImportResult {
         import_id,
@@ -1507,6 +1671,10 @@ async fn run_url_import<R: Runtime>(
             language: language.clone(),
             model: model.clone(),
             provider: provider.clone(),
+            // Imports and recovery run unannotated: one long segment per
+            // upload, the cheapest option against the daily quota.
+            diarization: false,
+            word_timestamps: false,
             created_at: chrono::Utc::now().to_rfc3339(),
         },
     )

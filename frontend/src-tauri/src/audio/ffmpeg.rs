@@ -21,6 +21,67 @@ pub fn find_ffmpeg_path() -> Option<PathBuf> {
     FFMPEG_PATH.as_ref().map(|p| p.clone())
 }
 
+/// ffprobe sits next to ffmpeg in every distribution we bundle or find.
+pub fn find_ffprobe_path() -> Option<PathBuf> {
+    let ffprobe = find_ffmpeg_path()?.with_file_name(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    ffprobe.exists().then_some(ffprobe)
+}
+
+/// Container duration in whole milliseconds.
+///
+/// Strict, unlike the best-effort probe used for crash recovery: the Gemini
+/// batch planner sizes uploads from this, and a silent 0 would plan a single
+/// empty chunk and burn a request on nothing.
+pub fn probe_duration_ms(path: &std::path::Path) -> Result<u64, String> {
+    let ffprobe = find_ffprobe_path().ok_or("ffprobe not found next to ffmpeg")?;
+
+    let mut command = std::process::Command::new(ffprobe);
+    command.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]);
+    command.arg(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("could not run ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let seconds: f64 = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("ffprobe returned no duration for {}", path.display()))?;
+
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!("ffprobe returned {} for {}", seconds, path.display()));
+    }
+
+    Ok((seconds * 1000.0).round() as u64)
+}
+
 fn find_ffmpeg_path_internal() -> Option<PathBuf> {
     debug!("Starting search for ffmpeg executable");
 
