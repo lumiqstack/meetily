@@ -54,6 +54,65 @@ fn strip_title_if_present(markdown: &str) -> String {
 }
 
 const ENGLISH_CACHE_FIELD: &str = "english_cache";
+pub(crate) const PROVENANCE_FIELD: &str = "provenance";
+
+/// Fields of `summary_processes.result` that are owned by the generation
+/// pipeline rather than by the summary editor. A manual save sends only
+/// `{markdown, summary_json}`, so these have to be carried forward explicitly
+/// or editing a summary would erase them.
+pub(crate) const PRESERVED_RESULT_FIELDS: &[&str] = &[ENGLISH_CACHE_FIELD, PROVENANCE_FIELD];
+
+/// Records which model, template and language actually produced a summary.
+///
+/// Stamped once, when generation completes, because the alternative — reading
+/// the user's current model settings at render time — relabels old summaries
+/// with a model that never touched them as soon as the settings change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryProvenance {
+    pub provider: String,
+    pub model: String,
+    pub template_id: String,
+    /// The requested output language, absent when the summary followed the
+    /// transcript's own language.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_language: Option<String>,
+    pub generated_at: String,
+    pub app_version: String,
+}
+
+impl SummaryProvenance {
+    fn new(
+        provider: &str,
+        model: &str,
+        template_id: &str,
+        summary_language: Option<&str>,
+    ) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            template_id: template_id.to_string(),
+            summary_language: summary_language.map(str::to_string),
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// Adds the provenance stamp to a freshly built result blob.
+///
+/// Kept separate from [`build_summary_result_json`] so the English-cache shape
+/// and the provenance stamp stay independently testable.
+fn attach_summary_provenance(result: &mut serde_json::Value, provenance: &SummaryProvenance) {
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    match serde_json::to_value(provenance) {
+        Ok(value) => {
+            object.insert(PROVENANCE_FIELD.to_string(), value);
+        }
+        Err(e) => warn!("Failed to serialize summary provenance: {}", e),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct SummaryCacheSource {
@@ -578,11 +637,20 @@ impl SummaryService {
                     }
                 }
 
-                let result_json = build_summary_result_json(
+                let mut result_json = build_summary_result_json(
                     &final_markdown,
                     &english_markdown,
                     cache_source,
                     summary_language.as_deref(),
+                );
+                attach_summary_provenance(
+                    &mut result_json,
+                    &SummaryProvenance::new(
+                        &model_provider,
+                        &model_name,
+                        &template_id,
+                        summary_language.as_deref(),
+                    ),
                 );
 
                 // Update database with completed status
@@ -814,6 +882,40 @@ mod tests {
             strip_title_if_present("  # Title\n## Section\nbody"),
             "## Section\nbody"
         );
+    }
+
+    #[test]
+    fn provenance_stamp_records_the_model_that_produced_the_summary() {
+        let mut result = serde_json::json!({ "markdown": "body" });
+        attach_summary_provenance(
+            &mut result,
+            &SummaryProvenance::new("anthropic", "claude-opus-5", "daily_standup", Some("fr")),
+        );
+
+        assert_eq!(result["provenance"]["provider"], "anthropic");
+        assert_eq!(result["provenance"]["model"], "claude-opus-5");
+        assert_eq!(result["provenance"]["template_id"], "daily_standup");
+        assert_eq!(result["provenance"]["summary_language"], "fr");
+        assert_eq!(result["provenance"]["app_version"], env!("CARGO_PKG_VERSION"));
+        // Existing content is preserved alongside the stamp.
+        assert_eq!(result["markdown"], "body");
+    }
+
+    #[test]
+    fn provenance_omits_summary_language_when_following_the_transcript() {
+        let mut result = serde_json::json!({});
+        attach_summary_provenance(
+            &mut result,
+            &SummaryProvenance::new("ollama", "llama3", "daily_standup", None),
+        );
+
+        assert!(result["provenance"].get("summary_language").is_none());
+    }
+
+    #[test]
+    fn provenance_generated_at_is_parseable_rfc3339() {
+        let provenance = SummaryProvenance::new("groq", "llama-3.3", "daily_standup", None);
+        assert!(chrono::DateTime::parse_from_rfc3339(&provenance.generated_at).is_ok());
     }
 
     fn sample_cache_source() -> SummaryCacheSource {

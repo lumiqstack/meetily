@@ -1,7 +1,7 @@
 "use client";
 
-import { Summary, SummaryResponse, Transcript } from '@/types';
-import { EditableTitle } from '@/components/EditableTitle';
+import { Summary, SummaryResponse, Transcript, SummaryProvenance } from '@/types';
+import { SummaryMetaHeader } from './SummaryMetaHeader';
 import { BlockNoteSummaryView, BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
@@ -41,6 +41,8 @@ interface SummaryPanelProps {
   onSaveToObsidian: () => Promise<void>;
   onOpenFolder: () => Promise<void>;
   aiSummary: Summary | null;
+  /** Stamped at generation time; null for summaries generated before that existed. */
+  summaryProvenance?: SummaryProvenance | null;
   summaryStatus: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
   transcripts: Transcript[];
   modelConfig: ModelConfig;
@@ -78,6 +80,7 @@ export function SummaryPanel({
   onSaveToObsidian,
   onOpenFolder,
   aiSummary,
+  summaryProvenance = null,
   summaryStatus,
   transcripts,
   modelConfig,
@@ -258,13 +261,17 @@ export function SummaryPanel({
     <div className="flex-1 min-w-0 flex flex-col bg-white overflow-hidden">
       {/* Title area */}
       <div className="p-4 border-b border-gray-200">
-        {/* <EditableTitle
+        <SummaryMetaHeader
           title={meetingTitle}
-          isEditing={isEditingTitle}
-          onStartEditing={onStartEditTitle}
-          onFinishEditing={onFinishEditTitle}
-          onChange={onTitleChange}
-        /> */}
+          isEditingTitle={isEditingTitle}
+          onStartEditTitle={onStartEditTitle}
+          onFinishEditTitle={onFinishEditTitle}
+          onTitleChange={onTitleChange}
+          createdAt={meeting.created_at}
+          transcripts={transcripts}
+          provenance={summaryProvenance}
+          availableTemplates={availableTemplates}
+        />
 
         {/* Button groups - only show when summary exists */}
         {aiSummary && !isSummaryLoading && (

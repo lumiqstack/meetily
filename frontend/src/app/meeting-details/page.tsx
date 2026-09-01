@@ -1,7 +1,7 @@
 "use client"
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
 import { useState, useEffect, useCallback, Suspense } from "react";
-import { Transcript, Summary } from "@/types";
+import { Transcript, Summary, SummaryProvenance } from "@/types";
 import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
@@ -28,6 +28,8 @@ function MeetingDetailsContent() {
   const router = useRouter();
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
   const [meetingSummary, setMeetingSummary] = useState<Summary | null>(null);
+  // Stamped at generation time; null for summaries generated before provenance existed.
+  const [summaryProvenance, setSummaryProvenance] = useState<SummaryProvenance | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
@@ -164,6 +166,7 @@ function MeetingDetailsContent() {
   useEffect(() => {
     setMeetingDetails(null);
     setMeetingSummary(null);
+    setSummaryProvenance(null);
     setError(null);
     setIsLoading(true);
     // Reset auto-generation state to allow new meeting to be checked
@@ -196,6 +199,7 @@ function MeetingDetailsContent() {
 
     setMeetingDetails(null);
     setMeetingSummary(null);
+    setSummaryProvenance(null);
     setError(null);
     setIsLoading(true);
 
@@ -228,6 +232,12 @@ function MeetingDetailsContent() {
         }
 
         console.log('🔍 FETCH SUMMARY: Parsed data:', parsedData);
+
+        // Provenance is metadata about the summary, not a part of it: lift it
+        // out so it never reaches the section formatter or the BlockNote editor.
+        const { provenance, ...summaryContent } = parsedData;
+        setSummaryProvenance((provenance as SummaryProvenance) ?? null);
+        parsedData = summaryContent;
 
         // Priority 1: BlockNote JSON format
         if (parsedData.summary_json) {
@@ -361,6 +371,8 @@ function MeetingDetailsContent() {
   return <PageContent
     meeting={meetingDetails}
     summaryData={meetingSummary}
+    summaryProvenance={summaryProvenance}
+    onSummaryProvenanceChange={setSummaryProvenance}
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {

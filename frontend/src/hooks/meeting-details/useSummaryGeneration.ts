@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Transcript, Summary } from '@/types';
+import { Transcript, Summary, SummaryProvenance } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { CurrentMeeting, useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
@@ -24,6 +24,8 @@ interface UseSummaryGenerationProps {
   onMeetingUpdated?: () => Promise<void>;
   updateMeetingTitle: (title: string) => void;
   setAiSummary: (summary: Summary | null) => void;
+  /** Surfaces the stamp the backend attached to a freshly generated summary. */
+  setSummaryProvenance?: (provenance: SummaryProvenance | null) => void;
   onOpenModelSettings?: () => void;
 }
 
@@ -36,6 +38,7 @@ export function useSummaryGeneration({
   onMeetingUpdated,
   updateMeetingTitle,
   setAiSummary,
+  setSummaryProvenance,
   onOpenModelSettings,
 }: UseSummaryGenerationProps) {
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
@@ -229,6 +232,12 @@ export function useSummaryGeneration({
         // Handle successful completion
         if (pollingResult.status === 'completed' && pollingResult.data) {
           console.log('Summary generation completed:', pollingResult.data);
+
+          // Set before the format branches below so the header reflects the run
+          // that just finished, whichever summary shape came back.
+          setSummaryProvenance?.(
+            (pollingResult.data.provenance as SummaryProvenance | undefined) ?? null
+          );
 
           // Update meeting title if available
           const meetingName = pollingResult.data.MeetingName || pollingResult.meetingName;

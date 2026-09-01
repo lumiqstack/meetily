@@ -81,10 +81,27 @@ export interface BlockNoteBlock {
 export interface SummaryDataResponse {
   markdown?: string;
   summary_json?: BlockNoteBlock[];
+  provenance?: SummaryProvenance;
   // Legacy format fields
   MeetingName?: string;
   _section_order?: string[];
   [key: string]: any; // For legacy section data
+}
+
+/**
+ * Stamped by the Rust generation pipeline when a summary completes, so the
+ * header reports the model that actually ran rather than whatever the model
+ * settings happen to say now. Absent on summaries generated before this existed.
+ */
+export interface SummaryProvenance {
+  provider: string;
+  model: string;
+  template_id: string;
+  /** Absent when the summary followed the transcript's own language. */
+  summary_language?: string;
+  /** RFC 3339. */
+  generated_at: string;
+  app_version: string;
 }
 
 // Pagination types for optimized transcript loading
