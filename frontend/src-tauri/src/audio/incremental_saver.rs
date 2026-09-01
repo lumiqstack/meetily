@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use anyhow::{Result, anyhow};
-use log::{info, error};
+use log::{error, info, warn};
 use super::recording_state::AudioChunk;
 use super::stream_encoder::StreamingEncoder;
 use serde::{Serialize, Deserialize};
@@ -86,47 +86,27 @@ pub struct AudioRecoveryStatus {
     pub message: String,
 }
 
-/// Duration of an existing audio file, via ffprobe/ffmpeg. Best-effort: a
-/// fragmented MP4 from an interrupted recording may not carry a duration, in
-/// which case we report 0 rather than failing the recovery.
+/// Duration of an existing audio file. Best-effort: a fragmented MP4 from an
+/// interrupted recording may not carry a duration, in which case we report 0
+/// rather than failing the recovery.
+///
+/// This used to require ffprobe and return 0 the moment it was missing — which
+/// is always, since the app bundles only ffmpeg. Every recovered meeting was
+/// therefore reported as 0 seconds long, silently. It now shares
+/// `ffmpeg::probe_duration_ms`, which falls back to parsing ffmpeg's own
+/// output, and logs when it genuinely cannot tell.
 fn probe_duration_seconds(path: &PathBuf) -> f64 {
-    let Some(ffmpeg) = find_ffmpeg_path() else {
-        return 0.0;
-    };
-    // ffprobe sits next to ffmpeg in every distribution we bundle or find.
-    let ffprobe = ffmpeg.with_file_name(if cfg!(windows) {
-        "ffprobe.exe"
-    } else {
-        "ffprobe"
-    });
-    if !ffprobe.exists() {
-        return 0.0;
+    match crate::audio::ffmpeg::probe_duration_ms(path) {
+        Ok(ms) => ms as f64 / 1000.0,
+        Err(e) => {
+            warn!(
+                "Could not determine duration of {} during recovery: {}",
+                path.display(),
+                e
+            );
+            0.0
+        }
     }
-
-    let mut command = std::process::Command::new(ffprobe);
-    command.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ]);
-    command.arg(path);
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    command
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
-        .unwrap_or(0.0)
 }
 
 /// Recover audio after a crash.
