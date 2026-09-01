@@ -83,6 +83,7 @@ export interface SummaryDataResponse {
   summary_json?: BlockNoteBlock[];
   reasoning_stripped?: boolean;
   normalization_fallback?: boolean;
+  provenance?: SummaryProvenance;
   // Legacy format fields
   MeetingName?: string;
   _section_order?: string[];
@@ -119,6 +120,22 @@ export interface SummaryProcessResponse {
   end: string | null;
   data: unknown | null;
   error: string | null;
+}
+
+/**
+ * Stamped by the Rust generation pipeline when a summary completes, so the
+ * header reports the model that actually ran rather than whatever the model
+ * settings happen to say now. Absent on summaries generated before this existed.
+ */
+export interface SummaryProvenance {
+  provider: string;
+  model: string;
+  template_id: string;
+  /** Absent when the summary followed the transcript's own language. */
+  summary_language?: string;
+  /** RFC 3339. */
+  generated_at: string;
+  app_version: string;
 }
 
 // Pagination types for optimized transcript loading

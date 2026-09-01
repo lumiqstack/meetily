@@ -4,6 +4,7 @@ import {
   MeetingSummary,
   ProcessTranscriptResponse,
   SummaryProcessResponse,
+  SummaryProvenance,
   Transcript,
 } from '@/types';
 import { ModelConfig } from '@/components/ModelSettingsModal';
@@ -79,6 +80,8 @@ interface UseSummaryGenerationProps {
   onMeetingUpdated?: () => Promise<void>;
   updateMeetingTitle: (title: string) => void;
   setAiSummary: (summary: MeetingSummary | null) => void;
+  /** Surfaces the stamp the backend attached to a freshly generated summary. */
+  setSummaryProvenance?: (provenance: SummaryProvenance | null) => void;
   onOpenModelSettings?: () => void;
 }
 
@@ -92,6 +95,7 @@ export function useSummaryGeneration({
   onMeetingUpdated,
   updateMeetingTitle,
   setAiSummary,
+  setSummaryProvenance,
   onOpenModelSettings,
 }: UseSummaryGenerationProps) {
   const restored = initialSummary?.meeting_id === meeting.id ? initialSummary : null;
@@ -249,6 +253,9 @@ export function useSummaryGeneration({
       if (meetingName) {
         updateMeetingTitle(meetingName);
       }
+      // The header reports the run that just finished, not the current settings.
+      const provenance = (pollingResult.data as { provenance?: SummaryProvenance } | null)?.provenance;
+      setSummaryProvenance?.(provenance ?? null);
       setAiSummary(summary);
       setSummaryStatus('completed');
       activeProcessIdRef.current = null;
@@ -273,7 +280,7 @@ export function useSummaryGeneration({
         metadata.normalizationFallback ? 'fallback' : 'ok',
       );
     }
-  }, [failGeneration, finishGeneration, meeting.id, onMeetingUpdated, setAiSummary, updateMeetingTitle]);
+  }, [failGeneration, finishGeneration, meeting.id, onMeetingUpdated, setAiSummary, setSummaryProvenance, updateMeetingTitle]);
 
   // Keep polling attached across ordinary rerenders without retaining stale view callbacks.
   const pollingResultRef = useRef(handlePollingResult);
