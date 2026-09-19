@@ -1011,6 +1011,9 @@ async fn get_or_init_whisper<R: Runtime>(
 
     match engine {
         Some(e) => {
+            crate::whisper_engine::commands::sync_whisper_vocabulary_hint_from_config(app, &e)
+                .await
+                .map_err(|e| anyhow!("Failed to load Whisper vocabulary hints: {}", e))?;
             let target_model = match requested_model {
                 Some(model) => model.to_string(),
                 None => get_configured_model(app, "whisper").await?,

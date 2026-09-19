@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, Manager, Runtime, State};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
@@ -59,7 +59,8 @@ pub async fn initialize_parallel_processor(
 }
 
 #[tauri::command]
-pub async fn start_parallel_processing(
+pub async fn start_parallel_processing<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, ParallelProcessorState>,
     audio_chunks: Vec<serde_json::Value>, // JSON representation of AudioChunk
     model_name: String,
@@ -73,6 +74,16 @@ pub async fn start_parallel_processing(
     let mut processor_guard = state.processor.write().await;
     let processor = processor_guard.as_mut()
         .ok_or_else(|| "Parallel processor not initialized".to_string())?;
+
+    let vocabulary_hint = crate::api::api::api_get_transcript_config(
+        app.clone(),
+        app.state(),
+        None,
+    )
+    .await?
+    .map(|config| config.vocabulary_hint)
+    .unwrap_or_else(|| crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string());
+    processor.set_vocabulary_hint(vocabulary_hint);
 
     processor.start_processing(chunks.clone(), model_name.clone())
         .await

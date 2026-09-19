@@ -51,6 +51,38 @@ pub async fn whisper_init() -> Result<(), String> {
     Ok(())
 }
 
+/// Update the prompt on the shared engine when transcription settings change.
+/// It is also loaded from the database before every engine acquisition, so a
+/// persisted setting survives app restarts.
+pub async fn set_whisper_vocabulary_hint(vocabulary_hint: String) {
+    let engine = {
+        let guard = WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = engine {
+        engine.set_vocabulary_hint(vocabulary_hint).await;
+    }
+}
+
+/// Copy the persisted vocabulary setting into an engine before it can create
+/// any whisper-rs `FullParams` instances.
+pub async fn sync_whisper_vocabulary_hint_from_config<R: Runtime>(
+    app: &AppHandle<R>,
+    engine: &WhisperEngine,
+) -> Result<(), String> {
+    let config = crate::api::api::api_get_transcript_config(
+        app.clone(),
+        app.state(),
+        None,
+    )
+    .await?
+    .ok_or_else(|| "Transcript configuration is unavailable".to_string())?;
+
+    engine.set_vocabulary_hint(config.vocabulary_hint).await;
+    Ok(())
+}
+
 #[command]
 pub async fn whisper_get_available_models() -> Result<Vec<ModelInfo>, String> {
     let engine = {
@@ -286,6 +318,7 @@ pub async fn whisper_validate_model_ready_with_config<R: tauri::Runtime>(
     };
 
     if let Some(engine) = engine {
+        sync_whisper_vocabulary_hint_from_config(app, &engine).await?;
         // Check if a model is currently loaded
         if engine.is_model_loaded().await {
             if let Some(current_model) = engine.get_current_model().await {
@@ -385,13 +418,17 @@ pub async fn whisper_validate_model_ready_with_config<R: tauri::Runtime>(
 }
 
 #[command]
-pub async fn whisper_transcribe_audio(audio_data: Vec<f32>) -> Result<String, String> {
+pub async fn whisper_transcribe_audio<R: Runtime>(
+    app: AppHandle<R>,
+    audio_data: Vec<f32>,
+) -> Result<String, String> {
     let engine = {
         let guard = WHISPER_ENGINE.lock().unwrap();
         guard.as_ref().cloned()
     };
 
     if let Some(engine) = engine {
+        sync_whisper_vocabulary_hint_from_config(&app, &engine).await?;
         // Get language preference
         let language = crate::get_language_preference_internal();
         engine

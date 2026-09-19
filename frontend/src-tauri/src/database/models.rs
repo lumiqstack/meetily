@@ -161,4 +161,7 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "openaiCompatibleApiKey")]
     #[serde(rename = "openaiCompatibleApiKey")]
     pub openai_compatible_api_key: Option<String>,
+    #[sqlx(rename = "whisperVocabularyHint")]
+    #[serde(rename = "whisperVocabularyHint")]
+    pub whisper_vocabulary_hint: String,
 }

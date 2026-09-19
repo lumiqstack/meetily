@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Input } from './ui/input';
+import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
 import { Switch } from './ui/switch';
@@ -21,6 +22,7 @@ export interface TranscriptModelProps {
     model: string;
     apiKey?: string | null;
     baseUrl?: string | null;
+    vocabularyHint?: string;
     realtimeTranscriptionEnabled: boolean;
 }
 
@@ -58,6 +60,8 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         )
     );
     const [remoteSaveStatus, setRemoteSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+    const [vocabularyHint, setVocabularyHint] = useState<string>(transcriptModelConfig.vocabularyHint || '');
+    const [vocabularySaveStatus, setVocabularySaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
@@ -77,6 +81,10 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             setRemoteModel(transcriptModelConfig.model);
         }
     }, [transcriptModelConfig.baseUrl, transcriptModelConfig.provider, transcriptModelConfig.model]);
+
+    useEffect(() => {
+        setVocabularyHint(transcriptModelConfig.vocabularyHint || '');
+    }, [transcriptModelConfig.vocabularyHint]);
 
     useEffect(() => {
         if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
@@ -218,6 +226,37 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const handleSaveVocabularyHint = async () => {
+        const trimmedHint = vocabularyHint.trim();
+        if (trimmedHint.includes('\0')) {
+            setVocabularySaveStatus('error');
+            return;
+        }
+
+        setVocabularySaveStatus('saving');
+        const updatedConfig = {
+            ...transcriptModelConfig,
+            vocabularyHint: trimmedHint,
+        };
+
+        try {
+            await invoke('api_save_transcript_config', {
+                provider: transcriptModelConfig.provider,
+                model: transcriptModelConfig.model,
+                realtimeTranscriptionEnabled: transcriptModelConfig.realtimeTranscriptionEnabled ?? false,
+                apiKey: transcriptModelConfig.apiKey ?? null,
+                baseUrl: transcriptModelConfig.baseUrl ?? null,
+                vocabularyHint: trimmedHint,
+            });
+            setTranscriptModelConfig(updatedConfig);
+            setVocabularySaveStatus('saved');
+            setTimeout(() => setVocabularySaveStatus('idle'), 2000);
+        } catch (err) {
+            console.error('Failed to save Whisper vocabulary hints:', err);
+            setVocabularySaveStatus('error');
+        }
+    };
+
     return (
         <div>
             <div>
@@ -295,6 +334,39 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                     {uiProvider === 'localWhisper' && (
                         <div className="mt-6">
+                            <div className="mb-6 space-y-3 rounded-md border border-gray-200 bg-white px-4 py-4">
+                                <div>
+                                    <Label htmlFor="whisper-vocabulary-hints" className="text-sm font-medium text-gray-900">
+                                        Whisper vocabulary hints
+                                    </Label>
+                                    <p className="mt-1 text-xs text-gray-500">
+                                        Names and domain terms to prime local Whisper. Separate terms with commas; leave blank to disable.
+                                    </p>
+                                </div>
+                                <Textarea
+                                    id="whisper-vocabulary-hints"
+                                    value={vocabularyHint}
+                                    onChange={(event) => setVocabularyHint(event.target.value)}
+                                    placeholder="Murex, Banamex, Azteca, Zeinab, Oropeza, Pasquel"
+                                    rows={3}
+                                />
+                                <div className="flex items-center gap-3">
+                                    <Button
+                                        type="button"
+                                        onClick={handleSaveVocabularyHint}
+                                        disabled={vocabularySaveStatus === 'saving'}
+                                        className="bg-blue-600 hover:bg-blue-700 text-white"
+                                    >
+                                        {vocabularySaveStatus === 'saving' ? 'Saving...' : 'Save Vocabulary Hints'}
+                                    </Button>
+                                    {vocabularySaveStatus === 'saved' && (
+                                        <span className="text-sm text-green-600">Saved</span>
+                                    )}
+                                    {vocabularySaveStatus === 'error' && (
+                                        <span className="text-sm text-red-600">Failed to save vocabulary hints</span>
+                                    )}
+                                </div>
+                            </div>
                             <ModelManager
                                 selectedModel={transcriptModelConfig.provider === 'localWhisper' ? transcriptModelConfig.model : undefined}
                                 onModelSelect={handleWhisperModelSelect}
@@ -487,7 +559,6 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         </div >
     )
 }
-
 
 
 

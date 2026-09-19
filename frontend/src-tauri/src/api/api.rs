@@ -106,6 +106,10 @@ pub struct TranscriptConfig {
     /// Base URL for the openaiCompatible provider (e.g. "http://127.0.0.1:8000/v1")
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
+    /// A user-managed list of names and domain terms passed to local
+    /// whisper-rs as `initial_prompt` for every transcription.
+    #[serde(rename = "vocabularyHint")]
+    pub vocabulary_hint: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,6 +122,8 @@ pub struct SaveTranscriptConfigRequest {
     pub api_key: Option<String>,
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
+    #[serde(rename = "vocabularyHint")]
+    pub vocabulary_hint: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -655,6 +661,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                         realtime_transcription_enabled: config.realtime_transcription_enabled,
                         api_key,
                         base_url: config.openai_compatible_base_url,
+                        vocabulary_hint: config.whisper_vocabulary_hint,
                     }))
                 }
                 Err(e) => {
@@ -675,6 +682,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                 realtime_transcription_enabled: false,
                 api_key: None,
                 base_url: None,
+                vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
             }))
         }
         Err(e) => {
@@ -693,6 +701,7 @@ pub async fn api_save_transcript_config<R: Runtime>(
     realtime_transcription_enabled: Option<bool>,
     api_key: Option<String>,
     base_url: Option<String>,
+    vocabulary_hint: Option<String>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -742,6 +751,25 @@ pub async fn api_save_transcript_config<R: Runtime>(
                 return Err(e.to_string());
             }
         }
+    }
+
+    if let Some(vocabulary_hint) = vocabulary_hint {
+        if vocabulary_hint.contains('\0') {
+            return Err("Vocabulary hints cannot contain a null character".to_string());
+        }
+
+        let vocabulary_hint = vocabulary_hint.trim();
+        if let Err(e) = SettingsRepository::save_whisper_vocabulary_hint(pool, vocabulary_hint).await {
+            log_error!("Failed to save Whisper vocabulary hints: {}", e);
+            return Err(e.to_string());
+        }
+
+        // Update an already-loaded engine immediately; future engines load
+        // this persisted value before their first transcription.
+        crate::whisper_engine::commands::set_whisper_vocabulary_hint(
+            vocabulary_hint.to_string(),
+        )
+        .await;
     }
 
     log_info!("Successfully saved transcript configuration.");

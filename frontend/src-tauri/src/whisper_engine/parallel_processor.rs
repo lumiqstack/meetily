@@ -78,6 +78,7 @@ pub struct ParallelProcessor {
     event_sender: mpsc::UnboundedSender<ProcessingEvent>,
     system_monitor: Arc<SystemMonitor>,
     config: ParallelConfig,
+    vocabulary_hint: String,
     is_paused: Arc<RwLock<bool>>,
     is_stopped: Arc<RwLock<bool>>,
     semaphore: Arc<Semaphore>, // Limit concurrent workers
@@ -103,6 +104,18 @@ impl ParallelProcessor {
         config: ParallelConfig,
         system_monitor: Arc<SystemMonitor>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<ProcessingEvent>)> {
+        Self::new_with_vocabulary_hint(
+            config,
+            system_monitor,
+            crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+        )
+    }
+
+    pub fn new_with_vocabulary_hint(
+        config: ParallelConfig,
+        system_monitor: Arc<SystemMonitor>,
+        vocabulary_hint: String,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<ProcessingEvent>)> {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
 
         // Safety check: Never exceed 4 workers
@@ -121,6 +134,7 @@ impl ParallelProcessor {
             event_sender,
             system_monitor,
             config: safe_config,
+            vocabulary_hint,
             is_paused: Arc::new(RwLock::new(false)),
             is_stopped: Arc::new(RwLock::new(false)),
             semaphore: Arc::new(Semaphore::new(safe_max_workers)),
@@ -128,6 +142,11 @@ impl ParallelProcessor {
 
         info!("Parallel processor initialized with {} workers", safe_max_workers);
         Ok((processor, event_receiver))
+    }
+
+    /// Set the persisted vocabulary before workers are spawned for a run.
+    pub fn set_vocabulary_hint(&mut self, vocabulary_hint: String) {
+        self.vocabulary_hint = vocabulary_hint;
     }
 
     /// Calculate safe worker count based on system resources
@@ -210,6 +229,7 @@ impl ParallelProcessor {
         let semaphore = self.semaphore.clone();
         let config = self.config.clone();
         let engine_ref = whisper_engine.clone();
+        let vocabulary_hint = self.vocabulary_hint.clone();
 
         // Spawn worker task
         let handle = tokio::spawn(async move {
@@ -223,6 +243,7 @@ impl ParallelProcessor {
             {
                 let mut engine_guard = engine_ref.write().await;
                 let engine = WhisperEngine::new().map_err(|e| anyhow!("Failed to create WhisperEngine: {}", e))?;
+                engine.set_vocabulary_hint(vocabulary_hint).await;
                 engine.load_model(&model_name).await.map_err(|e| anyhow!("Failed to load model {}: {}", model_name, e))?;
                 *engine_guard = Some(engine);
                 info!("Worker {} loaded model {}", worker_id, model_name);

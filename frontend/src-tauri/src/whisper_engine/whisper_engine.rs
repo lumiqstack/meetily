@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use crate::config::WHISPER_MODEL_CATALOG;
+use crate::config::{DEFAULT_WHISPER_VOCABULARY_HINT, WHISPER_MODEL_CATALOG};
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +65,28 @@ pub enum CancelDownloadOutcome {
 
 const CANCEL_DOWNLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Small adapter around whisper-rs so the prompt handoff can be tested without
+/// loading a GGML model. The production implementation delegates directly to
+/// `FullParams::set_initial_prompt`.
+trait InitialPromptParameters {
+    fn set_initial_prompt(&mut self, prompt: &str);
+}
+
+impl InitialPromptParameters for FullParams<'_, '_> {
+    fn set_initial_prompt(&mut self, prompt: &str) {
+        FullParams::set_initial_prompt(self, prompt);
+    }
+}
+
+fn apply_vocabulary_hint_to_whisper_params(
+    params: &mut impl InitialPromptParameters,
+    vocabulary_hint: &str,
+) {
+    if !vocabulary_hint.is_empty() {
+        params.set_initial_prompt(vocabulary_hint);
+    }
+}
+
 pub struct WhisperEngine {
     models_dir: PathBuf,
     current_context: Arc<RwLock<Option<WhisperContext>>>,
@@ -75,6 +97,9 @@ pub struct WhisperEngine {
     short_audio_warning_logged: Arc<RwLock<bool>>,
     // Performance optimization: reduce logging frequency
     transcription_count: Arc<RwLock<u64>>,
+    // User-managed proper nouns and domain terms supplied to whisper-rs as an
+    // initial prompt for every FullParams instance.
+    vocabulary_hint: Arc<RwLock<String>>,
     // A model remains active until its owning worker has completed cleanup.
     active_downloads: Arc<Mutex<HashMap<String, Arc<ActiveDownload>>>>,
     #[cfg(test)]
@@ -191,12 +216,25 @@ impl WhisperEngine {
             short_audio_warning_logged: Arc::new(RwLock::new(false)),
             // Performance optimization: reduce logging frequency
             transcription_count: Arc::new(RwLock::new(0)),
+            vocabulary_hint: Arc::new(RwLock::new(
+                DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+            )),
             active_downloads: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             download_state_test_hook: std::sync::Mutex::new(None),
         };
         
         Ok(engine)
+    }
+
+    /// Replace the vocabulary used to prime subsequent local transcriptions.
+    /// An empty string intentionally disables vocabulary priming.
+    pub async fn set_vocabulary_hint(&self, vocabulary_hint: String) {
+        *self.vocabulary_hint.write().await = vocabulary_hint;
+    }
+
+    async fn vocabulary_hint(&self) -> String {
+        self.vocabulary_hint.read().await.clone()
     }
 
     #[cfg(test)]
@@ -574,6 +612,7 @@ impl WhisperEngine {
         };
         params.set_language(language_code);
         params.set_translate(should_translate);
+        apply_vocabulary_hint_to_whisper_params(&mut params, &self.vocabulary_hint().await);
 
         // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
         // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
@@ -691,6 +730,7 @@ impl WhisperEngine {
         };
         params.set_language(language_code);
         params.set_translate(should_translate);
+        apply_vocabulary_hint_to_whisper_params(&mut params, &self.vocabulary_hint().await);
 
         // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
         // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
@@ -1802,5 +1842,26 @@ mod tests {
         assert!(!model_path.exists());
         let models = engine.discover_models().await.unwrap();
         assert!(matches!(tiny_model(&models).status, ModelStatus::Missing));
+    }
+
+    #[test]
+    fn vocabulary_hint_reaches_the_whisper_initial_prompt_parameter() {
+        #[derive(Default)]
+        struct CapturingWhisperParams {
+            initial_prompt: Option<String>,
+        }
+
+        impl InitialPromptParameters for CapturingWhisperParams {
+            fn set_initial_prompt(&mut self, prompt: &str) {
+                self.initial_prompt = Some(prompt.to_string());
+            }
+        }
+
+        let prompt = "Murex, Zeinab, Oropeza, Pasquel";
+        let mut params = CapturingWhisperParams::default();
+
+        apply_vocabulary_hint_to_whisper_params(&mut params, prompt);
+
+        assert_eq!(params.initial_prompt.as_deref(), Some(prompt));
     }
 }

@@ -177,6 +177,23 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Persist the vocabulary prompt used by local Whisper. Keeping this
+    /// separate from model selection prevents unrelated settings saves from
+    /// overwriting the user's custom terms.
+    pub async fn save_whisper_vocabulary_hint(
+        pool: &SqlitePool,
+        vocabulary_hint: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE transcript_settings SET whisperVocabularyHint = $1 WHERE id = '1'",
+        )
+        .bind(vocabulary_hint)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_base_url(
         pool: &SqlitePool,
         base_url: &str,

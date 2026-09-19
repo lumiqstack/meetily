@@ -74,6 +74,7 @@ const Sidebar: React.FC = () => {
   const [transcriptModelConfig, setTranscriptModelConfig] = useState<TranscriptModelProps>({
     provider: 'parakeet',
     model: 'parakeet-tdt-0.6b-v3-int8',
+    vocabularyHint: '',
     realtimeTranscriptionEnabled: false,
   });
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState<boolean | null>(null);

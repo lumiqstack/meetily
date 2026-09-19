@@ -11,6 +11,13 @@ pub const DEFAULT_WHISPER_MODEL: &str = "large-v3-turbo";
 /// This is the quantized version optimized for speed.
 pub const DEFAULT_PARAKEET_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
 
+/// Vocabulary supplied to local Whisper as an initial decoding prompt until
+/// the user customizes it in transcription settings. This gives commonly
+/// recurring names and domain terms useful context without changing language
+/// detection or transcript output formatting.
+pub const DEFAULT_WHISPER_VOCABULARY_HINT: &str =
+    "Murex, Banamex, Azteca, Zeinab, Oropeza, Pasquel, MFFX, bpv, cámara";
+
 /// Whisper model catalog with metadata for all supported models.
 /// Used by both WhisperEngine::discover_models() and discover_models_standalone().
 ///

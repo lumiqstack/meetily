@@ -137,6 +137,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     model: 'parakeet-tdt-0.6b-v3-int8',
     apiKey: null,
     baseUrl: null,
+    vocabularyHint: '',
     realtimeTranscriptionEnabled: false
   });
 
@@ -232,6 +233,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             model: config.model || 'parakeet-tdt-0.6b-v3-int8',
             apiKey: config.apiKey || null,
             baseUrl: config.baseUrl || null,
+            vocabularyHint: config.vocabularyHint || '',
             realtimeTranscriptionEnabled: config.realtimeTranscriptionEnabled ?? false
           });
         }

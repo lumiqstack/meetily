@@ -76,6 +76,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 realtime_transcription_enabled: false,
                 api_key: None,
                 base_url: None,
+                vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
             }
         }
         Err(e) => {
@@ -86,6 +87,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 realtime_transcription_enabled: false,
                 api_key: None,
                 base_url: None,
+                vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
             }
         }
     };
@@ -198,6 +200,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 realtime_transcription_enabled: false,
                 api_key: None,
                 base_url: None,
+                vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
             }
         }
         Err(e) => {
@@ -208,6 +211,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 realtime_transcription_enabled: false,
                 api_key: None,
                 base_url: None,
+                vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
             }
         }
     };
@@ -282,6 +286,8 @@ pub async fn get_or_init_whisper<R: Runtime>(
     };
 
     if let Some(engine) = existing_engine {
+        crate::whisper_engine::commands::sync_whisper_vocabulary_hint_from_config(app, &engine)
+            .await?;
         // Check if a model is already loaded
         if engine.is_model_loaded().await {
             let current_model = engine
@@ -367,6 +373,9 @@ pub async fn get_or_init_whisper<R: Runtime>(
             .cloned()
             .ok_or("Failed to get initialized engine")?
     };
+
+    crate::whisper_engine::commands::sync_whisper_vocabulary_hint_from_config(app, &engine)
+        .await?;
 
     // Get model configuration from API
     let model_to_load =
