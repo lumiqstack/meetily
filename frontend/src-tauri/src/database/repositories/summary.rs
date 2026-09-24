@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tracing::{error, info as log_info};
+use uuid::Uuid;
 
 pub struct SummaryProcessesRepository;
 
@@ -77,12 +78,59 @@ impl SummaryProcessesRepository {
         pool: &SqlitePool,
         meeting_id: &str,
     ) -> Result<Option<SummaryProcess>, sqlx::Error> {
-        sqlx::query_as::<_, SummaryProcess>(
-            "SELECT p.* FROM summary_processes p JOIN transcript_chunks t ON p.meeting_id = t.meeting_id WHERE p.meeting_id = ?",
+        // Imported recaps intentionally have no transcript_chunks row.
+        Self::get_summary_data(pool, meeting_id).await
+    }
+
+    /// Atomically create a transcript-free meeting with an already-completed
+    /// summary. No speech-to-text or summary model is involved.
+    pub async fn create_meeting_with_imported_summary(
+        pool: &SqlitePool,
+        title: &str,
+        summary: &Value,
+        source_url: Option<&str>,
+    ) -> Result<String, sqlx::Error> {
+        let meeting_id = format!("meeting-{}", Uuid::new_v4());
+        let now = Utc::now();
+        let result_json = serde_json::to_string(summary)
+            .map_err(|e| sqlx::Error::Protocol(format!("Failed to serialize recap: {e}")))?;
+        let metadata = serde_json::to_string(&serde_json::json!({
+            "source": "microsoft_copilot_recap",
+            "source_url": source_url,
+        }))
+        .map_err(|e| sqlx::Error::Protocol(format!("Failed to serialize recap metadata: {e}")))?;
+
+        let mut transaction = pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
         )
-        .bind(meeting_id)
-        .fetch_optional(pool)
-        .await
+        .bind(&meeting_id)
+        .bind(title)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO summary_processes (
+                meeting_id, status, created_at, updated_at, start_time, end_time,
+                result, chunk_count, processing_time, metadata
+            ) VALUES (?, 'completed', ?, ?, ?, ?, ?, 0, 0.0, ?)
+            "#,
+        )
+        .bind(&meeting_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(result_json)
+        .bind(metadata)
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+        Ok(meeting_id)
     }
 
     pub async fn create_or_reset_process(
@@ -223,6 +271,17 @@ mod tests {
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::query(
+            "CREATE TABLE meetings (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "CREATE TABLE summary_processes (
                 meeting_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -235,13 +294,48 @@ mod tests {
                 end_time TEXT,
                 chunk_count INTEGER,
                 processing_time REAL,
-                error TEXT
+                error TEXT,
+                metadata TEXT
             )",
         )
         .execute(&pool)
         .await
         .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn imported_recap_is_retrievable_without_transcript_chunks() {
+        let pool = test_pool().await;
+        let summary = json!({
+            "markdown": "# Decisions\n\n- Use the existing treasury workflow.",
+            "imported_from": "microsoft_copilot_recap"
+        });
+
+        let meeting_id = SummaryProcessesRepository::create_meeting_with_imported_summary(
+            &pool,
+            "Treasury kick-off",
+            &summary,
+            Some("https://tenant.sharepoint.com/recording"),
+        )
+        .await
+        .unwrap();
+
+        let stored = SummaryProcessesRepository::get_summary_data_for_meeting(&pool, &meeting_id)
+            .await
+            .unwrap()
+            .expect("imported recap should be returned without a transcript chunk");
+        assert_eq!(stored.status, "completed");
+        assert_eq!(
+            serde_json::from_str::<Value>(stored.result.as_deref().unwrap()).unwrap(),
+            summary
+        );
+        let title: String = sqlx::query_scalar("SELECT title FROM meetings WHERE id = ?")
+            .bind(&meeting_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "Treasury kick-off");
     }
 
     async fn seed_pending(

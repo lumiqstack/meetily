@@ -17,6 +17,8 @@ import {
   Files,
   Cloud,
   RefreshCw,
+  Sparkles,
+  ClipboardPaste,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -118,6 +120,19 @@ function formatFileSize(bytes: number): string {
 function deriveTitleFromUrl(url: string): string {
   try {
     const u = new URL(url);
+    if (detectLinkContentMode(url) === 'recap') {
+      const fileUrl = u.searchParams.get('fileUrl');
+      if (fileUrl) {
+        const fileName = new URL(fileUrl).pathname.split('/').filter(Boolean).pop() || '';
+        const title = decodeURIComponent(fileName)
+          .replace(/\.mp4$/i, '')
+          .replace(/-Meeting Transcript$/i, '')
+          .replace(/-\d{8}_\d{6}$/, '')
+          .trim();
+        if (title) return title;
+      }
+      return 'Teams meeting recap';
+    }
     const id = u.searchParams.get('id');
     const raw = id ? decodeURIComponent(id) : decodeURIComponent(u.pathname);
     const base = raw.split('/').filter(Boolean).pop() || '';
@@ -150,7 +165,9 @@ export function ImportAudioDialog({
   const [sourceMode, setSourceMode] = useState<'file' | 'link' | 'sharepoint'>('file');
   const [batchFiles, setBatchFiles] = useState<BatchCandidate[]>([]);
   const [linkUrl, setLinkUrl] = useState('');
-  const [linkContentMode, setLinkContentMode] = useState<'audio' | 'transcript'>('audio');
+  const [linkContentMode, setLinkContentMode] = useState<'audio' | 'transcript' | 'recap'>('audio');
+  const [recapText, setRecapText] = useState('');
+  const [isImportingRecap, setIsImportingRecap] = useState(false);
   const [linkModeTouched, setLinkModeTouched] = useState(false);
   const [spHubUrl, setSpHubUrl] = useState('');
   const [spSinceDate, setSpSinceDate] = useState(() => defaultSinceDate());
@@ -224,6 +241,8 @@ export function ImportAudioDialog({
       setBatchFiles([]);
       setLinkUrl('');
       setLinkContentMode('audio');
+      setRecapText('');
+      setIsImportingRecap(false);
       setLinkModeTouched(false);
       setSpScanning(false);
       setSpItems(null);
@@ -438,12 +457,31 @@ export function ImportAudioDialog({
   };
 
   const linkValid = isLikelyHttpUrl(linkUrl);
+  const canFetchTeamsRecap = linkValid && detectLinkContentMode(linkUrl) === 'recap';
   const canImport =
     sourceMode === 'file'
       ? !!fileInfo || batchFiles.length > 0
       : sourceMode === 'sharepoint'
       ? spSelected.size > 0
+      : linkContentMode === 'recap'
+      ? !isImportingRecap && title.trim().length > 0 &&
+        (canFetchTeamsRecap || (recapText.trim().length > 0 && (!linkUrl.trim() || linkValid)))
       : linkValid;
+
+  const handlePasteRecap = async () => {
+    try {
+      const clipboardText = await navigator.clipboard.readText();
+      if (!clipboardText.trim()) {
+        toast.info('Clipboard is empty');
+        return;
+      }
+      setRecapText(clipboardText);
+    } catch {
+      toast.error('Could not read the clipboard', {
+        description: 'Use the standard paste shortcut in the recap field instead.',
+      });
+    }
+  };
 
   const handleStartImport = async () => {
     const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
@@ -456,6 +494,41 @@ export function ImportAudioDialog({
     }
 
     if (sourceMode === 'link') {
+      if (linkContentMode === 'recap') {
+        if (!canImport) return;
+        setIsImportingRecap(true);
+        try {
+          const fetchFromTeams = canFetchTeamsRecap && !recapText.trim();
+          const result = fetchFromTeams
+            ? await invoke<{ meetingId: string; title: string; obsidianFilePath: string }>(
+                'api_import_copilot_recap_from_link',
+                { title: title.trim(), sourceUrl: linkUrl.trim() }
+              )
+            : await invoke<{ meetingId: string; title: string }>(
+                'api_import_copilot_recap',
+                {
+                  title: title.trim(),
+                  recap: recapText.trim(),
+                  sourceUrl: linkUrl.trim() || null,
+                }
+              );
+          await refetchMeetings();
+          onComplete?.();
+          onOpenChange(false);
+          toast.success('Copilot recap imported', {
+            description: fetchFromTeams
+              ? `Saved to Meetily and Obsidian: ${'obsidianFilePath' in result ? result.obsidianFilePath : ''}`
+              : 'Saved directly as the meeting summary. No transcription or AI generation was run.',
+          });
+          router.push(`/meeting-details?id=${result.meetingId}`);
+        } catch (e) {
+          toast.error('Could not import Copilot recap', { description: String(e) });
+        } finally {
+          setIsImportingRecap(false);
+        }
+        return;
+      }
+
       if (!linkValid) return;
 
       const isTranscript = linkContentMode === 'transcript';
@@ -535,20 +608,20 @@ export function ImportAudioDialog({
 
   // Prevent closing during processing
   const handleOpenChange = (newOpen: boolean) => {
-    if (!newOpen && isProcessing) {
+    if (!newOpen && (isProcessing || isImportingRecap)) {
       return;
     }
     onOpenChange(newOpen);
   };
 
   const handleEscapeKeyDown = (event: KeyboardEvent) => {
-    if (isProcessing) {
+    if (isProcessing || isImportingRecap) {
       event.preventDefault();
     }
   };
 
   const handleInteractOutside = (event: Event) => {
-    if (isProcessing) {
+    if (isProcessing || isImportingRecap) {
       event.preventDefault();
     }
   };
@@ -556,16 +629,16 @@ export function ImportAudioDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="sm:max-w-[500px]"
+        className="max-h-[90vh] overflow-y-auto sm:max-w-[500px]"
         onEscapeKeyDown={handleEscapeKeyDown}
         onInteractOutside={handleInteractOutside}
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            {isProcessing ? (
+            {isProcessing || isImportingRecap ? (
               <>
                 <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
-                Importing Audio...
+                {isImportingRecap ? 'Importing Teams Recap...' : 'Importing Audio...'}
               </>
             ) : error ? (
               <>
@@ -579,23 +652,33 @@ export function ImportAudioDialog({
               </>
             ) : (
               <>
-                <Upload className="h-5 w-5 text-blue-600" />
-                Import Audio File
+                {sourceMode === 'link' && linkContentMode === 'recap' ? (
+                  <Sparkles className="h-5 w-5 text-blue-600" />
+                ) : (
+                  <Upload className="h-5 w-5 text-blue-600" />
+                )}
+                {sourceMode === 'link' && linkContentMode === 'recap'
+                  ? 'Import Copilot Recap'
+                  : 'Import Meeting'}
               </>
             )}
           </DialogTitle>
           <DialogDescription>
-            {isProcessing
+            {isImportingRecap
+              ? 'Reading the Teams AI summary and saving it to Meetily and Obsidian…'
+              : isProcessing
               ? progress?.message || 'Processing audio...'
               : error
               ? 'An error occurred during import'
-              : 'Import an audio file to create a new meeting with transcripts'}
+              : sourceMode === 'link' && linkContentMode === 'recap'
+              ? 'Create a meeting from an existing Microsoft 365 Copilot recap without transcribing audio'
+              : 'Import audio, a Teams transcript, or a SharePoint recording'}
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
           {/* File selection / info */}
-          {!isProcessing && !error && (
+          {!isProcessing && !isImportingRecap && !error && (
             <>
               {/* Source toggle: local file vs link vs SharePoint sync */}
               <div className="grid grid-cols-3 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
@@ -754,7 +837,9 @@ export function ImportAudioDialog({
               {sourceMode === 'link' && (
                 <div className="space-y-3">
                   <div className="space-y-1">
-                    <label className="text-sm font-medium text-gray-700">Recording Link</label>
+                    <label className="text-sm font-medium text-gray-700">
+                      {linkContentMode === 'recap' ? 'Teams recap link' : 'Recording Link'}
+                    </label>
                     <Input
                       value={linkUrl}
                       onChange={(e) => {
@@ -768,18 +853,21 @@ export function ImportAudioDialog({
                           if (detected) setLinkContentMode(detected);
                         }
                       }}
-                      placeholder="https://…sharepoint.com/…/stream.aspx?id=…"
+                      placeholder={linkContentMode === 'recap'
+                        ? 'https://teams.microsoft.com/l/meetingrecap?...'
+                        : 'https://…sharepoint.com/…/stream.aspx?id=…'}
                     />
                     <p className="text-xs text-muted-foreground">
-                      Paste a recording or transcript link from Teams or SharePoint. A sign-in window
-                      may appear the first time; after that it stays signed in and runs in the background.
+                      {linkContentMode === 'recap'
+                        ? 'Paste a Teams meeting recap link to fetch its AI summary through the existing WebView2 sign-in and save it to Obsidian. You can still paste recap text manually below.'
+                        : 'Paste a recording or transcript link from Teams or SharePoint. A sign-in window may appear the first time; after that it stays signed in and runs in the background.'}
                     </p>
                   </div>
 
                   {/* What to import: recording audio vs Teams transcript */}
                   <div className="space-y-1">
                     <label className="text-sm font-medium text-gray-700">What to import</label>
-                    <div className="grid grid-cols-2 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
+                    <div className="grid grid-cols-3 gap-1 p-1 bg-gray-100 rounded-lg text-sm font-medium">
                       <button
                         type="button"
                         onClick={() => { setLinkContentMode('audio'); setLinkModeTouched(true); }}
@@ -798,13 +886,46 @@ export function ImportAudioDialog({
                       >
                         Teams transcript
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => { setLinkContentMode('recap'); setLinkModeTouched(true); }}
+                        className={`rounded-md py-2 transition-colors ${
+                          linkContentMode === 'recap' ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                        }`}
+                      >
+                        Copilot recap
+                      </button>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      {linkContentMode === 'transcript'
+                      {linkContentMode === 'recap'
+                        ? 'Imports Teams meeting notes and follow-up tasks as an editable summary and Obsidian note — no audio download or transcription.'
+                        : linkContentMode === 'transcript'
                         ? "Imports Teams' generated transcript with speaker names — no re-transcription."
                         : 'Downloads the recording and transcribes the audio.'}
                     </p>
                   </div>
+
+                  {linkContentMode === 'recap' && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="text-sm font-medium text-gray-700">Recap text (optional fallback)</label>
+                        <Button type="button" variant="outline" size="sm" onClick={handlePasteRecap}>
+                          <ClipboardPaste className="h-3.5 w-3.5 mr-1.5" />
+                          Paste from clipboard
+                        </Button>
+                      </div>
+                      <textarea
+                        value={recapText}
+                        onChange={(e) => setRecapText(e.target.value)}
+                        placeholder="Leave blank to fetch from a Teams recap link, or paste recap text manually…"
+                        rows={10}
+                        className="flex min-h-[180px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        If pasted, this text is imported instead of fetching from Teams. The link-only path also exports to your configured Obsidian vault.
+                      </p>
+                    </div>
+                  )}
 
                   <div className="space-y-1">
                     <label className="text-sm font-medium text-gray-700">Meeting Title</label>
@@ -1055,8 +1176,20 @@ export function ImportAudioDialog({
                   </>
                 ) : sourceMode === 'link' ? (
                   <>
-                    <Link2 className="h-4 w-4 mr-2" />
-                    {linkContentMode === 'transcript' ? 'Import Transcript' : 'Import from Link'}
+                    {linkContentMode === 'recap' ? (
+                      <Sparkles className="h-4 w-4 mr-2" />
+                    ) : (
+                      <Link2 className="h-4 w-4 mr-2" />
+                    )}
+                    {linkContentMode === 'recap'
+                      ? isImportingRecap
+                        ? 'Importing Recap…'
+                        : canFetchTeamsRecap && !recapText.trim()
+                        ? 'Fetch Recap to Obsidian'
+                        : 'Import Copilot Recap'
+                      : linkContentMode === 'transcript'
+                      ? 'Import Transcript'
+                      : 'Import from Link'}
                   </>
                 ) : batchFiles.length > 0 ? (
                   <>

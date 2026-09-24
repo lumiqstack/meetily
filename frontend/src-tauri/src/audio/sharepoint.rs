@@ -29,7 +29,7 @@ const AUTH_WINDOW_LABEL: &str = "meetily-sp-auth";
 /// each other's window mid-poll, which surfaces as a `cookies_for_url` panic
 /// (`RecvError`: the webview died while servicing the cookie read). Serialize
 /// the flows instead — the loser waits, it does not kill the winner.
-static AUTH_FLOW_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+pub(crate) static AUTH_FLOW_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
 
 /// Cookie names that prove a *host-scoped* SharePoint session.
@@ -310,7 +310,7 @@ pub async fn ensure_auth_cookies_mode<R: Runtime, F: Fn(&str)>(
 /// "Failed to open the SharePoint sign-in window" until the app restarts
 /// (observed 2026-07-28). Creation is retried once after a longer settle for
 /// the same reason.
-async fn create_auth_window<R: Runtime>(
+pub(crate) async fn create_auth_window<R: Runtime>(
     app: &AppHandle<R>,
     url: &Url,
     data_dir: &std::path::Path,
@@ -338,8 +338,13 @@ fn build_auth_window<R: Runtime>(
     url: &Url,
     data_dir: &std::path::Path,
 ) -> tauri::Result<tauri::WebviewWindow<R>> {
+    let title = if url.host_str().unwrap_or("").starts_with("teams.") {
+        "Sign in to Teams — Meetily"
+    } else {
+        "Sign in to SharePoint — Meetily"
+    };
     WebviewWindowBuilder::new(app, AUTH_WINDOW_LABEL, WebviewUrl::External(url.clone()))
-        .title("Sign in to SharePoint — Meetily")
+        .title(title)
         .inner_size(1024.0, 768.0)
         .data_directory(data_dir.to_path_buf())
         .visible(false)

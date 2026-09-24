@@ -53,6 +53,21 @@ pub struct ProcessTranscriptResponse {
     pub process_id: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedRecapResponse {
+    pub meeting_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedRecapFromLinkResponse {
+    pub meeting_id: String,
+    pub title: String,
+    pub obsidian_file_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SummaryLanguageStorage {
@@ -86,6 +101,137 @@ impl MeetingSummaryLanguagePreference {
 enum MeetingFolderResolution {
     Folder(PathBuf),
     NoFolder,
+}
+
+/// Creates a meeting whose summary is an existing Microsoft Copilot recap.
+/// This intentionally bypasses recording download, speech-to-text, and LLM
+/// summary generation.
+#[tauri::command]
+pub async fn api_import_copilot_recap<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    title: String,
+    recap: String,
+    source_url: Option<String>,
+) -> Result<ImportedRecapResponse, String> {
+    let title = title.trim();
+    let recap = recap.trim();
+    if title.is_empty() {
+        return Err("Meeting title is required.".into());
+    }
+    if title.chars().count() > 500 {
+        return Err("Meeting title is too long (maximum 500 characters).".into());
+    }
+    if recap.is_empty() {
+        return Err("Copilot recap is required.".into());
+    }
+    if recap.chars().count() > 500_000 {
+        return Err("Copilot recap is too large (maximum 500,000 characters).".into());
+    }
+    if contains_reasoning_marker(recap) {
+        return Err("The recap contains a model reasoning marker and was not imported.".into());
+    }
+
+    let source_url = source_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(url) = source_url.as_deref() {
+        if url.len() > 8_192
+            || !url::Url::parse(url)
+                .ok()
+                .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+        {
+            return Err("Source link must be a valid HTTP or HTTPS URL.".into());
+        }
+    }
+
+    let summary = serde_json::json!({
+        "markdown": recap,
+        "imported_from": "microsoft_copilot_recap",
+        "source_url": source_url.as_deref(),
+    });
+    if !summary_is_renderable(&summary) {
+        return Err("Copilot recap contains no visible content and was not imported.".into());
+    }
+
+    let meeting_id = SummaryProcessesRepository::create_meeting_with_imported_summary(
+        state.db_manager.pool(),
+        title,
+        &summary,
+        source_url.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("Failed to import Copilot recap: {e}"))?;
+
+    log_info!(
+        "Imported Microsoft Copilot recap as transcript-free meeting {}",
+        meeting_id
+    );
+    Ok(ImportedRecapResponse {
+        meeting_id,
+        title: title.to_string(),
+    })
+}
+
+/// Open a Teams recap in the existing SharePoint-authenticated WebView2
+/// profile, read its AI summary, and write the imported meeting to Obsidian.
+#[tauri::command]
+pub async fn api_import_copilot_recap_from_link<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    title: String,
+    source_url: String,
+) -> Result<ImportedRecapFromLinkResponse, String> {
+    let validated_url = crate::audio::teams_recap::validate_recap_url(source_url.trim())
+        .map_err(|e| e.to_string())?;
+    let source_url = validated_url.as_str();
+
+    // An explicit "import to Obsidian" must not silently succeed only in
+    // Meetily because the vault has not been configured on this machine.
+    let settings = crate::obsidian::load_obsidian_settings(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+    let vault_path = settings
+        .vault_path
+        .ok_or_else(|| "Set an Obsidian vault in Meetily Settings before importing a Teams recap link.".to_string())?;
+    if !std::path::Path::new(&vault_path).is_dir() {
+        return Err("The configured Obsidian vault folder is not available on this machine.".into());
+    }
+
+    let recap = crate::audio::teams_recap::extract_teams_recap(&app, source_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let recap_markdown = format!(
+        "{}\n[Open original Teams recap](<{}>)",
+        recap.markdown.trim(),
+        source_url
+    );
+    let imported = api_import_copilot_recap(
+        app.clone(),
+        state,
+        title,
+        recap_markdown.clone(),
+        Some(source_url.to_string()),
+    )
+    .await?;
+    let exported = crate::obsidian::export_meeting_note(
+        &app,
+        &imported.meeting_id,
+        &imported.title,
+        &Utc::now().to_rfc3339(),
+        &recap_markdown,
+        "",
+    )
+    .await
+    .map_err(|e| format!(
+        "The recap was saved in Meetily as meeting {}, but the Obsidian export failed: {e}",
+        imported.meeting_id
+    ))?;
+    Ok(ImportedRecapFromLinkResponse {
+        meeting_id: imported.meeting_id,
+        title: imported.title,
+        obsidian_file_path: exported.file_path,
+    })
 }
 
 /// Saves a meeting summary (Native SQLx implementation)

@@ -785,6 +785,8 @@ pub fn run() {
             summary::commands::api_process_transcript,
             summary::commands::api_get_summary,
             summary::commands::api_save_meeting_summary,
+            summary::commands::api_import_copilot_recap,
+            summary::commands::api_import_copilot_recap_from_link,
             summary::commands::api_get_meeting_summary_language,
             summary::commands::api_save_meeting_summary_language,
             summary::commands::api_get_meeting_detected_summary_language,

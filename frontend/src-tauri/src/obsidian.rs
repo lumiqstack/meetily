@@ -174,7 +174,14 @@ fn render_filename_template(
     let date = parse_created_date(created_at)
         .format("%Y-%m-%d")
         .to_string();
-    let short_id = meeting_id.chars().take(8).collect::<String>();
+    // Imported meetings use `meeting-<uuid>`; using the first eight characters
+    // verbatim would give all of them the same "meeting-" suffix.
+    let short_id = meeting_id
+        .strip_prefix("meeting-")
+        .unwrap_or(meeting_id)
+        .chars()
+        .take(8)
+        .collect::<String>();
     let rendered = template
         .replace("{date}", &date)
         .replace("{title}", title)
@@ -206,15 +213,20 @@ fn build_obsidian_markdown(
     let title = title.trim();
     let created = parse_created_date(created_at).to_rfc3339();
 
-    format!(
-        "---\nsource: meetily\nmeeting_id: \"{}\"\ncreated: \"{}\"\nexported: \"{}\"\ntags:\n  - meetings\n---\n\n# {}\n\n## Summary\n\n{}\n\n## Transcript\n\n{}\n",
+    let mut note = format!(
+        "---\nsource: meetily\nmeeting_id: \"{}\"\ncreated: \"{}\"\nexported: \"{}\"\ntags:\n  - meetings\n---\n\n# {}\n\n## Summary\n\n{}\n",
         meeting_id,
         created,
         exported_at,
         title,
         summary_markdown.trim(),
-        transcript_markdown.trim()
-    )
+    );
+    if !transcript_markdown.trim().is_empty() {
+        note.push_str("\n## Transcript\n\n");
+        note.push_str(transcript_markdown.trim());
+        note.push('\n');
+    }
+    note
 }
 
 /// Render transcript segments as the same markdown the manual "Save to
@@ -396,7 +408,12 @@ async fn resolve_export_filename(
 
     let current = render_filename_template(&settings.filename_template, meeting_id, title, created_at);
     let legacy = render_filename_template(LEGACY_FILENAME_TEMPLATE, meeting_id, title, created_at);
-    for candidate in [&legacy, &current] {
+    // Adopt a note exported by the old `{short_id}` renderer too. Before the
+    // fix it wrote the literal "meeting-" prefix for imported meeting IDs.
+    let old_short_id = meeting_id.chars().take(8).collect::<String>();
+    let old_template = settings.filename_template.replace("{short_id}", &old_short_id);
+    let old_current = render_filename_template(&old_template, meeting_id, title, created_at);
+    for candidate in [&legacy, &old_current, &current] {
         if note_belongs_to_meeting(&meetings_dir.join(candidate), meeting_id) {
             return candidate.clone();
         }
@@ -497,6 +514,19 @@ mod tests {
     use crate::database::models::Transcript;
 
     #[test]
+    fn transcript_free_recap_export_omits_empty_transcript_section() {
+        let note = build_obsidian_markdown(
+            "meeting-recap-test",
+            "Treasury kick-off",
+            "2026-09-23T11:40:00Z",
+            "## Meeting notes\n\n- Existing Copilot recap",
+            "",
+        );
+        assert!(note.contains("## Meeting notes"));
+        assert!(!note.contains("## Transcript"));
+    }
+
+    #[test]
     fn settings_without_auto_export_field_default_to_enabled() {
         // Pre-existing obsidian_settings.json files predate the flag.
         let settings: ObsidianSettings = serde_json::from_str(
@@ -557,6 +587,20 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains("aaaaaaaa"));
         assert!(b.contains("bbbbbbbb"));
+        let imported_a = render_filename_template(
+            DEFAULT_FILENAME_TEMPLATE,
+            "meeting-aaaaaaaa-1111",
+            "Standup",
+            created,
+        );
+        let imported_b = render_filename_template(
+            DEFAULT_FILENAME_TEMPLATE,
+            "meeting-bbbbbbbb-2222",
+            "Standup",
+            created,
+        );
+        assert_ne!(imported_a, imported_b);
+        assert!(imported_a.contains("aaaaaaaa"));
     }
 
     #[tokio::test]
@@ -622,6 +666,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_fix_meeting_prefix_note_is_adopted() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let meeting_id = "meeting-aaaaaaaa-1111";
+        let created = "2026-07-25T10:00:00Z";
+        let old_name = "2026-07-25 Standup meeting-.md";
+        std::fs::write(
+            dir.path().join(old_name),
+            format!("---\nmeeting_id: \"{meeting_id}\"\n---\n"),
+        )
+        .unwrap();
+
+        let resolved = resolve_export_filename(
+            Some(&pool),
+            &settings(DEFAULT_FILENAME_TEMPLATE),
+            dir.path(),
+            meeting_id,
+            "Standup",
+            created,
+        )
+        .await;
+        assert_eq!(resolved, old_name);
+    }
+
+    #[tokio::test]
     async fn unrelated_note_with_same_name_is_not_adopted() {
         let pool = test_pool().await;
         let dir = tempfile::tempdir().unwrap();
@@ -647,7 +716,7 @@ mod tests {
         )
         .await;
         assert_ne!(resolved, legacy_name);
-        assert!(resolved.contains("meeting-"));
+        assert!(resolved.ends_with(" a.md"));
     }
 
     #[test]

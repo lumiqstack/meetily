@@ -82,11 +82,12 @@ export function TranscriptButtonGroup({
           size="sm"
           variant="outline"
           className="px-2 @[22rem]:px-4"
+          disabled={!meetingFolderPath}
           onClick={() => {
             Analytics.trackButtonClick('open_recording_folder', 'meeting_details');
             onOpenMeetingFolder();
           }}
-          title="Open Recording Folder"
+          title={meetingFolderPath ? 'Open Recording Folder' : 'No recording folder available'}
         >
           <FolderOpen className="@[22rem]:mr-2" size={18} />
           <span className="hidden @[22rem]:inline">Recording</span>

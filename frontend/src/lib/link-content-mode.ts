@@ -1,9 +1,13 @@
-// Guess whether a link points at a recording or a Teams transcript, from the
-// file name in the `id` param. Returns null when it can't tell.
-export function detectLinkContentMode(url: string): 'audio' | 'transcript' | null {
+// Recognize Teams recap deep links first, then guess recording/transcript
+// links from the `id` filename. Returns null when it cannot tell.
+export function detectLinkContentMode(url: string): 'audio' | 'transcript' | 'recap' | null {
   let raw = url.toLowerCase();
   try {
     const u = new URL(url);
+    if (/^teams\.(microsoft\.com|cloud\.microsoft)(\.mcas\.ms)?$/i.test(u.hostname)
+      && u.pathname === '/l/meetingrecap') {
+      return 'recap';
+    }
     raw = (u.searchParams.get('id') || u.pathname).toLowerCase();
   } catch {
     // fall back to scanning the whole string
