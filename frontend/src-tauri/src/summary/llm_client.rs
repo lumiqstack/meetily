@@ -316,7 +316,11 @@ pub(crate) async fn generate_summary(
             user_prompt,
             cancellation_token,
         )
-        .await;
+        .await
+        .map(|content| LlmCompletion {
+            content,
+            reasoning_stripped: false,
+        });
     }
 
     let (api_url, mut headers) = match provider {
@@ -732,6 +736,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&cancellation_token),
         );
         tokio::pin!(generation);
@@ -818,6 +823,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&cancellation_token),
         );
         tokio::pin!(generation);
@@ -896,6 +902,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(&cancellation_token),
             ),
         )
@@ -946,5 +953,3 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::CopilotCli => "GitHub Copilot CLI",
     }
 }
-
-

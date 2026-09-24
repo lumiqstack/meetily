@@ -10,6 +10,7 @@ use crate::database::repositories::transcript_chunk::TranscriptChunksRepository;
 use crate::pipeline::settings::PipelineSettings;
 use crate::pipeline::StageError;
 use crate::summary::SummaryService;
+use chrono::Utc;
 use sqlx::SqlitePool;
 use std::path::Path;
 use tauri::{AppHandle, Runtime};
@@ -115,7 +116,8 @@ pub async fn run_summary_stage<R: Runtime>(
 
     let summary_language = resolve_summary_language(pool, meeting_id).await;
 
-    SummaryProcessesRepository::create_or_reset_process(pool, meeting_id)
+    let started_at = Utc::now();
+    SummaryProcessesRepository::create_or_reset_process(pool, meeting_id, started_at)
         .await
         .map_err(|e| StageError::hard(format!("Failed to initialize summary process: {}", e)))?;
 
@@ -133,10 +135,13 @@ pub async fn run_summary_stage<R: Runtime>(
 
     // Awaited in-process: no status polling, and the Obsidian auto-export
     // happens inside on success.
+    let cancellation_token = SummaryService::register_cancellation_token(meeting_id, started_at);
     SummaryService::process_transcript_background(
         app.clone(),
         pool.clone(),
         meeting_id.to_string(),
+        started_at,
+        cancellation_token,
         text,
         model_config.provider.clone(),
         model_config.model.clone(),
