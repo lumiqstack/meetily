@@ -97,11 +97,12 @@ function MeetingDetailsContent() {
       const hasGemma = await checkForGemmaModel();
 
       if (hasGemma) {
+        const fallbackModel = 'gemma3:1b';
         console.log('💾 DB empty, using gemma3:1b as initial default');
 
         await invoke('api_save_model_config', {
           provider: 'ollama',
-          model: '',
+          model: fallbackModel,
           whisperModel: 'large-v3',
           apiKey: null,
           ollamaEndpoint: null,

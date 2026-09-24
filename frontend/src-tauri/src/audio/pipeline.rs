@@ -674,6 +674,22 @@ impl AudioCapture {
     }
 }
 
+#[cfg(test)]
+static TEST_VAD_FACTORY: std::sync::OnceLock<fn(u32, u32) -> Result<ContinuousVadProcessor>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn create_vad_processor(sample_rate: u32, redemption_time: u32) -> Result<Option<ContinuousVadProcessor>> {
+    if let Some(factory) = TEST_VAD_FACTORY.get() {
+        return factory(sample_rate, redemption_time).map(Some);
+    }
+    ContinuousVadProcessor::new(sample_rate, redemption_time).map(Some)
+}
+
+#[cfg(not(test))]
+fn create_vad_processor(sample_rate: u32, redemption_time: u32) -> Result<Option<ContinuousVadProcessor>> {
+    ContinuousVadProcessor::new(sample_rate, redemption_time).map(Some)
+}
+
 /// VAD-driven audio processing pipeline
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
@@ -727,7 +743,7 @@ impl AudioPipeline {
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
         vad_enabled: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
         info!("   Mic: '{}' ({:?}) - Buffer: {:?}",
@@ -747,14 +763,15 @@ impl AudioPipeline {
         let redemption_time = if cfg!(target_os = "macos") { 400 } else { 400 };
 
         let vad_processor = if vad_enabled {
-            match ContinuousVadProcessor::new(sample_rate, redemption_time) {
-                Ok(processor) => {
+            match create_vad_processor(sample_rate, redemption_time) {
+                Ok(Some(processor)) => {
                     info!("VAD-driven pipeline: VAD segments will be sent directly to Whisper (no time-based accumulation)");
                     Some(processor)
                 }
+                Ok(None) => None,
                 Err(e) => {
                     error!("Failed to create VAD processor: {}", e);
-                    panic!("VAD processor creation failed: {}", e);
+                    return Err(anyhow::anyhow!("VAD processor creation failed: {}", e));
                 }
             }
         } else {
@@ -769,7 +786,7 @@ impl AudioPipeline {
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
 
-        Self {
+        Ok(Self {
             receiver,
             transcription_sender,
             state,
@@ -793,7 +810,7 @@ impl AudioPipeline {
             segment_aggregator: super::source_attribution::SegmentAggregator::new(),
             mic_window: Vec::new(),
             sys_window: Vec::new(),
-        }
+        })
     }
 
     /// Run the VAD-driven audio processing pipeline
@@ -1111,16 +1128,15 @@ impl AudioPipelineManager {
         // Create audio processing channel
         let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // Set sender in state for audio captures to use
-        state.set_audio_sender(audio_sender.clone());
-
         // A streaming provider runs its own endpointing on continuous audio, so
         // local VAD is both unnecessary and harmful (it would strip the silence
         // the recognizer uses to detect utterance boundaries).
         let vad_enabled = vad_enabled && !streaming_live;
 
-        // Create and start pipeline with device information for adaptive mixing
-        let mut pipeline = AudioPipeline::new(
+        // Create and start pipeline with device information for adaptive mixing.
+        // Do this before publishing the audio sender so failed startup leaves the
+        // state in a clean, non-recording condition.
+        let mut pipeline = match AudioPipeline::new(
             audio_receiver,
             transcription_sender.clone(),
             state.clone(),
@@ -1131,7 +1147,17 @@ impl AudioPipelineManager {
             system_device_name,
             system_device_kind,
             vad_enabled,
-        );
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(err) => {
+                state.clear_audio_sender();
+                self.audio_sender = None;
+                error!("Failed to initialize audio pipeline: {}", err);
+                return Err(err);
+            }
+        };
+
+        state.set_audio_sender(audio_sender.clone());
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings
@@ -1222,6 +1248,35 @@ impl AudioPipelineManager {
 
         // Now stop normally
         self.stop().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_pipeline_new_returns_error_when_vad_init_fails() {
+        let (tx, rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let state = RecordingState::new();
+
+        let factory = |_, _| Err(anyhow::anyhow!("forced VAD init failure"));
+        let _ = TEST_VAD_FACTORY.set(factory);
+
+        let result = AudioPipeline::new(
+            rx,
+            tx,
+            state,
+            0,
+            48000,
+            "Mic".to_string(),
+            super::super::device_detection::InputDeviceKind::Unknown,
+            "System".to_string(),
+            super::super::device_detection::InputDeviceKind::Unknown,
+            true,
+        );
+
+        assert!(result.is_err(), "VAD initialization errors should be returned as startup errors");
     }
 }
 

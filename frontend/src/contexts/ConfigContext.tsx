@@ -6,6 +6,7 @@ import { SelectedDevices } from '@/components/DeviceSelection';
 import { configService, ModelConfig } from '@/services/configService';
 import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
+import { COPILOT_CLI_MODELS, normalizeCopilotCliModel } from '@/lib/copilot-cli-models';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
 
 export interface OllamaModel {
@@ -301,7 +302,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             try {
               const copilotConfig = await configService.getCopilotCliConfig();
               if (copilotConfig) {
-                const resolvedModel = copilotConfig.model || data.model || 'auto';
+                const resolvedModel = normalizeCopilotCliModel(copilotConfig.model || data.model);
                 setModelConfig(prev => ({
                   ...prev,
                   provider: data.provider,
@@ -427,7 +428,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
     'builtin-ai': [],
     'custom-openai': [],
-    'copilot-cli': ['auto'],
+    'copilot-cli': COPILOT_CLI_MODELS,
   }), [models]);
 
   // Toggle confidence indicator with localStorage persistence

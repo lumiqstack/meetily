@@ -66,8 +66,9 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       const picked = await invoke<string | null>('select_recording_folder');
       if (!picked) return; // user cancelled
 
-      setPreferences(prev => ({ ...prev, save_folder: picked }));
-      toast.success('Recordings folder updated', { description: picked });
+      const updatedPreferences = { ...preferences, save_folder: picked };
+      setPreferences(updatedPreferences);
+      await savePreferences(updatedPreferences);
       await Analytics.track('recordings_folder_changed', {});
     } catch (error) {
       console.error('Failed to change recordings folder:', error);

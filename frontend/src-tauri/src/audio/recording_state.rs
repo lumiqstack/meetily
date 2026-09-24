@@ -283,6 +283,10 @@ impl RecordingState {
         *self.audio_sender.lock().unwrap() = Some(sender);
     }
 
+    pub fn clear_audio_sender(&self) {
+        *self.audio_sender.lock().unwrap() = None;
+    }
+
     pub fn send_audio_chunk(&self, chunk: AudioChunk) -> Result<()> {
         // Don't send audio chunks when paused
         if self.is_paused() {

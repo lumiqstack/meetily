@@ -152,7 +152,7 @@ fn output_snippet(text: &str) -> String {
 ///
 /// # Arguments
 /// * `binary_path` - Optional explicit path to the `copilot` binary
-/// * `model_name` - Copilot model id (e.g. "auto", "claude-sonnet-4.5"); empty or "auto" lets Copilot pick
+/// * `model_name` - Copilot model id (e.g. "auto", "claude-sonnet-5"); empty or "auto" lets Copilot pick
 /// * `github_token` - Optional GitHub token passed as COPILOT_GITHUB_TOKEN (otherwise `copilot login` credentials are used)
 /// * `system_prompt` / `user_prompt` - Prompts, written to a temp file the CLI reads
 /// * `cancellation_token` - Optional token to abort (kills the child process)
@@ -224,7 +224,13 @@ async fn run_copilot(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let model = model_name.trim();
+    let model = match model_name.trim() {
+        "claude-sonnet-4.5" => "claude-sonnet-5",
+        "claude-sonnet-4" => "claude-sonnet-4.6",
+        "gpt-5" => "gpt-5.5",
+        "gpt-5-mini" | "gpt-4.1" | "gemini-2.5-pro" => "auto",
+        model => model,
+    };
     if !model.is_empty() {
         command.arg("--model").arg(model);
     }

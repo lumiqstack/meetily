@@ -38,7 +38,7 @@ pub struct CopilotCliConfig {
     /// Explicit path to the `copilot` binary (optional; auto-detected when empty)
     #[serde(rename = "binaryPath")]
     pub binary_path: Option<String>,
-    /// Copilot model id (e.g. "auto", "claude-sonnet-4.5"); availability depends on the Copilot plan
+    /// Copilot model id (e.g. "auto", "claude-sonnet-5"); availability depends on the Copilot plan
     pub model: Option<String>,
     /// GitHub token passed to the CLI as COPILOT_GITHUB_TOKEN (optional)
     #[serde(rename = "githubToken")]

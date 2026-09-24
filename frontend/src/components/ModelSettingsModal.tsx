@@ -28,6 +28,7 @@ import {
   CommandList,
 } from '@/components/ui/command';
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
+import { COPILOT_CLI_MODELS } from '@/lib/copilot-cli-models';
 import { toast } from 'sonner';
 
 export interface ModelConfig {
@@ -102,19 +103,6 @@ const GROQ_FALLBACK_MODELS = [
   'llama-3.1-70b-versatile',
   'mixtral-8x7b-32768',
   'gemma2-9b-it',
-];
-
-// Copilot model availability depends on the user's Copilot plan;
-// 'auto' lets Copilot pick and works on every plan
-const COPILOT_CLI_MODELS = [
-  'auto',
-  'claude-sonnet-4.5',
-  'claude-sonnet-4',
-  'claude-haiku-4.5',
-  'gpt-5',
-  'gpt-5-mini',
-  'gpt-4.1',
-  'gemini-2.5-pro',
 ];
 
 interface ModelSettingsModalProps {
@@ -1176,10 +1164,11 @@ export function ModelSettingsModal({
           <div className="space-y-4 border-t pt-4">
             <Alert>
               <AlertDescription>
-                Summaries are generated locally through the GitHub Copilot CLI using your
+                Summaries are generated through the GitHub Copilot CLI using your
                 Copilot subscription. Install it with <code className="font-mono text-xs">npm install -g @github/copilot</code> and
                 sign in with <code className="font-mono text-xs">copilot login</code>, or provide a GitHub token below.
-                Model availability depends on your Copilot plan; &quot;auto&quot; works on every plan.
+                Copilot CLI is used for summaries, not live transcription. Model availability depends on your Copilot plan;
+                &quot;auto&quot; lets Copilot choose an available model.
               </AlertDescription>
             </Alert>
 

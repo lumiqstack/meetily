@@ -4,6 +4,26 @@ import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSe
 
 const DEFAULT_PAGE_SIZE = 100;
 
+export interface RequestStalenessCheck {
+    activeMeetingId: string | null;
+    requestMeetingId: string | null;
+    activeGeneration: number;
+    requestGeneration: number;
+}
+
+export function isRequestStale({
+    activeMeetingId,
+    requestMeetingId,
+    activeGeneration,
+    requestGeneration,
+}: RequestStalenessCheck): boolean {
+    if (!activeMeetingId || !requestMeetingId) {
+        return false;
+    }
+
+    return activeMeetingId !== requestMeetingId || activeGeneration !== requestGeneration;
+}
+
 interface UsePaginatedTranscriptsProps {
     meetingId: string | null;
     /** Optional initial timestamp (in seconds) from URL for loading the correct page */
@@ -58,11 +78,13 @@ export function usePaginatedTranscripts({
     // have to rescan everything loaded so far.
     const loadedIdsRef = useRef<Set<string>>(new Set());
     const loadedMeetingIdRef = useRef<string | null>(null);
+    const requestGenerationRef = useRef(0);
     const isLoadingRef = useRef(false);
     const lastLoadTimeRef = useRef(0); // Debounce protection
 
     // Reset state when meeting changes
     const reset = useCallback(() => {
+        requestGenerationRef.current += 1;
         setMetadata(null);
         setTranscripts([]);
         setTotalCount(0);
@@ -78,13 +100,34 @@ export function usePaginatedTranscripts({
     const loadMetadata = useCallback(async (): Promise<MeetingMetadata | null> => {
         if (!meetingId) return null;
 
+        const requestGeneration = requestGenerationRef.current;
+
         try {
             const data = await invoke<MeetingMetadata>('api_get_meeting_metadata', {
                 meetingId,
             });
+
+            if (isRequestStale({
+                activeMeetingId: meetingId,
+                requestMeetingId: meetingId,
+                activeGeneration: requestGenerationRef.current,
+                requestGeneration,
+            })) {
+                return null;
+            }
+
             setMetadata(data);
             return data;
         } catch (err) {
+            if (isRequestStale({
+                activeMeetingId: meetingId,
+                requestMeetingId: meetingId,
+                activeGeneration: requestGenerationRef.current,
+                requestGeneration,
+            })) {
+                return null;
+            }
+
             console.error('Failed to load meeting metadata:', err);
             setError('Failed to load meeting details');
             return null;
@@ -98,6 +141,8 @@ export function usePaginatedTranscripts({
     ): Promise<Transcript[]> => {
         if (!meetingId) return [];
 
+        const requestGeneration = requestGenerationRef.current;
+
         try {
             const response = await invoke<PaginatedTranscriptsResponse>(
                 'api_get_meeting_transcripts',
@@ -107,6 +152,15 @@ export function usePaginatedTranscripts({
                     offset,
                 }
             );
+
+            if (isRequestStale({
+                activeMeetingId: meetingId,
+                requestMeetingId: meetingId,
+                activeGeneration: requestGenerationRef.current,
+                requestGeneration,
+            })) {
+                return [];
+            }
 
             const newTranscripts = response.transcripts;
 
@@ -118,7 +172,17 @@ export function usePaginatedTranscripts({
                     uniqueNew.forEach(t => existingIds.add(t.id));
                     // Pages arrive in order, so only the new page needs sorting
                     uniqueNew.sort((a, b) => (a.audio_start_time ?? 0) - (b.audio_start_time ?? 0));
-                    setTranscripts(prev => prev.concat(uniqueNew));
+                    setTranscripts(prev => {
+                        if (isRequestStale({
+                            activeMeetingId: meetingId,
+                            requestMeetingId: meetingId,
+                            activeGeneration: requestGenerationRef.current,
+                            requestGeneration,
+                        })) {
+                            return prev;
+                        }
+                        return prev.concat(uniqueNew);
+                    });
                 }
             } else {
                 loadedIdsRef.current = new Set(newTranscripts.map(t => t.id));
@@ -131,6 +195,15 @@ export function usePaginatedTranscripts({
 
             return newTranscripts;
         } catch (err) {
+            if (isRequestStale({
+                activeMeetingId: meetingId,
+                requestMeetingId: meetingId,
+                activeGeneration: requestGenerationRef.current,
+                requestGeneration,
+            })) {
+                return [];
+            }
+
             console.error('Failed to load transcripts:', err);
             setError('Failed to load transcripts');
             return [];
@@ -162,6 +235,7 @@ export function usePaginatedTranscripts({
     const refetch = useCallback(async () => {
         if (!meetingId) return;
 
+        requestGenerationRef.current += 1;
         reset();
         setIsLoading(true);
         try {
@@ -175,6 +249,7 @@ export function usePaginatedTranscripts({
     // Initial load
     useEffect(() => {
         if (!meetingId) {
+            requestGenerationRef.current += 1;
             reset();
             return;
         }
@@ -182,6 +257,7 @@ export function usePaginatedTranscripts({
         // Avoid reloading the same meeting
         if (loadedMeetingIdRef.current === meetingId) return;
         loadedMeetingIdRef.current = meetingId;
+        requestGenerationRef.current += 1;
 
         reset();
 

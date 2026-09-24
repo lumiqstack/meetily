@@ -1,0 +1,424 @@
+warning: patch for the non root package will be ignored, specify patch at the workspace root:
+package:   D:\codex\meetily-0.4.0\frontend\src-tauri\Cargo.toml
+workspace: D:\codex\meetily-0.4.0\Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   D:\codex\meetily-0.4.0\llama-helper\Cargo.toml
+workspace: D:\codex\meetily-0.4.0\Cargo.toml
+warning: unused import: `std::io::Read`
+   --> frontend\src-tauri\build\ffmpeg.rs:210:9
+    |
+210 |     use std::io::Read;
+    |         ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `meetily` (build script) generated 1 warning
+   Compiling meetily v0.4.0 (D:\codex\meetily-0.4.0\frontend\src-tauri)
+warning: meetily@0.4.0: ≡ƒÜÇ Building Meetily for: windows
+warning: meetily@0.4.0: ΓÜá∩╕Å  Windows: Using CPU-only mode (no GPU or BLAS acceleration)
+warning: meetily@0.4.0: ≡ƒÆí For NVIDIA GPU: cargo build --release --features cuda
+warning: meetily@0.4.0: ≡ƒÆí For AMD/Intel GPU: cargo build --release --features vulkan
+warning: meetily@0.4.0: ≡ƒÆí For CPU optimization: cargo build --release --features openblas
+warning: meetily@0.4.0: ≡ƒôè Performance: CPU-only builds are significantly slower than GPU/BLAS builds
+warning: meetily@0.4.0: ≡ƒôÜ See README.md for GPU/BLAS setup instructions
+warning: meetily@0.4.0: ≡ƒÄ¼ Checking FFmpeg binary for target: x86_64-pc-windows-msvc
+warning: meetily@0.4.0: ≡ƒöì Found cached FFmpeg binary: ffmpeg-x86_64-pc-windows-msvc.exe
+warning: meetily@0.4.0: Γ£à FFmpeg verification passed: ffmpeg version 8.0.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg developers
+warning: meetily@0.4.0: Γ£à FFmpeg binary already cached and verified: ffmpeg-x86_64-pc-windows-msvc.exe
+warning: unused import: `perf_debug`
+  --> frontend\src-tauri\src\lib.rs:32:16
+   |
+32 | pub(crate) use perf_debug;
+   |                ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `perf_trace`
+  --> frontend\src-tauri\src\lib.rs:33:16
+   |
+33 | pub(crate) use perf_trace;
+   |                ^^^^^^^^^^
+
+warning: unnecessary parentheses around closure body
+   --> frontend\src-tauri\src\audio\decoder.rs:709:50
+    |
+709 |         let input: Vec<f32> = (0..96000).map(|i| (i as f32 / 96000.0)).collect();
+    |                                                  ^                  ^
+    |
+    = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+    |
+709 -         let input: Vec<f32> = (0..96000).map(|i| (i as f32 / 96000.0)).collect();
+709 +         let input: Vec<f32> = (0..96000).map(|i| i as f32 / 96000.0).collect();
+    |
+
+warning: unused import: `warn`
+  --> frontend\src-tauri\src\audio\devices\fallback.rs:22:17
+   |
+22 | use log::{info, warn};
+   |                 ^^^^
+
+warning: unused import: `find_builtin_input_device`
+  --> frontend\src-tauri\src\audio\devices\fallback.rs:25:47
+   |
+25 | use super::microphone::{default_input_device, find_builtin_input_device};
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::audio::device_detection::InputDeviceKind`
+  --> frontend\src-tauri\src\audio\devices\fallback.rs:27:5
+   |
+27 | use crate::audio::device_detection::InputDeviceKind;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+   --> frontend\src-tauri\src\audio\devices\fallback.rs:168:9
+    |
+168 |     use super::*;
+    |         ^^^^^^^^
+
+warning: unused import: `cpal::SampleFormat`
+   --> frontend\src-tauri\src\audio\diagnostics.rs:291:9
+    |
+291 |     use cpal::SampleFormat;
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> frontend\src-tauri\src\audio\recording_preferences.rs:84:16
+   |
+84 |             Ok(mut p) => {
+   |                ----^
+   |                |
+   |                help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::os::windows::process::CommandExt`
+  --> frontend\src-tauri\src\summary\summary_engine\sidecar.rs:16:5
+   |
+16 | use std::os::windows::process::CommandExt;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `device`
+   --> frontend\src-tauri\src\audio\diagnostics.rs:296:13
+    |
+296 |         let device = AudioDevice::new("Test Device".to_string(), DeviceType::Input);
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_device`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `state` is never read
+   --> frontend\src-tauri\src\audio\pipeline.rs:698:5
+    |
+695 | pub struct AudioPipeline {
+    |            ------------- field in this struct
+...
+698 |     state: Arc<RecordingState>,
+    |     ^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: comparison is useless due to type limits
+   --> frontend\src-tauri\src\audio\system_audio_commands.rs:123:25
+    |
+123 |                 assert!(device_list.len() >= 0); // Should at least not crash
+    |                         ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_comparisons)]` on by default
+
+warning: `meetily` (lib test) generated 13 warnings (run `cargo fix --lib -p meetily --tests` to apply 10 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 52s
+     Running unittests src\lib.rs (target\debug\deps\app_lib-397cb10a5752f59c.exe)
+
+running 289 tests
+test audio::buffer_pool::tests::test_buffer_pool ... ok
+test audio::buffer_pool::tests::test_pool_max_size ... ok
+test audio::capture::backend_config::tests::test_available_backends ... ok
+test audio::buffer_pool::tests::test_pooled_buffer_raii ... ok
+test audio::capture::backend_config::tests::test_backend_config ... ok
+test audio::capture::backend_config::tests::test_backend_to_string ... ok
+test audio::capture::backend_config::tests::test_backend_from_string ... ok
+test audio::capture::backend_config::tests::test_default_backend ... ok
+test audio::decoder::tests::test_chunked_resample_empty_input ... ok
+test audio::decoder::tests::mono_16k_conversion_reuses_the_input_allocation ... ok
+test audio::decoder::tests::test_chunked_resample_same_rate ... ok
+test audio::decoder::tests::test_decoded_audio_duration_calculation ... ok
+test audio::decoder::tests::test_decoded_audio_stereo_duration ... ok
+test audio::decoder::tests::test_normalize_audio_samples_already_normalized ... ok
+test audio::decoder::tests::test_needs_ffmpeg_conversion ... ok
+test audio::decoder::tests::test_normalize_audio_samples_handles_nan ... ok
+test audio::decoder::tests::test_normalize_audio_samples_handles_infinity ... ok
+test audio::decoder::tests::test_normalize_audio_samples_exceeds_range ... ok
+test audio::common::tests::test_engine_lifecycle_lock_serializes_acquirers ... ok
+test audio::decoder::tests::test_to_whisper_format_mono_16k ... ok
+test audio::decoder::tests::test_to_whisper_format_stereo_to_mono ... ok
+test audio::device_detection::tests::test_airpods_detection ... ok
+test audio::device_detection::tests::test_buffer_timeout_bluetooth ... ok
+test audio::device_detection::tests::test_buffer_timeout_wired ... ok
+test audio::device_detection::tests::test_builtin_mic_detection ... ok
+test audio::device_detection::tests::test_bluetooth_by_buffer_size ... ok
+test audio::device_detection::tests::test_virtual_device_detection ... ok
+test audio::device_detection::tests::test_calculate_buffer_timeout_bluetooth ... ok
+test audio::device_detection::tests::test_wired_by_buffer_size ... ok
+test audio::device_detection::tests::test_calculate_buffer_timeout_wired ... ok
+test audio::device_monitor::tests::test_bluetooth_detection ... ok
+test audio::diagnostics::tests::test_diagnostics_dont_panic ... ok
+test audio::engine_coordinator::tests::aborted_recording_start_releases_unparked_claim ... ok
+test audio::engine_coordinator::tests::claim_succeeds_when_engine_free ... ok
+test audio::engine_coordinator::tests::conflicting_claim_fails_and_reports_holder ... ok
+test audio::device_monitor::tests::test_monitor_creation ... ok
+test audio::engine_coordinator::tests::dropping_claim_releases_engine_for_next_consumer ... ok
+test audio::engine_coordinator::tests::same_kind_of_consumer_cannot_double_claim ... ok
+test audio::engine_coordinator::tests::recording_claim_blocks_local_jobs_until_released ... ok
+test audio::engine_coordinator::tests::release_recording_claim_without_parked_claim_is_noop ... ok
+test audio::ffmpeg::tests::parses_hours ... ok
+test audio::ffmpeg::tests::parses_the_duration_ffmpeg_prints_to_stderr ... ok
+test audio::engine_coordinator::tests::recording_claim_fails_and_names_holder_while_engine_is_busy ... ok
+test audio::ffmpeg::tests::parses_zero_and_sub_second_durations ... ok
+test audio::ffmpeg::tests::rejects_unknown_or_missing_durations ... ok
+test audio::ffmpeg_mixer::tests::test_audio_mixer_clipping_prevention ... ok
+test audio::ffmpeg_mixer::tests::test_ffmpeg_mixer_creation ... ok
+test audio::hardware_detector::tests::test_hardware_detection ... ok
+test audio::hardware_detector::tests::test_performance_tier_logic ... ok
+test audio::hardware_detector::tests::test_whisper_config_generation ... ok
+test audio::import::tests::folder_scan::empty_folder_yields_empty_untruncated_result ... ok
+test audio::import::tests::folder_scan::respects_the_depth_cap ... ok
+test audio::import::tests::folder_scan::finds_audio_recursively_and_skips_non_audio_and_dot_entries ... ok
+test audio::hardware_detector::tests::hardware_detector_rejects_missing_windows_vulkan_loader ... ok
+test audio::hardware_detector::tests::hardware_detector_finds_windows_vulkan_loader_in_system32 ... ok
+test audio::ffmpeg_mixer::tests::test_source_buffer_basic ... ok
+test audio::ffmpeg_mixer::tests::test_rms_calculation ... ok
+test audio::import::tests::local_import_does_not_consume_remote_slots ... ok
+test audio::decoder::tests::test_to_whisper_format_handles_large_file_threshold ... ok
+test audio::import::tests::job_started_during_cancel_all_drain_is_not_cancelled ... ok
+test audio::decoder::tests::test_to_whisper_format_resamples_48k_to_16k ... ok
+test audio::import::tests::local_import_is_rejected_while_recording_holds_engine ... ok
+test audio::import::tests::remote_imports_beyond_cap_are_rejected_until_a_slot_frees ... ok
+test audio::import::tests::test_audio_extensions ... ok
+test audio::import::tests::test_cancellation_flag ... ok
+test audio::import::tests::test_create_transcript_segments_single ... ok
+test audio::import::tests::test_create_transcript_segments_empty ... ok
+test audio::import::tests::test_import_pipeline_decode_vad ... ignored
+test audio::import::tests::folder_scan::truncates_at_the_file_cap ... ok
+test audio::import::tests::test_extract_duration_from_metadata_mp3 ... ok
+test audio::import::tests::test_extract_duration_from_metadata_wav ... ok
+test audio::import::tests::test_split_segment_at_silence_short_segment ... ok
+test audio::import::tests::test_validate_audio_file_nonexistent ... ok
+test audio::import::tests::test_validate_audio_file_with_metadata ... ok
+test audio::import::tests::test_validate_audio_file_wrong_extension ... ok
+test audio::incremental_saver::tests::has_audio_checkpoints_ignores_an_empty_file ... ok
+test audio::import::tests::test_split_segment_at_silence_splits_long_segment ... ok
+test audio::import::tests::test_write_transcripts_json ... ok
+test audio::import::tests::test_split_segment_at_silence_no_silence_uses_overlap ... ok
+test audio::incremental_saver::tests::has_audio_checkpoints_sees_a_streamed_file ... ok
+test audio::incremental_saver::tests::has_audio_checkpoints_sees_legacy_checkpoints ... ok
+test audio::import::tests::test_write_import_metadata ... ok
+test audio::job_persistence::tests::dismiss_does_not_touch_a_rerun_job_that_reused_the_id ... ok
+test audio::job_persistence::tests::cleanly_finished_job_is_not_reported_after_restart ... ok
+test audio::job_persistence::tests::job_started_after_reconcile_is_not_reported_as_interrupted ... ok
+test audio::job_persistence::tests::job_running_at_crash_is_reported_as_interrupted_after_restart ... ok
+test audio::job_persistence::tests::dismissed_interrupted_job_is_gone_for_good ... ok
+test audio::decoder::tests::test_chunked_resample_preserves_signal_range ... ok
+test audio::job_persistence::tests::reconcile_keeps_a_committed_folder_despite_a_verbatim_prefix ... ok
+test audio::job_persistence::tests::reconcile_keeps_a_committed_folder_despite_a_trailing_separator ... ok
+test audio::job_persistence::tests::reconcile_keeps_a_committed_folder_despite_mixed_path_separators ... ok
+test audio::job_persistence::tests::reconcile_keeps_a_committed_folder_despite_a_case_difference ... ok
+test audio::job_persistence::tests::reconcile_keeps_a_folder_a_meeting_row_points_at ... ok
+test audio::job_persistence::tests::reconcile_keeps_a_folder_that_already_has_completed_content ... ok
+test audio::job_persistence::tests::reconcile_never_deletes_a_retranscription_folder ... ok
+test audio::job_registry::tests::acquire_clears_a_stale_cancel_request_for_a_reused_id ... ok
+test audio::job_registry::tests::acquire_registers_job_and_drop_clears_it ... ok
+test audio::job_registry::tests::cancel_marks_a_single_job_and_drain_clears_the_flag ... ok
+test audio::job_registry::tests::double_acquire_of_same_id_is_rejected ... ok
+test audio::job_registry::tests::job_started_during_cancel_all_drain_is_not_cancelled ... ok
+test audio::job_registry::tests::local_job_requires_exclusive_engine_claim ... ok
+test audio::job_registry::tests::poisoned_locks_are_recovered_instead_of_propagating_the_panic ... ok
+test audio::job_registry::tests::remote_jobs_skip_engine_and_share_the_remote_cap ... ok
+test audio::permissions::tests::test_check_permission ... ok
+test audio::pipeline::tests::audio_pipeline_new_returns_error_when_vad_init_fails ... ok
+test audio::job_persistence::tests::reconcile_removes_the_orphaned_folder_of_a_crashed_import ... ok
+test audio::remote_concurrency::tests::acquires_up_to_cap_then_rejects_with_clear_message ... ok
+test audio::remote_concurrency::tests::dropping_a_permit_frees_a_slot ... ok
+test audio::retranscription::tests::job_started_during_cancel_all_drain_is_not_cancelled ... ok
+test audio::retranscription::tests::local_retranscription_is_rejected_while_engine_is_busy ... ok
+test audio::retranscription::tests::remote_cap_is_shared_with_other_remote_jobs ... ok
+test audio::retranscription::tests::remote_retranscriptions_beyond_cap_are_rejected_until_a_slot_frees ... ok
+test audio::retranscription::tests::test_audio_extensions_constant ... ok
+test audio::retranscription::tests::test_cancellation_flag ... ok
+test audio::retranscription::tests::test_create_transcript_segments_empty ... ok
+test audio::retranscription::tests::test_create_transcript_segments_generates_unique_ids ... ok
+test audio::retranscription::tests::test_create_transcript_segments_multiple ... ok
+test audio::retranscription::tests::test_create_transcript_segments_single ... ok
+test audio::retranscription::tests::test_create_transcript_segments_trims_whitespace ... ok
+test audio::playback_monitor::tests::test_get_output_device ... ok
+test audio::retranscription::tests::test_find_audio_file_common_candidates ... ok
+test audio::retranscription::tests::test_find_audio_file_empty_folder ... ok
+test audio::retranscription::tests::test_find_audio_file_non_mp4_extensions ... ok
+test audio::retranscription::tests::test_find_audio_file_fallback_scan ... ok
+test audio::retranscription::tests::test_find_audio_file_nonexistent_folder ... ok
+test audio::retranscription::tests::test_vad_redemption_time_constant ... ok
+test audio::job_persistence::tests::set_job_folder_records_the_folder_for_crash_reporting ... ok
+test audio::sharepoint_sync::tests::bare_date_since_is_widened_to_a_full_odata_datetime ... ok
+test audio::sharepoint_sync::tests::derives_the_my_host_from_a_root_host ... ok
+test audio::retranscription::tests::test_find_audio_file_priority_order ... ok
+test audio::sharepoint_sync::tests::direct_media_url_accepts_files_and_stream_pages ... ok
+test audio::sharepoint_sync::tests::download_candidates_ask_for_bytes_before_the_bare_url ... ok
+test audio::sharepoint_sync::tests::download_candidates_keep_an_existing_query ... ok
+test audio::sharepoint_sync::tests::file_url_keys_collide_across_encodings_and_case ... ok
+test audio::sharepoint_sync::tests::merge_dedupes_by_url_tags_sources_and_flags_existing ... ok
+test audio::sharepoint_sync::tests::onedrive_parser_tolerates_missing_or_odd_shapes ... ok
+test audio::sharepoint_sync::tests::odata_quotes_are_doubled_in_paths ... ok
+test audio::sharepoint_sync::tests::onedrive_parser_drops_non_media_files ... ok
+test audio::sharepoint_sync::tests::percent_decoding_handles_encoded_and_malformed_input ... ok
+test audio::sharepoint_sync::tests::parses_search_rest_rows ... ok
+test audio::sharepoint_sync::tests::parses_a_onedrive_folder_listing ... ok
+test audio::sharepoint_sync::tests::personal_path_mangles_upn_like_sharepoint_does ... ok
+test audio::sharepoint_sync::tests::recordings_query_url_embeds_path_filter_and_order ... ok
+test audio::sharepoint_sync::tests::player_page_url_is_site_scoped_and_fully_encoded ... ok
+test audio::sharepoint_sync::tests::redirect_summary_drops_the_query ... ok
+test audio::sharepoint_sync::tests::redirects_are_classified_by_target ... ok
+test audio::sharepoint_sync::tests::search_parser_prefers_direct_url_over_dispform_path ... ok
+test audio::sharepoint_sync::tests::search_body_summary_counts_rows_at_each_wrapping ... ok
+test audio::sharepoint_sync::tests::search_parser_tolerates_empty_results ... ok
+test audio::sharepoint_sync::tests::search_probe_url_encodes_kql ... ok
+test audio::sharepoint_sync::tests::search_query_url_uses_filetype_and_requests_url_properties ... ok
+test audio::sharepoint_sync::tests::search_parser_uses_title_over_generic_file_names ... ok
+test audio::sharepoint_sync::tests::stream_url_escapes_reserved_characters ... ok
+test audio::sharepoint_sync::tests::title_stem_matches_the_frontend_rule ... ok
+test audio::source_attribution::tests::aggregator_majority_energy_wins_over_count ... ok
+test audio::source_attribution::tests::aggregator_picks_energy_weighted_winner ... ok
+test audio::source_attribution::tests::aggregator_resets_after_finalize ... ok
+test audio::source_attribution::tests::aggregator_with_no_labeled_windows_yields_none ... ok
+test audio::source_attribution::tests::ambiguous_window_carries_previous_label ... ok
+test audio::source_attribution::tests::first_ambiguous_window_has_no_label ... ok
+test audio::source_attribution::tests::mic_dominant_window_is_labeled_microphone ... ok
+test audio::sharepoint_sync::tests::site_collection_url_finds_the_owning_site ... ok
+test audio::source_attribution::tests::near_equal_energy_does_not_flap ... ok
+test audio::source_attribution::tests::one_sided_signal_over_silence_is_labeled ... ok
+test audio::source_attribution::tests::rms_of_empty_window_is_zero ... ok
+test audio::source_attribution::tests::silence_breaks_the_carry_chain ... ok
+test audio::source_attribution::tests::silent_window_has_no_label ... ok
+test audio::source_attribution::tests::system_dominant_window_is_labeled_system ... ok
+test audio::job_persistence::tests::url_import_journal_round_trips_source_url_and_mode ... ok
+test audio::decoder::tests::test_chunked_resample_downsamples_correctly ... ok
+test audio::system_audio_commands::tests::test_check_permissions ... ok
+test audio::decoder::tests::test_chunked_resample_matches_single_pass ... ok
+test audio::system_detector::tests::test_system_audio_detector ... ignored
+test audio::transcription::gemini_batch::tests::a_pause_ends_a_segment ... ok
+test audio::transcription::gemini_batch::tests::a_speaker_change_ends_a_segment_even_without_a_pause ... ok
+test audio::transcription::gemini_batch::tests::an_hour_unannotated_is_a_single_request ... ok
+test audio::transcription::gemini_batch::tests::an_unpunctuated_monologue_still_breaks_at_the_cap ... ok
+test audio::transcription::gemini_batch::tests::authoritative_pass_always_requests_word_timestamps ... ok
+test audio::transcription::gemini_batch::tests::cancellation_is_neither_transient_nor_a_failure_to_retry ... ok
+test audio::transcription::gemini_batch::tests::chunks_tile_the_source_exactly ... ok
+test audio::transcription::gemini_batch::tests::configuration_and_contract_failures_are_hard ... ok
+test audio::transcription::gemini_batch::tests::diarization_alone_still_counts_as_annotated ... ok
+test audio::transcription::gemini_batch::tests::exactly_at_the_annotated_limit_is_a_single_request ... ok
+test audio::transcription::gemini_batch::tests::identical_labels_from_different_chunks_are_not_conflated ... ok
+test audio::transcription::gemini_batch::tests::just_over_the_limit_splits_evenly ... ok
+test audio::transcription::gemini_batch::tests::malformed_durations_are_errors_not_zero ... ok
+test audio::transcription::gemini_batch::tests::no_words_yields_no_segments ... ok
+test audio::transcription::gemini_batch::tests::offsets_are_shifted_by_the_chunk_base ... ok
+test audio::transcription::gemini_batch::tests::parses_google_duration_strings ... ok
+test audio::transcription::gemini_batch::tests::punctuation_does_not_split_below_the_minimum_length ... ok
+test audio::transcription::gemini_batch::tests::punctuation_splits_once_past_the_minimum_length ... ok
+test audio::transcription::gemini_batch::tests::quota_and_infrastructure_failures_are_transient ... ok
+test audio::transcription::gemini_batch::tests::quota_message_tells_the_user_it_is_retryable ... ok
+test audio::transcription::gemini_batch::tests::replanning_adds_one_chunk_and_eventually_gives_up ... ok
+test audio::transcription::gemini_batch::tests::segments_are_ordered_and_non_overlapping_but_gaps_survive ... ok
+test audio::transcription::gemini_batch::tests::segments_without_a_speaker_stay_unlabelled ... ok
+test audio::transcription::gemini_batch::tests::seventy_five_minutes_is_two_even_chunks_not_sixty_plus_fifteen ... ok
+test audio::transcription::gemini_batch::tests::speakers_are_numbered_by_first_appearance ... ok
+test audio::transcription::gemini_batch::tests::status_codes_map_to_the_right_variants ... ok
+test audio::transcription::gemini_batch::tests::unannotated_gets_the_full_hour ... ok
+test audio::transcription::gemini_batch::tests::unannotated_upload_becomes_exactly_one_segment_spanning_the_chunk ... ok
+test audio::transcription::gemini_transcribe_provider::tests::an_unrecognized_shape_fails_loudly_with_the_body ... ok
+test audio::transcription::gemini_transcribe_provider::tests::audio_shorter_than_the_minimum_is_rejected_before_any_request ... ok
+test audio::transcription::gemini_transcribe_provider::tests::bearer_token_is_required ... ok
+test audio::transcription::gemini_transcribe_provider::tests::blank_model_falls_back_to_the_batch_default ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::a_cancelled_token_stops_before_sending_anything ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::a_missing_upload_file_fails_before_any_request ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::a_success_body_that_is_not_json_is_a_hard_error ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::annotation_flags_track_the_options ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::http_statuses_map_to_typed_errors ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::omits_language_when_unset_or_auto ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::parses_words_with_offsets_and_opaque_speakers ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::quota_and_server_errors_are_retryable_but_auth_is_not ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::requesting_word_timestamps_and_getting_none_is_an_error ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::sends_every_documented_multipart_field ... ok
+test audio::transcription::gemini_transcribe_provider::tests::contract::unannotated_response_without_words_is_fine ... ok
+test audio::transcription::gemini_transcribe_provider::tests::empty_transcript_is_allowed ... ok
+test audio::transcription::gemini_transcribe_provider::tests::endpoint_is_derived_once_at_construction ... ok
+test audio::transcription::gemini_transcribe_provider::tests::extra_fields_are_ignored ... ok
+test audio::transcription::gemini_transcribe_provider::tests::falls_back_to_the_transcript_field ... ok
+test audio::transcription::gemini_transcribe_provider::tests::non_json_fails_with_the_body ... ok
+test audio::transcription::gemini_transcribe_provider::tests::parses_the_real_gateway_response ... ok
+test audio::transcription::gemini_transcribe_provider::tests::reads_the_text_field ... ok
+test audio::transcription::hermes_endpoints::tests::a_base_without_the_gateway_segment_is_left_alone ... ok
+test audio::transcription::hermes_endpoints::tests::derives_both_endpoints_from_the_configured_base ... ok
+test audio::transcription::hermes_endpoints::tests::empty_base_is_rejected ... ok
+test audio::transcription::hermes_endpoints::tests::explicit_ws_base_is_preserved ... ok
+test audio::transcription::hermes_endpoints::tests::gateway_segment_is_never_duplicated ... ok
+test audio::transcription::hermes_endpoints::tests::plain_http_downgrades_to_ws_for_local_gateways ... ok
+test audio::transcription::hermes_endpoints::tests::resolution_is_idempotent ... ok
+test audio::transcription::hermes_endpoints::tests::trailing_slashes_and_whitespace_are_tolerated ... ok
+test audio::transcription::hermes_endpoints::tests::unsupported_scheme_is_rejected ... ok
+test audio::transcription::hermes_live_protocol::tests::an_explicit_language_is_forwarded ... ok
+test audio::transcription::hermes_live_protocol::tests::auto_and_blank_languages_mean_gateway_detection ... ok
+test audio::transcription::hermes_live_protocol::tests::malformed_payloads_surface_an_error ... ok
+test audio::transcription::hermes_live_protocol::tests::optional_fields_default_to_none ... ok
+test audio::transcription::hermes_live_protocol::tests::parses_interim_and_final ... ok
+test audio::transcription::hermes_live_protocol::tests::parses_session_finished_and_error ... ok
+test audio::transcription::hermes_live_protocol::tests::parses_session_started ... ok
+test audio::transcription::hermes_live_protocol::tests::start_frame_matches_the_documented_shape ... ok
+test audio::transcription::hermes_live_protocol::tests::stop_frame_is_just_a_type ... ok
+test audio::transcription::hermes_live_protocol::tests::unknown_event_types_are_not_fatal ... ok
+test audio::transcription::hermes_live_protocol::tests::unknown_fields_are_ignored ... ok
+test audio::transcription::hermes_live_session::tests::a_drop_after_audio_was_sent_is_reported_as_such ... ok
+test audio::transcription::hermes_live_session::tests::a_failed_send_returns_the_frame_to_the_front ... ok
+test audio::transcription::hermes_live_session::tests::accounting_stays_consistent_across_push_and_pop ... ok
+test audio::transcription::hermes_live_session::tests::backoff_grows_then_saturates ... ok
+test audio::transcription::hermes_live_session::tests::buffer_is_bounded_and_drops_oldest_audio ... ok
+test audio::transcription::hermes_live_session::tests::chunks_already_at_16k_are_not_resampled ... ok
+test audio::transcription::hermes_live_session::tests::chunks_are_resampled_down_to_16k ... ok
+test audio::transcription::hermes_live_session::tests::client_errors_on_upgrade_are_fatal ... ok
+test audio::transcription::hermes_live_session::tests::final_span_overshoots_by_at_most_the_forwarded_lead ... ok
+test audio::transcription::hermes_live_session::tests::finals_partition_the_forwarded_timeline ... ok
+test audio::transcription::hermes_live_session::tests::out_of_order_forwarding_does_not_rewind_the_clock ... ok
+test audio::transcription::hermes_live_session::tests::server_errors_on_upgrade_are_retried ... ok
+test audio::transcription::hermes_live_session::tests::spans_never_run_backwards ... ok
+test audio::transcription::hermes_live_session::tests::transport_errors_are_retried ... ok
+test audio::transcription::hermes_live_session::tests::unsent_frames_are_retried_in_order ... ok
+test audio::transcription::pcm::tests::full_scale_hits_the_rails ... ok
+test audio::transcription::pcm::tests::out_of_range_samples_clamp_instead_of_wrapping ... ok
+test audio::transcription::pcm::tests::silence_encodes_to_zero_samples ... ok
+test audio::pcm_stream::tests::reports_a_missing_file_as_an_error ... ok
+test audio::transcription::pcm::tests::two_bytes_per_sample ... ok
+test audio::transcription::pcm::tests::wav_header_is_44_bytes_and_declares_the_payload ... ok
+test audio::incremental_saver::tests::empty_recording_reports_an_error ... ok
+test audio::incremental_saver::tests::finalizing_twice_is_an_error_not_a_panic ... ok
+test audio::stream_encoder::tests::duration_tracks_samples_written ... ok
+test audio::stream_encoder::tests::empty_writes_are_ignored ... ok
+test audio::vtt::tests::does_not_merge_across_long_gaps ... ok
+test audio::ffmpeg::tests::probes_a_real_file_without_requiring_ffprobe ... ok
+test audio::pcm_stream::tests::round_trips_a_tone_written_by_the_encoder ... ok
+test audio::stream_encoder::tests::encodes_a_playable_file ... ok
+test audio::vtt::tests::empty_input_errors ... ok
+test audio::stream_encoder::tests::a_full_backlog_drops_windows_instead_of_blocking ... ok
+test audio::vtt::tests::handles_mm_ss_and_multiline ... ok
+test audio::vtt::tests::handles_missing_voice_tag_and_entities ... ok
+test audio::vtt::tests::handles_unclosed_voice_tag ... ok
+test audio::vtt::tests::merge_respects_text_length_cap ... ok
+test audio::vtt::tests::merges_consecutive_same_speaker_cues ... ok
+test audio::vtt::tests::parses_teams_voice_cues ... ok
+test audio::vtt::tests::speakerless_cues_merge_with_each_other_but_not_with_named ... ok
+test audio::vtt::tests::tolerates_missing_webvtt_header ... ok
+test audio::system_audio_commands::tests::test_list_system_audio_devices ... ok
+test audio::incremental_saver::tests::streams_audio_straight_to_the_meeting_folder ... ok
+test audio::vad::tests::test_vad_continuous_processor_state_across_chunks ... ok
+test audio::vad::tests::test_vad_cancellation ... ok
+test audio::vad::tests::test_vad_large_file_progress ... ok
+test audio::vad::tests::test_vad_400ms_vs_2000ms_segmentation ... ok
+test audio::vad::tests::test_vad_chunked_vs_single_processing ... ok
+
+test result: ok. 287 passed; 0 failed; 2 ignored; 0 measured; 202 filtered out; finished in 15.61s
+
