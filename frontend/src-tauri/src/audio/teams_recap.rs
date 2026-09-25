@@ -48,7 +48,7 @@ mod windows {
         take_pwstr, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
         LaunchingExternalUriSchemeEventHandler,
     };
-    use windows::core::{Interface, PWSTR};
+    use ::windows::core::{Interface, PWSTR};
 
     const SILENT_WAIT: Duration = Duration::from_secs(25);
     const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
@@ -124,7 +124,7 @@ mod windows {
         let (sender, receiver) = oneshot::channel::<Result<(), String>>();
         window
             .with_webview(move |webview| {
-                let outcome = (|| -> windows::core::Result<()> {
+                let outcome = (|| -> ::windows::core::Result<()> {
                     let core = unsafe { webview.controller().CoreWebView2()? };
                     let core18: ICoreWebView2_18 = core.cast()?;
                     let handler =
