@@ -18,6 +18,7 @@ use log::{debug, info, warn};
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri::webview::Cookie;
+use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 
@@ -315,11 +316,31 @@ pub(crate) async fn create_auth_window<R: Runtime>(
     url: &Url,
     data_dir: &std::path::Path,
 ) -> Result<tauri::WebviewWindow<R>> {
+    create_auth_window_impl(app, url, data_dir, false).await
+}
+
+/// Let a caller install WebView2 event handlers before loading an external
+/// URL. Teams recap deep links may otherwise launch the desktop app before
+/// the recap importer can block that protocol hand-off.
+pub(crate) async fn create_auth_window_deferred<R: Runtime>(
+    app: &AppHandle<R>,
+    url: &Url,
+    data_dir: &std::path::Path,
+) -> Result<tauri::WebviewWindow<R>> {
+    create_auth_window_impl(app, url, data_dir, true).await
+}
+
+async fn create_auth_window_impl<R: Runtime>(
+    app: &AppHandle<R>,
+    url: &Url,
+    data_dir: &std::path::Path,
+    defer_navigation: bool,
+) -> Result<tauri::WebviewWindow<R>> {
     if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
         let _ = existing.destroy();
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    match build_auth_window(app, url, data_dir) {
+    match build_auth_window(app, url, data_dir, defer_navigation) {
         Ok(w) => Ok(w),
         Err(first) => {
             warn!("Auth window creation failed ({first}); destroying leftovers and retrying once");
@@ -327,7 +348,7 @@ pub(crate) async fn create_auth_window<R: Runtime>(
                 let _ = existing.destroy();
             }
             tokio::time::sleep(Duration::from_millis(700)).await;
-            build_auth_window(app, url, data_dir)
+            build_auth_window(app, url, data_dir, defer_navigation)
                 .context("Failed to open the SharePoint sign-in window")
         }
     }
@@ -337,18 +358,48 @@ fn build_auth_window<R: Runtime>(
     app: &AppHandle<R>,
     url: &Url,
     data_dir: &std::path::Path,
+    defer_navigation: bool,
 ) -> tauri::Result<tauri::WebviewWindow<R>> {
     let title = if url.host_str().unwrap_or("").starts_with("teams.") {
         "Sign in to Teams — Meetily"
     } else {
         "Sign in to SharePoint — Meetily"
     };
-    WebviewWindowBuilder::new(app, AUTH_WINDOW_LABEL, WebviewUrl::External(url.clone()))
-        .title(title)
-        .inner_size(1024.0, 768.0)
-        .data_directory(data_dir.to_path_buf())
-        .visible(false)
-        .build()
+    let initial_url = if defer_navigation {
+        Url::parse("about:blank").expect("about:blank is a valid URL")
+    } else {
+        url.clone()
+    };
+    let mut builder =
+        WebviewWindowBuilder::new(app, AUTH_WINDOW_LABEL, WebviewUrl::External(initial_url))
+            .title(title)
+            .inner_size(1024.0, 768.0)
+            .data_directory(data_dir.to_path_buf())
+            .visible(false);
+    if defer_navigation {
+        let app_for_popup = app.clone();
+        builder = builder.on_new_window(move |target, _| {
+            let scheme = target.scheme();
+            if scheme.eq_ignore_ascii_case("msteams") || scheme.eq_ignore_ascii_case("ms-teams") {
+                return NewWindowResponse::Deny;
+            }
+            let host = target.host_str().unwrap_or("").to_ascii_lowercase();
+            if matches!(
+                host.as_str(),
+                "teams.microsoft.com"
+                    | "teams.cloud.microsoft"
+                    | "teams.microsoft.com.mcas.ms"
+                    | "teams.cloud.microsoft.mcas.ms"
+            ) {
+                if let Some(window) = app_for_popup.get_webview_window(AUTH_WINDOW_LABEL) {
+                    let _ = window.navigate(target);
+                }
+                return NewWindowResponse::Deny;
+            }
+            NewWindowResponse::Allow
+        });
+    }
+    builder.build()
 }
 
 /// Build a yt-dlp cookie file from cookies already harvested by a

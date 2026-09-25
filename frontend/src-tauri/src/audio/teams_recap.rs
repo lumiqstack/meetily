@@ -43,7 +43,12 @@ mod windows {
     use std::time::Duration;
     use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
     use tokio::sync::oneshot;
-    use webview2_com::{CoTaskMemPWSTR, ExecuteScriptCompletedHandler};
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_18;
+    use webview2_com::{
+        take_pwstr, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
+        LaunchingExternalUriSchemeEventHandler,
+    };
+    use windows::core::{Interface, PWSTR};
 
     const SILENT_WAIT: Duration = Duration::from_secs(25);
     const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
@@ -62,7 +67,21 @@ mod windows {
       const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
       const tabs = [...document.querySelectorAll('[role="tab"]')];
       const tab = tabs.find(el => /^ai summary$/i.test(text(el)));
-      if (!tab) return { status: 'waiting' };
+      if (!tab) {
+        const choices = [...document.querySelectorAll('a,button,[role="button"]')];
+        const webChoice = choices.find(el =>
+          /^(continue (on|in) (this|the) browser|use the web app( instead)?|open (in|on) (the )?web( app)?|continue in browser)$/i
+            .test(text(el) || el.getAttribute('aria-label') || ''));
+        if (webChoice) {
+          webChoice.click();
+          return { status: 'opening_web' };
+        }
+        const page = text(document.body).slice(0, 1200);
+        if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(page)) {
+          return { status: 'launcher' };
+        }
+        return { status: 'waiting' };
+      }
       if (tab.getAttribute('aria-selected') !== 'true') {
         tab.click();
         return { status: 'waiting' };
@@ -99,6 +118,46 @@ mod windows {
         notes: Vec<String>,
         #[serde(default)]
         tasks: Vec<String>,
+    }
+
+    async fn block_desktop_handoff<R: Runtime>(window: &WebviewWindow<R>) -> Result<()> {
+        let (sender, receiver) = oneshot::channel::<Result<(), String>>();
+        window
+            .with_webview(move |webview| {
+                let outcome = (|| -> windows::core::Result<()> {
+                    let core = unsafe { webview.controller().CoreWebView2()? };
+                    let core18: ICoreWebView2_18 = core.cast()?;
+                    let handler =
+                        LaunchingExternalUriSchemeEventHandler::create(Box::new(move |_, args| {
+                            if let Some(args) = args {
+                                let mut uri = PWSTR::null();
+                                unsafe { args.Uri(&mut uri)? };
+                                let uri = take_pwstr(uri);
+                                let scheme = uri.split(':').next().unwrap_or("");
+                                if scheme.eq_ignore_ascii_case("msteams")
+                                    || scheme.eq_ignore_ascii_case("ms-teams")
+                                {
+                                    unsafe { args.SetCancel(true)? };
+                                    log::info!(
+                                        "Blocked Teams desktop-app handoff during recap import"
+                                    );
+                                }
+                            }
+                            Ok(())
+                        }));
+                    let mut token = 0;
+                    unsafe { core18.add_LaunchingExternalUriScheme(&handler, &mut token)? };
+                    Ok(())
+                })()
+                .map_err(|error| error.to_string());
+                let _ = sender.send(outcome);
+            })
+            .map_err(|e| anyhow!("Could not configure the Teams WebView2 window: {e}"))?;
+        tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .map_err(|_| anyhow!("Timed out configuring the Teams WebView2 window."))?
+            .map_err(|_| anyhow!("The Teams WebView2 window closed during setup."))?
+            .map_err(|e| anyhow!("Could not block Teams desktop-app handoff: {e}"))
     }
 
     async fn execute_script<R: Runtime>(window: &WebviewWindow<R>, script: &str) -> Result<String> {
@@ -175,11 +234,22 @@ mod windows {
         window: &WebviewWindow<R>,
         deadline: tokio::time::Instant,
     ) -> Result<Option<TeamsRecap>> {
+        let mut launcher_since = None;
         while tokio::time::Instant::now() < deadline {
             if let Ok(raw) = execute_script(window, RECAP_SCRIPT).await {
                 if let Ok(probe) = serde_json::from_str::<Probe>(&raw) {
                     if probe.status == "ready" {
                         return format_recap(probe).map(Some);
+                    }
+                    if probe.status == "launcher" || probe.status == "opening_web" {
+                        let since = launcher_since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() > Duration::from_secs(45) {
+                            return Err(anyhow!(
+                                "Teams stayed on its app-choice page. Select the web/browser option in Meetily's sign-in window, not the Teams desktop app, then retry."
+                            ));
+                        }
+                    } else {
+                        launcher_since = None;
                     }
                 }
             }
@@ -198,9 +268,12 @@ mod windows {
             .map_err(|e| anyhow!("Could not resolve app data directory: {e}"))?
             .join("sp-webview");
         std::fs::create_dir_all(&data_dir)?;
-        let window = super::super::sharepoint::create_auth_window(app, url, &data_dir).await?;
+        let window =
+            super::super::sharepoint::create_auth_window_deferred(app, url, &data_dir).await?;
 
         let result = async {
+            block_desktop_handoff(&window).await?;
+            window.navigate(url.clone())?;
             if let Some(recap) = poll(&window, tokio::time::Instant::now() + SILENT_WAIT).await? {
                 return Ok(recap);
             }
