@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
-const rust = readFileSync(new URL('../../src-tauri/src/audio/teams_recap.rs', import.meta.url), 'utf8');
-const script = rust.match(/const RECAP_SCRIPT: &str = r#"([\s\S]*?)"#;/)[1];
+const script = readFileSync(new URL('../../src-tauri/src/audio/teams_recap.js', import.meta.url), 'utf8');
 function tab(name, selected = false) {
   return { innerText: name, clicked: false,
     getAttribute: () => String(selected),

@@ -7,9 +7,15 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
+#[path = "obsidian_filename.rs"]
+mod filename;
+
 const STORE_FILE: &str = "obsidian_settings.json";
 const STORE_KEY: &str = "settings";
 const MEETINGS_FOLDER: &str = "Meetings";
+// Serialize filename selection and writing so simultaneous readable-name
+// exports cannot select the same free path within this app.
+static EXPORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// New exports use `{short_id}` so two meetings sharing a date and title do
 /// not overwrite each other in the vault.
 const DEFAULT_FILENAME_TEMPLATE: &str = "{date} {title} {short_id}.md";
@@ -390,7 +396,7 @@ fn note_belongs_to_meeting(path: &Path, meeting_id: &str) -> bool {
 /// 2. otherwise adopt a pre-existing note (from before this table existed)
 ///    whose front matter matches — legacy template first, then the current
 ///    template — so earlier exports are not duplicated or renamed;
-/// 3. otherwise a fresh export uses the configured (collision-safe) template.
+/// 3. otherwise use the template, adding a readable number on collision.
 /// Read-only: recording happens after a successful write.
 async fn resolve_export_filename(
     pool: Option<&SqlitePool>,
@@ -419,7 +425,12 @@ async fn resolve_export_filename(
         }
     }
 
-    current
+    // A readable/custom template may omit an ID. Keep other meetings and
+    // manually written notes intact, using a human-readable collision suffix.
+    filename::available_filename(&current, |candidate| {
+        let path = meetings_dir.join(candidate);
+        !path.exists() || note_belongs_to_meeting(&path, meeting_id)
+    })
 }
 
 /// Write a meeting note into the configured vault. Shared by the manual
@@ -433,9 +444,38 @@ pub async fn export_meeting_note<R: Runtime>(
     summary_markdown: &str,
     transcript_markdown: &str,
 ) -> Result<ObsidianExportResult, String> {
-    let settings = load_obsidian_settings(app)
+    export_note(
+        app, meeting_id, title, created_at, summary_markdown, transcript_markdown, false,
+    )
+    .await
+}
+
+/// Recap notes use date + title, while their stable ID remains in front matter.
+pub async fn export_copilot_recap_note<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    title: &str,
+    created_at: &str,
+    summary_markdown: &str,
+) -> Result<ObsidianExportResult, String> {
+    export_note(app, meeting_id, title, created_at, summary_markdown, "", true).await
+}
+
+async fn export_note<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    title: &str,
+    created_at: &str,
+    summary_markdown: &str,
+    transcript_markdown: &str,
+    readable_recap_name: bool,
+) -> Result<ObsidianExportResult, String> {
+    let mut settings = load_obsidian_settings(app)
         .await
         .map_err(|e| e.to_string())?;
+    if readable_recap_name {
+        settings.filename_template = LEGACY_FILENAME_TEMPLATE.to_string();
+    }
     let vault_path = settings
         .vault_path
         .clone()
@@ -448,6 +488,7 @@ pub async fn export_meeting_note<R: Runtime>(
         .map_err(|e| format!("Failed to create Meetings folder: {}", e))?;
 
     let pool = pool_of(app);
+    let _export_guard = EXPORT_LOCK.lock().await;
     let filename = resolve_export_filename(
         pool.as_ref(),
         &settings,
@@ -717,6 +758,21 @@ mod tests {
         .await;
         assert_ne!(resolved, legacy_name);
         assert!(resolved.ends_with(" a.md"));
+    }
+
+    #[tokio::test]
+    async fn readable_recap_name_has_no_id_and_preserves_colliding_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings(LEGACY_FILENAME_TEMPLATE);
+        let created = "2026-07-25T12:00:00Z";
+        let name = resolve_export_filename(None, &settings, dir.path(), "meeting-aaaa", "Weekly", created).await;
+        assert_eq!(name, "2026-07-25 Weekly.md");
+        std::fs::write(dir.path().join(&name), "Keep this personal note").unwrap();
+        let second = resolve_export_filename(None, &settings, dir.path(), "meeting-bbbb", "Weekly", created).await;
+        assert_eq!(second, "2026-07-25 Weekly (2).md");
+        std::fs::write(dir.path().join(&second), "---\nmeeting_id: \"meeting-bbbb\"\n---\n").unwrap();
+        assert_eq!(resolve_export_filename(None, &settings, dir.path(), "meeting-bbbb", "Weekly", created).await, second);
+        assert_eq!(std::fs::read_to_string(dir.path().join(&name)).unwrap(), "Keep this personal note");
     }
 
     #[test]

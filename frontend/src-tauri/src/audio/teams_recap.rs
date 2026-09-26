@@ -62,67 +62,7 @@ mod windows {
     // role/name, then read only its notes and task rows. A layout change
     // produces "waiting" and ultimately a clear error, never a transcript
     // or unrelated Activity text masquerading as a recap.
-    const RECAP_SCRIPT: &str = r#"(() => {
-      const host = location.hostname.toLowerCase();
-      if (!['teams.microsoft.com', 'teams.cloud.microsoft',
-            'teams.microsoft.com.mcas.ms', 'teams.cloud.microsoft.mcas.ms'].includes(host)) {
-        return { status: 'waiting' };
-      }
-      const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
-      const tabs = [...document.querySelectorAll('[role="tab"]')];
-      const tab = tabs.find(el => /^ai summary$/i.test(text(el)));
-      if (!tab) {
-        const choices = [...document.querySelectorAll('a,button,[role="button"]')];
-        const webChoice = choices.find(el =>
-          /^(continue (on|in) (this|the) browser|use the web app( instead)?|open (in|on) (the )?web( app)?|continue in browser)$/i
-            .test(text(el) || el.getAttribute('aria-label') || ''));
-        if (webChoice) {
-          webChoice.click();
-          return { status: 'opening_web' };
-        }
-        const page = text(document.body).slice(0, 1200);
-        if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(page)) {
-          return { status: 'launcher' };
-        }
-        // Sign-in can restore the last chat and lose the incoming deep link.
-        // Never click that chat's Recap tab: it may be a different meeting.
-        const names = tabs.map(text);
-        const recapSelected = tabs.some(el => /^recap$/i.test(text(el)) &&
-          el.getAttribute('aria-selected') === 'true');
-        if (!recapSelected && names.some(s => /^chat$/i.test(s)) &&
-            names.some(s => /^(shared|files|recap)$/i.test(s))) {
-          return { status: 'signed_in_chat' };
-        }
-        return { status: 'waiting' };
-      }
-      if (tab.getAttribute('aria-selected') !== 'true') {
-        tab.click();
-        return { status: 'waiting' };
-      }
-      const headings = [...document.querySelectorAll('h2,[role="heading"]')];
-      const notesHeading = headings.find(el => /^meeting notes$/i.test(text(el)));
-      const tasksHeading = headings.find(el => /^follow-up tasks$/i.test(text(el)));
-      if (!notesHeading && !tasksHeading) return { status: 'waiting' };
-      const expand = [...document.querySelectorAll('button')]
-        .find(el => /^expand all$/i.test(text(el)));
-      if (expand && !window.__meetilyRecapExpanded) {
-        window.__meetilyRecapExpanded = true;
-        expand.click();
-        return { status: 'waiting' };
-      }
-      const follows = (first, second) =>
-        !!(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
-      const rowsAfter = (heading, before) => heading
-        ? [...document.querySelectorAll('[role="row"]')]
-            .filter(row => follows(heading, row) && (!before || follows(row, before)))
-            .map(text).filter(Boolean)
-        : [];
-      const notes = rowsAfter(notesHeading, tasksHeading);
-      const tasks = rowsAfter(tasksHeading, null)
-        .map(s => s.replace(/^\s*[•.\-]\s*/, ''));
-      if (!notes.length && !tasks.length) return { status: 'waiting' };
-      return { status: 'ready', notes, tasks };
-    })()"#;
+    const RECAP_SCRIPT: &str = include_str!("teams_recap.js");
 
     #[derive(Debug, Deserialize)]
     struct Probe {
@@ -219,8 +159,7 @@ mod windows {
         if !probe.notes.is_empty() {
             markdown.push_str("## Meeting notes\n\n");
             for note in probe.notes {
-                markdown.push_str("- ");
-                markdown.push_str(note.trim());
+                markdown.push_str(note.trim_end());
                 markdown.push('\n');
             }
         }
@@ -230,7 +169,6 @@ mod windows {
             }
             markdown.push_str("## Follow-up tasks\n\n");
             for task in probe.tasks {
-                markdown.push_str("- ");
                 markdown.push_str(task.trim());
                 markdown.push('\n');
             }
@@ -251,6 +189,7 @@ mod windows {
         started: tokio::time::Instant,
     ) -> Result<Option<TeamsRecap>> {
         let mut launcher_since = None;
+        let mut tasks_since = None;
         let mut previous_status = String::new();
         while tokio::time::Instant::now() < deadline {
             if window.url().is_err() {
@@ -266,6 +205,8 @@ mod windows {
                         "launcher" => "launcher",
                         "opening_web" => "opening_web",
                         "signed_in_chat" => "signed_in_chat",
+                        "waiting_tasks" => "waiting_tasks",
+                        "collecting_recap" => "collecting_recap",
                         _ => "waiting",
                     };
                     if status != previous_status {
@@ -290,7 +231,20 @@ mod windows {
                         navigation::Action::Wait => {}
                     }
                     if probe.status == "ready" {
+                        log::info!(
+                            "Teams recap extracted: notes={}, tasks={}",
+                            probe.notes.len(),
+                            probe.tasks.len()
+                        );
                         return format_recap(probe).map(Some);
+                    }
+                    if status == "waiting_tasks" {
+                        let since = tasks_since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() > Duration::from_secs(45) {
+                            return Err(anyhow!("Teams meeting notes loaded, but its Follow-up tasks section could not be read. No partial recap was saved. Open Follow-up tasks in the recap window and retry."));
+                        }
+                    } else {
+                        tasks_since = None;
                     }
                     if probe.status == "launcher" || probe.status == "opening_web" {
                         let since = launcher_since.get_or_insert_with(tokio::time::Instant::now);

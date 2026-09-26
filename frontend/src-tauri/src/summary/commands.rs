@@ -214,13 +214,12 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         Some(source_url.to_string()),
     )
     .await?;
-    let exported = crate::obsidian::export_meeting_note(
+    let exported = crate::obsidian::export_copilot_recap_note(
         &app,
         &imported.meeting_id,
         &imported.title,
         &Utc::now().to_rfc3339(),
         &recap_markdown,
-        "",
     )
     .await
     .map_err(|e| format!(
