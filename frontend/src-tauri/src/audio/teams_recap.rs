@@ -6,6 +6,10 @@
 use anyhow::{anyhow, Result};
 use url::Url;
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "teams_recap_navigation.rs"]
+mod navigation;
+
 #[derive(Debug, Clone)]
 pub struct TeamsRecap {
     pub markdown: String,
@@ -39,6 +43,7 @@ pub fn validate_recap_url(input: &str) -> Result<Url> {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
+    use ::windows::core::{Interface, PWSTR};
     use serde::Deserialize;
     use std::time::Duration;
     use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
@@ -48,7 +53,6 @@ mod windows {
         take_pwstr, CoTaskMemPWSTR, ExecuteScriptCompletedHandler,
         LaunchingExternalUriSchemeEventHandler,
     };
-    use ::windows::core::{Interface, PWSTR};
 
     const SILENT_WAIT: Duration = Duration::from_secs(25);
     const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
@@ -79,6 +83,15 @@ mod windows {
         const page = text(document.body).slice(0, 1200);
         if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(page)) {
           return { status: 'launcher' };
+        }
+        // Sign-in can restore the last chat and lose the incoming deep link.
+        // Never click that chat's Recap tab: it may be a different meeting.
+        const names = tabs.map(text);
+        const recapSelected = tabs.some(el => /^recap$/i.test(text(el)) &&
+          el.getAttribute('aria-selected') === 'true');
+        if (!recapSelected && names.some(s => /^chat$/i.test(s)) &&
+            names.some(s => /^(shared|files|recap)$/i.test(s))) {
+          return { status: 'signed_in_chat' };
         }
         return { status: 'waiting' };
       }
@@ -233,11 +246,49 @@ mod windows {
     async fn poll<R: Runtime>(
         window: &WebviewWindow<R>,
         deadline: tokio::time::Instant,
+        source_url: &Url,
+        navigation: &mut navigation::Navigation,
+        started: tokio::time::Instant,
     ) -> Result<Option<TeamsRecap>> {
         let mut launcher_since = None;
+        let mut previous_status = String::new();
         while tokio::time::Instant::now() < deadline {
+            if window.url().is_err() {
+                return Err(anyhow!(
+                    "The Teams recap window was closed. Retry the import when ready."
+                ));
+            }
             if let Ok(raw) = execute_script(window, RECAP_SCRIPT).await {
                 if let Ok(probe) = serde_json::from_str::<Probe>(&raw) {
+                    // Only log fixed state names, never page text or private URLs.
+                    let status = match probe.status.as_str() {
+                        "ready" => "ready",
+                        "launcher" => "launcher",
+                        "opening_web" => "opening_web",
+                        "signed_in_chat" => "signed_in_chat",
+                        _ => "waiting",
+                    };
+                    if status != previous_status {
+                        log::info!("Teams recap state: {status}");
+                        previous_status = status.to_owned();
+                    }
+                    match navigation.observe(status, started.elapsed().as_millis() as u64) {
+                        navigation::Action::RetryLink => {
+                            log::info!(
+                                "Teams recap: retrying original link after sign-in restored a chat"
+                            );
+                            window.set_title("Teams recap — reopening requested meeting")?;
+                            window.show()?;
+                            window.navigate(source_url.clone())?;
+                        }
+                        navigation::Action::ReportWrongPage => {
+                            log::info!("Teams recap state: wrong_page_after_retry");
+                            return Err(anyhow!(
+                                "Teams signed in but opened a chat instead of the requested meeting recap, even after reopening the link. No recap was imported. Check that this link opens the correct recap in Teams on the web; you can also paste its AI summary into Meetily's recap field."
+                            ));
+                        }
+                        navigation::Action::Wait => {}
+                    }
                     if probe.status == "ready" {
                         return format_recap(probe).map(Some);
                     }
@@ -274,12 +325,15 @@ mod windows {
         let result = async {
             block_desktop_handoff(&window).await?;
             window.navigate(url.clone())?;
-            if let Some(recap) = poll(&window, tokio::time::Instant::now() + SILENT_WAIT).await? {
+            let started = tokio::time::Instant::now();
+            let mut navigation = navigation::Navigation::default();
+            if let Some(recap) = poll(&window, started + SILENT_WAIT, url, &mut navigation, started).await? {
                 return Ok(recap);
             }
+            window.set_title("Teams recap — sign in and open the requested AI summary")?;
             window.show()?;
             window.set_focus()?;
-            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT)
+            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, started)
                 .await?
                 .ok_or_else(|| anyhow!(
                     "Teams did not show an AI summary for this link. Sign in if prompted, then check that the recap's AI summary tab is available."
