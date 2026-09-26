@@ -214,6 +214,7 @@ fn build_obsidian_markdown(
     created_at: &str,
     summary_markdown: &str,
     transcript_markdown: &str,
+    recorded_at: Option<&str>,
 ) -> String {
     let exported_at = Utc::now().to_rfc3339();
     let title = title.trim();
@@ -231,6 +232,9 @@ fn build_obsidian_markdown(
         note.push_str("\n## Transcript\n\n");
         note.push_str(transcript_markdown.trim());
         note.push('\n');
+    }
+    if let Some(recorded_at) = recorded_at.filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value)) {
+        note = note.replacen("\ncreated:", &format!("\nrecorded_at: \"{recorded_at}\"\ncreated:"), 1);
     }
     note
 }
@@ -445,7 +449,7 @@ pub async fn export_meeting_note<R: Runtime>(
     transcript_markdown: &str,
 ) -> Result<ObsidianExportResult, String> {
     export_note(
-        app, meeting_id, title, created_at, summary_markdown, transcript_markdown, false,
+        app, meeting_id, title, created_at, summary_markdown, transcript_markdown, false, None,
     )
     .await
 }
@@ -457,8 +461,9 @@ pub async fn export_copilot_recap_note<R: Runtime>(
     title: &str,
     created_at: &str,
     summary_markdown: &str,
+    recorded_at: Option<&str>,
 ) -> Result<ObsidianExportResult, String> {
-    export_note(app, meeting_id, title, created_at, summary_markdown, "", true).await
+    export_note(app, meeting_id, title, created_at, summary_markdown, "", true, recorded_at).await
 }
 
 async fn export_note<R: Runtime>(
@@ -469,12 +474,16 @@ async fn export_note<R: Runtime>(
     summary_markdown: &str,
     transcript_markdown: &str,
     readable_recap_name: bool,
+    recorded_at: Option<&str>,
 ) -> Result<ObsidianExportResult, String> {
     let mut settings = load_obsidian_settings(app)
         .await
         .map_err(|e| e.to_string())?;
     if readable_recap_name {
-        settings.filename_template = LEGACY_FILENAME_TEMPLATE.to_string();
+        settings.filename_template = recorded_at
+            .filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value))
+            .map(|value| format!("{} {{title}}.md", &value[..10]))
+            .unwrap_or_else(|| LEGACY_FILENAME_TEMPLATE.to_string());
     }
     let vault_path = settings
         .vault_path
@@ -499,12 +508,24 @@ async fn export_note<R: Runtime>(
     )
     .await;
     let file_path = meetings_dir.join(&filename);
+    // A later manual re-export receives Markdown only. Retain the recording
+    // property already attached to this meeting's existing note.
+    let saved_recorded_at = if recorded_at.is_none() && note_belongs_to_meeting(&file_path, meeting_id) {
+        std::fs::read_to_string(&file_path).ok().and_then(|content| {
+            content.lines().take(15).find_map(|line| {
+                line.strip_prefix("recorded_at: \"")?.strip_suffix('"')
+                    .filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value))
+                    .map(str::to_owned)
+            })
+        })
+    } else { None };
     let markdown = build_obsidian_markdown(
         meeting_id,
         title,
         created_at,
         summary_markdown,
         transcript_markdown,
+        recorded_at.or(saved_recorded_at.as_deref()),
     );
 
     std::fs::write(&file_path, markdown)
@@ -562,9 +583,11 @@ mod tests {
             "2026-09-23T11:40:00Z",
             "## Meeting notes\n\n- Existing Copilot recap",
             "",
+            Some("2026-09-23T11:40:00"),
         );
         assert!(note.contains("## Meeting notes"));
         assert!(!note.contains("## Transcript"));
+        assert!(note.contains("recorded_at: \"2026-09-23T11:40:00\""));
     }
 
     #[test]

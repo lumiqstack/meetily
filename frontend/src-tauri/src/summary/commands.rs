@@ -111,6 +111,7 @@ async fn save_extracted_copilot_recap(
     title: String,
     recap: String,
     source_url: Option<String>,
+    recorded_at: Option<String>,
 ) -> Result<ImportedRecapResponse, String> {
     let title = title.trim();
     let recap = recap.trim();
@@ -147,6 +148,7 @@ async fn save_extracted_copilot_recap(
         "markdown": recap,
         "imported_from": "microsoft_copilot_recap",
         "source_url": source_url.as_deref(),
+        "recorded_at": recorded_at,
     });
     if !summary_is_renderable(&summary) {
         return Err("Copilot recap contains no visible content and was not imported.".into());
@@ -182,6 +184,10 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
 ) -> Result<ImportedRecapFromLinkResponse, String> {
     let validated_url = crate::audio::teams_recap::validate_recap_url(source_url.trim())
         .map_err(|e| e.to_string())?;
+    let recording = crate::audio::teams_recap::recording_metadata(&validated_url);
+    let title = crate::audio::teams_recap::metadata::from_filename(&title)
+        .map(|metadata| metadata.title)
+        .unwrap_or(title);
     let source_url = validated_url.as_str();
 
     // An explicit "import to Obsidian" must not silently succeed only in
@@ -209,6 +215,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         title,
         recap_markdown.clone(),
         Some(source_url.to_string()),
+        recording.as_ref().map(|metadata| metadata.recorded_at.clone()),
     )
     .await?;
     let exported = crate::obsidian::export_copilot_recap_note(
@@ -217,6 +224,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         &imported.title,
         &Utc::now().to_rfc3339(),
         &recap_markdown,
+        recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
     )
     .await
     .map_err(|e| format!(

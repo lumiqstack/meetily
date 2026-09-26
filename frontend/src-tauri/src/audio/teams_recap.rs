@@ -6,6 +6,15 @@
 use anyhow::{anyhow, Result};
 use url::Url;
 
+#[path = "teams_recap_metadata.rs"]
+pub(crate) mod metadata;
+
+pub(crate) fn recording_metadata(url: &Url) -> Option<metadata::RecordingMetadata> {
+    let (_, file_url) = url.query_pairs().find(|(key, _)| key == "fileUrl")?;
+    let file_url = Url::parse(&file_url).ok()?;
+    metadata::from_filename(file_url.path().rsplit('/').next()?)
+}
+
 #[cfg(any(target_os = "windows", test))]
 #[path = "teams_recap_navigation.rs"]
 mod navigation;

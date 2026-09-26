@@ -44,6 +44,7 @@ import { useRouter } from 'next/navigation';
 import { useSidebar } from '../Sidebar/SidebarProvider';
 import { LANGUAGES } from '@/constants/languages';
 import { detectLinkContentMode } from '@/lib/link-content-mode';
+import { recapTitleFromFileUrl } from '@/lib/teams-recap-title';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import { getSharedImportQueue } from '@/lib/import-queue';
 import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
@@ -122,12 +123,7 @@ function deriveTitleFromUrl(url: string): string {
     if (detectLinkContentMode(url) === 'recap') {
       const fileUrl = u.searchParams.get('fileUrl');
       if (fileUrl) {
-        const fileName = new URL(fileUrl).pathname.split('/').filter(Boolean).pop() || '';
-        const title = decodeURIComponent(fileName)
-          .replace(/\.mp4$/i, '')
-          .replace(/-Meeting Transcript$/i, '')
-          .replace(/-\d{8}_\d{6}$/, '')
-          .trim();
+        const title = recapTitleFromFileUrl(fileUrl);
         if (title) return title;
       }
       return 'Teams meeting recap';

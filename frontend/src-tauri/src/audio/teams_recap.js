@@ -57,17 +57,19 @@
       }
       const follows = (first, second) =>
         !!(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
-      const controls = /^(copy|copy notes|copy link|edit|more options|expand|collapse|assign|unassigned)$/i;
+      const controls = /^(copy|copy notes|copy link|edit|more options|expand|collapse|assign|unassigned|are these (?:tasks|notes) useful\??)$/i;
+      const timestamp = /^\d{1,2}:\d{2}(?::\d{2})?$/;
       const inline = node => {
         if (node.nodeType === Node.TEXT_NODE)
           return node.textContent.replace(/([\\*_\[\]])/g, '\\$1');
         if (node.nodeType !== Node.ELEMENT_NODE) return '';
         if (node.matches('script,style,svg,input,[aria-hidden="true"]') ||
-            (node.matches('button,[role="button"]') && controls.test(text(node)))) return '';
+            (node.matches('button,a,[role="button"],sup,time') &&
+              (controls.test(text(node)) || timestamp.test(text(node)) || /^\d+$/.test(text(node))))) return '';
         if (node.tagName === 'BR') return '\n';
         const value = [...node.childNodes].map(inline).join('');
         if (node.matches('strong,b')) return value.trim() ? '**' + value.trim() + '**' : '';
-        if (node.matches('p,div')) return value + '\n';
+        if (node.matches('p,div')) return '\n' + value + '\n';
         return value;
       };
       const rowMarkdown = (row, tasks) => {
@@ -75,10 +77,14 @@
         const child = /^\s*[.\u2022\u25e6]\s+/.test(raw) ||
           Number(row.getAttribute('aria-level') || 1) > 1;
         let value = raw.replace(/^\s*(?:[.\u2022\u25e6-]\s+)+/, '').trim();
-        if (!value || controls.test(value)) return '';
+        // Playback timestamps can also be plain sibling text after the note.
+        // Keep times used inside actual sentences (for example "meet at 10:30").
+        value = value.split('\n').filter(line => !timestamp.test(line.trim())).join('\n').trim();
+        if (!value || controls.test(value) || /^[\d\s.\u2022\u25e6-]+$/.test(value)) return '';
+        value = value.replace(/(\*\*[^*\n]+:\*\*)(?=\S)/g, '$1 ');
         // Some Teams rows render the topic in a styled span rather than <strong>.
         if (!value.startsWith('**')) {
-          const subject = value.match(/^([^:\n]{1,160}):\s*/);
+          const subject = value.match(/^([^:\n]{1,160}):(?:\s+|(?=[^\d]))/);
           if (subject) value = '**' + subject[1].trim() + ':** ' + value.slice(subject[0].length);
         }
         const indent = !tasks && child ? '  ' : '';

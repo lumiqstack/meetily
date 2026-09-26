@@ -69,3 +69,22 @@ test('does not include unrelated content outside the recap panel', async () => {
     assert.deepEqual((await ready(page)).tasks, ['- [ ] **Follow up:** Alex']);
   } finally { await page.close(); }
 });
+
+test('drops playback timestamps, reference controls and task feedback artifacts', async () => {
+  const page = await pageFor('<h3>Meeting notes</h3><div role="row"><b>Planning:</b> Keep the release small.<div>00:11</div></div><div role="row" aria-level="2"><button>1</button><button>2</button></div><h3>Follow-up tasks</h3><p>.</p><li><strong>Send estimate:</strong>Alex to send it tomorrow.</li><p>Are these tasks useful?</p>');
+  try {
+    const result = await ready(page);
+    assert.deepEqual(result.notes, ['- **Planning:** Keep the release small.']);
+    assert.deepEqual(result.tasks, ['- [ ] **Send estimate:** Alex to send it tomorrow.']);
+  } finally { await page.close(); }
+});
+
+test('retains substantive times and quantities within sentences', async () => {
+  const page = await pageFor('<h3>Meeting notes</h3><div role="row"><strong>Schedule:</strong> Meet at 10:30 with 200 units.<button>01:20</button></div><h3>Follow-up tasks</h3><li>Deliver at 14:00: Alex</li>');
+  try {
+    const result = await ready(page);
+    assert.match(result.notes[0], /Meet at 10:30 with 200 units\./);
+    assert.ok(!result.notes[0].includes('01:20'));
+    assert.match(result.tasks[0], /14:00/);
+  } finally { await page.close(); }
+});
