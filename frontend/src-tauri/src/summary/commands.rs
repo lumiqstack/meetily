@@ -103,12 +103,10 @@ enum MeetingFolderResolution {
     NoFolder,
 }
 
-/// Creates a meeting whose summary is an existing Microsoft Copilot recap.
+/// Persist a recap already extracted from the authenticated Teams webview.
 /// This intentionally bypasses recording download, speech-to-text, and LLM
 /// summary generation.
-#[tauri::command]
-pub async fn api_import_copilot_recap<R: Runtime>(
-    _app: AppHandle<R>,
+async fn save_extracted_copilot_recap(
     state: tauri::State<'_, AppState>,
     title: String,
     recap: String,
@@ -206,8 +204,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         recap.markdown.trim(),
         source_url
     );
-    let imported = api_import_copilot_recap(
-        app.clone(),
+    let imported = save_extracted_copilot_recap(
         state,
         title,
         recap_markdown.clone(),

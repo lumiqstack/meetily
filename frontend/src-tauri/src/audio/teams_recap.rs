@@ -225,7 +225,7 @@ mod windows {
                         navigation::Action::ReportWrongPage => {
                             log::info!("Teams recap state: wrong_page_after_retry");
                             return Err(anyhow!(
-                                "Teams signed in but opened a chat instead of the requested meeting recap, even after reopening the link. No recap was imported. Check that this link opens the correct recap in Teams on the web; you can also paste its AI summary into Meetily's recap field."
+                                "Teams signed in but opened a chat instead of the requested meeting recap, even after reopening the link. No recap was imported. Check that this link opens the correct recap in Teams on the web, then retry the link in Meetily."
                             ));
                         }
                         navigation::Action::Wait => {}

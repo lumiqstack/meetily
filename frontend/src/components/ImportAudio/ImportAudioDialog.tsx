@@ -18,7 +18,6 @@ import {
   Cloud,
   RefreshCw,
   Sparkles,
-  ClipboardPaste,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -166,7 +165,6 @@ export function ImportAudioDialog({
   const [batchFiles, setBatchFiles] = useState<BatchCandidate[]>([]);
   const [linkUrl, setLinkUrl] = useState('');
   const [linkContentMode, setLinkContentMode] = useState<'audio' | 'transcript' | 'recap'>('audio');
-  const [recapText, setRecapText] = useState('');
   const [isImportingRecap, setIsImportingRecap] = useState(false);
   const [linkModeTouched, setLinkModeTouched] = useState(false);
   const [spHubUrl, setSpHubUrl] = useState('');
@@ -241,7 +239,6 @@ export function ImportAudioDialog({
       setBatchFiles([]);
       setLinkUrl('');
       setLinkContentMode('audio');
-      setRecapText('');
       setIsImportingRecap(false);
       setLinkModeTouched(false);
       setSpScanning(false);
@@ -464,24 +461,8 @@ export function ImportAudioDialog({
       : sourceMode === 'sharepoint'
       ? spSelected.size > 0
       : linkContentMode === 'recap'
-      ? !isImportingRecap && title.trim().length > 0 &&
-        (canFetchTeamsRecap || (recapText.trim().length > 0 && (!linkUrl.trim() || linkValid)))
+      ? !isImportingRecap && title.trim().length > 0 && canFetchTeamsRecap
       : linkValid;
-
-  const handlePasteRecap = async () => {
-    try {
-      const clipboardText = await navigator.clipboard.readText();
-      if (!clipboardText.trim()) {
-        toast.info('Clipboard is empty');
-        return;
-      }
-      setRecapText(clipboardText);
-    } catch {
-      toast.error('Could not read the clipboard', {
-        description: 'Use the standard paste shortcut in the recap field instead.',
-      });
-    }
-  };
 
   const handleStartImport = async () => {
     const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
@@ -498,27 +479,15 @@ export function ImportAudioDialog({
         if (!canImport) return;
         setIsImportingRecap(true);
         try {
-          const fetchFromTeams = canFetchTeamsRecap && !recapText.trim();
-          const result = fetchFromTeams
-            ? await invoke<{ meetingId: string; title: string; obsidianFilePath: string }>(
-                'api_import_copilot_recap_from_link',
-                { title: title.trim(), sourceUrl: linkUrl.trim() }
-              )
-            : await invoke<{ meetingId: string; title: string }>(
-                'api_import_copilot_recap',
-                {
-                  title: title.trim(),
-                  recap: recapText.trim(),
-                  sourceUrl: linkUrl.trim() || null,
-                }
-              );
+          const result = await invoke<{ meetingId: string; title: string; obsidianFilePath: string }>(
+            'api_import_copilot_recap_from_link',
+            { title: title.trim(), sourceUrl: linkUrl.trim() }
+          );
           await refetchMeetings();
           onComplete?.();
           onOpenChange(false);
           toast.success('Copilot recap imported', {
-            description: fetchFromTeams
-              ? `Saved to Meetily and Obsidian: ${'obsidianFilePath' in result ? result.obsidianFilePath : ''}`
-              : 'Saved directly as the meeting summary. No transcription or AI generation was run.',
+            description: `Saved to Meetily and Obsidian: ${result.obsidianFilePath}`,
           });
           router.push(`/meeting-details?id=${result.meetingId}`);
         } catch (e) {
@@ -859,7 +828,7 @@ export function ImportAudioDialog({
                     />
                     <p className="text-xs text-muted-foreground">
                       {linkContentMode === 'recap'
-                        ? 'Paste a Teams meeting recap link to fetch its AI summary through the existing WebView2 sign-in and save it to Obsidian. You can still paste recap text manually below.'
+                        ? 'Paste a Teams meeting recap link to fetch its AI summary through the existing WebView2 sign-in and save it to Obsidian.'
                         : 'Paste a recording or transcript link from Teams or SharePoint. A sign-in window may appear the first time; after that it stays signed in and runs in the background.'}
                     </p>
                   </div>
@@ -904,28 +873,6 @@ export function ImportAudioDialog({
                         : 'Downloads the recording and transcribes the audio.'}
                     </p>
                   </div>
-
-                  {linkContentMode === 'recap' && (
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <label className="text-sm font-medium text-gray-700">Recap text (optional fallback)</label>
-                        <Button type="button" variant="outline" size="sm" onClick={handlePasteRecap}>
-                          <ClipboardPaste className="h-3.5 w-3.5 mr-1.5" />
-                          Paste from clipboard
-                        </Button>
-                      </div>
-                      <textarea
-                        value={recapText}
-                        onChange={(e) => setRecapText(e.target.value)}
-                        placeholder="Leave blank to fetch from a Teams recap link, or paste recap text manually…"
-                        rows={10}
-                        className="flex min-h-[180px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        If pasted, this text is imported instead of fetching from Teams. The link-only path also exports to your configured Obsidian vault.
-                      </p>
-                    </div>
-                  )}
 
                   <div className="space-y-1">
                     <label className="text-sm font-medium text-gray-700">Meeting Title</label>
@@ -1184,9 +1131,7 @@ export function ImportAudioDialog({
                     {linkContentMode === 'recap'
                       ? isImportingRecap
                         ? 'Importing Recap…'
-                        : canFetchTeamsRecap && !recapText.trim()
-                        ? 'Fetch Recap to Obsidian'
-                        : 'Import Copilot Recap'
+                        : 'Fetch Recap to Obsidian'
                       : linkContentMode === 'transcript'
                       ? 'Import Transcript'
                       : 'Import from Link'}
