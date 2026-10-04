@@ -160,8 +160,8 @@ impl SettingsRepository {
     ) -> std::result::Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO transcript_settings (id, provider, model, realtimeTranscriptionEnabled)
-            VALUES ('1', $1, $2, $3)
+            INSERT INTO transcript_settings (id, provider, model, realtimeTranscriptionEnabled, whisperVocabularyHint)
+            VALUES ('1', $1, $2, $3, $4)
             ON CONFLICT(id) DO UPDATE SET
                 provider = excluded.provider,
                 model = excluded.model,
@@ -171,6 +171,8 @@ impl SettingsRepository {
         .bind(provider)
         .bind(model)
         .bind(realtime_transcription_enabled)
+        // New rows only: the column's historical default must not apply.
+        .bind(crate::config::DEFAULT_WHISPER_VOCABULARY_HINT)
         .execute(pool)
         .await?;
 
@@ -200,14 +202,15 @@ impl SettingsRepository {
     ) -> std::result::Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO transcript_settings (id, provider, model, openaiCompatibleBaseUrl)
-            VALUES ('1', 'parakeet', $1, $2)
+            INSERT INTO transcript_settings (id, provider, model, openaiCompatibleBaseUrl, whisperVocabularyHint)
+            VALUES ('1', 'parakeet', $1, $2, $3)
             ON CONFLICT(id) DO UPDATE SET
                 openaiCompatibleBaseUrl = excluded.openaiCompatibleBaseUrl
             "#,
         )
         .bind(crate::config::DEFAULT_PARAKEET_MODEL)
         .bind(base_url)
+        .bind(crate::config::DEFAULT_WHISPER_VOCABULARY_HINT)
         .execute(pool)
         .await?;
 
@@ -236,14 +239,18 @@ impl SettingsRepository {
 
         let query = format!(
             r#"
-            INSERT INTO transcript_settings (id, provider, model, "{}")
-            VALUES ('1', 'parakeet', '{}', $1)
+            INSERT INTO transcript_settings (id, provider, model, "{}", whisperVocabularyHint)
+            VALUES ('1', 'parakeet', '{}', $1, $2)
             ON CONFLICT(id) DO UPDATE SET
                 "{}" = $1
             "#,
             api_key_column, crate::config::DEFAULT_PARAKEET_MODEL, api_key_column
         );
-        sqlx::query(&query).bind(api_key).execute(pool).await?;
+        sqlx::query(&query)
+            .bind(api_key)
+            .bind(crate::config::DEFAULT_WHISPER_VOCABULARY_HINT)
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -471,5 +478,59 @@ impl SettingsRepository {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_default_tests {
+    use super::*;
+
+    async fn migrated_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn hint(pool: &SqlitePool) -> String {
+        sqlx::query_scalar("SELECT whisperVocabularyHint FROM transcript_settings WHERE id = '1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_new_settings_row_starts_with_an_empty_vocabulary() {
+        let pool = migrated_pool().await;
+        SettingsRepository::save_transcript_config(&pool, "parakeet", "m", false).await.unwrap();
+        assert_eq!(hint(&pool).await, "");
+
+        let pool = migrated_pool().await;
+        SettingsRepository::save_transcript_base_url(&pool, "http://127.0.0.1:8000").await.unwrap();
+        assert_eq!(hint(&pool).await, "");
+
+        let pool = migrated_pool().await;
+        SettingsRepository::save_transcript_api_key(&pool, "openaiCompatible", "k").await.unwrap();
+        assert_eq!(hint(&pool).await, "");
+    }
+
+    #[tokio::test]
+    async fn existing_vocabulary_survives_later_settings_saves() {
+        let pool = migrated_pool().await;
+        SettingsRepository::save_transcript_config(&pool, "parakeet", "m", false).await.unwrap();
+        SettingsRepository::save_whisper_vocabulary_hint(&pool, "Acme, Zephyr").await.unwrap();
+
+        SettingsRepository::save_transcript_config(&pool, "localWhisper", "large-v3", true).await.unwrap();
+        SettingsRepository::save_transcript_base_url(&pool, "http://127.0.0.1:8000").await.unwrap();
+        SettingsRepository::save_transcript_api_key(&pool, "openaiCompatible", "k").await.unwrap();
+        assert_eq!(hint(&pool).await, "Acme, Zephyr");
+    }
+
+    #[test]
+    fn application_default_is_empty() {
+        assert_eq!(crate::config::DEFAULT_WHISPER_VOCABULARY_HINT, "");
     }
 }

@@ -347,7 +347,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     id="whisper-vocabulary-hints"
                                     value={vocabularyHint}
                                     onChange={(event) => setVocabularyHint(event.target.value)}
-                                    placeholder="Murex, Banamex, Azteca, Zeinab, Oropeza, Pasquel"
+                                    placeholder="Company, product and people names, e.g. Acme, Zephyr"
                                     rows={3}
                                 />
                                 <div className="flex items-center gap-3">

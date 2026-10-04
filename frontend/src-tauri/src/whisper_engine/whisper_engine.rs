@@ -1868,7 +1868,7 @@ mod tests {
             }
         }
 
-        let prompt = "Murex, Zeinab, Oropeza, Pasquel";
+        let prompt = "Acme, Zephyr, Quillon";
         let mut params = CapturingWhisperParams::default();
 
         apply_vocabulary_hint_to_whisper_params(&mut params, prompt);
