@@ -110,6 +110,10 @@ pub struct TranscriptConfig {
     /// whisper-rs as `initial_prompt` for every transcription.
     #[serde(rename = "vocabularyHint")]
     pub vocabulary_hint: String,
+    /// Send `vocabulary_hint` to the remote (openaiCompatible) server as the
+    /// transcription `prompt`. Explicit opt-in, off by default.
+    #[serde(rename = "remoteVocabularyEnabled")]
+    pub remote_vocabulary_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -400,8 +404,8 @@ pub async fn api_search_transcripts<R: Runtime>(
     auth_token: Option<String>,
 ) -> Result<Vec<TranscriptSearchResult>, String> {
     log_info!(
-        "api_search_transcripts called with query: '{}', auth_token: {}",
-        query,
+        "api_search_transcripts called with a {} char query, auth_token: {}",
+        query.chars().count(),
         auth_token.is_some()
     );
 
@@ -416,7 +420,7 @@ pub async fn api_search_transcripts<R: Runtime>(
             Ok(results)
         }
         Err(e) => {
-            log_error!("Error searching transcripts for query '{}': {}", query, e);
+            log_error!("Error searching transcripts ({} char query): {}", query.chars().count(), e);
             Err(format!("Failed to search transcripts: {}", e))
         }
     }
@@ -662,6 +666,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                         api_key,
                         base_url: config.openai_compatible_base_url,
                         vocabulary_hint: config.whisper_vocabulary_hint,
+                        remote_vocabulary_enabled: config.remote_vocabulary_enabled,
                     }))
                 }
                 Err(e) => {
@@ -683,6 +688,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                 api_key: None,
                 base_url: None,
                 vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+                remote_vocabulary_enabled: false,
             }))
         }
         Err(e) => {
@@ -702,6 +708,7 @@ pub async fn api_save_transcript_config<R: Runtime>(
     api_key: Option<String>,
     base_url: Option<String>,
     vocabulary_hint: Option<String>,
+    remote_vocabulary_enabled: Option<bool>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -770,6 +777,13 @@ pub async fn api_save_transcript_config<R: Runtime>(
             vocabulary_hint.to_string(),
         )
         .await;
+    }
+
+    if let Some(enabled) = remote_vocabulary_enabled {
+        if let Err(e) = SettingsRepository::save_remote_vocabulary_enabled(pool, enabled).await {
+            log_error!("Failed to save remote vocabulary preference: {}", e);
+            return Err(e.to_string());
+        }
     }
 
     log_info!("Successfully saved transcript configuration.");
@@ -1029,23 +1043,18 @@ pub async fn api_save_transcript<R: Runtime>(
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
     folder_path: Option<String>,
+    transcription_incomplete: Option<bool>,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let transcription_incomplete = transcription_incomplete.unwrap_or(false);
     log_info!(
-        "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, auth_token: {}",
+        "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, incomplete: {}, auth_token: {}",
         meeting_title,
         transcripts.len(),
         folder_path,
+        transcription_incomplete,
         auth_token.is_some()
     );
-
-    // Log first transcript for debugging
-    if let Some(first) = transcripts.first() {
-        log_debug!(
-            "First transcript data: {}",
-            serde_json::to_string_pretty(first).unwrap_or_default()
-        );
-    }
 
     // Convert serde_json::Value to TranscriptSegment
     let transcripts_to_save: Vec<TranscriptSegment> = transcripts
@@ -1057,10 +1066,9 @@ pub async fn api_save_transcript<R: Runtime>(
             format!("Invalid transcript data format: {}. Please check the data structure.", e)
         })?;
 
-    // Log parsed segments count and first segment details
+    // Timing only: segment text is meeting content.
     if let Some(first_seg) = transcripts_to_save.first() {
-        log_debug!("First parsed segment: text='{}', audio_start_time={:?}, audio_end_time={:?}, duration={:?}",
-                   first_seg.text.chars().take(50).collect::<String>(),
+        log_debug!("First parsed segment: audio_start_time={:?}, audio_end_time={:?}, duration={:?}",
                    first_seg.audio_start_time,
                    first_seg.audio_end_time,
                    first_seg.duration);
@@ -1074,6 +1082,7 @@ pub async fn api_save_transcript<R: Runtime>(
         &meeting_title,
         &transcripts_to_save,
         folder_path,
+        transcription_incomplete,
     )
     .await
     {
@@ -1495,6 +1504,10 @@ pub async fn api_save_copilot_cli_config<R: Runtime>(
         &binary_path,
         &model
     );
+
+    if let Some(model) = model.as_deref() {
+        crate::summary::copilot_cli::validate_copilot_model(model)?;
+    }
 
     let config = CopilotCliConfig {
         binary_path: binary_path.filter(|p| !p.trim().is_empty()),

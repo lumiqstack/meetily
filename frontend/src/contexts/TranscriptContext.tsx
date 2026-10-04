@@ -438,7 +438,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         t => t.text === update.text && t.timestamp === update.timestamp
       );
       if (exists) {
-        console.log('🚫 Duplicate transcript detected, skipping:', update.text.substring(0, 30) + '...');
+        console.log('🚫 Duplicate transcript detected, skipping sequence_id:', update.sequence_id);
         return prev;
       }
 

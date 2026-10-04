@@ -135,6 +135,10 @@ fn open_folder(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Conservative UTF-8 byte budget for the sanitized stem, leaving room for the
+/// vault/Meetings path, collision suffixes and the `.md` extension.
+const MAX_SANITIZED_FILENAME_BYTES: usize = 120;
+
 fn sanitize_filename(input: &str) -> String {
     let mut filename = input
         .chars()
@@ -152,8 +156,14 @@ fn sanitize_filename(input: &str) -> String {
         .trim_matches(['.', ' ', '-'])
         .to_string();
 
-    if filename.len() > 120 {
-        filename.truncate(120);
+    if filename.len() > MAX_SANITIZED_FILENAME_BYTES {
+        // `String::truncate` panics inside a multi-byte character, so back
+        // off to the nearest char boundary first (accented/CJK/emoji titles).
+        let mut end = MAX_SANITIZED_FILENAME_BYTES;
+        while !filename.is_char_boundary(end) {
+            end -= 1;
+        }
+        filename.truncate(end);
         filename = filename.trim_matches(['.', ' ', '-']).to_string();
     }
 
@@ -640,6 +650,53 @@ mod tests {
             filename_template: template.to_string(),
             auto_export: true,
         }
+    }
+
+    fn assert_sanitized(input: &str) -> String {
+        let output = sanitize_filename(input);
+        assert!(output.len() <= MAX_SANITIZED_FILENAME_BYTES, "{} bytes", output.len());
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+        assert!(!output.is_empty());
+        output
+    }
+
+    #[test]
+    fn sanitize_truncates_on_char_boundary_for_accented_titles() {
+        // Byte 120 falls inside "ó" (bytes 119..121).
+        let input = format!("{}ón de revisión", "a".repeat(119));
+        assert_eq!(assert_sanitized(&input), "a".repeat(119));
+    }
+
+    #[test]
+    fn sanitize_truncates_cjk_and_emoji_without_panicking() {
+        let cjk = assert_sanitized(&"会议纪要".repeat(20));
+        assert_eq!(cjk.len() % 3, 0);
+        let emoji = assert_sanitized(&"📅 Weekly ".repeat(20));
+        assert!(emoji.chars().count() > 0);
+    }
+
+    #[test]
+    fn sanitize_keeps_short_ascii_and_falls_back_when_empty() {
+        assert_eq!(assert_sanitized("Weekly sync"), "Weekly sync");
+        assert_eq!(assert_sanitized(&"x".repeat(200)), "x".repeat(120));
+        assert_eq!(assert_sanitized(""), "Untitled Meeting");
+        assert_eq!(assert_sanitized("  ...--  "), "Untitled Meeting");
+    }
+
+    #[test]
+    fn rendered_long_accented_filename_keeps_date_and_extension() {
+        let title = format!("{}ón", "Revisión trimestral de capitalización ".repeat(5));
+        let rendered = render_filename_template(
+            DEFAULT_FILENAME_TEMPLATE,
+            "aaaaaaaa-1111",
+            &title,
+            "2026-07-25T10:00:00Z",
+        );
+        assert!(rendered.starts_with("2026-07-25"));
+        assert!(rendered.ends_with(".md"));
+        assert!(rendered.len() <= MAX_SANITIZED_FILENAME_BYTES + 3);
+        let suffixed = filename::available_filename(&rendered, |name| name != rendered);
+        assert!(suffixed.ends_with(" (2).md"));
     }
 
     #[test]

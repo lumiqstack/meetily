@@ -6,6 +6,7 @@ use tauri::{AppHandle, Runtime, Emitter};
 use tokio::sync::mpsc;
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
@@ -50,6 +51,85 @@ pub struct DeviceInfo {
     pub system_audio: Option<String>,
 }
 
+/// How long `stop_and_save` waits for the accumulation writer to drain every
+/// queued chunk after all producers stopped. Generous: a slow disk must not
+/// lose the tail of a meeting, but a stuck writer must not hang Stop forever.
+const ACCUMULATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// After aborting a timed-out writer, how long to wait for it to terminate.
+const ACCUMULATION_ABORT_GRACE: Duration = Duration::from_secs(5);
+
+/// Background writer that owns the recording receiver. Resolves to the number
+/// of chunks written, or the first write failure.
+type AccumulationTask = tokio::task::JoinHandle<std::result::Result<u64, String>>;
+
+/// How the accumulation writer ended at stop time.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DrainOutcome {
+    /// Every producer closed and every accepted chunk was written.
+    Drained(u64),
+    /// A write failed or the task panicked; queued chunks were not written.
+    WriterFailed(String),
+    /// The writer did not finish in time. `writer_stopped` reports whether
+    /// it terminated after being aborted; if not it may still hold the saver.
+    TimedOut { writer_stopped: bool },
+}
+
+/// Consume `receiver` until every sender is dropped, writing each chunk via
+/// `sink`. After the first sink failure later chunks are still received (so
+/// producers never observe a closed channel) but not written, and the failure
+/// is returned once the channel closes.
+async fn drain_into<F, Fut>(
+    mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    mut sink: F,
+) -> std::result::Result<u64, String>
+where
+    F: FnMut(AudioChunk) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut written = 0u64;
+    let mut first_error: Option<String> = None;
+    while let Some(chunk) = receiver.recv().await {
+        if first_error.is_some() {
+            continue;
+        }
+        match sink(chunk).await {
+            Ok(()) => written += 1,
+            Err(e) => {
+                error!("Failed to add chunk to incremental saver: {}", e);
+                first_error = Some(e.to_string());
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(written),
+    }
+}
+
+/// Wait for the writer to finish draining, bounded by `timeout`. A timed-out
+/// writer is aborted and awaited for `grace` so the caller knows whether it is
+/// still running; dropping a JoinHandle alone would not stop it.
+async fn await_accumulation(
+    mut handle: AccumulationTask,
+    timeout: Duration,
+    grace: Duration,
+) -> DrainOutcome {
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(Ok(Ok(written))) => DrainOutcome::Drained(written),
+        Ok(Ok(Err(e))) => DrainOutcome::WriterFailed(e),
+        Ok(Err(join_error)) => DrainOutcome::WriterFailed(if join_error.is_panic() {
+            "the audio writer task panicked".to_string()
+        } else {
+            "the audio writer task was cancelled".to_string()
+        }),
+        Err(_) => {
+            handle.abort();
+            let writer_stopped = tokio::time::timeout(grace, &mut handle).await.is_ok();
+            DrainOutcome::TimedOut { writer_stopped }
+        }
+    }
+}
+
 /// New recording saver using incremental saving strategy
 pub struct RecordingSaver {
     incremental_saver: Option<Arc<AsyncMutex<IncrementalAudioSaver>>>,
@@ -57,7 +137,9 @@ pub struct RecordingSaver {
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
-    is_saving: Arc<Mutex<bool>>,
+    accumulation_task: Option<AccumulationTask>,
+    /// True when this recording promised to keep audio (auto_save).
+    save_audio: bool,
 }
 
 impl RecordingSaver {
@@ -68,7 +150,8 @@ impl RecordingSaver {
             meeting_name: None,
             metadata: None,
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
-            is_saving: Arc::new(Mutex::new(false)),
+            accumulation_task: None,
+            save_audio: false,
         }
     }
 
@@ -136,89 +219,79 @@ impl RecordingSaver {
         self.add_transcript_segment(segment);
     }
 
-    /// Start accumulation with optional incremental saving
-    ///
-    /// # Arguments
-    /// * `auto_save` - If true, creates checkpoints and enables saving. If false, audio chunks are discarded.
-    pub fn start_accumulation(
-        &mut self,
-        auto_save: bool,
-        mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    ) {
+    /// Create the meeting folder (and, with `auto_save`, the checkpoint
+    /// writer) before any audio is captured. Both modes promise persistence —
+    /// audio checkpoints, or transcripts + metadata — so a failure here must
+    /// stop the recording from starting rather than surface only at Stop.
+    pub fn prepare_storage(&mut self, auto_save: bool) -> Result<()> {
+        let base_folder = super::recording_preferences::get_default_recordings_folder();
+        self.prepare_storage_in(&base_folder, auto_save)
+    }
+
+    fn prepare_storage_in(&mut self, base_folder: &PathBuf, auto_save: bool) -> Result<()> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
             info!("Starting recording without audio saving (auto-save DISABLED - transcripts only)");
         }
+        self.save_audio = auto_save;
+        let name = self
+            .meeting_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No meeting name was set for the recording"))?;
+        // Without auto_save the folder still holds transcripts/metadata, but
+        // no .checkpoints directory or audio writer is created.
+        self.initialize_meeting_folder(base_folder, &name, auto_save)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Cannot create the recording folder in {}: {}",
+                    base_folder.display(),
+                    e
+                )
+            })?;
+        info!(
+            "Successfully initialized meeting folder ({})",
+            if auto_save { "with checkpoints" } else { "transcripts only" }
+        );
+        Ok(())
+    }
 
-        // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
-        if auto_save {
-            if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, true) {
-                    Ok(()) => info!("Successfully initialized meeting folder with checkpoints"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                        // Continue anyway - will use fallback flat structure
-                    }
-                }
-            }
-        } else {
-            // When auto_save is false, still create meeting folder for transcripts/metadata
-            // but skip .checkpoints directory
-            if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, false) {
-                    Ok(()) => info!("Successfully initialized meeting folder (transcripts only)"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                    }
-                }
-            }
-        }
-
-        // Start accumulation task
-        let is_saving_clone = self.is_saving.clone();
+    /// Start the background writer for a recording whose storage was prepared
+    /// with [`prepare_storage`](Self::prepare_storage).
+    ///
+    /// # Arguments
+    /// * `auto_save` - If true, audio chunks go to the checkpoint writer. If false, they are discarded.
+    pub fn start_accumulation(
+        &mut self,
+        auto_save: bool,
+        receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    ) {
+        // Start the accumulation writer. It owns the receiver and ends only
+        // when every producer has dropped its sender, so stop_and_save can
+        // await it and know every accepted chunk reached the saver.
         let incremental_saver_arc = self.incremental_saver.clone();
         let save_audio = auto_save;
 
-        tokio::spawn(async move {
+        self.accumulation_task = Some(tokio::spawn(async move {
             info!("Recording saver accumulation task started (save_audio: {})", save_audio);
-
-            while let Some(chunk) = receiver.recv().await {
-                // Check if we should continue
-                let should_continue = if let Ok(is_saving) = is_saving_clone.lock() {
-                    *is_saving
-                } else {
-                    false
-                };
-
-                if !should_continue {
-                    break;
-                }
-
-                // Only process audio chunks if auto_save is enabled
-                if save_audio {
-                    // Add chunk to incremental saver
-                    if let Some(saver_arc) = &incremental_saver_arc {
-                        let mut saver_guard = saver_arc.lock().await;
-                        if let Err(e) = saver_guard.add_chunk(chunk) {
-                            error!("Failed to add chunk to incremental saver: {}", e);
-                        }
-                    } else {
-                        error!("Incremental saver not available while accumulating");
+            let result = drain_into(receiver, |chunk| {
+                let saver = incremental_saver_arc.clone();
+                async move {
+                    if !save_audio {
+                        // Transcript-only mode: transcription already happened
+                        // in the pipeline, the audio itself is not kept.
+                        return Ok(());
                     }
-                } else {
-                    // auto_save is false: discard audio chunk (no-op)
-                    // Transcription already happened in the pipeline before this point
+                    let saver = saver
+                        .ok_or_else(|| anyhow::anyhow!("Incremental saver not available while accumulating"))?;
+                    let mut guard = saver.lock().await;
+                    guard.add_chunk(chunk)
                 }
-            }
-
+            })
+            .await;
             info!("Recording saver accumulation task ended");
-        });
-
-        // Set saving flag
-        if let Ok(mut is_saving) = self.is_saving.lock() {
-            *is_saving = true;
-        }
+            result
+        }));
     }
 
     /// Initialize meeting folder structure and metadata
@@ -226,12 +299,14 @@ impl RecordingSaver {
     /// # Arguments
     /// * `meeting_name` - Name of the meeting
     /// * `create_checkpoints` - Whether to create .checkpoints/ directory and IncrementalAudioSaver
-    fn initialize_meeting_folder(&mut self, meeting_name: &str, create_checkpoints: bool) -> Result<()> {
-        // Load preferences to get base recordings folder
-        let base_folder = super::recording_preferences::get_default_recordings_folder();
-
+    fn initialize_meeting_folder(
+        &mut self,
+        base_folder: &PathBuf,
+        meeting_name: &str,
+        create_checkpoints: bool,
+    ) -> Result<()> {
         // Create meeting folder structure (with or without .checkpoints/ subdirectory)
-        let meeting_folder = create_meeting_folder(&base_folder, meeting_name, create_checkpoints)?;
+        let meeting_folder = create_meeting_folder(base_folder, meeting_name, create_checkpoints)?;
 
         // Only initialize incremental saver if checkpoints are needed (auto_save is true)
         if create_checkpoints {
@@ -361,18 +436,31 @@ impl RecordingSaver {
     ) -> Result<Option<String>, String> {
         info!("Stopping recording saver");
 
-        // Stop accumulation
-        if let Ok(mut is_saving) = self.is_saving.lock() {
-            *is_saving = false;
+        // Callers stop and await every producer (streams, then the pipeline
+        // task that owns the mixed-audio sender) before calling this, so the
+        // writer ends once it has drained the queue.
+        let drain = match self.accumulation_task.take() {
+            Some(handle) => {
+                await_accumulation(handle, ACCUMULATION_DRAIN_TIMEOUT, ACCUMULATION_ABORT_GRACE).await
+            }
+            None => DrainOutcome::Drained(0),
+        };
+        match drain {
+            DrainOutcome::Drained(written) => {
+                info!("Recording writer drained: {} chunks accepted", written);
+            }
+            outcome => return Err(self.preserve_incomplete_recording(outcome)),
         }
 
-        // Give time for final chunks
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Audio was promised but no writer exists: never report that as
+        // "auto-save disabled".
+        if self.save_audio && self.incremental_saver.is_none() {
+            return Err(self.preserve_incomplete_recording(DrainOutcome::WriterFailed(
+                "no audio writer was initialized".to_string(),
+            )));
+        }
 
-        // Check if incremental saver exists (indicates auto_save was enabled)
-        let should_save_audio = self.incremental_saver.is_some();
-
-        if !should_save_audio {
+        if self.incremental_saver.is_none() {
             info!("⚠️  No audio saver initialized (auto-save was disabled) - skipping audio finalization");
             info!("✅ Transcripts and metadata already saved incrementally");
             return Ok(None);
@@ -457,6 +545,62 @@ impl RecordingSaver {
         Ok(Some(final_audio_path.to_string_lossy().to_string()))
     }
 
+    /// Wind down after a start that failed once the writer was running: the
+    /// caller has already closed every producer, so the writer finishes; the
+    /// folder is kept (never deleted) but marked as a failed start.
+    pub async fn discard_after_failed_start(&mut self) {
+        if let Some(handle) = self.accumulation_task.take() {
+            let outcome =
+                await_accumulation(handle, ACCUMULATION_ABORT_GRACE, ACCUMULATION_ABORT_GRACE).await;
+            info!("Writer after failed start ended: {:?}", outcome);
+        }
+        if let (Some(folder), Some(mut metadata)) = (&self.meeting_folder, self.metadata.clone()) {
+            metadata.status = "start_failed".to_string();
+            if let Err(e) = self.write_metadata(folder, &metadata) {
+                warn!("Failed to mark recording metadata as a failed start: {}", e);
+            }
+        }
+    }
+
+    /// The writer did not drain cleanly: never finalize (merging checkpoints
+    /// while a writer may still touch them, or presenting a truncated file as
+    /// complete). Keep checkpoints and transcripts for recovery, mark the
+    /// metadata incomplete and describe what happened.
+    fn preserve_incomplete_recording(&self, outcome: DrainOutcome) -> String {
+        let reason = match outcome {
+            DrainOutcome::WriterFailed(e) => format!("the audio writer failed ({})", e),
+            DrainOutcome::TimedOut { writer_stopped: true } => format!(
+                "the audio writer did not finish within {}s and was stopped",
+                ACCUMULATION_DRAIN_TIMEOUT.as_secs()
+            ),
+            DrainOutcome::TimedOut { writer_stopped: false } => format!(
+                "the audio writer did not finish within {}s and is still running; the recording was quarantined",
+                ACCUMULATION_DRAIN_TIMEOUT.as_secs()
+            ),
+            DrainOutcome::Drained(_) => unreachable!("drained recordings are finalized"),
+        };
+        error!("❌ Recording audio not finalized: {}", reason);
+
+        if let Some(folder) = &self.meeting_folder {
+            if let Err(e) = self.write_transcripts_json(folder) {
+                warn!("Failed to write transcripts for incomplete recording: {}", e);
+            }
+            if let Some(mut metadata) = self.metadata.clone() {
+                metadata.status = "incomplete".to_string();
+                if let Err(e) = self.write_metadata(folder, &metadata) {
+                    warn!("Failed to mark recording metadata incomplete: {}", e);
+                }
+            }
+        }
+
+        let location = self
+            .meeting_folder
+            .as_ref()
+            .map(|f| format!(" Audio checkpoints were kept in {} for recovery.", f.display()))
+            .unwrap_or_default();
+        format!("The recording audio could not be fully saved: {}.{}", reason, location)
+    }
+
     /// Get the meeting folder path (for passing to backend)
     pub fn get_meeting_folder(&self) -> Option<&PathBuf> {
         self.meeting_folder.as_ref()
@@ -480,5 +624,222 @@ impl RecordingSaver {
 impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn chunk(id: u64) -> AudioChunk {
+        AudioChunk {
+            data: vec![0.0; 480],
+            sample_rate: 48000,
+            timestamp: id as f64 * 0.01,
+            chunk_id: id,
+            device_type: super::super::recording_state::DeviceType::Microphone,
+            dominant_source: None,
+        }
+    }
+
+    fn prefilled(n: u64) -> mpsc::UnboundedReceiver<AudioChunk> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for id in 0..n {
+            tx.send(chunk(id)).unwrap();
+        }
+        rx // tx dropped: every producer has stopped
+    }
+
+    #[tokio::test]
+    async fn drains_every_queued_chunk_in_order_after_producers_stop() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let handle: AccumulationTask = tokio::spawn(drain_into(prefilled(250), move |c| {
+            let seen = sink_seen.clone();
+            async move {
+                seen.lock().unwrap().push(c.chunk_id);
+                Ok(())
+            }
+        }));
+        let outcome = await_accumulation(handle, Duration::from_secs(5), Duration::from_secs(1)).await;
+        assert_eq!(outcome, DrainOutcome::Drained(250));
+        assert_eq!(*seen.lock().unwrap(), (0..250).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn slow_sink_still_receives_the_whole_tail() {
+        let written = Arc::new(AtomicU64::new(0));
+        let counter = written.clone();
+        let handle: AccumulationTask = tokio::spawn(drain_into(prefilled(20), move |_| {
+            let counter = counter.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+        let outcome = await_accumulation(handle, Duration::from_secs(5), Duration::from_secs(1)).await;
+        assert_eq!(outcome, DrainOutcome::Drained(20));
+        assert_eq!(written.load(Ordering::SeqCst), 20);
+    }
+
+    #[tokio::test]
+    async fn sink_failure_is_reported_and_producers_never_see_a_closed_channel() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let handle: AccumulationTask = tokio::spawn(drain_into(rx, move |c| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if c.chunk_id == 2 {
+                    Err(anyhow::anyhow!("disk full"))
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        for id in 0..10 {
+            tx.send(chunk(id)).expect("receiver must stay open after a write failure");
+            tokio::task::yield_now().await;
+        }
+        drop(tx);
+        let outcome = await_accumulation(handle, Duration::from_secs(5), Duration::from_secs(1)).await;
+        assert_eq!(outcome, DrainOutcome::WriterFailed("disk full".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "no writes after the first failure");
+    }
+
+    #[tokio::test]
+    async fn writer_panic_is_a_failure_not_success() {
+        let handle: AccumulationTask = tokio::spawn(drain_into(prefilled(3), |c| async move {
+            if c.chunk_id == 1 {
+                panic!("writer bug");
+            }
+            Ok(())
+        }));
+        let outcome = await_accumulation(handle, Duration::from_secs(5), Duration::from_secs(1)).await;
+        assert_eq!(outcome, DrainOutcome::WriterFailed("the audio writer task panicked".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stuck_producer_times_out_and_writer_is_stopped() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(chunk(0)).unwrap();
+        let handle: AccumulationTask = tokio::spawn(drain_into(rx, |_| async { Ok(()) }));
+        let outcome = await_accumulation(handle, Duration::from_millis(50), Duration::from_secs(1)).await;
+        assert_eq!(outcome, DrainOutcome::TimedOut { writer_stopped: true });
+        drop(tx);
+    }
+
+    #[test]
+    fn incomplete_recording_keeps_artifacts_and_marks_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = RecordingSaver::new();
+        saver.meeting_folder = Some(dir.path().to_path_buf());
+        saver.metadata = Some(MeetingMetadata {
+            version: "1.0".to_string(),
+            meeting_id: None,
+            meeting_name: Some("Test".to_string()),
+            created_at: "2026-10-04T00:00:00Z".to_string(),
+            completed_at: None,
+            duration_seconds: None,
+            devices: DeviceInfo { microphone: None, system_audio: None },
+            audio_file: "audio.mp4".to_string(),
+            transcript_file: "transcripts.json".to_string(),
+            sample_rate: 48000,
+            status: "recording".to_string(),
+        });
+        let checkpoints = dir.path().join(".checkpoints");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        std::fs::write(checkpoints.join("audio_chunk_000.mp4"), b"chunk").unwrap();
+
+        let message = saver.preserve_incomplete_recording(DrainOutcome::TimedOut { writer_stopped: false });
+
+        assert!(message.contains("quarantined"), "{message}");
+        assert!(message.contains("kept"), "{message}");
+        assert!(checkpoints.join("audio_chunk_000.mp4").exists());
+        assert!(!dir.path().join("audio.mp4").exists(), "must not finalize");
+        assert!(dir.path().join("transcripts.json").exists());
+        let metadata = std::fs::read_to_string(dir.path().join("metadata.json")).unwrap();
+        assert!(metadata.contains("\"status\": \"incomplete\""), "{metadata}");
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    fn named_saver() -> RecordingSaver {
+        let mut saver = RecordingSaver::new();
+        saver.set_meeting_name(Some("Weekly".to_string()));
+        saver
+    }
+
+    #[test]
+    fn audio_mode_fails_when_the_recordings_folder_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the recordings folder should be: portable
+        // (unlike read-only directories, which Windows does not enforce).
+        let blocked = dir.path().join("recordings");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let mut saver = named_saver();
+        let error = saver.prepare_storage_in(&blocked, true).unwrap_err().to_string();
+        assert!(error.contains("Cannot create the recording folder"), "{error}");
+        assert!(saver.incremental_saver.is_none());
+    }
+
+    #[test]
+    fn transcript_only_mode_also_requires_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("recordings");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert!(named_saver().prepare_storage_in(&blocked, false).is_err());
+    }
+
+    #[test]
+    fn transcript_only_mode_creates_folder_without_audio_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = named_saver();
+        saver.prepare_storage_in(&dir.path().to_path_buf(), false).unwrap();
+        let folder = saver.meeting_folder.clone().unwrap();
+        assert!(folder.join("metadata.json").exists());
+        assert!(!folder.join(".checkpoints").exists());
+        assert!(saver.incremental_saver.is_none());
+    }
+
+    #[test]
+    fn audio_mode_creates_checkpoint_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = named_saver();
+        saver.prepare_storage_in(&dir.path().to_path_buf(), true).unwrap();
+        assert!(saver.meeting_folder.clone().unwrap().join(".checkpoints").is_dir());
+        assert!(saver.incremental_saver.is_some());
+    }
+
+    #[test]
+    fn missing_meeting_name_fails_instead_of_recording_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = RecordingSaver::new();
+        assert!(saver.prepare_storage_in(&dir.path().to_path_buf(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_start_ends_the_writer_and_marks_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = named_saver();
+        saver.prepare_storage_in(&dir.path().to_path_buf(), true).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        saver.start_accumulation(true, rx);
+        drop(tx); // the pipeline was stopped
+        saver.discard_after_failed_start().await;
+        assert!(saver.accumulation_task.is_none());
+        let folder = saver.meeting_folder.clone().unwrap();
+        let metadata = std::fs::read_to_string(folder.join("metadata.json")).unwrap();
+        assert!(metadata.contains("start_failed"), "{metadata}");
+        // A retry gets a fresh saver; nothing here blocks it.
+        let mut retry = named_saver();
+        assert!(retry.prepare_storage_in(&dir.path().to_path_buf(), true).is_ok());
     }
 }

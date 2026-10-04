@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/command';
 import { cn, isOllamaNotInstalledError } from '@/lib/utils';
 import { toast } from 'sonner';
+import { COPILOT_CLI_MODELS, copilotCliModelProblem } from '@/lib/copilot-cli-models';
 
 export interface ModelConfig {
   provider: 'ollama' | 'groq' | 'claude' | 'openai' | 'openrouter' | 'builtin-ai' | 'custom-openai' | 'copilot-cli';
@@ -104,18 +105,6 @@ const GROQ_FALLBACK_MODELS = [
   'gemma2-9b-it',
 ];
 
-// Copilot model availability depends on the user's Copilot plan;
-// 'auto' lets Copilot pick and works on every plan
-const COPILOT_CLI_MODELS = [
-  'auto',
-  'claude-sonnet-4.5',
-  'claude-sonnet-4',
-  'claude-haiku-4.5',
-  'gpt-5',
-  'gpt-5-mini',
-  'gpt-4.1',
-  'gemini-2.5-pro',
-];
 
 interface ModelSettingsModalProps {
   modelConfig: ModelConfig;
@@ -683,6 +672,12 @@ export function ModelSettingsModal({
 
     // For copilot-cli provider, save the CLI config first
     if (modelConfig.provider === 'copilot-cli') {
+      const problem = copilotCliModelProblem(modelConfig.model);
+      if (problem) {
+        setError(problem);
+        toast.error(problem);
+        return;
+      }
       try {
         await invoke('api_save_copilot_cli_config', {
           binaryPath: copilotBinaryPath.trim() || null,
@@ -920,7 +915,9 @@ export function ModelSettingsModal({
                 const defaultModel = providerModels && providerModels.length > 0
                   ? providerModels[0]
                   : '';
-                const model = (savedModel && providerModels?.includes(savedModel))
+                // A Copilot selection outside the catalog (custom or retired)
+                // is kept so it can be flagged, never silently replaced.
+                const model = (savedModel && (providerModels?.includes(savedModel) || provider === 'copilot-cli'))
                   ? savedModel
                   : defaultModel;
 
@@ -1182,6 +1179,12 @@ export function ModelSettingsModal({
                 Model availability depends on your Copilot plan; &quot;auto&quot; works on every plan.
               </AlertDescription>
             </Alert>
+
+            {copilotCliModelProblem(modelConfig.model) && (
+              <Alert variant="destructive">
+                <AlertDescription>{copilotCliModelProblem(modelConfig.model)}</AlertDescription>
+              </Alert>
+            )}
 
             <div>
               <Label htmlFor="copilot-binary-path">Binary Path (optional)</Label>

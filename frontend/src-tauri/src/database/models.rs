@@ -21,6 +21,9 @@ pub struct PendingMeetingModel {
     pub folder_path: Option<String>,
     pub transcript_count: i64,
     pub summary_status: Option<String>,
+    /// Saved before live transcription finished: needs re-transcription from
+    /// audio before it may be summarized.
+    pub transcription_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -164,4 +167,9 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "whisperVocabularyHint")]
     #[serde(rename = "whisperVocabularyHint")]
     pub whisper_vocabulary_hint: String,
+    /// Explicit opt-in to send the vocabulary to the remote transcription
+    /// server; off by default.
+    #[sqlx(rename = "remoteVocabularyEnabled")]
+    #[serde(rename = "remoteVocabularyEnabled")]
+    pub remote_vocabulary_enabled: bool,
 }

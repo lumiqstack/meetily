@@ -23,6 +23,8 @@ export interface TranscriptModelProps {
     apiKey?: string | null;
     baseUrl?: string | null;
     vocabularyHint?: string;
+    /** Explicit opt-in to send vocabularyHint to the remote server. */
+    remoteVocabularyEnabled?: boolean;
     realtimeTranscriptionEnabled: boolean;
 }
 
@@ -62,6 +64,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [remoteSaveStatus, setRemoteSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
     const [vocabularyHint, setVocabularyHint] = useState<string>(transcriptModelConfig.vocabularyHint || '');
     const [vocabularySaveStatus, setVocabularySaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+    const remoteVocabularyEnabled = transcriptModelConfig.remoteVocabularyEnabled ?? false;
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
@@ -247,6 +250,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 apiKey: transcriptModelConfig.apiKey ?? null,
                 baseUrl: transcriptModelConfig.baseUrl ?? null,
                 vocabularyHint: trimmedHint,
+                remoteVocabularyEnabled,
             });
             setTranscriptModelConfig(updatedConfig);
             setVocabularySaveStatus('saved');
@@ -256,6 +260,61 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             setVocabularySaveStatus('error');
         }
     };
+
+    const handleRemoteVocabularyToggle = async (enabled: boolean) => {
+        try {
+            await invoke('api_save_transcript_config', {
+                provider: transcriptModelConfig.provider,
+                model: transcriptModelConfig.model,
+                realtimeTranscriptionEnabled: transcriptModelConfig.realtimeTranscriptionEnabled ?? false,
+                apiKey: transcriptModelConfig.apiKey ?? null,
+                baseUrl: transcriptModelConfig.baseUrl ?? null,
+                remoteVocabularyEnabled: enabled,
+            });
+            setTranscriptModelConfig({ ...transcriptModelConfig, remoteVocabularyEnabled: enabled });
+        } catch (err) {
+            console.error('Failed to save remote vocabulary preference:', err);
+            setVocabularySaveStatus('error');
+        }
+    };
+
+    const vocabularyEditor = (
+        <div className="mb-6 space-y-3 rounded-md border border-gray-200 bg-white px-4 py-4">
+            <div>
+                <Label htmlFor="whisper-vocabulary-hints" className="text-sm font-medium text-gray-900">
+                    Vocabulary hints
+                </Label>
+                <p className="mt-1 text-xs text-gray-500">
+                    {uiProvider === 'openaiCompatible'
+                        ? 'Names and domain terms that help recognition. Separate terms with commas; leave blank to disable.'
+                        : 'Names and domain terms to prime local Whisper. Separate terms with commas; leave blank to disable.'}
+                </p>
+            </div>
+            <Textarea
+                id="whisper-vocabulary-hints"
+                value={vocabularyHint}
+                onChange={(event) => setVocabularyHint(event.target.value)}
+                placeholder="Company, product and people names, e.g. Acme, Zephyr"
+                rows={3}
+            />
+            <div className="flex items-center gap-3">
+                <Button
+                    type="button"
+                    onClick={handleSaveVocabularyHint}
+                    disabled={vocabularySaveStatus === 'saving'}
+                    className="bg-blue-600 hover:bg-blue-700 text-white"
+                >
+                    {vocabularySaveStatus === 'saving' ? 'Saving...' : 'Save Vocabulary Hints'}
+                </Button>
+                {vocabularySaveStatus === 'saved' && (
+                    <span className="text-sm text-green-600">Saved</span>
+                )}
+                {vocabularySaveStatus === 'error' && (
+                    <span className="text-sm text-red-600">Failed to save vocabulary hints</span>
+                )}
+            </div>
+        </div>
+    );
 
     return (
         <div>
@@ -334,39 +393,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
 
                     {uiProvider === 'localWhisper' && (
                         <div className="mt-6">
-                            <div className="mb-6 space-y-3 rounded-md border border-gray-200 bg-white px-4 py-4">
-                                <div>
-                                    <Label htmlFor="whisper-vocabulary-hints" className="text-sm font-medium text-gray-900">
-                                        Whisper vocabulary hints
-                                    </Label>
-                                    <p className="mt-1 text-xs text-gray-500">
-                                        Names and domain terms to prime local Whisper. Separate terms with commas; leave blank to disable.
-                                    </p>
-                                </div>
-                                <Textarea
-                                    id="whisper-vocabulary-hints"
-                                    value={vocabularyHint}
-                                    onChange={(event) => setVocabularyHint(event.target.value)}
-                                    placeholder="Murex, Banamex, Azteca, Zeinab, Oropeza, Pasquel"
-                                    rows={3}
-                                />
-                                <div className="flex items-center gap-3">
-                                    <Button
-                                        type="button"
-                                        onClick={handleSaveVocabularyHint}
-                                        disabled={vocabularySaveStatus === 'saving'}
-                                        className="bg-blue-600 hover:bg-blue-700 text-white"
-                                    >
-                                        {vocabularySaveStatus === 'saving' ? 'Saving...' : 'Save Vocabulary Hints'}
-                                    </Button>
-                                    {vocabularySaveStatus === 'saved' && (
-                                        <span className="text-sm text-green-600">Saved</span>
-                                    )}
-                                    {vocabularySaveStatus === 'error' && (
-                                        <span className="text-sm text-red-600">Failed to save vocabulary hints</span>
-                                    )}
-                                </div>
-                            </div>
+                            {vocabularyEditor}
                             <ModelManager
                                 selectedModel={transcriptModelConfig.provider === 'localWhisper' ? transcriptModelConfig.model : undefined}
                                 onModelSelect={handleWhisperModelSelect}
@@ -382,6 +409,29 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onModelSelect={handleParakeetModelSelect}
                                 autoSave={true}
                             />
+                        </div>
+                    )}
+
+                    {uiProvider === 'openaiCompatible' && (
+                        <div className="mt-6">
+                            {vocabularyEditor}
+                            <div className="mb-6 flex items-start justify-between gap-4 rounded-md border border-gray-200 bg-white px-4 py-4">
+                                <div>
+                                    <Label htmlFor="remote-vocabulary" className="text-sm font-medium text-gray-900">
+                                        Send vocabulary to the remote server
+                                    </Label>
+                                    <p className="mt-1 text-xs text-gray-500">
+                                        Off by default. When on, the terms above are sent as the transcription prompt with
+                                        every audio chunk to {transcriptModelConfig.baseUrl || 'the configured server'}.
+                                        Servers that do not support prompts will report an error instead of ignoring it.
+                                    </p>
+                                </div>
+                                <Switch
+                                    id="remote-vocabulary"
+                                    checked={remoteVocabularyEnabled}
+                                    onCheckedChange={handleRemoteVocabularyToggle}
+                                />
+                            </div>
                         </div>
                     )}
 

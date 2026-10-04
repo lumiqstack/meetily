@@ -19,6 +19,44 @@ use tracing::{info, warn};
 
 const COPILOT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Retired (or retiring in October 2026) Copilot model IDs. Must match
+/// `RETIRED_COPILOT_CLI_MODELS` in frontend/src/lib/copilot-cli-models.ts; a
+/// test below enforces that. Never remapped: the user picks a replacement.
+pub(crate) const RETIRED_COPILOT_CLI_MODELS: &[&str] = &[
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "gpt-5",
+    "gpt-4.1",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "kimi-k2.7-code",
+    "claude-opus-4.7",
+    "gpt-5-mini",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+    "gemini-3.7-flash",
+    "grok-4.5",
+];
+
+/// Reject a retired model with an actionable message; anything else
+/// (including 'auto' and unknown custom IDs) is allowed through.
+pub(crate) fn validate_copilot_model(model: &str) -> Result<(), String> {
+    let model = model.trim();
+    if RETIRED_COPILOT_CLI_MODELS
+        .iter()
+        .any(|retired| retired.eq_ignore_ascii_case(model))
+    {
+        return Err(format!(
+            "GitHub has retired the Copilot model \"{}\". Choose another model in Settings (Auto works on every plan).",
+            model
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves the Copilot CLI binary, preferring an explicitly configured path.
 ///
 /// GUI apps on macOS launch with a minimal PATH, so after a plain PATH lookup
@@ -152,7 +190,7 @@ fn output_snippet(text: &str) -> String {
 ///
 /// # Arguments
 /// * `binary_path` - Optional explicit path to the `copilot` binary
-/// * `model_name` - Copilot model id (e.g. "auto", "claude-sonnet-4.5"); empty or "auto" lets Copilot pick
+/// * `model_name` - Copilot model id (e.g. "auto", "claude-haiku-4.5"); empty or "auto" lets Copilot pick
 /// * `github_token` - Optional GitHub token passed as COPILOT_GITHUB_TOKEN (otherwise `copilot login` credentials are used)
 /// * `system_prompt` / `user_prompt` - Prompts, written to a temp file the CLI reads
 /// * `cancellation_token` - Optional token to abort (kills the child process)
@@ -164,6 +202,7 @@ pub async fn generate_with_copilot_cli(
     user_prompt: &str,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
+    validate_copilot_model(model_name)?;
     let binary = resolve_copilot_binary(binary_path)?;
 
     let prompt_file =
@@ -345,6 +384,39 @@ mod tests {
     fn returns_none_when_no_final_message() {
         let jsonl = r#"{"type":"assistant.message","data":{"content":"narration","toolRequests":[{"name":"view"}]}}"#;
         assert_eq!(extract_final_message(jsonl), None);
+    }
+
+    #[test]
+    fn retired_models_are_rejected_before_running_the_cli() {
+        for model in ["gpt-5-mini", "GPT-5.5", " claude-opus-4.7 ", "claude-sonnet-4.5"] {
+            assert!(validate_copilot_model(model).unwrap_err().contains("retired"));
+        }
+        for model in ["", "auto", "claude-haiku-4.5", "my-org-model"] {
+            assert!(validate_copilot_model(model).is_ok(), "{model}");
+        }
+    }
+
+    #[test]
+    fn retired_list_matches_the_frontend_catalog() {
+        let ts = include_str!("../../../src/lib/copilot-cli-models.ts");
+        let start = ts.find("RETIRED_COPILOT_CLI_MODELS: string[] = [").unwrap();
+        let end = start + ts[start..].find("];").unwrap();
+        let frontend: Vec<&str> = ts[start..end]
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('\''))
+            .filter_map(|rest| rest.split('\'').next())
+            .collect();
+        let mut rust: Vec<&str> = RETIRED_COPILOT_CLI_MODELS.to_vec();
+        let mut frontend_sorted = frontend.clone();
+        rust.sort();
+        frontend_sorted.sort();
+        assert_eq!(rust, frontend_sorted);
+
+        let offered_start = ts.find("COPILOT_CLI_MODELS: string[] = [").unwrap();
+        let offered = &ts[offered_start..offered_start + ts[offered_start..].find("];").unwrap()];
+        for retired in RETIRED_COPILOT_CLI_MODELS {
+            assert!(!offered.contains(&format!("'{retired}'")), "{retired} is offered");
+        }
     }
 
     #[test]

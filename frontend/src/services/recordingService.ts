@@ -21,6 +21,8 @@ export interface RecordingStoppedPayload {
   folder_path?: string;
   meeting_name?: string;
   realtime_transcription_enabled?: boolean;
+  /** Set when the recording audio could not be fully saved (checkpoints kept). */
+  audio_save_error?: string | null;
 }
 
 // Bound the start invoke: > ~40s Bluetooth mic cold-start and ~90s worst-case

@@ -676,8 +676,12 @@ pub async fn api_process_transcript<R: Runtime>(
     let cancellation_token =
         SummaryService::register_cancellation_token(&m_id, started_at);
     let meeting_id_clone = m_id.clone();
+    let supervisor_pool = pool.clone();
+    let supervisor_meeting_id = m_id.clone();
     tauri::async_runtime::spawn(async move {
-        SummaryService::process_transcript_background(
+        // The supervisor turns a panicking attempt into a terminal 'failed'
+        // row for this attempt only, and always releases its cancel token.
+        let attempt = SummaryService::process_transcript_background(
             app,
             pool,
             meeting_id_clone,
@@ -689,6 +693,12 @@ pub async fn api_process_transcript<R: Runtime>(
             final_prompt,
             final_template_id,
             summary_language,
+        );
+        SummaryService::supervise_summary_attempt(
+            supervisor_pool,
+            supervisor_meeting_id,
+            started_at,
+            attempt,
         )
         .await;
     });

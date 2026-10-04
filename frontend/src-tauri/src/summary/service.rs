@@ -21,6 +21,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+/// Stored when a summary attempt dies without reaching a terminal state.
+const SUMMARY_TASK_CRASHED: &str =
+    "Summary generation stopped unexpectedly (internal error). Please try again.";
+
 static METADATA_CACHE: LazyLock<ModelMetadataCache> =
     LazyLock::new(|| ModelMetadataCache::new(Duration::from_secs(300)));
 
@@ -252,6 +256,29 @@ impl SummaryService {
     }
 
     /// Cleans up only the matching generation token after processing completes.
+    /// Run one summary attempt so it always ends in a terminal state. A Rust
+    /// panic (unwind) inside the attempt marks *that* attempt failed via the
+    /// compare-and-set on (meeting_id, start_time, pending): a completion that
+    /// was already persisted, or a newer attempt, is never overwritten. The
+    /// cancellation token is released on every exit. Native aborts cannot be
+    /// caught here; startup reconciliation covers those.
+    pub(crate) async fn supervise_summary_attempt<F>(
+        pool: SqlitePool,
+        meeting_id: String,
+        started_at: DateTime<Utc>,
+        attempt: F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt;
+        if std::panic::AssertUnwindSafe(attempt).catch_unwind().await.is_err() {
+            // Never log the panic payload: it can quote meeting content.
+            error!("Summary task for meeting {} panicked", meeting_id);
+            Self::update_process_failed(&pool, &meeting_id, started_at, SUMMARY_TASK_CRASHED).await;
+        }
+        Self::cleanup_cancellation_token(&meeting_id, started_at);
+    }
+
     fn cleanup_cancellation_token(meeting_id: &str, started_at: DateTime<Utc>) {
         let mut registry = CANCELLATION_REGISTRY
             .lock()
@@ -784,6 +811,107 @@ impl SummaryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn supervisor_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m', 'M', '2026-10-04T00:00:00Z', '2026-10-04T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn status_of(pool: &SqlitePool) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error FROM summary_processes WHERE meeting_id = 'm'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn panic_before_persistence_fails_only_that_attempt_and_cleans_up() {
+        let pool = supervisor_pool().await;
+        let started_at = Utc::now();
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", started_at).await.unwrap();
+        let token = SummaryService::register_cancellation_token("m", started_at);
+
+        SummaryService::supervise_summary_attempt(pool.clone(), "m".into(), started_at, async {
+            panic!("bug in a provider adapter");
+        })
+        .await;
+
+        let (status, error) = status_of(&pool).await;
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some(SUMMARY_TASK_CRASHED));
+        assert!(!SummaryService::cancel_summary("m", started_at), "token must be released");
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn panic_after_persistence_preserves_the_completed_summary() {
+        let pool = supervisor_pool().await;
+        let started_at = Utc::now();
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", started_at).await.unwrap();
+        let inner = pool.clone();
+        SummaryService::supervise_summary_attempt(pool.clone(), "m".into(), started_at, async move {
+            SummaryProcessesRepository::update_process_completed(
+                &inner, "m", started_at, serde_json::json!({"markdown": "done"}), 1, 1.0,
+            )
+            .await
+            .unwrap();
+            panic!("export failed after save");
+        })
+        .await;
+        assert_eq!(status_of(&pool).await.0, "completed");
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_panic_cannot_change_a_newer_attempt() {
+        let pool = supervisor_pool().await;
+        let old_start = Utc::now();
+        let new_start = old_start + chrono::Duration::seconds(1);
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", new_start).await.unwrap();
+        SummaryService::supervise_summary_attempt(pool.clone(), "m".into(), old_start, async {
+            panic!("old attempt");
+        })
+        .await;
+        assert_eq!(status_of(&pool).await.0.to_lowercase(), "pending");
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_fails_orphaned_attempts_and_restores_previous_summary() {
+        let pool = supervisor_pool().await;
+        let first = Utc::now();
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", first).await.unwrap();
+        SummaryProcessesRepository::update_process_completed(
+            &pool, "m", first, serde_json::json!({"markdown": "previous"}), 1, 1.0,
+        )
+        .await
+        .unwrap();
+        // Regeneration started, then the app died natively.
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m", first + chrono::Duration::seconds(5))
+            .await
+            .unwrap();
+
+        assert_eq!(SummaryProcessesRepository::fail_interrupted_processes(&pool).await.unwrap(), 1);
+        let (status, error) = status_of(&pool).await;
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("interrupted"));
+        let result: Option<String> = sqlx::query_scalar("SELECT result FROM summary_processes WHERE meeting_id = 'm'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(result.unwrap().contains("previous"));
+        // Completed rows are left alone on later startups.
+        assert_eq!(SummaryProcessesRepository::fail_interrupted_processes(&pool).await.unwrap(), 0);
+    }
 
     #[test]
     fn stale_cleanup_keeps_the_replacement_cancellation_token() {

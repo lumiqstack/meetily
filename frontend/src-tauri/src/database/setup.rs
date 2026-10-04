@@ -55,6 +55,14 @@ pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), Strin
             }
             Err(e) => log::warn!("Failed to reconcile interrupted background jobs: {}", e),
         }
+
+        // Summary attempts never survive a restart; fail any left pending so
+        // the UI shows a retryable failure instead of endless "processing".
+        match crate::database::repositories::summary::SummaryProcessesRepository::fail_interrupted_processes(&pool).await {
+            Ok(0) => {}
+            Ok(count) => info!("Marked {} interrupted summary attempt(s) as failed", count),
+            Err(e) => log::warn!("Failed to reconcile interrupted summary attempts: {}", e),
+        }
     }
 
     Ok(())

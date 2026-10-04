@@ -99,9 +99,13 @@ describe('summary state restored when returning to a meeting', () => {
   test('repeated recovery read failures end regeneration and retain visible notes', async () => {
     await show(response({ data: { markdown: 'Previous summary' } }));
     getSummary = async () => { throw new Error('Database unavailable'); };
+    for (let i = 0; i < 5; i++) await tick();
+    expect(timers.size).toBe(1); // transient read errors keep polling
+    expect(state.summaryStatus).not.toBe('error');
     await tick();
     expect(state.summaryStatus).toBe('error');
     expect(state.summaryError).toContain('Database unavailable');
+    expect(state.summaryError).toContain('may still be running');
     expect(text()).toContain('Previous summary');
     expect(timers.size).toBe(0);
   });
@@ -136,8 +140,35 @@ describe('summary state restored when returning to a meeting', () => {
       if (failure === 'read') throw new Error('Database unavailable');
       return response({ status: 'completed', data: { markdown: 'Finished summary' } });
     };
-    await tick();
+    for (let i = 0; i < 6; i++) await tick();
     expect(timers.size).toBe(0);
+  });
+
+  test('a transient status read error does not fail a healthy job', async () => {
+    await show(response());
+    let reads = 0;
+    getSummary = async () => {
+      reads += 1;
+      if (reads <= 2) throw new Error('IPC hiccup');
+      if (reads === 3) return response();
+      return response({ status: 'completed', data: { markdown: 'Finished summary' } });
+    };
+    await tick();
+    await tick();
+    expect(state.summaryStatus).toBe('processing');
+    expect(state.summaryError).toBeNull();
+    await tick();
+    await tick();
+    expect(text()).toContain('completed');
+    expect(text()).toContain('Finished summary');
+    expect(timers.size).toBe(0);
+  });
+
+  test('a long-running job is never failed by poll count', async () => {
+    await show(response());
+    for (let i = 0; i < 400; i++) await tick();
+    expect(state.summaryStatus).toBe('processing');
+    expect(timers.size).toBe(1);
   });
 
   test('resumes pending generation after leaving and returning, then displays completion', async () => {

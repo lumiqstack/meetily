@@ -1,12 +1,31 @@
-// Run with node --test; playwright can be supplied through NODE_PATH.
+// Browser fixture suite for the Teams recap extractor. Not part of the
+// default `bun test` unit run (no ".test." in the name); run it explicitly with
+// `pnpm run test:browser` — see tests/README.md for its prerequisites.
+// Missing prerequisites fail loudly: this suite must never silently pass.
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
-const { chromium } = require('playwright');
+let chromium;
+try {
+  ({ chromium } = require('playwright'));
+} catch (error) {
+  throw new Error(
+    'The Teams recap DOM suite needs the Playwright module, which is not a project dependency. ' +
+    'Point NODE_PATH at an existing Playwright install (see tests/README.md). ' + error.message
+  );
+}
 const script = readFileSync(join(__dirname, '../../src-tauri/src/audio/teams_recap.js'), 'utf8');
 let browser;
-before(async () => { browser = await chromium.launch({ channel: 'chrome', headless: true }); });
+before(async () => {
+  try {
+    browser = await chromium.launch({ channel: 'chrome', headless: true });
+  } catch (error) {
+    throw new Error(
+      'The Teams recap DOM suite needs Google Chrome installed (Playwright channel "chrome"). ' + error.message
+    );
+  }
+});
 after(async () => { await browser?.close(); });
 
 async function pageFor(content) {

@@ -89,6 +89,60 @@ impl Drop for StoppingGuard {
     }
 }
 
+/// True from the moment a start command claims the start transition until it
+/// returns (success or failure). Serializes the two start entry points with
+/// each other and lets `stop_recording` wait out an in-flight start.
+static IS_RECORDING_STARTING: AtomicBool = AtomicBool::new(false);
+
+/// RAII claim on the start transition. Acquire it *before* checking recording
+/// state so a concurrent start cannot pass the same check (check-then-act);
+/// Drop releases it on every return path and during unwind.
+struct StartingGuard;
+impl StartingGuard {
+    fn acquire() -> Result<Self, String> {
+        if IS_RECORDING_STARTING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("Recording is already starting".to_string());
+        }
+        let guard = StartingGuard;
+        // Recheck under the claim. A stop tail keeps IS_RECORDING true until
+        // it has released every resource, so this also refuses a new start
+        // while the previous recording is still shutting down.
+        if IS_RECORDING.load(Ordering::SeqCst) {
+            return Err(if IS_RECORDING_STOPPING.load(Ordering::SeqCst) {
+                "The previous recording is still stopping; try again in a moment".to_string()
+            } else {
+                "Recording already in progress".to_string()
+            });
+        }
+        Ok(guard)
+    }
+}
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        IS_RECORDING_STARTING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Upper bound for `stop_recording` waiting on an in-flight start (Bluetooth
+/// cold start and Windows device enumeration can take over a minute).
+const STOP_WAITS_FOR_START: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Wait (without holding any lock) until no start is in flight. Returns false
+/// if the start is still running after `limit`.
+async fn wait_for_start_transition(limit: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while IS_RECORDING_STARTING.load(Ordering::SeqCst) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    true
+}
+
 /// Shared start-path finalize. Both start commands MUST call this so a new
 /// start path can't silently ship with a per-session flag left unreset (e.g.
 /// the mic-recovery budget already exhausted).
@@ -148,6 +202,10 @@ fn map_recording_start_error<R: Runtime>(
                 error!("Failed to emit transcription runtime startup error: {emit_error}");
             }
             TRANSCRIPTION_RUNTIME_START_ERROR_CODE.to_string()
+        }
+        RecordingStartError::Storage(error) => {
+            error!("Recording storage could not be initialized: {error:#}");
+            format!("Failed to start recording: {}", RecordingStartError::Storage(error))
         }
         RecordingStartError::Other(error) => format!("Failed to start recording: {error}"),
     }
@@ -330,12 +388,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         meeting_name
     );
 
-    // Check if already recording
-    let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
-    info!("🔍 IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
-    }
+    // Claim the start transition before checking state, and hold it until
+    // the manager is published and IS_RECORDING is set (end of this
+    // function), so two starts can never both pass the check.
+    let _start_guard = StartingGuard::acquire()?;
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
     // Realtime transcription shares the global Whisper/Parakeet engines with
@@ -543,12 +599,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         mic_device_name, system_device_name, meeting_name
     );
 
-    // Check if already recording
-    let current_recording_state = IS_RECORDING.load(Ordering::SeqCst);
-    info!("🔍 IS_RECORDING state check: {}", current_recording_state);
-    if current_recording_state {
-        return Err("Recording already in progress".to_string());
-    }
+    // Claim the start transition before checking state, and hold it until
+    // the manager is published and IS_RECORDING is set (end of this
+    // function), so two starts can never both pass the check.
+    let _start_guard = StartingGuard::acquire()?;
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
     // Realtime transcription shares the global Whisper/Parakeet engines with
@@ -743,6 +797,11 @@ pub async fn stop_recording<R: Runtime>(
     info!(
         "🛑 Starting optimized recording shutdown - ensuring ALL transcript chunks are preserved"
     );
+    // A Stop that races a Start must not report "not active" and leave the
+    // new recording running: let the start finish (or fail) first.
+    if !wait_for_start_transition(STOP_WAITS_FOR_START).await {
+        return Err("Recording is still starting; try stopping again in a moment".to_string());
+    }
     let realtime_transcription_was_active =
         REALTIME_TRANSCRIPTION_ACTIVE.swap(false, Ordering::SeqCst);
 
@@ -1081,6 +1140,7 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Perform final cleanup with the manager if available
+    let mut audio_save_error: Option<String> = None;
     let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
@@ -1096,15 +1156,17 @@ pub async fn stop_recording<R: Runtime>(
                 info!("✅ Recording data saved successfully during cleanup");
             }
             Ok(Err(e)) => {
-                warn!(
-                    "⚠️ Error during recording cleanup (transcripts preserved): {}",
-                    e
-                );
-                // Don't fail shutdown - transcripts are already preserved
+                // Finish shutdown (transcripts are preserved) but report the
+                // incomplete audio to the frontend instead of claiming success.
+                warn!("⚠️ Recording audio was not fully saved: {}", e);
+                audio_save_error = Some(e.to_string());
             }
             Err(_) => {
                 warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
-                // Don't fail shutdown - transcripts are already preserved
+                audio_save_error = Some(
+                    "Saving the recording audio did not finish within 5 minutes. Audio checkpoints were kept for recovery."
+                        .to_string(),
+                );
             }
         }
 
@@ -1157,7 +1219,8 @@ pub async fn stop_recording<R: Runtime>(
             "message": "Recording stopped - frontend will save after all transcripts received",
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str,
-            "realtime_transcription_enabled": realtime_transcription_was_active
+            "realtime_transcription_enabled": realtime_transcription_was_active,
+            "audio_save_error": audio_save_error
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1765,5 +1828,106 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod start_transition_tests {
+    use super::*;
+
+    /// These tests share the process-wide flags; run them one at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reset() {
+        IS_RECORDING.store(false, Ordering::SeqCst);
+        IS_RECORDING_STOPPING.store(false, Ordering::SeqCst);
+        IS_RECORDING_STARTING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn second_start_is_rejected_while_first_holds_the_transition() {
+        let _serial = serial();
+        reset();
+        let first = StartingGuard::acquire().unwrap();
+        assert_eq!(StartingGuard::acquire().err().unwrap(), "Recording is already starting");
+        drop(first);
+        assert!(StartingGuard::acquire().is_ok());
+        reset();
+    }
+
+    #[test]
+    fn start_after_first_finished_sees_recording_in_progress() {
+        let _serial = serial();
+        reset();
+        {
+            let _first = StartingGuard::acquire().unwrap();
+            finalize_recording_start(); // first start published IS_RECORDING
+        }
+        assert_eq!(StartingGuard::acquire().err().unwrap(), "Recording already in progress");
+        assert!(!IS_RECORDING_STARTING.load(Ordering::SeqCst), "failed acquire must release");
+        reset();
+    }
+
+    #[test]
+    fn start_is_refused_while_previous_stop_tail_runs() {
+        let _serial = serial();
+        reset();
+        IS_RECORDING.store(true, Ordering::SeqCst);
+        let _stopping = StoppingGuard::new();
+        let err = StartingGuard::acquire().err().unwrap();
+        assert!(err.contains("still stopping"), "{err}");
+        drop(_stopping);
+        reset();
+    }
+
+    #[test]
+    fn failed_start_releases_transition_for_retry_even_on_unwind() {
+        let _serial = serial();
+        reset();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = StartingGuard::acquire().unwrap();
+            panic!("start failed mid-initialization");
+        });
+        assert!(result.is_err());
+        assert!(!IS_RECORDING_STARTING.load(Ordering::SeqCst));
+        assert!(StartingGuard::acquire().is_ok());
+        reset();
+    }
+
+    #[test]
+    fn concurrent_starts_admit_exactly_one() {
+        let _serial = serial();
+        reset();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    StartingGuard::acquire().map(std::mem::forget).is_ok()
+                })
+            })
+            .collect();
+        let admitted = handles.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(admitted, 1);
+        reset();
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_an_in_flight_start() {
+        let _serial = serial();
+        reset();
+        let guard = StartingGuard::acquire().unwrap();
+        let waiter = tokio::spawn(wait_for_start_transition(std::time::Duration::from_secs(5)));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "stop must not proceed during a start");
+        drop(guard);
+        assert!(waiter.await.unwrap());
+        let _guard = StartingGuard::acquire().unwrap();
+        assert!(!wait_for_start_transition(std::time::Duration::from_millis(100)).await);
+        reset();
     }
 }

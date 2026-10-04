@@ -15,6 +15,7 @@ impl TranscriptsRepository {
         meeting_title: &str,
         transcripts: &[TranscriptSegment],
         folder_path: Option<String>,
+        transcription_incomplete: bool,
     ) -> Result<String, SqlxError> {
         let meeting_id = format!("meeting-{}", Uuid::new_v4());
 
@@ -25,13 +26,15 @@ impl TranscriptsRepository {
 
         // 1. Create the new meeting
         let result = sqlx::query(
-            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path, transcription_incomplete) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&meeting_id)
         .bind(meeting_title)
         .bind(now)
         .bind(now)
         .bind(&folder_path)
+        .bind(transcription_incomplete)
         .execute(&mut *transaction)
         .await;
 
@@ -261,7 +264,7 @@ mod tests {
 
     async fn save_meeting(pool: &SqlitePool, title: &str, texts: &[&str]) -> String {
         let segments: Vec<TranscriptSegment> = texts.iter().map(|t| seg(t)).collect();
-        TranscriptsRepository::save_transcript(pool, title, &segments, None)
+        TranscriptsRepository::save_transcript(pool, title, &segments, None, false)
             .await
             .expect("save_transcript")
     }
@@ -274,7 +277,7 @@ mod tests {
         let unlabeled = seg("ambiguous crosstalk");
 
         let meeting_id =
-            TranscriptsRepository::save_transcript(&pool, "Labeled", &[labeled, unlabeled], None)
+            TranscriptsRepository::save_transcript(&pool, "Labeled", &[labeled, unlabeled], None, false)
                 .await
                 .unwrap();
 

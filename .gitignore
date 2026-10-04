@@ -78,3 +78,6 @@ target/
 
 frontend/src-tauri/binaries/
 .gstack/
+
+# Machine-specific launcher paths (see Start-Meetily-Vulkan.cmd)
+Start-Meetily-Vulkan.local.cmd

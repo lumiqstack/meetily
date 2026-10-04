@@ -63,7 +63,8 @@ pub struct PipelineStatus {
 }
 
 fn stage_for(meeting: &PendingMeetingModel) -> Stage {
-    if meeting.transcript_count == 0 {
+    // A partial live transcript is never summarized: recover it from audio.
+    if meeting.transcript_count == 0 || meeting.transcription_incomplete {
         Stage::Transcribe
     } else {
         Stage::Summarize
@@ -382,6 +383,7 @@ mod tests {
             folder_path: Some("/tmp/m".to_string()),
             transcript_count: transcripts,
             summary_status: None,
+            transcription_incomplete: false,
         }
     }
 
@@ -389,6 +391,15 @@ mod tests {
     fn meetings_without_transcripts_transcribe_first() {
         assert_eq!(stage_for(&meeting(0)), Stage::Transcribe);
         assert_eq!(stage_for(&meeting(12)), Stage::Summarize);
+    }
+
+    #[test]
+    fn incomplete_transcripts_are_retranscribed_never_summarized() {
+        for count in [0, 7] {
+            let mut partial = meeting(count);
+            partial.transcription_incomplete = true;
+            assert_eq!(stage_for(&partial), Stage::Transcribe);
+        }
     }
 
     #[test]

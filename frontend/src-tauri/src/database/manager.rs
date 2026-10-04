@@ -36,9 +36,18 @@ impl DatabaseManager {
 
         let pool = SqlitePool::connect(tauri_db_path).await?;
 
-        Self::reconcile_orphaned_cloud_transcript_provider_migration(&pool).await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        Self::ensure_cloud_transcript_provider_columns(&pool).await?;
+        let initialized = async {
+            Self::reconcile_orphaned_cloud_transcript_provider_migration(&pool).await?;
+            sqlx::migrate!("./migrations").run(&pool).await?;
+            Self::ensure_cloud_transcript_provider_columns(&pool).await
+        }
+        .await;
+        if let Err(e) = initialized {
+            // Release every connection before reporting failure so nothing
+            // keeps the database files open behind the caller's back.
+            pool.close().await;
+            return Err(e);
+        }
 
         Ok(DatabaseManager { pool })
     }
@@ -57,7 +66,16 @@ impl DatabaseManager {
             fs::create_dir_all(&app_data_dir).map_err(|e| sqlx::Error::Io(e))?;
         }
 
-        // Define database paths
+        Self::open_in_dir(&app_data_dir).await
+    }
+
+    /// Open (and migrate) `meeting_minutes.sqlite` inside `app_data_dir`.
+    ///
+    /// Fails closed: on any open/migration error the database set
+    /// (`.sqlite`, `-wal`, `-shm`) is left exactly as found. The WAL can hold
+    /// committed meetings that were never checkpointed into the main file, so
+    /// deleting or moving it is never a safe automatic "recovery".
+    pub(crate) async fn open_in_dir(app_data_dir: &Path) -> Result<Self> {
         let tauri_db_path = app_data_dir
             .join("meeting_minutes.sqlite")
             .to_string_lossy()
@@ -68,59 +86,39 @@ impl DatabaseManager {
             .to_string_lossy()
             .to_string();
 
-        // WAL file paths for defensive cleanup
-        let wal_path = app_data_dir.join("meeting_minutes.sqlite-wal");
-        let shm_path = app_data_dir.join("meeting_minutes.sqlite-shm");
-
         log::info!("Tauri DB path: {}", tauri_db_path);
         log::info!("Legacy backend DB path: {}", backend_db_path);
 
-        // Try to open database with defensive WAL handling
         match Self::new(&tauri_db_path, &backend_db_path).await {
             Ok(db_manager) => {
                 log::info!("Database opened successfully");
                 Ok(db_manager)
             }
             Err(e) => {
-                // Check if error is due to corrupted WAL file
-                let error_msg = e.to_string();
-                if error_msg.contains("malformed") || error_msg.contains("corrupt") {
-                    log::warn!("Database appears corrupted, likely due to orphaned WAL file. Attempting recovery...");
-                    log::warn!("Error details: {}", error_msg);
-
-                    // Delete potentially corrupted WAL/SHM files
-                    if wal_path.exists() {
-                        match fs::remove_file(&wal_path) {
-                            Ok(_) => log::info!("Removed orphaned WAL file: {:?}", wal_path),
-                            Err(e) => log::warn!("Failed to remove WAL file: {}", e),
-                        }
-                    }
-                    if shm_path.exists() {
-                        match fs::remove_file(&shm_path) {
-                            Ok(_) => log::info!("Removed orphaned SHM file: {:?}", shm_path),
-                            Err(e) => log::warn!("Failed to remove SHM file: {}", e),
-                        }
-                    }
-
-                    // Retry connection without WAL files
-                    log::info!("Retrying database connection after WAL cleanup...");
-                    match Self::new(&tauri_db_path, &backend_db_path).await {
-                        Ok(db_manager) => {
-                            log::info!("Database opened successfully after WAL recovery");
-                            Ok(db_manager)
-                        }
-                        Err(retry_err) => {
-                            log::error!("Database connection failed even after WAL cleanup: {}", retry_err);
-                            Err(retry_err)
-                        }
-                    }
-                } else {
-                    // Not a WAL-related error, propagate original error
-                    log::error!("Database connection failed: {}", error_msg);
-                    Err(e)
-                }
+                let message = Self::open_failure_message(app_data_dir, &e);
+                log::error!("{}", message);
+                Err(sqlx::Error::Configuration(message.into()))
             }
         }
+    }
+
+    /// Actionable, data-preserving explanation for a failed database open.
+    fn open_failure_message(app_data_dir: &Path, error: &sqlx::Error) -> String {
+        let detail = error.to_string();
+        let lower = detail.to_ascii_lowercase();
+        let looks_damaged = lower.contains("malformed")
+            || lower.contains("corrupt")
+            || lower.contains("not a database");
+        format!(
+            "Meetily could not open its database in {} ({}): {}. \
+             No database files were deleted or moved; meeting_minutes.sqlite and its \
+             -wal/-shm files (which may contain recent meetings) are untouched. \
+             Quit Meetily, copy that whole folder somewhere safe, and only then attempt \
+             a repair from the copy. Do not delete the -wal file.",
+            app_data_dir.display(),
+            if looks_damaged { "the database appears damaged" } else { "startup or migration failed" },
+            detail
+        )
     }
 
     /// Check if this is the first launch (sqlite database doesn't exist yet)
@@ -332,5 +330,109 @@ impl DatabaseManager {
         log::info!("Database connection pool closed");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod open_failure_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    fn read(path: &Path) -> Option<Vec<u8>> {
+        fs::read(path).ok()
+    }
+
+    /// Copy of a live WAL-mode database whose committed rows are still only
+    /// in the WAL: the writer stays open (no last-close checkpoint) while the
+    /// set is copied. Returns (fixture dir, writer to drop afterwards).
+    async fn uncheckpointed_fixture(
+        setup: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, sqlx::SqliteConnection) {
+        let source = tempfile::tempdir().unwrap();
+        let source_db = source.path().join("meeting_minutes.sqlite");
+        let mut writer = SqliteConnectOptions::from_str(source_db.to_str().unwrap())
+            .unwrap()
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("wal_autocheckpoint", "0")
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE marker (id INTEGER PRIMARY KEY)")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        for statement in setup {
+            sqlx::query(statement).execute(&mut writer).await.unwrap();
+        }
+        // Put the schema in the main file; only the rows below stay in the WAL.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        for id in 1..=3 {
+            sqlx::query("INSERT INTO marker (id) VALUES (?)")
+                .bind(id)
+                .execute(&mut writer)
+                .await
+                .unwrap();
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let name = format!("meeting_minutes.sqlite{suffix}");
+            fs::copy(source.path().join(&name), fixture.path().join(&name)).unwrap();
+        }
+        assert!(fs::metadata(fixture.path().join("meeting_minutes.sqlite-wal")).unwrap().len() > 0);
+        (fixture, source, writer)
+    }
+
+    #[tokio::test]
+    async fn damaged_main_file_is_left_byte_identical_with_actionable_error() {
+        // No sidecars here on purpose: SQLite itself may discard an invalid
+        // WAL on close, which is not application cleanup. The WAL-preservation
+        // property is covered by `uncheckpointed_wal_rows_survive_a_failed_open`.
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("meeting_minutes.sqlite");
+        fs::write(&main, vec![0xA5; 8192]).unwrap();
+        let before = read(&main);
+
+        let error = match DatabaseManager::open_in_dir(dir.path()).await {
+            Ok(_) => panic!("garbage main file must not open"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(read(&main) == before, "main file changed");
+        assert!(error.contains("appears damaged"), "{error}");
+        assert!(error.contains("untouched"), "{error}");
+        assert!(error.contains("Do not delete the -wal file"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn uncheckpointed_wal_rows_survive_a_failed_open() {
+        // An applied migration this build does not know makes startup fail
+        // for a non-corruption reason, after SQLite has read the WAL.
+        let (fixture, _source, writer) = uncheckpointed_fixture(&[
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, \
+             installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL, \
+             checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)",
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (99990101000000, 'from a newer build', 1, x'00', 0)",
+        ])
+        .await;
+
+        assert!(DatabaseManager::open_in_dir(fixture.path()).await.is_err());
+
+        let check = SqlitePool::connect(fixture.path().join("meeting_minutes.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM marker")
+            .fetch_one(&check)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3);
+        check.close().await;
+        drop(writer);
     }
 }

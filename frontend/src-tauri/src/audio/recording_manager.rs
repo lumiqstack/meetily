@@ -24,6 +24,8 @@ pub enum StreamManagerType {
 pub(crate) enum RecordingStartError {
     #[error("Failed to initialize speech recognition: {0}")]
     TranscriptionRuntime(#[source] anyhow::Error),
+    #[error("Cannot save the recording: {0}")]
+    Storage(#[source] anyhow::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -237,7 +239,13 @@ impl RecordingManager {
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
         let (recording_sender, recording_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // Start recording state first
+        // Required persistence comes first: if the folder or audio writer
+        // cannot be created, fail before any capture or pipeline exists.
+        self.recording_saver
+            .prepare_storage(auto_save)
+            .map_err(RecordingStartError::Storage)?;
+
+        // Start recording state
         self.state.start_recording()?;
 
         // Get device information for adaptive mixing
@@ -273,6 +281,7 @@ impl RecordingManager {
             sys_kind,
         ) {
             self.state.stop_recording();
+            self.recording_saver.discard_after_failed_start().await;
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
@@ -287,7 +296,14 @@ impl RecordingManager {
 
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
         // Pipeline handles mixing and distribution to both recording and transcription
-        self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
+        if let Err(error) = self
+            .stream_manager
+            .start_streams(microphone_device.clone(), system_device.clone(), None)
+            .await
+        {
+            self.abort_failed_start().await;
+            return Err(error.into());
+        }
 
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {
@@ -331,6 +347,23 @@ impl RecordingManager {
         Ok(())
     }
 
+    /// Undo a start that failed after the pipeline and writer were created:
+    /// stop capture, close the pipeline (dropping its recording sender) and
+    /// await both tasks, so no orphan task or stream outlives the error and a
+    /// later start begins from a clean state.
+    async fn abort_failed_start(&mut self) {
+        warn!("Recording start failed; stopping the partially started pipeline");
+        self.state.stop_recording();
+        if let Err(e) = self.stream_manager.stop_streams() {
+            warn!("Error stopping streams after failed start: {}", e);
+        }
+        if let Err(e) = self.pipeline_manager.stop().await {
+            warn!("Error stopping pipeline after failed start: {}", e);
+        }
+        self.recording_saver.discard_after_failed_start().await;
+        self.state.cleanup();
+    }
+
     /// Stop streams and force immediate pipeline flush to process all accumulated audio
     pub async fn stop_streams_and_force_flush(&mut self) -> Result<()> {
         info!("🚀 Stopping recording streams with IMMEDIATE pipeline flush");
@@ -372,7 +405,8 @@ impl RecordingManager {
         let recording_duration = self.state.get_active_recording_duration();
         info!("Recording duration from state: {:?}s", recording_duration);
 
-        // Save the recording with actual duration
+        // Save the recording with actual duration. Failures are returned so
+        // the stop command can tell the user; it still completes shutdown.
         match self.recording_saver.stop_and_save(app, recording_duration).await {
             Ok(Some(file_path)) => {
                 info!("Recording saved successfully to: {}", file_path);
@@ -382,7 +416,7 @@ impl RecordingManager {
             }
             Err(e) => {
                 error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
+                return Err(anyhow::anyhow!(e));
             }
         }
 
@@ -412,21 +446,23 @@ impl RecordingManager {
         }
 
         // Save the recording with actual duration
-        match self.recording_saver.stop_and_save(app, recording_duration).await {
+        let saved = match self.recording_saver.stop_and_save(app, recording_duration).await {
             Ok(Some(file_path)) => {
                 info!("Recording saved successfully to: {}", file_path);
+                Ok(())
             }
             Ok(None) => {
                 info!("Recording not saved (auto-save disabled or no audio data)");
+                Ok(())
             }
             Err(e) => {
                 error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
+                Err(anyhow::anyhow!(e))
             }
-        }
+        };
 
         info!("Recording manager stopped");
-        Ok(())
+        saved
     }
 
     /// Get recording stats from the saver
