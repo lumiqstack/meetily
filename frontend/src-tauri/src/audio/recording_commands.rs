@@ -1081,6 +1081,7 @@ pub async fn stop_recording<R: Runtime>(
     );
 
     // Perform final cleanup with the manager if available
+    let mut audio_save_error: Option<String> = None;
     let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
@@ -1096,15 +1097,17 @@ pub async fn stop_recording<R: Runtime>(
                 info!("✅ Recording data saved successfully during cleanup");
             }
             Ok(Err(e)) => {
-                warn!(
-                    "⚠️ Error during recording cleanup (transcripts preserved): {}",
-                    e
-                );
-                // Don't fail shutdown - transcripts are already preserved
+                // Finish shutdown (transcripts are preserved) but report the
+                // incomplete audio to the frontend instead of claiming success.
+                warn!("⚠️ Recording audio was not fully saved: {}", e);
+                audio_save_error = Some(e.to_string());
             }
             Err(_) => {
                 warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
-                // Don't fail shutdown - transcripts are already preserved
+                audio_save_error = Some(
+                    "Saving the recording audio did not finish within 5 minutes. Audio checkpoints were kept for recovery."
+                        .to_string(),
+                );
             }
         }
 
@@ -1157,7 +1160,8 @@ pub async fn stop_recording<R: Runtime>(
             "message": "Recording stopped - frontend will save after all transcripts received",
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str,
-            "realtime_transcription_enabled": realtime_transcription_was_active
+            "realtime_transcription_enabled": realtime_transcription_was_active,
+            "audio_save_error": audio_save_error
         }),
     )
     .map_err(|e| e.to_string())?;

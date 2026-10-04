@@ -372,7 +372,8 @@ impl RecordingManager {
         let recording_duration = self.state.get_active_recording_duration();
         info!("Recording duration from state: {:?}s", recording_duration);
 
-        // Save the recording with actual duration
+        // Save the recording with actual duration. Failures are returned so
+        // the stop command can tell the user; it still completes shutdown.
         match self.recording_saver.stop_and_save(app, recording_duration).await {
             Ok(Some(file_path)) => {
                 info!("Recording saved successfully to: {}", file_path);
@@ -382,7 +383,7 @@ impl RecordingManager {
             }
             Err(e) => {
                 error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
+                return Err(anyhow::anyhow!(e));
             }
         }
 
@@ -412,21 +413,23 @@ impl RecordingManager {
         }
 
         // Save the recording with actual duration
-        match self.recording_saver.stop_and_save(app, recording_duration).await {
+        let saved = match self.recording_saver.stop_and_save(app, recording_duration).await {
             Ok(Some(file_path)) => {
                 info!("Recording saved successfully to: {}", file_path);
+                Ok(())
             }
             Ok(None) => {
                 info!("Recording not saved (auto-save disabled or no audio data)");
+                Ok(())
             }
             Err(e) => {
                 error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
+                Err(anyhow::anyhow!(e))
             }
-        }
+        };
 
         info!("Recording manager stopped");
-        Ok(())
+        saved
     }
 
     /// Get recording stats from the saver

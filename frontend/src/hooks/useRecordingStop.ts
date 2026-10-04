@@ -87,6 +87,7 @@ export function useRecordingStop(
           folder_path?: string;
           meeting_name?: string;
           realtime_transcription_enabled?: boolean;
+          audio_save_error?: string | null;
         }>('recording-stopped', async (event) => {
           // Create promise that resolves when sessionStorage is set (prevents race condition)
           recordingStoppedDataRef.current = (async () => {
@@ -103,6 +104,15 @@ export function useRecordingStop(
               'last_recording_realtime_transcription_enabled',
               String(!!event.payload.realtime_transcription_enabled)
             );
+            if (event.payload.audio_save_error) {
+              sessionStorage.setItem('last_recording_audio_save_error', event.payload.audio_save_error);
+              toast.warning('Recording audio was not fully saved', {
+                description: event.payload.audio_save_error,
+                duration: 15000,
+              });
+            } else {
+              sessionStorage.removeItem('last_recording_audio_save_error');
+            }
           })();
 
         });
