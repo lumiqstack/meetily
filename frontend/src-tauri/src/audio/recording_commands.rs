@@ -149,6 +149,10 @@ fn map_recording_start_error<R: Runtime>(
             }
             TRANSCRIPTION_RUNTIME_START_ERROR_CODE.to_string()
         }
+        RecordingStartError::Storage(error) => {
+            error!("Recording storage could not be initialized: {error:#}");
+            format!("Failed to start recording: {}", RecordingStartError::Storage(error))
+        }
         RecordingStartError::Other(error) => format!("Failed to start recording: {error}"),
     }
 }

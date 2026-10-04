@@ -138,6 +138,8 @@ pub struct RecordingSaver {
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
     accumulation_task: Option<AccumulationTask>,
+    /// True when this recording promised to keep audio (auto_save).
+    save_audio: bool,
 }
 
 impl RecordingSaver {
@@ -149,6 +151,7 @@ impl RecordingSaver {
             metadata: None,
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
             accumulation_task: None,
+            save_audio: false,
         }
     }
 
@@ -216,45 +219,53 @@ impl RecordingSaver {
         self.add_transcript_segment(segment);
     }
 
-    /// Start accumulation with optional incremental saving
-    ///
-    /// # Arguments
-    /// * `auto_save` - If true, creates checkpoints and enables saving. If false, audio chunks are discarded.
-    pub fn start_accumulation(
-        &mut self,
-        auto_save: bool,
-        mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
-    ) {
+    /// Create the meeting folder (and, with `auto_save`, the checkpoint
+    /// writer) before any audio is captured. Both modes promise persistence —
+    /// audio checkpoints, or transcripts + metadata — so a failure here must
+    /// stop the recording from starting rather than surface only at Stop.
+    pub fn prepare_storage(&mut self, auto_save: bool) -> Result<()> {
+        let base_folder = super::recording_preferences::get_default_recordings_folder();
+        self.prepare_storage_in(&base_folder, auto_save)
+    }
+
+    fn prepare_storage_in(&mut self, base_folder: &PathBuf, auto_save: bool) -> Result<()> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
             info!("Starting recording without audio saving (auto-save DISABLED - transcripts only)");
         }
+        self.save_audio = auto_save;
+        let name = self
+            .meeting_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No meeting name was set for the recording"))?;
+        // Without auto_save the folder still holds transcripts/metadata, but
+        // no .checkpoints directory or audio writer is created.
+        self.initialize_meeting_folder(base_folder, &name, auto_save)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Cannot create the recording folder in {}: {}",
+                    base_folder.display(),
+                    e
+                )
+            })?;
+        info!(
+            "Successfully initialized meeting folder ({})",
+            if auto_save { "with checkpoints" } else { "transcripts only" }
+        );
+        Ok(())
+    }
 
-        // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
-        if auto_save {
-            if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, true) {
-                    Ok(()) => info!("Successfully initialized meeting folder with checkpoints"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                        // Continue anyway - will use fallback flat structure
-                    }
-                }
-            }
-        } else {
-            // When auto_save is false, still create meeting folder for transcripts/metadata
-            // but skip .checkpoints directory
-            if let Some(name) = self.meeting_name.clone() {
-                match self.initialize_meeting_folder(&name, false) {
-                    Ok(()) => info!("Successfully initialized meeting folder (transcripts only)"),
-                    Err(e) => {
-                        error!("Failed to initialize meeting folder: {}", e);
-                    }
-                }
-            }
-        }
-
+    /// Start the background writer for a recording whose storage was prepared
+    /// with [`prepare_storage`](Self::prepare_storage).
+    ///
+    /// # Arguments
+    /// * `auto_save` - If true, audio chunks go to the checkpoint writer. If false, they are discarded.
+    pub fn start_accumulation(
+        &mut self,
+        auto_save: bool,
+        receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    ) {
         // Start the accumulation writer. It owns the receiver and ends only
         // when every producer has dropped its sender, so stop_and_save can
         // await it and know every accepted chunk reached the saver.
@@ -288,12 +299,14 @@ impl RecordingSaver {
     /// # Arguments
     /// * `meeting_name` - Name of the meeting
     /// * `create_checkpoints` - Whether to create .checkpoints/ directory and IncrementalAudioSaver
-    fn initialize_meeting_folder(&mut self, meeting_name: &str, create_checkpoints: bool) -> Result<()> {
-        // Load preferences to get base recordings folder
-        let base_folder = super::recording_preferences::get_default_recordings_folder();
-
+    fn initialize_meeting_folder(
+        &mut self,
+        base_folder: &PathBuf,
+        meeting_name: &str,
+        create_checkpoints: bool,
+    ) -> Result<()> {
         // Create meeting folder structure (with or without .checkpoints/ subdirectory)
-        let meeting_folder = create_meeting_folder(&base_folder, meeting_name, create_checkpoints)?;
+        let meeting_folder = create_meeting_folder(base_folder, meeting_name, create_checkpoints)?;
 
         // Only initialize incremental saver if checkpoints are needed (auto_save is true)
         if create_checkpoints {
@@ -439,10 +452,15 @@ impl RecordingSaver {
             outcome => return Err(self.preserve_incomplete_recording(outcome)),
         }
 
-        // Check if incremental saver exists (indicates auto_save was enabled)
-        let should_save_audio = self.incremental_saver.is_some();
+        // Audio was promised but no writer exists: never report that as
+        // "auto-save disabled".
+        if self.save_audio && self.incremental_saver.is_none() {
+            return Err(self.preserve_incomplete_recording(DrainOutcome::WriterFailed(
+                "no audio writer was initialized".to_string(),
+            )));
+        }
 
-        if !should_save_audio {
+        if self.incremental_saver.is_none() {
             info!("⚠️  No audio saver initialized (auto-save was disabled) - skipping audio finalization");
             info!("✅ Transcripts and metadata already saved incrementally");
             return Ok(None);
@@ -525,6 +543,23 @@ impl RecordingSaver {
         }
 
         Ok(Some(final_audio_path.to_string_lossy().to_string()))
+    }
+
+    /// Wind down after a start that failed once the writer was running: the
+    /// caller has already closed every producer, so the writer finishes; the
+    /// folder is kept (never deleted) but marked as a failed start.
+    pub async fn discard_after_failed_start(&mut self) {
+        if let Some(handle) = self.accumulation_task.take() {
+            let outcome =
+                await_accumulation(handle, ACCUMULATION_ABORT_GRACE, ACCUMULATION_ABORT_GRACE).await;
+            info!("Writer after failed start ended: {:?}", outcome);
+        }
+        if let (Some(folder), Some(mut metadata)) = (&self.meeting_folder, self.metadata.clone()) {
+            metadata.status = "start_failed".to_string();
+            if let Err(e) = self.write_metadata(folder, &metadata) {
+                warn!("Failed to mark recording metadata as a failed start: {}", e);
+            }
+        }
     }
 
     /// The writer did not drain cleanly: never finalize (merging checkpoints
@@ -728,5 +763,83 @@ mod drain_tests {
         assert!(dir.path().join("transcripts.json").exists());
         let metadata = std::fs::read_to_string(dir.path().join("metadata.json")).unwrap();
         assert!(metadata.contains("\"status\": \"incomplete\""), "{metadata}");
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    fn named_saver() -> RecordingSaver {
+        let mut saver = RecordingSaver::new();
+        saver.set_meeting_name(Some("Weekly".to_string()));
+        saver
+    }
+
+    #[test]
+    fn audio_mode_fails_when_the_recordings_folder_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the recordings folder should be: portable
+        // (unlike read-only directories, which Windows does not enforce).
+        let blocked = dir.path().join("recordings");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let mut saver = named_saver();
+        let error = saver.prepare_storage_in(&blocked, true).unwrap_err().to_string();
+        assert!(error.contains("Cannot create the recording folder"), "{error}");
+        assert!(saver.incremental_saver.is_none());
+    }
+
+    #[test]
+    fn transcript_only_mode_also_requires_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("recordings");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert!(named_saver().prepare_storage_in(&blocked, false).is_err());
+    }
+
+    #[test]
+    fn transcript_only_mode_creates_folder_without_audio_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = named_saver();
+        saver.prepare_storage_in(&dir.path().to_path_buf(), false).unwrap();
+        let folder = saver.meeting_folder.clone().unwrap();
+        assert!(folder.join("metadata.json").exists());
+        assert!(!folder.join(".checkpoints").exists());
+        assert!(saver.incremental_saver.is_none());
+    }
+
+    #[test]
+    fn audio_mode_creates_checkpoint_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = named_saver();
+        saver.prepare_storage_in(&dir.path().to_path_buf(), true).unwrap();
+        assert!(saver.meeting_folder.clone().unwrap().join(".checkpoints").is_dir());
+        assert!(saver.incremental_saver.is_some());
+    }
+
+    #[test]
+    fn missing_meeting_name_fails_instead_of_recording_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = RecordingSaver::new();
+        assert!(saver.prepare_storage_in(&dir.path().to_path_buf(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_start_ends_the_writer_and_marks_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = named_saver();
+        saver.prepare_storage_in(&dir.path().to_path_buf(), true).unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        saver.start_accumulation(true, rx);
+        drop(tx); // the pipeline was stopped
+        saver.discard_after_failed_start().await;
+        assert!(saver.accumulation_task.is_none());
+        let folder = saver.meeting_folder.clone().unwrap();
+        let metadata = std::fs::read_to_string(folder.join("metadata.json")).unwrap();
+        assert!(metadata.contains("start_failed"), "{metadata}");
+        // A retry gets a fresh saver; nothing here blocks it.
+        let mut retry = named_saver();
+        assert!(retry.prepare_storage_in(&dir.path().to_path_buf(), true).is_ok());
     }
 }

@@ -24,6 +24,8 @@ pub enum StreamManagerType {
 pub(crate) enum RecordingStartError {
     #[error("Failed to initialize speech recognition: {0}")]
     TranscriptionRuntime(#[source] anyhow::Error),
+    #[error("Cannot save the recording: {0}")]
+    Storage(#[source] anyhow::Error),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -237,7 +239,13 @@ impl RecordingManager {
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
         let (recording_sender, recording_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // Start recording state first
+        // Required persistence comes first: if the folder or audio writer
+        // cannot be created, fail before any capture or pipeline exists.
+        self.recording_saver
+            .prepare_storage(auto_save)
+            .map_err(RecordingStartError::Storage)?;
+
+        // Start recording state
         self.state.start_recording()?;
 
         // Get device information for adaptive mixing
@@ -273,6 +281,7 @@ impl RecordingManager {
             sys_kind,
         ) {
             self.state.stop_recording();
+            self.recording_saver.discard_after_failed_start().await;
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
@@ -287,7 +296,14 @@ impl RecordingManager {
 
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
         // Pipeline handles mixing and distribution to both recording and transcription
-        self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
+        if let Err(error) = self
+            .stream_manager
+            .start_streams(microphone_device.clone(), system_device.clone(), None)
+            .await
+        {
+            self.abort_failed_start().await;
+            return Err(error.into());
+        }
 
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {
@@ -329,6 +345,23 @@ impl RecordingManager {
 
         debug!("Recording streams stopped successfully");
         Ok(())
+    }
+
+    /// Undo a start that failed after the pipeline and writer were created:
+    /// stop capture, close the pipeline (dropping its recording sender) and
+    /// await both tasks, so no orphan task or stream outlives the error and a
+    /// later start begins from a clean state.
+    async fn abort_failed_start(&mut self) {
+        warn!("Recording start failed; stopping the partially started pipeline");
+        self.state.stop_recording();
+        if let Err(e) = self.stream_manager.stop_streams() {
+            warn!("Error stopping streams after failed start: {}", e);
+        }
+        if let Err(e) = self.pipeline_manager.stop().await {
+            warn!("Error stopping pipeline after failed start: {}", e);
+        }
+        self.recording_saver.discard_after_failed_start().await;
+        self.state.cleanup();
     }
 
     /// Stop streams and force immediate pipeline flush to process all accumulated audio
