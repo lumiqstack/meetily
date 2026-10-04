@@ -232,6 +232,33 @@ impl SummaryProcessesRepository {
         Ok(update.rows_affected() == 1)
     }
 
+    /// Fail every attempt still marked pending. Call only at startup: no
+    /// summary task survives a restart, so such rows are orphaned (for example
+    /// after a native crash) and would otherwise show "processing" forever.
+    /// The previous summary, if this was a regeneration, is restored.
+    pub async fn fail_interrupted_processes(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+        let now = Utc::now();
+        let update = sqlx::query(
+            r#"
+            UPDATE summary_processes
+            SET
+                status = 'failed',
+                error = 'Summary generation was interrupted when Meetily closed. Please try again.',
+                updated_at = ?,
+                end_time = ?,
+                result = COALESCE(result_backup, result),
+                result_backup = NULL,
+                result_backup_timestamp = NULL
+            WHERE LOWER(status) IN ('pending', 'processing')
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(update.rows_affected())
+    }
+
     pub async fn update_process_cancelled(
         pool: &SqlitePool,
         meeting_id: &str,

@@ -29,6 +29,9 @@ interface TranscriptSearchResult {
   timestamp: string;
 }
 
+/** Consecutive failed status reads (5 s apart) before reporting lost contact. */
+const MAX_CONSECUTIVE_SUMMARY_READ_FAILURES = 6;
+
 interface SummaryPoll {
   processId: string;
   timer: NodeJS.Timeout;
@@ -225,6 +228,30 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   ) => {
     stopSummaryPolling(meetingId);
     let pollCount = 0;
+    // The backend owns the job's lifecycle (and marks crashed or interrupted
+    // jobs failed). A failed status read is a communication problem, not a
+    // generation failure: keep polling through transient errors and only
+    // report lost contact after a sustained run of them.
+    let consecutiveReadFailures = 0;
+    const reportPollingError = async (entry: SummaryPoll, message: string) => {
+      try {
+        await onUpdate({
+          status: 'error',
+          meetingName: null,
+          meeting_id: meetingId,
+          start: processId,
+          end: null,
+          data: null,
+          error: message,
+        });
+      } catch (callbackError) {
+        console.error('Failed to handle summary polling error:', callbackError);
+      } finally {
+        if (summaryPollsRef.current.get(meetingId) === entry) {
+          stopSummaryPolling(meetingId, processId);
+        }
+      }
+    };
     const poll = async () => {
       const entry = summaryPollsRef.current.get(meetingId);
       if (!entry || entry.processId !== processId || entry.inFlight) {
@@ -233,12 +260,38 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       entry.inFlight = true;
       try {
         pollCount += 1;
-        const result = await invoke<SummaryProcessResponse>('api_get_summary', { meetingId });
+        let result: SummaryProcessResponse;
+        try {
+          result = await invoke<SummaryProcessResponse>('api_get_summary', { meetingId });
+          consecutiveReadFailures = 0;
+        } catch (error) {
+          if (summaryPollsRef.current.get(meetingId) !== entry) return;
+          consecutiveReadFailures += 1;
+          const detail = error instanceof Error ? error.message : 'Unknown error';
+          if (consecutiveReadFailures < MAX_CONSECUTIVE_SUMMARY_READ_FAILURES) {
+            console.warn(
+              `Summary status read failed (${consecutiveReadFailures}/${MAX_CONSECUTIVE_SUMMARY_READ_FAILURES}); retrying:`,
+              detail
+            );
+            return;
+          }
+          await reportPollingError(
+            entry,
+            `Lost contact with the summary job (${detail}). It may still be running; reopen the meeting to check its status.`
+          );
+          return;
+        }
         const current = summaryPollsRef.current.get(meetingId);
         if (current !== entry || result.start !== processId) {
           return;
         }
-        await onUpdate(result);
+        try {
+          await onUpdate(result);
+        } catch (error) {
+          if (summaryPollsRef.current.get(meetingId) !== entry) return;
+          await reportPollingError(entry, error instanceof Error ? error.message : 'Unknown error');
+          return;
+        }
         if (summaryPollsRef.current.get(meetingId) !== entry) return;
         if (
           result.status === 'completed'
@@ -248,28 +301,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           || (result.status === 'idle' && pollCount > 1)
         ) {
           stopSummaryPolling(meetingId, processId);
-        }
-      } catch (error) {
-        const current = summaryPollsRef.current.get(meetingId);
-        if (current !== entry) {
-          return;
-        }
-        try {
-          await onUpdate({
-            status: 'error',
-            meetingName: null,
-            meeting_id: meetingId,
-            start: processId,
-            end: null,
-            data: null,
-            error: error instanceof Error ? error.message : 'Unknown error',
-          });
-        } catch (callbackError) {
-          console.error('Failed to handle summary polling error:', callbackError);
-        } finally {
-          if (summaryPollsRef.current.get(meetingId) === entry) {
-            stopSummaryPolling(meetingId, processId);
-          }
         }
       } finally {
         const current = summaryPollsRef.current.get(meetingId);
