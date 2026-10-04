@@ -444,7 +444,7 @@ async fn start_import_with_guard<R: Runtime>(
             kind: "import".to_string(),
             title: title.clone(),
             source_path: Some(source_path.clone()),
-            source_url,
+            source_url: source_url.clone(),
             mode,
             folder_path: None,
             meeting_id: None,
@@ -465,6 +465,7 @@ async fn start_import_with_guard<R: Runtime>(
         model,
         provider,
         meeting_date,
+        source_url,
     )
     .await;
 
@@ -518,6 +519,7 @@ async fn run_import<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     meeting_date: Option<String>,
+    source_url: Option<String>,
 ) -> Result<ImportResult> {
     let source = PathBuf::from(&source_path);
 
@@ -876,12 +878,25 @@ async fn run_import<R: Runtime>(
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
+    let created_at = resolve_meeting_date(&title, Some(&source_path), meeting_date.as_deref());
+    let import_source = source_url
+        .as_deref()
+        .map(crate::database::repositories::meeting_sources::url_import_source)
+        .unwrap_or("file");
+    let meeting_source = crate::database::repositories::meeting_sources::MeetingSource::for_import(
+        import_source,
+        &title,
+        source_url.as_deref(),
+        Some(&source_path),
+        Some(duration_seconds),
+    );
     let meeting_id = create_meeting_with_transcripts(
         app_state.db_manager.pool(),
         &title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
-        resolve_meeting_date(&title, Some(&source_path), meeting_date.as_deref()),
+        created_at,
+        &meeting_source,
     )
     .await?;
 
@@ -899,6 +914,7 @@ async fn run_import<R: Runtime>(
         duration_seconds,
         &dest_filename,
         "import",
+        &created_at.to_rfc3339(),
     ) {
         warn!("Failed to write metadata.json: {}", e);
     }
@@ -988,6 +1004,7 @@ async fn create_meeting_with_transcripts(
     segments: &[TranscriptSegment],
     folder_path: String,
     created_at: chrono::DateTime<chrono::Utc>,
+    source: &crate::database::repositories::meeting_sources::MeetingSource,
 ) -> Result<String> {
     let meeting_id = format!("meeting-{}", Uuid::new_v4());
     let now = chrono::Utc::now();
@@ -1030,6 +1047,11 @@ async fn create_meeting_with_transcripts(
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
     }
+
+    source
+        .insert(&mut *tx, &meeting_id)
+        .await
+        .map_err(|e| anyhow!("Failed to record meeting source: {}", e))?;
 
     tx.commit()
         .await
@@ -1183,6 +1205,7 @@ fn write_import_metadata(
     duration_seconds: f64,
     audio_filename: &str,
     source: &str,
+    created_at: &str,
 ) -> Result<()> {
     let metadata_path = folder.join("metadata.json");
     let temp_path = folder.join(".metadata.json.tmp");
@@ -1192,7 +1215,7 @@ fn write_import_metadata(
         "version": "1.0",
         "meeting_id": meeting_id,
         "meeting_name": title,
-        "created_at": now,
+        "created_at": created_at,
         "completed_at": now,
         "duration_seconds": duration_seconds,
         "audio_file": audio_filename,
@@ -1891,12 +1914,22 @@ async fn run_transcript_import<R: Runtime>(
     // Keep the raw VTT alongside the meeting for reference.
     let _ = std::fs::copy(&vtt_path, meeting_folder.join("transcript.vtt"));
 
+    let created_at = resolve_meeting_date(title, None, meeting_date);
+    let duration_seconds = cues.last().map(|c| c.end_s).unwrap_or(0.0);
+    let meeting_source = crate::database::repositories::meeting_sources::MeetingSource::for_import(
+        "teams-transcript",
+        title,
+        Some(url),
+        None,
+        Some(duration_seconds),
+    );
     let meeting_id = match create_meeting_with_transcripts(
         app_state.db_manager.pool(),
         title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
-        resolve_meeting_date(title, None, meeting_date),
+        created_at,
+        &meeting_source,
     )
     .await
     {
@@ -1910,8 +1943,6 @@ async fn run_transcript_import<R: Runtime>(
         }
     };
 
-    let duration_seconds = cues.last().map(|c| c.end_s).unwrap_or(0.0);
-
     if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
     }
@@ -1922,6 +1953,7 @@ async fn run_transcript_import<R: Runtime>(
         duration_seconds,
         "transcript.vtt",
         "transcript-import",
+        &created_at.to_rfc3339(),
     ) {
         warn!("Failed to write metadata.json: {}", e);
     }
@@ -1954,6 +1986,43 @@ pub async fn is_import_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn created_meeting_records_its_date_and_source() {
+        use crate::database::repositories::meeting_sources::{url_import_source, MeetingSource};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let url = "https://contoso-my.sharepoint.com/personal/j/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4";
+        let title = "Weekly sync-20260721_100221-Meeting Recording";
+        let created_at = resolve_meeting_date(title, None, Some("2026-07-21T15:48:10Z"));
+        let source = MeetingSource::for_import(url_import_source(url), title, Some(url), None, Some(60.0));
+        let segments = vec![TranscriptSegment {
+            id: "t1".into(),
+            text: "hello".into(),
+            timestamp: "00:00".into(),
+            audio_start_time: Some(0.0),
+            audio_end_time: Some(1.0),
+            duration: Some(1.0),
+            speaker: None,
+        }];
+        let meeting_id = create_meeting_with_transcripts(&pool, title, &segments, "/tmp/f".into(), created_at, &source)
+            .await
+            .unwrap();
+
+        let stored: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT created_at FROM meetings WHERE id = ?")
+                .bind(&meeting_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, created_at);
+        assert_eq!(MeetingSource::get(&pool, &meeting_id).await.unwrap(), Some(source));
+    }
 
     #[test]
     fn meeting_date_prefers_the_teams_stamp_then_the_hint() {
@@ -2332,6 +2401,7 @@ mod tests {
             1800.0,
             "audio.mp4",
             "import",
+            "2026-07-21T15:02:21+00:00",
         );
         assert!(result.is_ok(), "write_import_metadata failed: {:?}", result);
 
@@ -2347,6 +2417,7 @@ mod tests {
         assert_eq!(parsed["audio_file"], "audio.mp4");
         assert_eq!(parsed["status"], "completed");
         assert_eq!(parsed["source"], "import");
+        assert_eq!(parsed["created_at"], "2026-07-21T15:02:21+00:00");
     }
 
     /// Integration test that decodes a real audio file and runs VAD.

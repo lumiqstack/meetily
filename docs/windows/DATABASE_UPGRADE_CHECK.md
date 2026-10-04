@@ -19,7 +19,7 @@ database table `_sqlx_migrations`. Two rules follow:
 
 As of 2026-10-04, `main` contains every migration on
 `codex/reapply-local-features` plus three more, and the branch
-`enhance/meeting-tags-and-dates` adds one more on top of `main`:
+`enhance/meeting-tags-and-dates` adds two more on top of `main`:
 
 | Version | File | On codex | On main | On enhance/meeting-tags-and-dates |
 | --- | --- | --- | --- | --- |
@@ -27,9 +27,10 @@ As of 2026-10-04, `main` contains every migration on
 | 20261004000000 | add_meeting_transcription_incomplete | no | yes | yes |
 | 20261004000100 | add_remote_vocabulary_opt_in | no | yes | yes |
 | 20261004000200 | add_meeting_tags | no | no | yes |
+| 20261004000300 | add_meeting_sources | no | no | yes |
 
 Running that branch is therefore a one-way door for this database: afterwards
-only builds that contain all four files can open it, unless the backup from
+only builds that contain all five files can open it, unless the backup from
 step 2 is restored.
 
 ## Ground rules
@@ -167,7 +168,8 @@ them.
 1. Start Meetily the usual way.
 2. Confirm it opens and the existing meetings are listed.
 3. Close it and re-run the step 3 query on the **live** database (read-only).
-   `20261004000200` should now be present with `success` = 1.
+   `20261004000200` and `20261004000300` should now be present with
+   `success` = 1.
 4. Smoke test the new features: add a tag to a meeting, save it to Obsidian,
    and check that the note's front matter lists `meetings` plus the tag and
    that the sidebar shows the purple gem icon for that meeting.

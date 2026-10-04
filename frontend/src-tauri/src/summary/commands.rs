@@ -168,6 +168,20 @@ async fn save_extracted_copilot_recap(
     .await
     .map_err(|e| format!("Failed to import Copilot recap: {e}"))?;
 
+    let mut meeting_source = crate::database::repositories::meeting_sources::MeetingSource::for_import(
+        "copilot-recap",
+        title,
+        source_url.as_deref(),
+        None,
+        None,
+    );
+    if recorded_at.is_some() {
+        meeting_source.recorded_at = recorded_at.clone();
+    }
+    if let Err(e) = meeting_source.insert(state.db_manager.pool(), &meeting_id).await {
+        log::warn!("Failed to record source for imported recap {}: {}", meeting_id, e);
+    }
+
     log_info!(
         "Imported Microsoft Copilot recap as transcript-free meeting {}",
         meeting_id

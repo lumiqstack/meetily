@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
+use crate::database::repositories::meeting_sources::MeetingSource;
+
 #[path = "obsidian_filename.rs"]
 mod filename;
 
@@ -230,6 +232,22 @@ fn tags_yaml(tags: &[String]) -> String {
     yaml
 }
 
+/// A YAML double-quoted scalar (JSON string syntax is valid YAML).
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// `47:12`, or `1:02:03` from an hour on.
+fn format_duration(seconds: f64) -> String {
+    let total = seconds.round() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 fn build_obsidian_markdown(
     meeting_id: &str,
     title: &str,
@@ -237,28 +255,45 @@ fn build_obsidian_markdown(
     summary_markdown: &str,
     transcript_markdown: &str,
     recorded_at: Option<&str>,
+    source: Option<&MeetingSource>,
     tags: &[String],
 ) -> String {
     let exported_at = Utc::now().to_rfc3339();
     let title = title.trim();
     let created = parse_created_date(created_at).to_rfc3339();
+    let recorded_at = recorded_at
+        .or_else(|| source.and_then(|s| s.recorded_at.as_deref()))
+        .filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value));
 
-    let mut note = format!(
-        "---\nsource: meetily\nmeeting_id: \"{}\"\ncreated: \"{}\"\nexported: \"{}\"\n{}---\n\n# {}\n\n## Summary\n\n{}\n",
-        meeting_id,
-        created,
-        exported_at,
-        tags_yaml(tags),
-        title,
-        summary_markdown.trim(),
-    );
+    // `meeting_id` stays within the first lines: re-exports find a meeting's
+    // existing note by scanning the head of the file for it.
+    let mut front = format!("---\nsource: meetily\nmeeting_id: \"{meeting_id}\"\n");
+    if let Some(source) = source {
+        front.push_str(&format!("import_source: {}\n", source.import_source));
+    }
+    if let Some(recorded_at) = recorded_at {
+        front.push_str(&format!("recorded_at: \"{recorded_at}\"\n"));
+    }
+    front.push_str(&format!("created: \"{created}\"\nexported: \"{exported_at}\"\n"));
+    if let Some(source) = source {
+        if let Some(duration) = source.duration_seconds {
+            front.push_str(&format!("duration: \"{}\"\n", format_duration(duration)));
+        }
+        if let Some(file) = &source.recording_file {
+            front.push_str(&format!("recording_file: {}\n", yaml_string(file)));
+        }
+        if let Some(url) = &source.recording_url {
+            front.push_str(&format!("recording_url: {}\n", yaml_string(url)));
+        }
+    }
+    front.push_str(&tags_yaml(tags));
+    front.push_str("---\n");
+
+    let mut note = format!("{front}\n# {title}\n\n## Summary\n\n{}\n", summary_markdown.trim());
     if !transcript_markdown.trim().is_empty() {
         note.push_str("\n## Transcript\n\n");
         note.push_str(transcript_markdown.trim());
         note.push('\n');
-    }
-    if let Some(recorded_at) = recorded_at.filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value)) {
-        note = note.replacen("\ncreated:", &format!("\nrecorded_at: \"{recorded_at}\"\ncreated:"), 1);
     }
     note
 }
@@ -552,6 +587,13 @@ async fn export_note<R: Runtime>(
             }),
         None => Vec::new(),
     };
+    let source = match pool.as_ref() {
+        Some(pool) => MeetingSource::get(pool, meeting_id).await.unwrap_or_else(|e| {
+            warn!("Obsidian export: failed to load source for meeting {}: {}", meeting_id, e);
+            None
+        }),
+        None => None,
+    };
     let markdown = build_obsidian_markdown(
         meeting_id,
         title,
@@ -559,6 +601,7 @@ async fn export_note<R: Runtime>(
         summary_markdown,
         transcript_markdown,
         recorded_at.or(saved_recorded_at.as_deref()),
+        source.as_ref(),
         &tags,
     );
 
@@ -674,6 +717,7 @@ mod tests {
             "## Meeting notes\n\n- Existing Copilot recap",
             "",
             Some("2026-09-23T11:40:00"),
+            None,
             &[],
         );
         assert!(note.contains("## Meeting notes"));
@@ -690,9 +734,46 @@ mod tests {
             "summary",
             "",
             None,
+            None,
             &["clients".to_string(), "meetings".to_string(), "q4".to_string()],
         );
         assert!(note.contains("tags:\n  - meetings\n  - clients\n  - q4\n---\n"));
+    }
+
+    #[test]
+    fn sharepoint_import_properties_are_written_to_the_front_matter() {
+        let source = MeetingSource {
+            import_source: "sharepoint".into(),
+            recording_url: Some("https://contoso-my.sharepoint.com/personal/j/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4".into()),
+            recording_file: Some("Weekly sync \"Q3\"-20260721_100221-Meeting Recording.mp4".into()),
+            recorded_at: Some("2026-07-21T10:02:21".into()),
+            duration_seconds: Some(2832.4),
+        };
+        let note = build_obsidian_markdown(
+            "meeting-1", "Weekly sync", "2026-07-21T15:02:21Z", "summary", "", None, Some(&source), &["q3".into()],
+        );
+        let front: Vec<&str> = note.split("---\n").nth(1).unwrap().lines().collect();
+        assert_eq!(front[0], "source: meetily");
+        assert_eq!(front[1], "meeting_id: \"meeting-1\"");
+        assert_eq!(front[2], "import_source: sharepoint");
+        assert_eq!(front[3], "recorded_at: \"2026-07-21T10:02:21\"");
+        assert!(front.contains(&"duration: \"47:12\""));
+        assert!(front.contains(&r#"recording_file: "Weekly sync \"Q3\"-20260721_100221-Meeting Recording.mp4""#));
+        assert!(front.iter().any(|l| l.starts_with("recording_url: \"https://contoso-my.sharepoint.com/")));
+        assert_eq!(&front[front.len() - 3..], ["tags:", "  - meetings", "  - q3"]);
+        // An explicit recap stamp wins over the stored one.
+        let recap = build_obsidian_markdown("m", "T", "2026-07-21T15:02:21Z", "s", "", Some("2026-07-22T09:00:00"), Some(&source), &[]);
+        assert!(recap.contains("recorded_at: \"2026-07-22T09:00:00\""));
+        assert_eq!(format_duration(3723.0), "1:02:03");
+    }
+
+    #[test]
+    fn notes_without_a_source_keep_the_original_properties() {
+        let note = build_obsidian_markdown("m", "Live call", "2026-07-21T15:02:21Z", "s", "", None, None, &[]);
+        let front = note.split("---\n").nth(1).unwrap();
+        assert!(!front.contains("import_source"));
+        assert!(!front.contains("recording_"));
+        assert!(!front.contains("duration"));
     }
 
     #[test]
