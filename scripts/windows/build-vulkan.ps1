@@ -17,8 +17,9 @@
     5. Build: `cargo build --locked --release -p meetily --bin meetily --features vulkan`
        into the standard target directory. The previous executable is kept as
        target\release\meetily.previous.exe.
-    6. Launcher: creates Start-Meetily-Vulkan.local.cmd (gitignored) from the
-       parameters if it does not exist yet, so the existing shortcut keeps working.
+    6. Launcher: right after step 2, creates Start-Meetily-Vulkan.local.cmd
+       (gitignored) from the parameters if it does not exist yet, so the
+       existing shortcut keeps working even if the build later fails.
     7. Report: a timestamped Markdown report (PASS/FAIL per step) to -ReportPath,
        preserving that file's first "path header" line. No transcript text,
        credentials or authenticated URLs are written.
@@ -209,6 +210,9 @@ try {
     else {
         Add-Step 'Source' 'PASS' (Sync-Source)
     }
+    # Right after the source update (which may bring the templated launcher),
+    # so the existing shortcut keeps its paths even if the build fails later.
+    Add-Step 'Launcher config' 'PASS' (Write-LauncherConfig)
 
     # Toolchain environment (verified Windows setup; see STATUS.md)
     & $VsDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
@@ -280,9 +284,6 @@ try {
     $facts['Executable built'] = (Get-FileHash -LiteralPath $exe).Hash
     $facts['Build features'] = 'vulkan (Whisper GPU), --locked, release, raw executable only'
     Add-Step 'Vulkan build' 'PASS' ("{0:n0} min" -f ((Get-Date) - $buildStart).TotalMinutes)
-
-    # 6. Launcher
-    Add-Step 'Launcher config' 'PASS' (Write-LauncherConfig)
 
     if ($Launch) {
         $launcher = Join-Path $RepoRoot 'Start-Meetily-Vulkan.cmd'
