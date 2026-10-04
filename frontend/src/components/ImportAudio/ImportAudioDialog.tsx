@@ -48,6 +48,7 @@ import { recapTitleFromFileUrl } from '@/lib/teams-recap-title';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import { getSharedImportQueue } from '@/lib/import-queue';
 import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
+import { oldestMeetingFirst } from '@/lib/sharepoint-order';
 
 /** Matches the Rust BatchCandidate returned by the batch-selection commands. */
 interface BatchCandidate {
@@ -381,7 +382,9 @@ export function ImportAudioDialog({
   };
 
   const handleStartSharePointImport = () => {
-    const selected = (spItems ?? []).filter((r) => spSelected.has(r.file_url));
+    // The scan lists newest first; import the oldest meeting first so
+    // meetings are processed in the order they happened.
+    const selected = oldestMeetingFirst((spItems ?? []).filter((r) => spSelected.has(r.file_url)));
     if (selected.length === 0) return;
 
     const language = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
