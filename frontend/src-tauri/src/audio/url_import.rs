@@ -152,7 +152,7 @@ async fn download_attempt(
     harden_child_io(&mut cmd);
     no_console_window(&mut cmd);
 
-    debug!("Spawning yt-dlp for {url}");
+    debug!("Spawning yt-dlp for {}", url_host_for_log(url));
     let mut child = cmd.spawn().context("Failed to start yt-dlp")?;
 
     let stdout = child
@@ -257,14 +257,18 @@ async fn download_attempt(
     let stderr_text = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
-        // The user-facing error keeps the last few lines; the extractor's own
-        // warnings arrive earlier and are what actually explain a failure, so
-        // log the full tail (it may carry tenant manifest URLs — acceptable in
-        // the local log file, and failures here are undiagnosable without it).
-        warn!("yt-dlp failed ({status}); captured stderr:\n{stderr_text}");
+        // Raw yt-dlp output can carry authenticated manifest URLs, cookies or
+        // headers, and the returned error is persisted with the job. Report
+        // only an allowlisted failure category.
+        let category = classify_ytdlp_failure(&stderr_text);
+        warn!(
+            "yt-dlp failed ({status}); category={}, stderr_lines={}",
+            category.code(),
+            stderr_text.lines().count()
+        );
         return Err(anyhow!(
-            "Could not download the recording. It may be inaccessible, deleted, or require different permissions.\n\nyt-dlp: {}",
-            tail(&stderr_text, 8)
+            "Could not download the recording. It may be inaccessible, deleted, or require different permissions.\n\nReason: {}",
+            category.description()
         ));
     }
 
@@ -348,7 +352,7 @@ pub async fn fetch_transcript(
     harden_child_io(&mut cmd);
     no_console_window(&mut cmd);
 
-    debug!("Fetching transcript subtitles for {url}");
+    debug!("Fetching transcript subtitles from {}", url_host_for_log(url));
     let (_ok, output) = run_capture(cmd, cancel).await?;
 
     if let Some(vtt) = find_vtt(out_dir) {
@@ -360,10 +364,13 @@ pub async fn fetch_transcript(
     let listed = list_subs(ytdlp, ffmpeg, cookies_txt, url, cancel)
         .await
         .unwrap_or_else(|e| format!("(could not list subtitles: {e})"));
-    // Raw yt-dlp output can contain tenant manifest URLs — keep it at debug;
-    // the warn line carries only the track list.
-    warn!("No transcript track found. Available subs:\n{listed}");
-    debug!("yt-dlp transcript-fetch output:\n{output}");
+    // Raw yt-dlp output can contain tenant manifest URLs; never log it.
+    let listed = without_urls(&listed);
+    warn!(
+        "No transcript track found ({} subtitle listing lines, fetch category={})",
+        listed.lines().count(),
+        classify_ytdlp_failure(&output).code()
+    );
 
     Err(anyhow!(
         "No transcript was found for this link. Teams may not have generated a transcript for this meeting, or it isn't exposed for download.\n\nAvailable subtitle tracks:\n{}",
@@ -504,10 +511,88 @@ fn parse_progress(line: &str) -> Option<u32> {
     Some(pct.round().clamp(0.0, 100.0) as u32)
 }
 
-fn tail(text: &str, lines: usize) -> String {
-    let all: Vec<&str> = text.lines().collect();
-    let start = all.len().saturating_sub(lines);
-    all[start..].join("\n")
+/// Allowlisted yt-dlp failure categories. Only these fixed strings leave the
+/// process output: raw lines may contain authenticated URLs or headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YtdlpFailure {
+    AccessDenied,
+    NotFound,
+    Unsupported,
+    Network,
+    NoFormat,
+    Ffmpeg,
+    Unknown,
+}
+
+impl YtdlpFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::AccessDenied => "access_denied",
+            Self::NotFound => "not_found",
+            Self::Unsupported => "unsupported_url",
+            Self::Network => "network",
+            Self::NoFormat => "no_format",
+            Self::Ffmpeg => "ffmpeg",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::AccessDenied => "access was denied (sign in again or check your permissions)",
+            Self::NotFound => "the recording was not found (it may have been moved or deleted)",
+            Self::Unsupported => "the link is not a supported recording link",
+            Self::Network => "a network error or timeout interrupted the download",
+            Self::NoFormat => "no downloadable media format was offered",
+            Self::Ffmpeg => "post-processing with ffmpeg failed",
+            Self::Unknown => "yt-dlp reported an unrecognized error",
+        }
+    }
+}
+
+fn classify_ytdlp_failure(output: &str) -> YtdlpFailure {
+    let text = output.to_ascii_lowercase();
+    if text.contains("http error 401")
+        || text.contains("http error 403")
+        || text.contains("forbidden")
+        || text.contains("unauthorized")
+        || text.contains("sign in")
+        || text.contains("login required")
+    {
+        YtdlpFailure::AccessDenied
+    } else if text.contains("http error 404") || text.contains("not found") {
+        YtdlpFailure::NotFound
+    } else if text.contains("unsupported url") {
+        YtdlpFailure::Unsupported
+    } else if text.contains("requested format is not available") || text.contains("no video formats") {
+        YtdlpFailure::NoFormat
+    } else if text.contains("ffmpeg") || text.contains("postprocessing") {
+        YtdlpFailure::Ffmpeg
+    } else if text.contains("timed out")
+        || text.contains("connection")
+        || text.contains("getaddrinfo")
+        || text.contains("unable to download")
+    {
+        YtdlpFailure::Network
+    } else {
+        YtdlpFailure::Unknown
+    }
+}
+
+/// Scheme + host only; paths and query strings can carry share tokens.
+fn url_host_for_log(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| format!("{}://{}", u.scheme(), h)))
+        .unwrap_or_else(|| "<invalid url>".to_string())
+}
+
+/// Drop any line that carries a URL (manifest/redirect lines in listings).
+fn without_urls(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.contains("://"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Find the single downloaded media file in `dir`, ignoring yt-dlp temp files.
@@ -536,4 +621,40 @@ fn find_output_file(dir: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+#[cfg(test)]
+mod log_redaction_tests {
+    use super::*;
+
+    const SECRET_STDERR: &str = "[generic] Extracting URL: https://tenant.sharepoint.com/x?token=SECRET123\n\
+        ERROR: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403>); \
+        Cookie: FedAuth=SECRET123";
+
+    #[test]
+    fn classification_never_echoes_raw_output() {
+        let category = classify_ytdlp_failure(SECRET_STDERR);
+        assert_eq!(category, YtdlpFailure::AccessDenied);
+        assert!(!category.code().contains("SECRET"));
+        assert!(!category.description().contains("SECRET"));
+    }
+
+    #[test]
+    fn classifies_common_failures() {
+        assert_eq!(classify_ytdlp_failure("ERROR: HTTP Error 404: Not Found"), YtdlpFailure::NotFound);
+        assert_eq!(classify_ytdlp_failure("ERROR: Unsupported URL: https://x"), YtdlpFailure::Unsupported);
+        assert_eq!(classify_ytdlp_failure("ERROR: Requested format is not available"), YtdlpFailure::NoFormat);
+        assert_eq!(classify_ytdlp_failure("ERROR: read operation timed out"), YtdlpFailure::Network);
+        assert_eq!(classify_ytdlp_failure("something odd"), YtdlpFailure::Unknown);
+    }
+
+    #[test]
+    fn url_logging_keeps_only_scheme_and_host() {
+        assert_eq!(
+            url_host_for_log("https://tenant-my.sharepoint.com/personal/a/b.mp4?share=SECRET"),
+            "https://tenant-my.sharepoint.com"
+        );
+        assert_eq!(url_host_for_log("not a url"), "<invalid url>");
+        assert_eq!(without_urls("en  vtt\nhttps://cdn/x?sig=SECRET\nes  vtt"), "en  vtt\nes  vtt");
+    }
 }

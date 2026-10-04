@@ -416,7 +416,7 @@ pub async fn api_search_transcripts<R: Runtime>(
             Ok(results)
         }
         Err(e) => {
-            log_error!("Error searching transcripts for query '{}': {}", query, e);
+            log_error!("Error searching transcripts ({} char query): {}", query.chars().count(), e);
             Err(format!("Failed to search transcripts: {}", e))
         }
     }

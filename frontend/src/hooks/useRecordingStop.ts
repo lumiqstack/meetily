@@ -278,9 +278,7 @@ export function useRecordingStop(
         console.log('💾 Saving COMPLETE transcripts to database...', {
           transcript_count: freshTranscripts.length,
           meeting_name: savedMeetingName || meetingTitle,
-          folder_path: folderPath,
-          sample_text: freshTranscripts.length > 0 ? freshTranscripts[0].text.substring(0, 50) + '...' : 'none',
-          last_transcript: freshTranscripts.length > 0 ? freshTranscripts[freshTranscripts.length - 1].text.substring(0, 30) + '...' : 'none',
+          has_folder_path: Boolean(folderPath),
         });
 
         try {

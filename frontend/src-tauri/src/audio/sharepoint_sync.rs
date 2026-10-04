@@ -1150,7 +1150,7 @@ pub fn mark_imported_public<R: Runtime>(app: &AppHandle<R>, file_url: &str) {
         .imported
         .insert(file_url.to_string(), chrono::Utc::now().to_rfc3339());
     if let Err(e) = save_sync_state(app, &state) {
-        warn!("[sp-scan] could not record import of {file_url}: {e}");
+        warn!("[sp-scan] could not record import of a recording: {e}");
     }
 }
 
