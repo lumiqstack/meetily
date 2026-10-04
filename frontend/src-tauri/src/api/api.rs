@@ -1491,6 +1491,10 @@ pub async fn api_save_copilot_cli_config<R: Runtime>(
         &model
     );
 
+    if let Some(model) = model.as_deref() {
+        crate::summary::copilot_cli::validate_copilot_model(model)?;
+    }
+
     let config = CopilotCliConfig {
         binary_path: binary_path.filter(|p| !p.trim().is_empty()),
         model: model.filter(|m| !m.trim().is_empty()),
