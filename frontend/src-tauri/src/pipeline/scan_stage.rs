@@ -177,6 +177,7 @@ pub async fn run_scan_stage(
             transcript_config.model.clone(),
             transcript_config.provider.clone(),
             Some("audio".to_string()),
+            Some(created.clone()).filter(|c| !c.is_empty()),
             AuthMode::SilentOnly,
         )
         .await

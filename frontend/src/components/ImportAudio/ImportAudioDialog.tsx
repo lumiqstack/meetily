@@ -391,7 +391,7 @@ export function ImportAudioDialog({
     queue.enqueueBatch(
       // The direct file URL downloads via an authenticated GET in the backend
       // (no yt-dlp page scraping, which breaks on newer Stream UIs).
-      selected.map((r) => ({ url: r.file_url, title: titleFromFileName(r.name) })),
+      selected.map((r) => ({ url: r.file_url, title: titleFromFileName(r.name), meetingDate: r.created || undefined })),
       {
         language,
         model: selectedModel?.name || null,

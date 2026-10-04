@@ -89,6 +89,7 @@ impl SummaryProcessesRepository {
         title: &str,
         summary: &Value,
         source_url: Option<&str>,
+        created_at: chrono::DateTime<Utc>,
     ) -> Result<String, sqlx::Error> {
         let meeting_id = format!("meeting-{}", Uuid::new_v4());
         let now = Utc::now();
@@ -106,7 +107,7 @@ impl SummaryProcessesRepository {
         )
         .bind(&meeting_id)
         .bind(title)
-        .bind(now)
+        .bind(created_at)
         .bind(now)
         .execute(&mut *transaction)
         .await?;
@@ -344,6 +345,7 @@ mod tests {
             "Treasury kick-off",
             &summary,
             Some("https://tenant.sharepoint.com/recording"),
+            Utc::now(),
         )
         .await
         .unwrap();

@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, Gem } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -37,6 +37,7 @@ interface SidebarItem {
   title: string;
   type: 'folder' | 'file';
   children?: SidebarItem[];
+  obsidianExported?: boolean;
 }
 
 const Sidebar: React.FC = () => {
@@ -611,7 +612,14 @@ const Sidebar: React.FC = () => {
           ) : (
             <div className="flex flex-col w-full">
               <div className="flex items-center w-full">
-                {isMeetingItem ? (
+                {isMeetingItem && item.obsidianExported ? (
+                  <div
+                    className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-purple-100"
+                    title="Saved to Obsidian"
+                  >
+                    <Gem className="w-3.5 h-3.5 text-purple-600" aria-label="Saved to Obsidian" />
+                  </div>
+                ) : isMeetingItem ? (
                   <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-gray-100">
                     <File className="w-3.5 h-3.5 text-gray-600" />
                   </div>

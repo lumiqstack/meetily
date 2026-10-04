@@ -1,0 +1,17 @@
+{"PrimaryQueryResult":{"RelevantResults":{"Table":{"Rows":[
+  {"Cells":[
+    {"Key":"Title","Value":"Quarterly review"},
+    {"Key":"Path","Value":"https://contoso.sharepoint.com/sites/finance/Shared Documents/Forms/DispForm.aspx?ID=12"},
+    {"Key":"DefaultEncodingURL","Value":"https://contoso.sharepoint.com/sites/finance/Shared%20Documents/Recordings/Quarterly%20review-20260915_140000-Meeting%20Recording.mp4"},
+    {"Key":"LastModifiedTime","Value":"2026-09-15T15:10:00Z"},
+    {"Key":"Created","Value":"2026-09-15T15:09:30Z"},
+    {"Key":"Size","Value":"73400320"}
+  ]},
+  {"Cells":[
+    {"Key":"Title","Value":"All hands town hall"},
+    {"Key":"Path","Value":"https://contoso.sharepoint.com/sites/comms/Videos/audio.mp4"},
+    {"Key":"LastModifiedTime","Value":"2026-09-20T18:00:00Z"},
+    {"Key":"Created","Value":"2026-09-20T17:45:00Z"},
+    {"Key":"Size","Value":"10485760"}
+  ]}
+]}}}}

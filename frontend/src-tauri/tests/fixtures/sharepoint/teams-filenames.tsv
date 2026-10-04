@@ -1,0 +1,9 @@
+# Teams recording/transcript file names and the local start time Meetily
+# should date the meeting with. Tab-separated: file name<TAB>expected
+# local timestamp, or "none" when the name carries no Teams stamp.
+Weekly sync-20260721_100221-Meeting Recording.mp4	2026-07-21T10:02:21
+Weekly%20sync-20260721_100221-Meeting%20Recording.mp4	2026-07-21T10:02:21
+CET Mercado Libre-20261004_090000-Meeting Recording.mp4	2026-10-04T09:00:00
+Client kickoff-20260930_083000-Meeting Transcript.vtt	2026-09-30T08:30:00
+audio.mp4	none
+Quarterly review.mp4	none

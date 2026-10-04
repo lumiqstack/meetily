@@ -412,6 +412,7 @@ pub async fn start_import<R: Runtime>(
         provider,
         None,
         None,
+        None,
         guard,
     )
     .await
@@ -428,6 +429,7 @@ async fn start_import_with_guard<R: Runtime>(
     provider: Option<String>,
     source_url: Option<String>,
     mode: Option<String>,
+    meeting_date: Option<String>,
     _guard: JobGuard<'static>,
 ) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
@@ -462,6 +464,7 @@ async fn start_import_with_guard<R: Runtime>(
         language,
         model,
         provider,
+        meeting_date,
     )
     .await;
 
@@ -514,6 +517,7 @@ async fn run_import<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    meeting_date: Option<String>,
 ) -> Result<ImportResult> {
     let source = PathBuf::from(&source_path);
 
@@ -877,6 +881,7 @@ async fn run_import<R: Runtime>(
         &title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
+        resolve_meeting_date(&title, Some(&source_path), meeting_date.as_deref()),
     )
     .await?;
 
@@ -935,12 +940,54 @@ fn emit_progress<R: Runtime>(
 }
 
 
+/// When an imported meeting actually took place, so it is dated by the
+/// meeting rather than by the import. In order of preference:
+/// 1. the Teams recording stamp (`Name-20260721_100221-Meeting Recording`,
+///    meeting start in local time) in the title or the source file name;
+/// 2. `hint`: an RFC 3339 timestamp, or a Teams-style local timestamp, from
+///    the source (SharePoint's file creation time, ≈ recording end);
+/// 3. now — nothing better is known (an ordinary audio file).
+pub(crate) fn resolve_meeting_date(
+    title: &str,
+    source: Option<&str>,
+    hint: Option<&str>,
+) -> chrono::DateTime<chrono::Utc> {
+    meeting_date_from_name(title)
+        .or_else(|| source.and_then(meeting_date_from_name))
+        .or_else(|| hint.and_then(parse_meeting_date))
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// The Teams recording stamp in a title, file name, path or URL.
+fn meeting_date_from_name(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let last = last.split(['?', '#']).next().unwrap_or(last);
+    let decoded = super::sharepoint_sync::percent_decode_component(last);
+    let metadata = super::teams_recap::metadata::from_filename(&decoded)?;
+    parse_meeting_date(&metadata.recorded_at)
+}
+
+fn parse_meeting_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    let value = value.trim();
+    if let Ok(date) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(date.with_timezone(&chrono::Utc));
+    }
+    // A timezone-less timestamp is local wall-clock time.
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|date| date.with_timezone(&chrono::Utc))
+}
+
 /// Create a new meeting with transcripts in the database
 async fn create_meeting_with_transcripts(
     pool: &sqlx::SqlitePool,
     title: &str,
     segments: &[TranscriptSegment],
     folder_path: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let meeting_id = format!("meeting-{}", Uuid::new_v4());
     let now = chrono::Utc::now();
@@ -958,7 +1005,7 @@ async fn create_meeting_with_transcripts(
     )
     .bind(&meeting_id)
     .bind(title)
-    .bind(now)
+    .bind(created_at)
     .bind(now)
     .bind(&folder_path)
     .execute(&mut *tx)
@@ -1314,6 +1361,7 @@ pub async fn start_import_audio_command<R: Runtime>(
             provider,
             None,
             None,
+            None,
             guard,
         )
         .await;
@@ -1368,6 +1416,7 @@ pub async fn start_import_from_url_command<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     mode: Option<String>,
+    meeting_date: Option<String>,
 ) -> Result<ImportStarted, String> {
     let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
 
@@ -1390,6 +1439,7 @@ pub async fn start_import_from_url_command<R: Runtime>(
             model,
             provider,
             mode,
+            meeting_date,
             cancel,
             super::sharepoint::AuthMode::AllowInteractive,
         )
@@ -1443,6 +1493,7 @@ pub async fn import_from_url_internal<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     mode: Option<String>,
+    meeting_date: Option<String>,
     auth_mode: super::sharepoint::AuthMode,
 ) -> Result<()> {
     let import_id = format!("import-{}", Uuid::new_v4());
@@ -1458,6 +1509,7 @@ pub async fn import_from_url_internal<R: Runtime>(
         model,
         provider,
         mode,
+        meeting_date,
         cancel,
         auth_mode,
     )
@@ -1485,10 +1537,17 @@ async fn run_url_import<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     mode: Option<String>,
+    meeting_date: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
     auth_mode: super::sharepoint::AuthMode,
 ) -> Result<()> {
     use super::{sharepoint, url_import, ytdlp};
+
+    // The downloaded file may not keep the recording's name, so date the
+    // meeting from the link itself (Teams stamp) before the caller's hint.
+    let meeting_date = meeting_date_from_name(&url)
+        .map(|date| date.to_rfc3339())
+        .or(meeting_date);
 
     let is_transcript = mode.as_deref() == Some("transcript");
 
@@ -1651,7 +1710,7 @@ async fn run_url_import<R: Runtime>(
         // meeting from it directly — no download, no Whisper, no engine guard.
         if is_transcript {
             let result =
-                run_transcript_import(&app, &import_id, &ytdlp_url, &title, &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
+                run_transcript_import(&app, &import_id, &ytdlp_url, &title, meeting_date.as_deref(), &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
                     .await;
             auth.cleanup();
             return result;
@@ -1719,6 +1778,7 @@ async fn run_url_import<R: Runtime>(
         provider,
         Some(url),
         mode,
+        meeting_date,
         guard,
     )
     .await;
@@ -1736,6 +1796,7 @@ async fn run_transcript_import<R: Runtime>(
     import_id: &str,
     url: &str,
     title: &str,
+    meeting_date: Option<&str>,
     ytdlp_path: &Path,
     ffmpeg_path: Option<&Path>,
     auth: &super::sharepoint::AuthCookies,
@@ -1835,6 +1896,7 @@ async fn run_transcript_import<R: Runtime>(
         title,
         &segments,
         meeting_folder.to_string_lossy().to_string(),
+        resolve_meeting_date(title, None, meeting_date),
     )
     .await
     {
@@ -1892,6 +1954,42 @@ pub async fn is_import_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meeting_date_prefers_the_teams_stamp_then_the_hint() {
+        use chrono::TimeZone;
+        let local = chrono::Local
+            .with_ymd_and_hms(2026, 7, 21, 10, 2, 21)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            resolve_meeting_date("Weekly sync-20260721_100221-Meeting Recording", None, Some("2026-01-01T00:00:00Z")),
+            local
+        );
+        assert_eq!(
+            resolve_meeting_date(
+                "Weekly sync",
+                Some("https://x-my.sharepoint.com/personal/u/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4"),
+                None,
+            ),
+            local
+        );
+        // Windows temp path of a downloaded recording.
+        assert_eq!(
+            resolve_meeting_date(
+                "Weekly sync",
+                Some(r"C:\Users\me\AppData\Local\Temp\meetily-url-1\Weekly sync-20260721_100221-Meeting Recording.mp4"),
+                None,
+            ),
+            local
+        );
+        assert_eq!(
+            resolve_meeting_date("CET Mercado Libre", None, Some("2026-09-30T15:30:00Z")).to_rfc3339(),
+            "2026-09-30T15:30:00+00:00"
+        );
+        let before = chrono::Utc::now();
+        assert!(resolve_meeting_date("Plain audio", Some("/tmp/a.mp3"), Some("garbage")) >= before);
+    }
     use crate::audio::engine_coordinator::{
         global_coordinator_test_lock, LocalEngineUser, LOCAL_ENGINE_COORDINATOR,
     };

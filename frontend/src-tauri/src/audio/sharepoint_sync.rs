@@ -1454,6 +1454,87 @@ mod tests {
         );
     }
 
+    fn fixture_files(dir: &str) -> Vec<(String, serde_json::Value)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sharepoint")
+            .join(dir);
+        let mut files: Vec<_> = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let json = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{}: invalid JSON: {e}", path.display()));
+                (path.file_name().unwrap().to_string_lossy().into_owned(), json)
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(!files.is_empty(), "no fixtures in {}", root.display());
+        files
+    }
+
+    /// What every parsed recording must satisfy for the import to work and
+    /// for the meeting to be dated by the recording rather than the import.
+    fn assert_importable(fixture: &str, recs: &[SharePointRecording]) {
+        assert!(!recs.is_empty(), "{fixture}: no recordings parsed");
+        for rec in recs {
+            assert!(has_media_extension(&percent_decode_component(&rec.file_url)), "{fixture}: {} is not media", rec.file_url);
+            assert!(rec.file_url.starts_with("https://"), "{fixture}: {}", rec.file_url);
+            assert!(direct_sharepoint_media_url(&rec.file_url).is_some(), "{fixture}: {} not directly downloadable", rec.file_url);
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(&rec.created).is_ok(),
+                "{fixture}: {} has unparseable created {:?}",
+                rec.name,
+                rec.created
+            );
+            let title = meeting_title_for(&rec.name);
+            let dated = crate::audio::import::resolve_meeting_date(&title, Some(&rec.file_url), Some(&rec.created));
+            let created = chrono::DateTime::parse_from_rfc3339(&rec.created).unwrap();
+            // Teams stamps are the local start time; the file is created at
+            // the end. Either way the meeting lands within a day of it.
+            assert!(
+                (dated - created.with_timezone(&chrono::Utc)).num_hours().abs() <= 24,
+                "{fixture}: {} dated {dated}, created {created}",
+                rec.name
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_onedrive_listings_parse_into_importable_recordings() {
+        for (name, json) in fixture_files("onedrive") {
+            assert_importable(&name, &parse_onedrive_files(&json, "contoso-my.sharepoint.com"));
+        }
+    }
+
+    #[test]
+    fn fixture_search_results_parse_into_importable_recordings() {
+        for (name, json) in fixture_files("search") {
+            assert_importable(&name, &parse_search_results(&json));
+        }
+    }
+
+    #[test]
+    fn fixture_teams_filenames_carry_the_expected_start_time() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sharepoint/teams-filenames.tsv");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut checked = 0;
+        for line in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
+            let (name, expected) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("missing tab in teams-filenames.tsv line: {line}"));
+            let parsed = crate::audio::teams_recap::metadata::from_filename(name).map(|m| m.recorded_at);
+            match expected.trim() {
+                "none" => assert_eq!(parsed, None, "{name}"),
+                stamp => assert_eq!(parsed.as_deref(), Some(stamp), "{name}"),
+            }
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
     #[test]
     fn parses_a_onedrive_folder_listing() {
         let json: serde_json::Value = serde_json::from_str(
