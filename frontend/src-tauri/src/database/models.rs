@@ -21,6 +21,9 @@ pub struct PendingMeetingModel {
     pub folder_path: Option<String>,
     pub transcript_count: i64,
     pub summary_status: Option<String>,
+    /// Saved before live transcription finished: needs re-transcription from
+    /// audio before it may be summarized.
+    pub transcription_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]

@@ -7,6 +7,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { describeIncompleteRecovery, postRecordingDestination, waitForLiveTranscription } from '@/lib/live-transcription-wait';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -189,10 +190,6 @@ export function useRecordingStop(
         console.log('Realtime transcription disabled for this recording; skipping live transcript wait');
       }
 
-      const MAX_WAIT_TIME = 60000; // 60 seconds maximum wait (increased for longer processing)
-      const POLL_INTERVAL = 500; // Check every 500ms
-      let elapsedTime = 0;
-
       // Listen for transcription-complete event
       const unlistenComplete = realtimeTranscriptionEnabled
         ? await listen('transcription-complete', () => {
@@ -201,47 +198,30 @@ export function useRecordingStop(
         })
         : undefined;
 
-      // Poll for transcription status
-      while (realtimeTranscriptionEnabled && elapsedTime < MAX_WAIT_TIME && !transcriptionComplete) {
-        try {
-          const status = await transcriptService.getTranscriptionStatus();
-          console.log('Transcription status:', status);
-
-          // Check if transcription is complete
-          if (!status.is_processing && status.chunks_in_queue === 0) {
-            console.log('Transcription complete - no active processing and no chunks in queue');
-            transcriptionComplete = true;
-            break;
-          }
-
-          // If no activity for more than 8 seconds and no chunks in queue, consider it done (increased from 5s to 8s)
-          if (status.last_activity_ms > 8000 && status.chunks_in_queue === 0) {
-            console.log('Transcription likely complete - no recent activity and empty queue');
-            transcriptionComplete = true;
-            break;
-          }
-
-          // Update user with current status
-          if (status.chunks_in_queue > 0) {
-            console.log(`Processing ${status.chunks_in_queue} remaining audio chunks...`);
-            setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, `Processing ${status.chunks_in_queue} remaining chunks...`);
-          }
-
-          // Wait before next check
-          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-          elapsedTime += POLL_INTERVAL;
-        } catch (error) {
-          console.error('Error checking transcription status:', error);
-          break;
-        }
+      let elapsedTime = 0;
+      if (realtimeTranscriptionEnabled) {
+        const wait = await waitForLiveTranscription({
+          getStatus: () => transcriptService.getTranscriptionStatus(),
+          completedByEvent: () => transcriptionComplete,
+          onQueue: (chunks) => {
+            console.log(`Processing ${chunks} remaining audio chunks...`);
+            setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, `Processing ${chunks} remaining chunks...`);
+          },
+        });
+        transcriptionComplete = wait.complete;
+        elapsedTime = wait.elapsedMs;
+        if (wait.reason) console.warn('Live transcription wait ended without completion:', wait.reason);
       }
 
       // Clean up listener
       console.log('🧹 CLEANUP: Cleaning up transcription-complete listener');
       unlistenComplete?.();
 
-      if (realtimeTranscriptionEnabled && !transcriptionComplete && elapsedTime >= MAX_WAIT_TIME) {
-        console.warn('⏰ Transcription wait timeout reached after', elapsedTime, 'ms');
+      // Saved either way; an incomplete live transcript is marked so it is
+      // re-transcribed from audio instead of being summarized as complete.
+      const transcriptionIncomplete = realtimeTranscriptionEnabled && !transcriptionComplete;
+      if (transcriptionIncomplete) {
+        console.warn('⏰ Live transcription did not finish (timeout or status errors) after', elapsedTime, 'ms');
       } else if (realtimeTranscriptionEnabled) {
         console.log('✅ Transcription completed after', elapsedTime, 'ms');
         // Wait longer for any late transcript segments (increased from 1s to 4s)
@@ -274,7 +254,7 @@ export function useRecordingStop(
       // Save to SQLite
       // NOTE: enabled to save COMPLETE transcripts after frontend receives all updates
       // This ensures user sees all transcripts streaming in before database save
-      if (isCallApi && (transcriptionComplete || !realtimeTranscriptionEnabled)) {
+      if (isCallApi) {
 
         setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
 
@@ -295,7 +275,8 @@ export function useRecordingStop(
           const responseData = await storageService.saveMeeting(
             savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
             freshTranscripts,
-            folderPath
+            folderPath,
+            transcriptionIncomplete
           );
 
           const meetingId = responseData.meeting_id;
@@ -339,6 +320,8 @@ export function useRecordingStop(
           sessionStorage.removeItem('last_recording_folder_path');
           sessionStorage.removeItem('last_recording_meeting_name');
           sessionStorage.removeItem('last_recording_realtime_transcription_enabled');
+          const audioSaveError = sessionStorage.getItem('last_recording_audio_save_error');
+          sessionStorage.removeItem('last_recording_audio_save_error');
           // Clean up IndexedDB meeting ID (redundant with markMeetingAsSaved cleanup, but ensures cleanup)
           sessionStorage.removeItem('indexeddb_current_meeting_id');
 
@@ -362,24 +345,37 @@ export function useRecordingStop(
           // Mark as completed
           setStatus(RecordingStatus.COMPLETED);
 
-          // Show success toast with navigation option
-          toast.success('Recording saved successfully!', {
-            description: realtimeTranscriptionEnabled
-              ? `${freshTranscripts.length} transcript segments saved.`
-              : 'Audio saved. You can transcribe it after the meeting.',
-            action: {
-              label: 'View Meeting',
-              onClick: () => {
-                router.push(`/meeting-details?id=${meetingId}`);
-                Analytics.trackButtonClick('view_meeting_from_toast', 'recording_complete');
-              }
-            },
-            duration: 10000,
-          });
+          if (transcriptionIncomplete) {
+            const recovery = await describeIncompleteRecovery(Boolean(folderPath) && !audioSaveError);
+            toast.warning('Meeting saved with an incomplete transcript', {
+              description: `${freshTranscripts.length} transcript segments were saved before live transcription finished. ${recovery}`,
+              action: {
+                label: 'View Meeting',
+                onClick: () => router.push(`/meeting-details?id=${meetingId}`),
+              },
+              duration: 15000,
+            });
+          } else {
+            // Show success toast with navigation option
+            toast.success('Recording saved successfully!', {
+              description: realtimeTranscriptionEnabled
+                ? `${freshTranscripts.length} transcript segments saved.`
+                : 'Audio saved. You can transcribe it after the meeting.',
+              action: {
+                label: 'View Meeting',
+                onClick: () => {
+                  router.push(`/meeting-details?id=${meetingId}`);
+                  Analytics.trackButtonClick('view_meeting_from_toast', 'recording_complete');
+                }
+              },
+              duration: 10000,
+            });
+          }
 
           // Auto-navigate after a short delay with source parameter
           setTimeout(() => {
-            router.push(`/meeting-details?id=${meetingId}&source=recording`);
+            // Incomplete transcripts must not trigger auto-summary.
+            router.push(postRecordingDestination(meetingId, transcriptionIncomplete));
             clearTranscripts()
             Analytics.trackPageView('meeting_details');
 

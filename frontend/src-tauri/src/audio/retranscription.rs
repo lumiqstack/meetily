@@ -530,6 +530,14 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
     }
 
+    // The transcript is now complete; clear any incomplete-live-transcription
+    // marker in the same transaction as the replacement.
+    sqlx::query("UPDATE meetings SET transcription_incomplete = 0 WHERE id = ?")
+        .bind(&meeting_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to clear incomplete-transcription marker: {}", e))?;
+
     tx.commit().await
         .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
 

@@ -400,8 +400,8 @@ pub async fn api_search_transcripts<R: Runtime>(
     auth_token: Option<String>,
 ) -> Result<Vec<TranscriptSearchResult>, String> {
     log_info!(
-        "api_search_transcripts called with query: '{}', auth_token: {}",
-        query,
+        "api_search_transcripts called with a {} char query, auth_token: {}",
+        query.chars().count(),
         auth_token.is_some()
     );
 
@@ -1029,23 +1029,18 @@ pub async fn api_save_transcript<R: Runtime>(
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
     folder_path: Option<String>,
+    transcription_incomplete: Option<bool>,
     auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let transcription_incomplete = transcription_incomplete.unwrap_or(false);
     log_info!(
-        "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, auth_token: {}",
+        "api_save_transcript called for meeting: {}, transcripts: {}, folder_path: {:?}, incomplete: {}, auth_token: {}",
         meeting_title,
         transcripts.len(),
         folder_path,
+        transcription_incomplete,
         auth_token.is_some()
     );
-
-    // Log first transcript for debugging
-    if let Some(first) = transcripts.first() {
-        log_debug!(
-            "First transcript data: {}",
-            serde_json::to_string_pretty(first).unwrap_or_default()
-        );
-    }
 
     // Convert serde_json::Value to TranscriptSegment
     let transcripts_to_save: Vec<TranscriptSegment> = transcripts
@@ -1057,10 +1052,9 @@ pub async fn api_save_transcript<R: Runtime>(
             format!("Invalid transcript data format: {}. Please check the data structure.", e)
         })?;
 
-    // Log parsed segments count and first segment details
+    // Timing only: segment text is meeting content.
     if let Some(first_seg) = transcripts_to_save.first() {
-        log_debug!("First parsed segment: text='{}', audio_start_time={:?}, audio_end_time={:?}, duration={:?}",
-                   first_seg.text.chars().take(50).collect::<String>(),
+        log_debug!("First parsed segment: audio_start_time={:?}, audio_end_time={:?}, duration={:?}",
                    first_seg.audio_start_time,
                    first_seg.audio_end_time,
                    first_seg.duration);
@@ -1074,6 +1068,7 @@ pub async fn api_save_transcript<R: Runtime>(
         &meeting_title,
         &transcripts_to_save,
         folder_path,
+        transcription_incomplete,
     )
     .await
     {

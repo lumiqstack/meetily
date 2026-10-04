@@ -26,13 +26,15 @@ impl MeetingsRepository {
             r#"
             SELECT m.id, m.title, m.created_at, m.folder_path,
                    COALESCE(t.cnt, 0) AS transcript_count,
-                   sp.status AS summary_status
+                   sp.status AS summary_status,
+                   m.transcription_incomplete
             FROM meetings m
             LEFT JOIN (
                 SELECT meeting_id, COUNT(*) AS cnt FROM transcripts GROUP BY meeting_id
             ) t ON t.meeting_id = m.id
             LEFT JOIN summary_processes sp ON sp.meeting_id = m.id
             WHERE (m.folder_path IS NOT NULL AND m.folder_path <> '' AND COALESCE(t.cnt, 0) = 0)
+               OR m.transcription_incomplete = 1
                OR (COALESCE(t.cnt, 0) > 0 AND (sp.status IS NULL OR sp.status IN ('failed', 'cancelled')))
             ORDER BY m.created_at DESC
             "#,
@@ -397,5 +399,82 @@ mod tests {
             by_id("failed-summary").summary_status.as_deref(),
             Some("failed")
         );
+    }
+
+    async fn mark_incomplete(pool: &SqlitePool, meeting_id: &str) {
+        sqlx::query("UPDATE meetings SET transcription_incomplete = 1 WHERE id = ?")
+            .bind(meeting_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_transcription_stays_pending_until_cleared() {
+        let pool = test_pool().await;
+
+        // Partial transcript saved at Stop: pending even with segments.
+        insert_meeting(&pool, "partial", Some("C:/rec/p")).await;
+        insert_transcript(&pool, "partial").await;
+        mark_incomplete(&pool, "partial").await;
+
+        // Zero transcripts and incomplete.
+        insert_meeting(&pool, "zero", Some("C:/rec/z")).await;
+        mark_incomplete(&pool, "zero").await;
+
+        // Even a summary someone ran manually does not hide it.
+        insert_meeting(&pool, "summarized-partial", Some("C:/rec/s")).await;
+        insert_transcript(&pool, "summarized-partial").await;
+        insert_summary_process(&pool, "summarized-partial", "completed").await;
+        mark_incomplete(&pool, "summarized-partial").await;
+
+        let pending = MeetingsRepository::get_pending_meetings(&pool).await.unwrap();
+        for id in ["partial", "zero", "summarized-partial"] {
+            let item = pending.iter().find(|p| p.id == id).unwrap_or_else(|| panic!("{id} pending"));
+            assert!(item.transcription_incomplete, "{id}");
+        }
+
+        // Retranscription replaces the transcript and clears the marker in one
+        // transaction (mirrors audio/retranscription.rs).
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
+            .bind("summarized-partial")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE meetings SET transcription_incomplete = 0 WHERE id = ?")
+            .bind("summarized-partial")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        insert_transcript(&pool, "summarized-partial").await;
+
+        let pending = MeetingsRepository::get_pending_meetings(&pool).await.unwrap();
+        assert!(!pending.iter().any(|p| p.id == "summarized-partial"));
+    }
+
+    #[tokio::test]
+    async fn save_persists_incomplete_marker_atomically_with_meeting() {
+        use crate::database::repositories::transcript::TranscriptsRepository;
+        let pool = test_pool().await;
+        let id = TranscriptsRepository::save_transcript(&pool, "Cut short", &[], Some("C:/rec/c".into()), true)
+            .await
+            .unwrap();
+        let flag: bool = sqlx::query_scalar("SELECT transcription_incomplete FROM meetings WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(flag);
+        let complete = TranscriptsRepository::save_transcript(&pool, "Normal", &[], None, false)
+            .await
+            .unwrap();
+        let flag: bool = sqlx::query_scalar("SELECT transcription_incomplete FROM meetings WHERE id = ?")
+            .bind(&complete)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!flag);
     }
 }
