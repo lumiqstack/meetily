@@ -235,6 +235,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
             apiKey: config.apiKey || null,
             baseUrl: config.baseUrl || null,
             vocabularyHint: config.vocabularyHint || '',
+            remoteVocabularyEnabled: Boolean(config.remoteVocabularyEnabled),
             realtimeTranscriptionEnabled: config.realtimeTranscriptionEnabled ?? false
           });
         }

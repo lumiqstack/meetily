@@ -110,6 +110,10 @@ pub struct TranscriptConfig {
     /// whisper-rs as `initial_prompt` for every transcription.
     #[serde(rename = "vocabularyHint")]
     pub vocabulary_hint: String,
+    /// Send `vocabulary_hint` to the remote (openaiCompatible) server as the
+    /// transcription `prompt`. Explicit opt-in, off by default.
+    #[serde(rename = "remoteVocabularyEnabled")]
+    pub remote_vocabulary_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -662,6 +666,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                         api_key,
                         base_url: config.openai_compatible_base_url,
                         vocabulary_hint: config.whisper_vocabulary_hint,
+                        remote_vocabulary_enabled: config.remote_vocabulary_enabled,
                     }))
                 }
                 Err(e) => {
@@ -683,6 +688,7 @@ pub async fn api_get_transcript_config<R: Runtime>(
                 api_key: None,
                 base_url: None,
                 vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+                remote_vocabulary_enabled: false,
             }))
         }
         Err(e) => {
@@ -702,6 +708,7 @@ pub async fn api_save_transcript_config<R: Runtime>(
     api_key: Option<String>,
     base_url: Option<String>,
     vocabulary_hint: Option<String>,
+    remote_vocabulary_enabled: Option<bool>,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!(
@@ -770,6 +777,13 @@ pub async fn api_save_transcript_config<R: Runtime>(
             vocabulary_hint.to_string(),
         )
         .await;
+    }
+
+    if let Some(enabled) = remote_vocabulary_enabled {
+        if let Err(e) = SettingsRepository::save_remote_vocabulary_enabled(pool, enabled).await {
+            log_error!("Failed to save remote vocabulary preference: {}", e);
+            return Err(e.to_string());
+        }
     }
 
     log_info!("Successfully saved transcript configuration.");

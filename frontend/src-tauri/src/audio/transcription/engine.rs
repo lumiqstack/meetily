@@ -77,6 +77,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 api_key: None,
                 base_url: None,
                 vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+                remote_vocabulary_enabled: false,
             }
         }
         Err(e) => {
@@ -88,6 +89,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 api_key: None,
                 base_url: None,
                 vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+                remote_vocabulary_enabled: false,
             }
         }
     };
@@ -201,6 +203,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 api_key: None,
                 base_url: None,
                 vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+                remote_vocabulary_enabled: false,
             }
         }
         Err(e) => {
@@ -212,6 +215,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 api_key: None,
                 base_url: None,
                 vocabulary_hint: crate::config::DEFAULT_WHISPER_VOCABULARY_HINT.to_string(),
+                remote_vocabulary_enabled: false,
             }
         }
     };
@@ -261,7 +265,11 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                 base_url,
                 config.model.clone(),
                 config.api_key.clone(),
-            )?;
+            )?
+            .with_prompt(super::openai_compatible_provider::remote_vocabulary_prompt(
+                config.remote_vocabulary_enabled,
+                &config.vocabulary_hint,
+            ));
             Ok(TranscriptionEngine::Provider(Arc::new(provider)))
         }
         "localWhisper" | _ => {

@@ -196,6 +196,19 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Persist the explicit opt-in for sending vocabulary to the remote
+    /// transcription server. Only updates an existing settings row.
+    pub async fn save_remote_vocabulary_enabled(
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query("UPDATE transcript_settings SET remoteVocabularyEnabled = $1 WHERE id = '1'")
+            .bind(enabled)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn save_transcript_base_url(
         pool: &SqlitePool,
         base_url: &str,
@@ -527,6 +540,19 @@ mod vocabulary_default_tests {
         SettingsRepository::save_transcript_base_url(&pool, "http://127.0.0.1:8000").await.unwrap();
         SettingsRepository::save_transcript_api_key(&pool, "openaiCompatible", "k").await.unwrap();
         assert_eq!(hint(&pool).await, "Acme, Zephyr");
+    }
+
+    #[tokio::test]
+    async fn remote_vocabulary_is_off_until_explicitly_enabled() {
+        let pool = migrated_pool().await;
+        SettingsRepository::save_transcript_config(&pool, "openaiCompatible", "m", true).await.unwrap();
+        let setting = SettingsRepository::get_transcript_config(&pool).await.unwrap().unwrap();
+        assert!(!setting.remote_vocabulary_enabled);
+
+        SettingsRepository::save_remote_vocabulary_enabled(&pool, true).await.unwrap();
+        SettingsRepository::save_transcript_config(&pool, "openaiCompatible", "m2", true).await.unwrap();
+        let setting = SettingsRepository::get_transcript_config(&pool).await.unwrap().unwrap();
+        assert!(setting.remote_vocabulary_enabled, "unrelated saves keep the opt-in");
     }
 
     #[test]

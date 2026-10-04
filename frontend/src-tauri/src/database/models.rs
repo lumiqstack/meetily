@@ -167,4 +167,9 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "whisperVocabularyHint")]
     #[serde(rename = "whisperVocabularyHint")]
     pub whisper_vocabulary_hint: String,
+    /// Explicit opt-in to send the vocabulary to the remote transcription
+    /// server; off by default.
+    #[sqlx(rename = "remoteVocabularyEnabled")]
+    #[serde(rename = "remoteVocabularyEnabled")]
+    pub remote_vocabulary_enabled: bool,
 }

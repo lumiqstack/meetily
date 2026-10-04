@@ -44,6 +44,7 @@ export default function SettingsPage() {
             apiKey: config.apiKey || null,
             baseUrl: config.baseUrl || null,
             vocabularyHint: config.vocabularyHint || '',
+            remoteVocabularyEnabled: Boolean(config.remoteVocabularyEnabled),
             realtimeTranscriptionEnabled: config.realtimeTranscriptionEnabled ?? false
           });
         }
