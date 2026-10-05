@@ -228,8 +228,12 @@ try {
     # Toolchain environment (verified Windows setup; see STATUS.md)
     & $VsDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
     if ($LibClangPath) {
-        $env:LIBCLANG_PATH = $LibClangPath
-        $env:PATH = "$(Split-Path -Parent $LibClangPath);$env:PATH"
+        # bindgen (clang-sys) wants the folder holding libclang.dll; given the
+        # file itself it found nothing ("couldn't find any valid shared libraries").
+        $libClangDir = if (Test-Path -LiteralPath $LibClangPath -PathType Leaf) { Split-Path -Parent $LibClangPath } else { $LibClangPath }
+        $env:LIBCLANG_PATH = $libClangDir
+        $env:PATH = "$libClangDir;$env:PATH"
+        $facts['libclang'] = $libClangDir
     }
     if ($CMakeBin) { $env:PATH = "$CMakeBin;$env:PATH" }
     $env:VULKAN_SDK = $VulkanSdk
@@ -282,7 +286,15 @@ try {
         $summary = ($testOutput | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)
         if ($testExit -ne 0) {
             $failed = @($testOutput | Where-Object { $_ -match '^test .* FAILED$' } | ForEach-Object { ($_ -split ' ')[1] })
-            throw "Rust tests failed (exit $testExit). $summary Failed: $($failed -join ', ')"
+            if ($failed.Count -gt 0) {
+                throw "Rust tests failed (exit $testExit). $summary Failed: $($failed -join ', ')"
+            }
+            # No per-test failures: the tests did not compile, or the test
+            # process crashed (e.g. a native access violation) before its summary.
+            $cause = @($testOutput | Where-Object {
+                $_ -match '^error(\[|:)' -or $_ -match "process didn't exit" -or $_ -match 'STATUS_' -or $_ -match '^test \S+ \.\.\. *$'
+            } | Select-Object -Last 3) -join ' | '
+            throw "Rust tests did not finish (exit $testExit). $cause"
         }
         Add-Step 'Rust tests' 'PASS' $summary
     }
