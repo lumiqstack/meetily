@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy, WhisperState};
 use serde::{Serialize, Deserialize};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
@@ -90,6 +90,7 @@ fn apply_vocabulary_hint_to_whisper_params(
 pub struct WhisperEngine {
     models_dir: PathBuf,
     current_context: Arc<RwLock<Option<WhisperContext>>>,
+    inference_state: Mutex<super::state_cache::StateCache<WhisperState>>,
     current_model: Arc<RwLock<Option<String>>>,
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     // State tracking for smart logging
@@ -209,6 +210,7 @@ impl WhisperEngine {
         let engine = Self {
             models_dir,
             current_context: Arc::new(RwLock::new(None)),
+            inference_state: Mutex::new(super::state_cache::StateCache::default()),
             current_model: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize state tracking
@@ -389,7 +391,11 @@ impl WhisperEngine {
                 };
 
                 // Update current context and model
-                *self.current_context.write().await = Some(ctx);
+                {
+                    let mut context = self.current_context.write().await;
+                    self.inference_state.lock().await.reset();
+                    *context = Some(ctx);
+                }
                 *self.current_model.write().await = Some(model_name.to_string());
 
                 // Enhanced acceleration status reporting
@@ -417,6 +423,7 @@ impl WhisperEngine {
 
     pub async fn unload_model(&self) -> bool  {
         let mut ctx_guard = self.current_context.write().await;
+        self.inference_state.lock().await.reset();
         let unloaded = ctx_guard.take().is_some();
         if unloaded {
             log::info!("📉Whisper model unloaded");
@@ -587,7 +594,11 @@ impl WhisperEngine {
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        // Lock order is always context -> state, also during unload/replacement.
+        // Hold both through inference/result extraction. One GPU state per model,
+        // no allocation/destruction for each chunk and no concurrent reuse.
         let ctx_lock = self.current_context.read().await;
+        let mut inference = self.inference_state.lock().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
 
@@ -610,6 +621,7 @@ impl WhisperEngine {
             Some("auto-translate") => (None, true),
             Some(lang) => (Some(lang), false),
         };
+        params.set_no_context(true); // Reuse GPU buffers, not prior chunk text.
         params.set_language(language_code);
         params.set_translate(should_translate);
         apply_vocabulary_hint_to_whisper_params(&mut params, &self.vocabulary_hint().await);
@@ -655,8 +667,11 @@ impl WhisperEngine {
         let (num_segments, state) = {
             // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
 
-            let mut state = ctx.create_state()?;
-            state.full(params, &audio_data)?;
+            let state = inference.run(|| {
+                log::info!("Creating reusable Whisper inference state (backend={})", WhisperCompiledBackend::current().as_str());
+                ctx.create_state()
+            }, |state| state.full(params, &audio_data))
+                .map_err(|e| anyhow!("Whisper inference stopped; no CPU fallback: {}. Reload the model before retrying.", e))?;
             let num_segments = state.full_n_segments();
 
             (num_segments, state)
@@ -705,7 +720,11 @@ impl WhisperEngine {
     }
 
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {
+        // Lock order is always context -> state, also during unload/replacement.
+        // Hold both through inference/result extraction. One GPU state per model,
+        // no allocation/destruction for each chunk and no concurrent reuse.
         let ctx_lock = self.current_context.read().await;
+        let mut inference = self.inference_state.lock().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
 
@@ -728,6 +747,7 @@ impl WhisperEngine {
             Some("auto-translate") => (None, true),
             Some(lang) => (Some(lang), false),
         };
+        params.set_no_context(true); // Reuse GPU buffers, not prior chunk text.
         params.set_language(language_code);
         params.set_translate(should_translate);
         apply_vocabulary_hint_to_whisper_params(&mut params, &self.vocabulary_hint().await);
@@ -811,8 +831,11 @@ impl WhisperEngine {
             log::info!("Starting transcription #{} of {} samples ({:.1}s duration)",
                       transcription_count, audio_data.len(), duration_seconds);
         }
-        let mut state = ctx.create_state()?;
-        state.full(params, &audio_data)?;
+        let state = inference.run(|| {
+                log::info!("Creating reusable Whisper inference state (backend={})", WhisperCompiledBackend::current().as_str());
+                ctx.create_state()
+            }, |state| state.full(params, &audio_data))
+            .map_err(|e| anyhow!("Whisper inference stopped; no CPU fallback: {}. Reload the model before retrying.", e))?;
 
         // Extract text with improved segment handling
         let num_segments = state.full_n_segments()?;
