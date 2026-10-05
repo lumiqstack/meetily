@@ -80,6 +80,7 @@ jobs:
         with:
           workspaces: '. -> target'
           prefix-key: windows-tests-v1
+          cache-on-failure: true
 
       - name: Configure build
         shell: pwsh
@@ -107,8 +108,10 @@ jobs:
 
       - name: Rust library tests
         # One thread: a native crash then names the test that caused it.
-        # Skipped tests need audio hardware, which hosted runners lack.
+        # Skipped tests need audio hardware, which hosted runners lack (listing
+        # system audio devices with none present crashes the process).
         run: >-
           cargo test --locked -p meetily --lib --
           --test-threads=1
           --skip audio::playback_monitor::tests::test_get_output_device
+          --skip audio::system_audio_commands::tests::test_list_system_audio_devices
