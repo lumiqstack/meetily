@@ -13,6 +13,7 @@ on:
       - 'llama-helper/**'
       - 'vendor/**'
       - 'tests/whisper-native/**'
+      - 'scripts/windows/meetily-check.ps1'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-tests.yml'
@@ -22,6 +23,7 @@ on:
       - 'llama-helper/**'
       - 'vendor/**'
       - 'tests/whisper-native/**'
+      - 'scripts/windows/meetily-check.ps1'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-tests.yml'
@@ -140,3 +142,54 @@ jobs:
 
       - name: Guard catches C++ exceptions under MSVC /EHsc
         run: python tests/whisper-native/run.py
+
+  meetily-check:
+    name: meetily-check.ps1 against a synthetic database
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Before and After verdicts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $migrations = 'frontend/src-tauri/migrations'
+          $versions = @(Get-ChildItem $migrations -Filter *.sql | Sort-Object Name | ForEach-Object { $_.Name.Split('_')[0] })
+          function New-Db([string]$dir, [string[]]$applied) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $code = "import sqlite3,sys`nc=sqlite3.connect(sys.argv[1])`nc.execute('CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT, success BOOLEAN)')`nfor v in sys.argv[2:]: c.execute('INSERT INTO _sqlx_migrations VALUES (?, ?, 1)', (int(v), 'test'))`nc.commit()"
+            Set-Content -Path "$env:RUNNER_TEMP/mkdb.py" -Value $code
+            python "$env:RUNNER_TEMP/mkdb.py" (Join-Path $dir 'meeting_minutes.sqlite') @applied
+            if ($LASTEXITCODE -ne 0) { throw 'could not create test database' }
+            Set-Content -Path (Join-Path $dir 'settings.json') -Value '{}'
+          }
+          function Check([string]$name, [int]$expected, [string[]]$scriptArgs) {
+            pwsh -File scripts/windows/meetily-check.ps1 @scriptArgs -NoStop -MigrationsDir $migrations -BackupRoot "$env:RUNNER_TEMP/backups"
+            if ($LASTEXITCODE -ne $expected) { throw "${name}: expected exit $expected, got $LASTEXITCODE" }
+            Write-Host "OK: ${name}"
+          }
+
+          # An older database (two migrations behind): safe to upgrade.
+          $old = "$env:RUNNER_TEMP/data-old"
+          New-Db $old $versions[0..($versions.Count - 3)]
+          Check 'older database passes' 0 @('-Mode', 'Before', '-DataDir', $old)
+          if (-not (Get-ChildItem "$env:RUNNER_TEMP/backups" -Recurse -Filter meeting_minutes.sqlite)) { throw 'backup missing' }
+
+          # A database upgraded by a build with an unknown migration: must stop.
+          $newer = "$env:RUNNER_TEMP/data-newer"
+          New-Db $newer ($versions + '29990101000000')
+          Check 'unknown migration stops' 2 @('-Mode', 'Before', '-DataDir', $newer)
+
+          # After: live database plus a log with one caught native exception.
+          $log = "$env:RUNNER_TEMP/meetily.log"
+          $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')
+          @(
+            "[$($now)Z INFO  meetily] Starting application...",
+            "[$($now)Z INFO  app_lib] Initialized bundled ONNX Runtime from C:\x\onnxruntime.dll",
+            "[$($now)Z INFO  app_lib::audio::com_keeper] WASAPI COM keeper ready (0 output device(s))",
+            "[$($now)Z INFO  app_lib::whisper_engine] Transcription #1 result: 42 chars, 5.0s audio",
+            "[$($now)Z ERROR app_lib::whisper_engine] meetily_whisper_native_exception: transcribe: injected"
+          ) | Set-Content -Path $log
+          Check 'after mode passes' 0 @('-Mode', 'After', '-DataDir', $old, '-LogFile', $log, '-Since', (Get-Date).AddHours(-1).ToString('o'))
+
