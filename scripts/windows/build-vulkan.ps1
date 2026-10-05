@@ -27,8 +27,7 @@
   Machine-specific paths are parameters on purpose; this file is public.
 
 .EXAMPLE
-  pwsh -File scripts\windows\build-vulkan.ps1 -VulkanSdk 'C:\VulkanSDK\1.4.304.0' `
-       -LlamaHelper 'C:\tools\llama-helper.exe' -ReportPath 'C:\notes\build-report.md' -Launch
+  pwsh -File scripts\windows\build-vulkan.ps1 -VulkanSdk 'D:\Apps\VulkanSDK\1.4.304.0' -LlamaHelper 'D:\mvk4276454\release\llama-helper.exe' -ReportPath 'D:\Vaults\Murex\Murex\Stash-Model.md' -Launch
 #>
 [CmdletBinding()]
 param(
