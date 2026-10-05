@@ -451,6 +451,10 @@ pub fn get_language_preference_internal() -> Option<String> {
 pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
 
+    // Before anything enumerates audio devices: keep cpal's shared WASAPI
+    // enumerator on a thread that outlives every caller (see com_keeper).
+    audio::com_keeper::ensure();
+
     let mut builder = tauri::Builder::default();
 
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
