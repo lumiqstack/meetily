@@ -1,0 +1,195 @@
+name: Windows tests
+
+# Runs the Rust library tests and the frontend tests on a Windows runner, so
+# changes made on macOS are checked against Windows before a local Windows
+# build. Tests only: the executable is still built on the Windows machine
+# (AGENTS.md), since these runs embed a stub frontend.
+
+on:
+  push:
+    branches: [main, 'enhance/**', 'fix/**', 'codex/**']
+    paths:
+      - 'frontend/**'
+      - 'llama-helper/**'
+      - 'vendor/**'
+      - 'tests/whisper-native/**'
+      - 'scripts/windows/meetily-check.ps1'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-tests.yml'
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - 'llama-helper/**'
+      - 'vendor/**'
+      - 'tests/whisper-native/**'
+      - 'scripts/windows/meetily-check.ps1'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: windows-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (bun test, tsc)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Unit and component tests
+        run: bun test
+
+  rust:
+    name: Rust library tests
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      # Match the release workflow: no host-CPU specialization in ggml.
+      RUSTFLAGS: -C target-cpu=x86-64-v2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          prefix-key: windows-tests-v1
+          cache-on-failure: true
+
+      - name: Configure build
+        shell: pwsh
+        run: |
+          $cmakeHook = (Join-Path $env:GITHUB_WORKSPACE '.github/force-portable-ggml.cmake').Replace('\', '/')
+          "CMAKE_PROJECT_INCLUDE=$cmakeHook" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Tests need neither the sidecar binaries nor a built frontend:
+          # point Tauri at a stub page and skip the externalBin check.
+          $dist = Join-Path $env:RUNNER_TEMP 'frontend-stub'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Set-Content -Path (Join-Path $dist 'index.html') -Value '<!doctype html><title>stub</title>'
+          $config = @{ bundle = @{ externalBin = @() }; build = @{ frontendDist = $dist.Replace('\', '/') } } |
+            ConvertTo-Json -Compress -Depth 4
+          "TAURI_CONFIG=$config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Tests skip app setup, which loads the bundled ONNX Runtime (1.22,
+          # staged by build.rs); without this, Windows' own older
+          # System32\onnxruntime.dll gets loaded and the VAD tests fail.
+          $ort = Join-Path $env:GITHUB_WORKSPACE 'frontend\src-tauri\binaries\onnxruntime\onnxruntime.dll'
+          "ORT_DYLIB_PATH=$ort" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (Test-Path (Join-Path $llvm 'libclang.dll')) {
+            "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          cmake --version
+          # Informational: CRLF checkouts exercise the fixture parsers' line handling.
+          Write-Host "core.autocrlf: $(git config --get core.autocrlf)"
+          exit 0
+
+      - name: Rust library tests
+        # One thread: a native crash then names the test that caused it.
+        # The skipped test needs an audio output device, which hosted runners lack.
+        run: >-
+          cargo test --locked -p meetily --lib --
+          --test-threads=1
+          --skip audio::playback_monitor::tests::test_get_output_device
+
+  whisper-native:
+    name: Whisper native exception boundary (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Puts cl.exe and lib.exe on PATH, as a Visual Studio developer shell would.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Guard catches C++ exceptions under MSVC /EHsc
+        run: python tests/whisper-native/run.py
+
+  meetily-check:
+    name: meetily-check.ps1 against a synthetic database
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Before and After verdicts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $migrations = 'frontend/src-tauri/migrations'
+          $versions = @(Get-ChildItem $migrations -Filter *.sql | Sort-Object Name | ForEach-Object { $_.Name.Split('_')[0] })
+          function New-Db([string]$dir, [string[]]$applied) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $code = "import sqlite3,sys`nc=sqlite3.connect(sys.argv[1])`nc.execute('CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT, success BOOLEAN)')`nfor v in sys.argv[2:]: c.execute('INSERT INTO _sqlx_migrations VALUES (?, ?, 1)', (int(v), 'test'))`nc.commit()"
+            Set-Content -Path "$env:RUNNER_TEMP/mkdb.py" -Value $code
+            python "$env:RUNNER_TEMP/mkdb.py" (Join-Path $dir 'meeting_minutes.sqlite') @applied
+            if ($LASTEXITCODE -ne 0) { throw 'could not create test database' }
+            Set-Content -Path (Join-Path $dir 'settings.json') -Value '{}'
+          }
+          function Check([string]$name, [int]$expected, [string[]]$scriptArgs) {
+            pwsh -File scripts/windows/meetily-check.ps1 @scriptArgs -NoStop -MigrationsDir $migrations -BackupRoot "$env:RUNNER_TEMP/backups"
+            if ($LASTEXITCODE -ne $expected) { throw "${name}: expected exit $expected, got $LASTEXITCODE" }
+            Write-Host "OK: ${name}"
+          }
+
+          # An older database (two migrations behind): safe to upgrade.
+          $old = "$env:RUNNER_TEMP/data-old"
+          New-Db $old $versions[0..($versions.Count - 3)]
+          Check 'older database passes' 0 @('-Mode', 'Before', '-DataDir', $old)
+          if (-not (Get-ChildItem "$env:RUNNER_TEMP/backups" -Recurse -Filter meeting_minutes.sqlite)) { throw 'backup missing' }
+
+          # A database upgraded by a build with an unknown migration: must stop.
+          $newer = "$env:RUNNER_TEMP/data-newer"
+          New-Db $newer ($versions + '29990101000000')
+          Check 'unknown migration stops' 2 @('-Mode', 'Before', '-DataDir', $newer)
+
+          # After: live database plus a log with one caught native exception.
+          $log = "$env:RUNNER_TEMP/meetily.log"
+          $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')
+          @(
+            "[$($now)Z INFO  meetily] Starting application...",
+            "[$($now)Z INFO  app_lib] Initialized bundled ONNX Runtime from C:\x\onnxruntime.dll",
+            "[$($now)Z INFO  app_lib::audio::com_keeper] WASAPI COM keeper ready (0 output device(s))",
+            "[$($now)Z INFO  app_lib::whisper_engine] Transcription #1 result: 42 chars, 5.0s audio",
+            "[$($now)Z ERROR app_lib::whisper_engine] meetily_whisper_native_exception: transcribe: injected"
+          ) | Set-Content -Path $log
+          Check 'after mode passes' 0 @('-Mode', 'After', '-DataDir', $old, '-LogFile', $log, '-Since', (Get-Date).AddHours(-1).ToString('o'))
+

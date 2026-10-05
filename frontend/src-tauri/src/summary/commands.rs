@@ -58,6 +58,9 @@ pub struct ProcessTranscriptResponse {
 pub struct ImportedRecapResponse {
     pub meeting_id: String,
     pub title: String,
+    /// When the meeting took place (RFC 3339): the recording's stamp when
+    /// known, otherwise the import time.
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,14 +157,30 @@ async fn save_extracted_copilot_recap(
         return Err("Copilot recap contains no visible content and was not imported.".into());
     }
 
+    let created_at = crate::audio::import::resolve_meeting_date(title, None, recorded_at.as_deref());
     let meeting_id = SummaryProcessesRepository::create_meeting_with_imported_summary(
         state.db_manager.pool(),
         title,
         &summary,
         source_url.as_deref(),
+        created_at,
     )
     .await
     .map_err(|e| format!("Failed to import Copilot recap: {e}"))?;
+
+    let mut meeting_source = crate::database::repositories::meeting_sources::MeetingSource::for_import(
+        "copilot-recap",
+        title,
+        source_url.as_deref(),
+        None,
+        None,
+    );
+    if recorded_at.is_some() {
+        meeting_source.recorded_at = recorded_at.clone();
+    }
+    if let Err(e) = meeting_source.insert(state.db_manager.pool(), &meeting_id).await {
+        log::warn!("Failed to record source for imported recap {}: {}", meeting_id, e);
+    }
 
     log_info!(
         "Imported Microsoft Copilot recap as transcript-free meeting {}",
@@ -170,6 +189,7 @@ async fn save_extracted_copilot_recap(
     Ok(ImportedRecapResponse {
         meeting_id,
         title: title.to_string(),
+        created_at: created_at.to_rfc3339(),
     })
 }
 
@@ -222,7 +242,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         &app,
         &imported.meeting_id,
         &imported.title,
-        &Utc::now().to_rfc3339(),
+        &imported.created_at,
         &recap_markdown,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
     )

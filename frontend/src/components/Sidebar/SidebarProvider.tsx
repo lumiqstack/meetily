@@ -4,6 +4,7 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
 
@@ -14,11 +15,14 @@ interface SidebarItem {
   title: string;
   type: 'folder' | 'file';
   children?: SidebarItem[];
+  /** The meeting has a note in the Obsidian vault. */
+  obsidianExported?: boolean;
 }
 
 export interface CurrentMeeting {
   id: string;
   title: string;
+  obsidianExported?: boolean;
 }
 
 // Search result type for transcript search
@@ -100,10 +104,11 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string }>;
-        const transformedMeetings = meetings.map((meeting: any) => ({
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, obsidian_exported?: boolean }>;
+        const transformedMeetings = meetings.map((meeting) => ({
           id: meeting.id,
-          title: meeting.title
+          title: meeting.title,
+          obsidianExported: !!meeting.obsidian_exported,
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -119,6 +124,25 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchMeetings();
   }, [serverAddress, fetchMeetings]);
 
+  // Manual and automatic Obsidian exports both emit this; flag the meeting
+  // without refetching the whole list.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    listen<string>('obsidian-exported', (event) => {
+      setMeetings(prev => prev.map(m => m.id === event.payload ? { ...m, obsidianExported: true } : m));
+    })
+      .then(fn => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(error => console.warn('Could not listen for Obsidian exports:', error));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   useEffect(() => {
     const fetchSettings = async () => {
       setServerAddress('http://localhost:5167');
@@ -133,7 +157,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       title: 'Meeting Notes',
       type: 'folder' as const,
       children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const }))
+        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const, obsidianExported: meeting.obsidianExported }))
       ]
     },
   ];

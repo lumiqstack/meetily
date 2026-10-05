@@ -263,6 +263,9 @@ try {
     }
     else {
         $testOutput = [System.Collections.Generic.List[string]]::new()
+        # Tests skip app setup, which loads the bundled ONNX Runtime; without
+        # this they can pick up an older onnxruntime.dll from System32.
+        $env:ORT_DYLIB_PATH = Join-Path $RepoRoot 'frontend\src-tauri\binaries\onnxruntime\onnxruntime.dll'
         & cargo test --locked -p meetily --lib --no-fail-fast --features vulkan 2>&1 | ForEach-Object { Write-Host $_; $testOutput.Add("$_") }
         $testExit = $LASTEXITCODE
         $summary = ($testOutput | Where-Object { $_ -match '^test result:' } | Select-Object -Last 1)

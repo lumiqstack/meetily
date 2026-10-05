@@ -162,6 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_output_device() {
+        crate::audio::com_keeper::ensure();
         let result = get_active_audio_output().await;
         assert!(result.is_ok(), "Should be able to get output device");
 

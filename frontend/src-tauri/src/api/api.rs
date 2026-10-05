@@ -8,7 +8,8 @@ use crate::{
     database::{
         models::{MeetingModel, PendingMeetingModel},
         repositories::{
-            meeting::MeetingsRepository, setting::SettingsRepository,
+            meeting::MeetingsRepository, meeting_tags::MeetingTagsRepository,
+            setting::SettingsRepository,
             transcript::TranscriptsRepository,
         },
     },
@@ -30,6 +31,9 @@ pub struct ApiResponse<T> {
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    /// The meeting has a note in the Obsidian vault.
+    #[serde(default)]
+    pub obsidian_exported: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -362,9 +366,19 @@ pub async fn api_get_meetings<R: Runtime>(
         Ok(meeting_models) => {
             log_info!("Successfully got {} meetings", meeting_models.len());
 
+            // Best-effort: a failed lookup only hides the sidebar indicator.
+            let exported: std::collections::HashSet<String> =
+                sqlx::query_scalar::<_, String>("SELECT meeting_id FROM obsidian_exports")
+                    .fetch_all(pool)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+
             let result: Vec<Meeting> = meeting_models
                 .into_iter()
                 .map(|m| Meeting {
+                    obsidian_exported: exported.contains(&m.id),
                     id: m.id,
                     title: m.title,
                 })
@@ -376,6 +390,43 @@ pub async fn api_get_meetings<R: Runtime>(
             Err(e.to_string())
         }
     }
+}
+
+#[tauri::command]
+pub async fn api_get_meeting_tags(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<String>, String> {
+    MeetingTagsRepository::get_tags(state.db_manager.pool(), &meeting_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Replace a meeting's tags and mirror them into its Obsidian note when one
+/// was already exported. Returns the normalized tags actually stored.
+#[tauri::command]
+pub async fn api_set_meeting_tags<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    tags: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let stored = MeetingTagsRepository::set_tags(state.db_manager.pool(), &meeting_id, &tags)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = crate::obsidian::sync_note_tags(&app, &meeting_id, &stored).await {
+        log_warn!("Failed to update Obsidian note tags for {}: {}", meeting_id, e);
+    }
+    Ok(stored)
+}
+
+#[tauri::command]
+pub async fn api_get_all_meeting_tags(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    MeetingTagsRepository::all_tags(state.db_manager.pool())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

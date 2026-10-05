@@ -6,12 +6,21 @@ Read this before making code changes or running builds in this workspace.
 
 - Workspace: `D:\codex\meetily-0.4.0`
 - Fork remote: `origin` (`lumiqstack/meetily`)
-- Current local feature branch: `codex/reapply-local-features`
-- Upstream release base: `v0.4.0`
+- Build and work from `main`. Pull requests target `main`.
+  (`codex/reapply-local-features` is retired: a database opened by a `main`
+  build cannot be opened by a build of that branch.)
+
+## Building and running a new version
+
+Follow `docs/windows/DATABASE_UPGRADE_CHECK.md` step by step: build without
+launching, run `scripts\windows\meetily-check.ps1`, then launch. The first
+launch of a new build upgrades the user's database irreversibly.
 
 ## Windows Build Rule
 
 For local Windows builds, create the raw **application executable** only. Do not intentionally create or rely on MSI or NSIS installer artifacts going forward.
+
+Prefer `scripts\windows\build-vulkan.ps1` (see the section above). The manual CPU commands below are a fallback only.
 
 Use:
 

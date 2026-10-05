@@ -8,6 +8,7 @@ pub mod vad;
 // Modularized device management
 pub mod devices;
 pub mod capture;
+pub mod com_keeper;
 pub mod permissions;
 
 // NEW: Device detection and diagnostics for adaptive buffering

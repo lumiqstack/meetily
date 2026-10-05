@@ -4,8 +4,10 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
+
+use crate::database::repositories::meeting_sources::MeetingSource;
 
 #[path = "obsidian_filename.rs"]
 mod filename;
@@ -218,6 +220,34 @@ fn parse_created_date(created_at: &str) -> DateTime<Local> {
         .unwrap_or_else(|_| Local::now())
 }
 
+/// The tag every exported note carries, ahead of the user's own tags.
+const BASE_TAG: &str = "meetings";
+
+/// The YAML `tags:` block: the base tag followed by the meeting's tags.
+fn tags_yaml(tags: &[String]) -> String {
+    let mut yaml = format!("tags:\n  - {BASE_TAG}\n");
+    for tag in tags.iter().filter(|tag| tag.as_str() != BASE_TAG) {
+        yaml.push_str(&format!("  - {tag}\n"));
+    }
+    yaml
+}
+
+/// A YAML double-quoted scalar (JSON string syntax is valid YAML).
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// `47:12`, or `1:02:03` from an hour on.
+fn format_duration(seconds: f64) -> String {
+    let total = seconds.round() as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 fn build_obsidian_markdown(
     meeting_id: &str,
     title: &str,
@@ -225,26 +255,45 @@ fn build_obsidian_markdown(
     summary_markdown: &str,
     transcript_markdown: &str,
     recorded_at: Option<&str>,
+    source: Option<&MeetingSource>,
+    tags: &[String],
 ) -> String {
     let exported_at = Utc::now().to_rfc3339();
     let title = title.trim();
     let created = parse_created_date(created_at).to_rfc3339();
+    let recorded_at = recorded_at
+        .or_else(|| source.and_then(|s| s.recorded_at.as_deref()))
+        .filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value));
 
-    let mut note = format!(
-        "---\nsource: meetily\nmeeting_id: \"{}\"\ncreated: \"{}\"\nexported: \"{}\"\ntags:\n  - meetings\n---\n\n# {}\n\n## Summary\n\n{}\n",
-        meeting_id,
-        created,
-        exported_at,
-        title,
-        summary_markdown.trim(),
-    );
+    // `meeting_id` stays within the first lines: re-exports find a meeting's
+    // existing note by scanning the head of the file for it.
+    let mut front = format!("---\nsource: meetily\nmeeting_id: \"{meeting_id}\"\n");
+    if let Some(source) = source {
+        front.push_str(&format!("import_source: {}\n", source.import_source));
+    }
+    if let Some(recorded_at) = recorded_at {
+        front.push_str(&format!("recorded_at: \"{recorded_at}\"\n"));
+    }
+    front.push_str(&format!("created: \"{created}\"\nexported: \"{exported_at}\"\n"));
+    if let Some(source) = source {
+        if let Some(duration) = source.duration_seconds {
+            front.push_str(&format!("duration: \"{}\"\n", format_duration(duration)));
+        }
+        if let Some(file) = &source.recording_file {
+            front.push_str(&format!("recording_file: {}\n", yaml_string(file)));
+        }
+        if let Some(url) = &source.recording_url {
+            front.push_str(&format!("recording_url: {}\n", yaml_string(url)));
+        }
+    }
+    front.push_str(&tags_yaml(tags));
+    front.push_str("---\n");
+
+    let mut note = format!("{front}\n# {title}\n\n## Summary\n\n{}\n", summary_markdown.trim());
     if !transcript_markdown.trim().is_empty() {
         note.push_str("\n## Transcript\n\n");
         note.push_str(transcript_markdown.trim());
         note.push('\n');
-    }
-    if let Some(recorded_at) = recorded_at.filter(|value| crate::audio::teams_recap::metadata::valid_recorded_at(value)) {
-        note = note.replacen("\ncreated:", &format!("\nrecorded_at: \"{recorded_at}\"\ncreated:"), 1);
     }
     note
 }
@@ -529,6 +578,22 @@ async fn export_note<R: Runtime>(
             })
         })
     } else { None };
+    let tags = match pool.as_ref() {
+        Some(pool) => crate::database::repositories::meeting_tags::MeetingTagsRepository::get_tags(pool, meeting_id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Obsidian export: failed to load tags for meeting {}: {}", meeting_id, e);
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    let source = match pool.as_ref() {
+        Some(pool) => MeetingSource::get(pool, meeting_id).await.unwrap_or_else(|e| {
+            warn!("Obsidian export: failed to load source for meeting {}: {}", meeting_id, e);
+            None
+        }),
+        None => None,
+    };
     let markdown = build_obsidian_markdown(
         meeting_id,
         title,
@@ -536,6 +601,8 @@ async fn export_note<R: Runtime>(
         summary_markdown,
         transcript_markdown,
         recorded_at.or(saved_recorded_at.as_deref()),
+        source.as_ref(),
+        &tags,
     );
 
     std::fs::write(&file_path, markdown)
@@ -544,6 +611,7 @@ async fn export_note<R: Runtime>(
     if let Some(pool) = pool.as_ref() {
         record_exported_filename(pool, meeting_id, &filename).await;
     }
+    let _ = app.emit("obsidian-exported", meeting_id);
 
     info!(
         "Exported meeting {} to Obsidian: {:?}",
@@ -558,6 +626,61 @@ async fn export_note<R: Runtime>(
             file_path.file_name().unwrap_or_default().to_string_lossy()
         ),
     })
+}
+
+/// Replace the `tags:` list inside a note's front matter, leaving every
+/// other line (including properties the user added in Obsidian) untouched.
+/// Returns `None` when the content has no recognizable front matter.
+fn replace_front_matter_tags(content: &str, tags: &[String]) -> Option<String> {
+    let rest = content.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    let (front, body) = rest.split_at(end + 1);
+
+    let mut out = String::from("---\n");
+    let mut lines = front.lines().peekable();
+    let mut replaced = false;
+    while let Some(line) = lines.next() {
+        if line.trim_end() == "tags:" || line.starts_with("tags: ") {
+            // Skip the old list items (block style) that follow the key.
+            while lines.peek().is_some_and(|next| next.starts_with("  - ") || next.starts_with("- ")) {
+                lines.next();
+            }
+            out.push_str(&tags_yaml(tags));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&tags_yaml(tags));
+    }
+    out.push_str(body);
+    Some(out)
+}
+
+/// Rewrite the tags of a meeting's already-exported note, if it has one.
+/// Tag edits should reach the vault without a full re-export (which needs
+/// the rendered summary the frontend holds).
+pub async fn sync_note_tags<R: Runtime>(app: &AppHandle<R>, meeting_id: &str, tags: &[String]) -> Result<bool> {
+    let Some(pool) = pool_of(app) else { return Ok(false) };
+    let Some(filename) = lookup_recorded_filename(&pool, meeting_id).await else {
+        return Ok(false);
+    };
+    let settings = load_obsidian_settings(app).await?;
+    let Some(vault_path) = settings.vault_path else { return Ok(false) };
+    let path = meetings_path(&vault_path).join(filename);
+    let _export_guard = EXPORT_LOCK.lock().await;
+    if !note_belongs_to_meeting(&path, meeting_id) {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&path)?;
+    let Some(updated) = replace_front_matter_tags(&content.replace("\r\n", "\n"), tags) else {
+        return Ok(false);
+    };
+    std::fs::write(&path, updated)?;
+    info!("Updated Obsidian tags for meeting {}: {:?}", meeting_id, path);
+    Ok(true)
 }
 
 #[tauri::command]
@@ -594,10 +717,76 @@ mod tests {
             "## Meeting notes\n\n- Existing Copilot recap",
             "",
             Some("2026-09-23T11:40:00"),
+            None,
+            &[],
         );
         assert!(note.contains("## Meeting notes"));
         assert!(!note.contains("## Transcript"));
         assert!(note.contains("recorded_at: \"2026-09-23T11:40:00\""));
+    }
+
+    #[test]
+    fn note_front_matter_lists_base_tag_then_user_tags() {
+        let note = build_obsidian_markdown(
+            "meeting-1",
+            "Sync",
+            "2026-09-23T11:40:00Z",
+            "summary",
+            "",
+            None,
+            None,
+            &["clients".to_string(), "meetings".to_string(), "q4".to_string()],
+        );
+        assert!(note.contains("tags:\n  - meetings\n  - clients\n  - q4\n---\n"));
+    }
+
+    #[test]
+    fn sharepoint_import_properties_are_written_to_the_front_matter() {
+        let source = MeetingSource {
+            import_source: "sharepoint".into(),
+            recording_url: Some("https://contoso-my.sharepoint.com/personal/j/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4".into()),
+            recording_file: Some("Weekly sync \"Q3\"-20260721_100221-Meeting Recording.mp4".into()),
+            recorded_at: Some("2026-07-21T10:02:21".into()),
+            duration_seconds: Some(2832.4),
+        };
+        let note = build_obsidian_markdown(
+            "meeting-1", "Weekly sync", "2026-07-21T15:02:21Z", "summary", "", None, Some(&source), &["q3".into()],
+        );
+        let front: Vec<&str> = note.split("---\n").nth(1).unwrap().lines().collect();
+        assert_eq!(front[0], "source: meetily");
+        assert_eq!(front[1], "meeting_id: \"meeting-1\"");
+        assert_eq!(front[2], "import_source: sharepoint");
+        assert_eq!(front[3], "recorded_at: \"2026-07-21T10:02:21\"");
+        assert!(front.contains(&"duration: \"47:12\""));
+        assert!(front.contains(&r#"recording_file: "Weekly sync \"Q3\"-20260721_100221-Meeting Recording.mp4""#));
+        assert!(front.iter().any(|l| l.starts_with("recording_url: \"https://contoso-my.sharepoint.com/")));
+        assert_eq!(&front[front.len() - 3..], ["tags:", "  - meetings", "  - q3"]);
+        // An explicit recap stamp wins over the stored one.
+        let recap = build_obsidian_markdown("m", "T", "2026-07-21T15:02:21Z", "s", "", Some("2026-07-22T09:00:00"), Some(&source), &[]);
+        assert!(recap.contains("recorded_at: \"2026-07-22T09:00:00\""));
+        assert_eq!(format_duration(3723.0), "1:02:03");
+    }
+
+    #[test]
+    fn notes_without_a_source_keep_the_original_properties() {
+        let note = build_obsidian_markdown("m", "Live call", "2026-07-21T15:02:21Z", "s", "", None, None, &[]);
+        let front = note.split("---\n").nth(1).unwrap();
+        assert!(!front.contains("import_source"));
+        assert!(!front.contains("recording_"));
+        assert!(!front.contains("duration"));
+    }
+
+    #[test]
+    fn replacing_tags_keeps_other_properties_and_body() {
+        let note = "---\nsource: meetily\ntags:\n  - meetings\n  - old\nstatus: done\n---\n\n# T\n\n- item\n";
+        let updated = replace_front_matter_tags(note, &["new".to_string()]).unwrap();
+        assert_eq!(
+            updated,
+            "---\nsource: meetily\ntags:\n  - meetings\n  - new\nstatus: done\n---\n\n# T\n\n- item\n"
+        );
+        let untagged = replace_front_matter_tags("---\nsource: meetily\n---\nbody\n", &[]).unwrap();
+        assert_eq!(untagged, "---\nsource: meetily\ntags:\n  - meetings\n---\nbody\n");
+        assert!(replace_front_matter_tags("no front matter", &[]).is_none());
     }
 
     #[test]

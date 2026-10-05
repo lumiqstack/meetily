@@ -451,6 +451,10 @@ pub fn get_language_preference_internal() -> Option<String> {
 pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
 
+    // Before anything enumerates audio devices: keep cpal's shared WASAPI
+    // enumerator on a thread that outlives every caller (see com_keeper).
+    audio::com_keeper::ensure();
+
     let mut builder = tauri::Builder::default();
 
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -751,6 +755,9 @@ pub fn run() {
             groq::groq::get_groq_models,
             api::api_get_meetings,
             api::api_get_pending_meetings,
+            api::api_get_meeting_tags,
+            api::api_set_meeting_tags,
+            api::api_get_all_meeting_tags,
             api::api_search_transcripts,
             api::api_get_profile,
             api::api_save_profile,

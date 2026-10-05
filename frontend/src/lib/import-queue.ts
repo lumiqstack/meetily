@@ -28,6 +28,9 @@ export interface BatchImportItem {
   /** Remote recording URL (SharePoint/Teams) — imported via the URL pipeline. */
   url?: string;
   title: string;
+  /** When the meeting took place (e.g. SharePoint's file creation time), so
+   * the meeting is dated by the recording rather than by the import. */
+  meetingDate?: string;
 }
 
 export interface BatchImportOptions {
@@ -179,7 +182,7 @@ export class ImportQueue {
       provider: item.options.provider ?? null,
     };
     const [command, args] = item.url
-      ? (['start_import_from_url_command', { ...common, url: item.url, mode: 'audio' }] as const)
+      ? (['start_import_from_url_command', { ...common, url: item.url, mode: 'audio', meetingDate: item.meetingDate ?? null }] as const)
       : (['start_import_audio_command', { ...common, sourcePath: item.path }] as const);
 
     try {
