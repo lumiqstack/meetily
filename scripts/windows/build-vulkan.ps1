@@ -179,6 +179,17 @@ try {
     if (Get-Process -Name meetily -ErrorAction SilentlyContinue) {
         throw 'Meetily is running. Let recordings and summaries finish, quit it from the tray menu, then rerun.'
     }
+    # tauri-build re-copies the sidecars (llama-helper, ffmpeg) into target\release;
+    # a leftover sidecar process still running from there fails that copy with
+    # "Access is denied" (OS error 5).
+    $releaseDir = (Join-Path $targetDir 'release') + '\'
+    $locking = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and $_.Path.StartsWith($releaseDir, [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($locking.Count -gt 0) {
+        $list = ($locking | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" }) -join ', '
+        throw "Processes are still running from $releaseDir and would block the sidecar copy: $list. Close them (Task Manager -> End task), then rerun."
+    }
     if (-not $VulkanSdk -or -not (Test-Path -LiteralPath (Join-Path $VulkanSdk 'Bin'))) {
         throw 'Vulkan SDK not found. Pass -VulkanSdk <SDK root> (the folder containing Bin\glslc.exe) or set VULKAN_SDK.'
     }
