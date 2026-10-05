@@ -106,4 +106,9 @@ jobs:
           exit 0
 
       - name: Rust library tests
-        run: cargo test --locked -p meetily --lib
+        # One thread: a native crash then names the test that caused it.
+        # Skipped tests need audio hardware, which hosted runners lack.
+        run: >-
+          cargo test --locked -p meetily --lib --
+          --test-threads=1
+          --skip audio::playback_monitor::tests::test_get_output_device
