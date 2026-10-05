@@ -97,6 +97,12 @@ jobs:
             ConvertTo-Json -Compress -Depth 4
           "TAURI_CONFIG=$config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+          # Tests skip app setup, which loads the bundled ONNX Runtime (1.22,
+          # staged by build.rs); without this, Windows' own older
+          # System32\onnxruntime.dll gets loaded and the VAD tests fail.
+          $ort = Join-Path $env:GITHUB_WORKSPACE 'frontend\src-tauri\binaries\onnxruntime\onnxruntime.dll'
+          "ORT_DYLIB_PATH=$ort" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           $llvm = 'C:\Program Files\LLVM\bin'
           if (Test-Path (Join-Path $llvm 'libclang.dll')) {
             "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
