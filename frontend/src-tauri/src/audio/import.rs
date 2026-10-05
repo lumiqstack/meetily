@@ -529,6 +529,11 @@ async fn run_import<R: Runtime>(
     source_url: Option<String>,
 ) -> Result<ImportResult> {
     let source = PathBuf::from(&source_path);
+    let origin = ImportOrigin {
+        source_path: source_path.clone(),
+        source_url,
+        meeting_date,
+    };
 
     // Validate source file
     if !source.exists() {
@@ -605,6 +610,7 @@ async fn run_import<R: Runtime>(
             dest_path,
             dest_filename,
             language,
+            origin,
         )
         .await;
     }
@@ -903,6 +909,7 @@ async fn run_import<R: Runtime>(
         &dest_filename,
         duration_seconds,
         segments,
+        &origin,
     )
     .await
 }
@@ -921,6 +928,7 @@ async fn run_gemini_import<R: Runtime>(
     audio_path: PathBuf,
     dest_filename: String,
     language: Option<String>,
+    origin: ImportOrigin,
 ) -> Result<ImportResult> {
     use crate::audio::transcription::gemini_batch::{self, GeminiBatchOptions};
 
@@ -1018,8 +1026,20 @@ async fn run_gemini_import<R: Runtime>(
         &dest_filename,
         duration_seconds,
         segments,
+        &origin,
     )
     .await
+}
+
+/// Where an import came from: dates the meeting and records its source.
+#[derive(Clone)]
+struct ImportOrigin {
+    /// Local file the importer read (a temp download for URL imports).
+    source_path: String,
+    /// Link the recording was downloaded from, for URL imports.
+    source_url: Option<String>,
+    /// Date hint from the caller (e.g. SharePoint's file creation time).
+    meeting_date: Option<String>,
 }
 
 /// Create the meeting, store its transcripts and write the sidecar files.
@@ -1034,15 +1054,17 @@ async fn finish_import<R: Runtime>(
     dest_filename: &str,
     duration_seconds: f64,
     segments: Vec<crate::api::TranscriptSegment>,
+    origin: &ImportOrigin,
 ) -> Result<ImportResult> {
     emit_progress(app, &import_id, "saving", 85, "Creating meeting...");
+    let ImportOrigin { source_path, source_url, meeting_date } = origin;
 
     // Save to database
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
-    let created_at = resolve_meeting_date(&title, Some(&source_path), meeting_date.as_deref());
+    let created_at = resolve_meeting_date(&title, Some(source_path), meeting_date.as_deref());
     let import_source = source_url
         .as_deref()
         .map(crate::database::repositories::meeting_sources::url_import_source)
@@ -1051,7 +1073,7 @@ async fn finish_import<R: Runtime>(
         import_source,
         &title,
         source_url.as_deref(),
-        Some(&source_path),
+        Some(source_path),
         Some(duration_seconds),
     );
     let meeting_id = create_meeting_with_transcripts(

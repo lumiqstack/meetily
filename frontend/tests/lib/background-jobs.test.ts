@@ -440,6 +440,8 @@ describe("interrupted jobs (crash recovery)", () => {
           language: null,
           model: "whisper-1",
           provider: "openaiCompatible",
+          // Required by start_retranscription_command; old journal rows default to off.
+          diarization: false,
         },
       ],
       ["dismiss_interrupted_job_command", { jobId: "meeting-7" }],
