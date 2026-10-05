@@ -11,6 +11,8 @@ on:
     paths:
       - 'frontend/**'
       - 'llama-helper/**'
+      - 'vendor/**'
+      - 'tests/whisper-native/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-tests.yml'
@@ -18,6 +20,8 @@ on:
     paths:
       - 'frontend/**'
       - 'llama-helper/**'
+      - 'vendor/**'
+      - 'tests/whisper-native/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-tests.yml'
@@ -119,3 +123,20 @@ jobs:
           cargo test --locked -p meetily --lib --
           --test-threads=1
           --skip audio::playback_monitor::tests::test_get_output_device
+
+  whisper-native:
+    name: Whisper native exception boundary (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Puts cl.exe and lib.exe on PATH, as a Visual Studio developer shell would.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Guard catches C++ exceptions under MSVC /EHsc
+        run: python tests/whisper-native/run.py
