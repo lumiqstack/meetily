@@ -306,7 +306,7 @@ impl AnalyticsClient {
         self.track_event("summary_generation_started", Some(properties)).await
     }
 
-    pub async fn track_summary_generation_completed(&self, model_provider: &str, model_name: &str, success: bool, duration_seconds: Option<u64>, error_message: Option<&str>) -> Result<(), String> {
+    pub async fn track_summary_generation_completed(&self, model_provider: &str, model_name: &str, success: bool, duration_seconds: Option<u64>) -> Result<(), String> {
         let mut properties = HashMap::new();
         properties.insert("model_provider".to_string(), model_provider.to_string());
         properties.insert("model_name".to_string(), model_name.to_string());
@@ -316,11 +316,6 @@ impl AnalyticsClient {
         if let Some(duration) = duration_seconds {
             properties.insert("duration_seconds".to_string(), duration.to_string());
         }
-        
-        if let Some(error) = error_message {
-            properties.insert("error_message".to_string(), error.to_string());
-        }
-        
         self.track_event("summary_generation_completed", Some(properties)).await
     }
 

@@ -76,7 +76,7 @@ export function useCopyOperations({
 
     if (!allTranscripts.length) {
       const error_msg = 'No transcripts available to copy';
-      console.log(error_msg);
+      console.warn('Failed to fetch transcripts for copying');
       toast.error(error_msg);
       return;
     }

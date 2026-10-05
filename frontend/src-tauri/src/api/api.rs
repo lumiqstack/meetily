@@ -278,7 +278,7 @@ async fn make_api_request<R: Runtime, T: for<'de> Deserialize<'de>>(
     let server_url = get_server_address(app).await?;
 
     let url = format!("{}{}", server_url, endpoint);
-    log_info!("Making {} request to: {}", method, url);
+    log_info!("Making {} request", method);
 
     let mut request = match method.to_uppercase().as_str() {
         "GET" => client.get(&url),
@@ -310,22 +310,24 @@ async fn make_api_request<R: Runtime, T: for<'de> Deserialize<'de>>(
         request = request.body(body_str.to_string());
     }
 
-    let response = request.send().await.map_err(|e| {
-        let error_msg = format!("Request failed: {}", e);
-        log_error!("{}", error_msg);
-        error_msg
+    let response = request.send().await.map_err(|error| {
+        let (category, message) = if error.is_timeout() {
+            ("timeout", "Request timed out")
+        } else if error.is_connect() {
+            ("connection", "Could not connect to the server")
+        } else {
+            ("request", "Request failed")
+        };
+        log_error!("API request failed ({})", category);
+        message.to_string()
     })?;
 
     let status = response.status();
     log_info!("Response status: {}", status);
 
     if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        let error_msg = format!("HTTP {}: {}", status, error_text);
-        log_error!("{}", error_msg);
+        let error_msg = format!("HTTP request failed with status {}", status);
+        log_error!("API request failed with HTTP status {}", status);
         return Err(error_msg);
     }
 
@@ -334,10 +336,6 @@ async fn make_api_request<R: Runtime, T: for<'de> Deserialize<'de>>(
         log_error!("{}", error_msg);
         error_msg
     })?;
-
-    // Safely truncate response for logging, respecting UTF-8 character boundaries
-    let truncated = response_text.chars().take(200).collect::<String>();
-    log_info!("Response body: {}", truncated);
 
     serde_json::from_str(&response_text).map_err(|e| {
         let error_msg = format!("Failed to parse JSON: {}", e);
@@ -1486,11 +1484,7 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
     api_key: Option<String>,
     model: String,
 ) -> Result<serde_json::Value, String> {
-    log_info!(
-        "api_test_custom_openai_connection called: endpoint='{}', model='{}'",
-        &endpoint,
-        &model
-    );
+    log_info!("api_test_custom_openai_connection called for model '{}'", &model);
 
     // Validate endpoint URL format
     if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
@@ -1565,17 +1559,28 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                         }
 
                         // Response was 200 but doesn't match OpenAI format
-                        log_warn!("⚠️ Endpoint returned 200 but response doesn't match OpenAI format: {}", response_text);
+                        log_warn!(
+                            "Custom OpenAI endpoint returned HTTP 200 with an incompatible response ({} bytes)",
+                            response_text.len()
+                        );
                         Err("Endpoint is reachable but doesn't appear to be OpenAI-compatible. Response is missing 'choices' array or 'message.content' / 'message.reasoning_content' field.".to_string())
                     }
                     Err(e) => {
-                        log_warn!("⚠️ Endpoint returned 200 but response is not valid JSON: {}", e);
-                        Err(format!("Endpoint is reachable but returned invalid JSON: {}. Response: {}", e, response_text))
+                        log_warn!(
+                            "Custom OpenAI endpoint returned invalid JSON ({} bytes): {}",
+                            response_text.len(),
+                            e
+                        );
+                        Err("Endpoint is reachable but returned invalid JSON.".to_string())
                     }
                 }
             } else {
-                log_warn!("⚠️ Custom OpenAI connection test failed with status {}: {}", status, response_text);
-                Err(format!("Connection failed with status {}: {}", status, response_text))
+                log_warn!(
+                    "Custom OpenAI connection test failed with HTTP status {} ({} response bytes)",
+                    status,
+                    response_text.len()
+                );
+                Err(format!("Connection failed with status {}.", status))
             }
         }
         Err(e) => {
@@ -1670,7 +1675,7 @@ pub async fn api_test_copilot_cli<R: Runtime>(
         &model
     );
 
-    let response = crate::summary::copilot_cli::generate_with_copilot_cli(
+    let _response = crate::summary::copilot_cli::generate_with_copilot_cli(
         binary_path.as_deref(),
         model.as_deref().unwrap_or(""),
         github_token.as_deref(),
@@ -1680,9 +1685,9 @@ pub async fn api_test_copilot_cli<R: Runtime>(
     )
     .await?;
 
-    log_info!("✅ Copilot CLI test successful: {}", response);
+    log_info!("✅ Copilot CLI test successful");
     Ok(serde_json::json!({
         "status": "success",
-        "message": format!("GitHub Copilot CLI responded successfully: {}", response)
+        "message": "GitHub Copilot CLI responded successfully"
     }))
 }

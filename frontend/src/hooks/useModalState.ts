@@ -107,7 +107,7 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
       try {
         console.log('Setting up chunk-drop-warning listener...');
         unlistenFn = await listen<string>('chunk-drop-warning', (event) => {
-          console.log('Chunk drop warning received:', event.payload);
+          console.log('Audio chunk drop warning received');
           showModal('chunkDropWarning', event.payload);
         });
         console.log('Chunk drop warning listener setup complete');
@@ -134,7 +134,7 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
       try {
         console.log('Setting up transcription-error listener...');
         unlistenFn = await listen<TranscriptionErrorPayload>('transcription-error', (event) => {
-          console.log('Transcription error received:', event.payload);
+          console.log('Transcription error received');
           const { userMessage, actionable } = event.payload;
 
           if (actionable) {

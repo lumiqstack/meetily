@@ -3,13 +3,15 @@
  * use. Keep RETIRED_COPILOT_CLI_MODELS identical to the Rust list in
  * src-tauri/src/summary/copilot_cli.rs (a Rust test compares them).
  *
- * Only identifiers known to be accepted are offered. Replacement families
- * named in GitHub's retirement notices (Sonnet 5, GPT-5.6 Sol/Luna, Gemini
- * 3.8 Flash, Kimi K3, Claude Opus 5.5, Grok 4.6) are deliberately absent
- * until their exact `--model` IDs are verified against an installed CLI and
- * account; 'auto' works on every plan meanwhile.
+ * Only identifiers verified with a representative invocation against the
+ * installed CLI and account are offered. `auto` is documented by the CLI.
  */
-export const COPILOT_CLI_MODELS: string[] = ['auto', 'claude-haiku-4.5'];
+export const COPILOT_CLI_MODELS: string[] = [
+  'auto',
+  'claude-haiku-4.5',
+  'gemini-3.8-flash',
+  'claude-opus-5.5',
+];
 
 /**
  * Retired, or retiring during October 2026, so never offered, never used as

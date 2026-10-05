@@ -150,7 +150,6 @@ export function useSummaryGeneration({
       attempt.model,
       outcome === 'ok' || outcome === 'fallback',
       (Date.now() - attempt.startedAt) / 1000,
-      outcome === 'ok' ? undefined : outcome,
     );
   }, []);
 

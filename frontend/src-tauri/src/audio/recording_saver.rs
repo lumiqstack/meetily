@@ -636,6 +636,10 @@ impl RecordingSaver {
     pub fn get_meeting_name(&self) -> Option<String> {
         self.meeting_name.clone()
     }
+
+    pub fn audio_saving_enabled(&self) -> bool {
+        self.save_audio
+    }
 }
 
 impl Default for RecordingSaver {
@@ -820,6 +824,7 @@ mod storage_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut saver = named_saver();
         saver.prepare_storage_in(&dir.path().to_path_buf(), false).unwrap();
+        assert!(!saver.audio_saving_enabled());
         let folder = saver.meeting_folder.clone().unwrap();
         assert!(folder.join("metadata.json").exists());
         assert!(!folder.join(".checkpoints").exists());
@@ -831,6 +836,7 @@ mod storage_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut saver = named_saver();
         saver.prepare_storage_in(&dir.path().to_path_buf(), true).unwrap();
+        assert!(saver.audio_saving_enabled());
         assert!(saver.incremental_saver.is_some());
         // The encoder writes a crash-recoverable audio.mp4 directly; the
         // .checkpoints/ directory is only read for meetings from older builds.

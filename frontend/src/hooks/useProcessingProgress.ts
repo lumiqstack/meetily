@@ -119,7 +119,7 @@ export function useProcessingProgress() {
     }));
 
     delete processingTimeRef.current[chunkId];
-    console.log(`Failed chunk ${chunkId}: ${errorMessage}`);
+    console.log(`Failed chunk ${chunkId}`);
   }, []);
 
   // Calculate estimated remaining time

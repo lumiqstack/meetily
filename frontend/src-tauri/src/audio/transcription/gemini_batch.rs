@@ -432,14 +432,13 @@ pub fn resolve_speaker_labels(segments: &mut [GeminiBatchSegment]) {
 // ============================================================================
 
 /// Map a gateway response status onto the typed error model.
-pub fn classify_status(status: u16, body: &str) -> GeminiBatchError {
-    let snippet: String = body.chars().take(300).collect();
+pub fn classify_status(status: u16, _body: &str) -> GeminiBatchError {
     match status {
         429 => GeminiBatchError::QuotaExceeded,
         401 | 403 => GeminiBatchError::Auth,
-        400 | 422 => GeminiBatchError::InvalidRequest(snippet),
+        400 | 422 => GeminiBatchError::InvalidRequest(format!("HTTP {}", status)),
         500..=599 => GeminiBatchError::ServerError(status),
-        other => GeminiBatchError::InvalidRequest(format!("unexpected status {}: {}", other, snippet)),
+        other => GeminiBatchError::InvalidRequest(format!("unexpected HTTP status {}", other)),
     }
 }
 
@@ -447,8 +446,10 @@ pub fn classify_status(status: u16, body: &str) -> GeminiBatchError {
 pub fn classify_transport(error: &reqwest::Error) -> GeminiBatchError {
     if error.is_timeout() {
         GeminiBatchError::Timeout
+    } else if error.is_connect() {
+        GeminiBatchError::Transport("Could not connect to the transcription gateway".to_string())
     } else {
-        GeminiBatchError::Transport(error.to_string())
+        GeminiBatchError::Transport("Transcription gateway request failed".to_string())
     }
 }
 
@@ -1029,12 +1030,26 @@ mod tests {
 
     #[test]
     fn status_codes_map_to_the_right_variants() {
-        assert!(matches!(classify_status(429, ""), GeminiBatchError::QuotaExceeded));
+        assert!(matches!(
+            classify_status(429, ""),
+            GeminiBatchError::QuotaExceeded
+        ));
         assert!(matches!(classify_status(401, ""), GeminiBatchError::Auth));
         assert!(matches!(classify_status(403, ""), GeminiBatchError::Auth));
-        assert!(matches!(classify_status(422, "no"), GeminiBatchError::InvalidRequest(_)));
-        assert!(matches!(classify_status(500, ""), GeminiBatchError::ServerError(500)));
-        assert!(matches!(classify_status(503, ""), GeminiBatchError::ServerError(503)));
+        assert!(matches!(
+            classify_status(422, "no"),
+            GeminiBatchError::InvalidRequest(_)
+        ));
+        assert!(matches!(
+            classify_status(500, ""),
+            GeminiBatchError::ServerError(500)
+        ));
+        assert!(matches!(
+            classify_status(503, ""),
+            GeminiBatchError::ServerError(503)
+        ));
+        let error = classify_status(422, "SYNTHETIC_PRIVATE_SENTINEL").to_string();
+        assert!(!error.contains("SYNTHETIC_PRIVATE_SENTINEL"));
     }
 
     #[test]

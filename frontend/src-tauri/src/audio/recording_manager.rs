@@ -616,6 +616,10 @@ impl RecordingManager {
         self.recording_saver.get_meeting_folder().map(|p| p.clone())
     }
 
+    pub fn audio_saving_enabled(&self) -> bool {
+        self.recording_saver.audio_saving_enabled()
+    }
+
     /// Take ownership of the device event receiver for use by a background processor.
     pub fn take_device_event_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<DeviceEvent>> {
         self.device_event_receiver.take()

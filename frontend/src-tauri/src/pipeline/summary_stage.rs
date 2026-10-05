@@ -136,7 +136,7 @@ pub async fn run_summary_stage<R: Runtime>(
     // Awaited in-process: no status polling, and the Obsidian auto-export
     // happens inside on success.
     let cancellation_token = SummaryService::register_cancellation_token(meeting_id, started_at);
-    SummaryService::process_transcript_background(
+    let attempt = SummaryService::process_transcript_background(
         app.clone(),
         pool.clone(),
         meeting_id.to_string(),
@@ -148,6 +148,12 @@ pub async fn run_summary_stage<R: Runtime>(
         String::new(),
         settings.summary_template_id.clone(),
         summary_language,
+    );
+    SummaryService::supervise_summary_attempt(
+        pool.clone(),
+        meeting_id.to_string(),
+        started_at,
+        attempt,
     )
     .await;
 

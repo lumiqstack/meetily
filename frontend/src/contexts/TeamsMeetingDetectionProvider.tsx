@@ -179,7 +179,7 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
       duration: 15000,
     });
 
-    console.log('[TeamsMeetingDetection] Start prompt payload:', payload);
+    console.log('[TeamsMeetingDetection] Start prompt displayed');
   };
 
   const handleStopPrompt = (payload: TeamsCallLikelyEndedPayload) => {
@@ -232,7 +232,7 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
       duration: 15000,
     });
 
-    console.log('[TeamsMeetingDetection] Stop prompt payload:', payload);
+    console.log('[TeamsMeetingDetection] Stop prompt displayed');
   };
 
   const stopRecordingFromPrompt = async () => {

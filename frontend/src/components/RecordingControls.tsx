@@ -277,12 +277,10 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       try {
         // Transcript error listener - handles both regular and actionable errors
         const transcriptErrorUnsubscribe = await listen('transcript-error', (event) => {
-          console.log('transcript-error event received:', event);
-          console.error('Transcription error received:', event.payload);
+          console.log('transcript-error event received');
           const errorMessage = event.payload as string;
 
           Analytics.trackTranscriptionError(errorMessage);
-          console.log('Tracked transcription error:', errorMessage);
 
           setTranscriptionErrors(prev => {
             const newCount = prev + 1;
@@ -299,13 +297,11 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
 
         // Transcription error listener - handles structured error objects with actionable flag
         const transcriptionErrorUnsubscribe = await listen<TranscriptionErrorPayload>('transcription-error', (event) => {
-          console.log('transcription-error event received:', event);
-          console.error('Transcription error received:', event.payload);
+          console.log('transcription-error event received');
 
           const errorMessage = event.payload.userMessage || event.payload.error;
 
           Analytics.trackTranscriptionError(errorMessage);
-          console.log('Tracked transcription error:', errorMessage);
 
           setTranscriptionErrors(prev => {
             const newCount = prev + 1;

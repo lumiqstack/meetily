@@ -87,6 +87,7 @@ export function useRecordingStop(
           message: string;
           folder_path?: string;
           meeting_name?: string;
+          audio_save_enabled?: boolean;
           realtime_transcription_enabled?: boolean;
           audio_save_error?: string | null;
         }>('recording-stopped', async (event) => {
@@ -104,6 +105,10 @@ export function useRecordingStop(
             sessionStorage.setItem(
               'last_recording_realtime_transcription_enabled',
               String(!!event.payload.realtime_transcription_enabled)
+            );
+            sessionStorage.setItem(
+              'last_recording_audio_save_enabled',
+              String(!!event.payload.audio_save_enabled)
             );
             if (event.payload.audio_save_error) {
               sessionStorage.setItem('last_recording_audio_save_error', event.payload.audio_save_error);
@@ -220,6 +225,8 @@ export function useRecordingStop(
       // Saved either way; an incomplete live transcript is marked so it is
       // re-transcribed from audio instead of being summarized as complete.
       const transcriptionIncomplete = realtimeTranscriptionEnabled && !transcriptionComplete;
+      const audioSaveEnabled =
+        sessionStorage.getItem('last_recording_audio_save_enabled') === 'true';
       if (transcriptionIncomplete) {
         console.warn('⏰ Live transcription did not finish (timeout or status errors) after', elapsedTime, 'ms');
       } else if (realtimeTranscriptionEnabled) {
@@ -320,6 +327,7 @@ export function useRecordingStop(
           sessionStorage.removeItem('last_recording_folder_path');
           sessionStorage.removeItem('last_recording_meeting_name');
           sessionStorage.removeItem('last_recording_realtime_transcription_enabled');
+          sessionStorage.removeItem('last_recording_audio_save_enabled');
           const audioSaveError = sessionStorage.getItem('last_recording_audio_save_error');
           sessionStorage.removeItem('last_recording_audio_save_error');
           // Clean up IndexedDB meeting ID (redundant with markMeetingAsSaved cleanup, but ensures cleanup)
@@ -346,7 +354,9 @@ export function useRecordingStop(
           setStatus(RecordingStatus.COMPLETED);
 
           if (transcriptionIncomplete) {
-            const recovery = await describeIncompleteRecovery(Boolean(folderPath) && !audioSaveError);
+            const recovery = await describeIncompleteRecovery(
+              Boolean(folderPath) && audioSaveEnabled && !audioSaveError
+            );
             toast.warning('Meeting saved with an incomplete transcript', {
               description: `${freshTranscripts.length} transcript segments were saved before live transcription finished. ${recovery}`,
               action: {
@@ -354,6 +364,26 @@ export function useRecordingStop(
                 onClick: () => router.push(`/meeting-details?id=${meetingId}`),
               },
               duration: 15000,
+            });
+          } else if (audioSaveError) {
+            toast.warning('Meeting transcript saved, but recording audio is incomplete', {
+              description: audioSaveError,
+              action: {
+                label: 'View Meeting',
+                onClick: () => router.push(`/meeting-details?id=${meetingId}`),
+              },
+              duration: 15000,
+            });
+          } else if (!audioSaveEnabled) {
+            toast.success('Meeting saved', {
+              description: realtimeTranscriptionEnabled
+                ? `${freshTranscripts.length} transcript segments saved. Audio was not retained, so it cannot be transcribed later.`
+                : 'Audio was not retained, so this meeting has no recording to transcribe later.',
+              action: {
+                label: 'View Meeting',
+                onClick: () => router.push(`/meeting-details?id=${meetingId}`),
+              },
+              duration: 10000,
             });
           } else {
             // Show success toast with navigation option

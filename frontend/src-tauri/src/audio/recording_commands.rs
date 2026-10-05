@@ -401,10 +401,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
-    info!(
-        "Starting recording with default devices, meeting: {:?}",
-        meeting_name
-    );
+    info!("Starting recording with default devices");
 
     // Claim the start transition before checking state, and hold it until
     // the manager is published and IS_RECORDING is set (end of this
@@ -630,10 +627,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     system_device_name: Option<String>,
     meeting_name: Option<String>,
 ) -> Result<(), String> {
-    info!(
-        "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
-        mic_device_name, system_device_name, meeting_name
-    );
+    info!("Starting recording with selected audio devices");
 
     // Claim the start transition before checking state, and hold it until
     // the manager is published and IS_RECORDING is set (end of this
@@ -1198,12 +1192,13 @@ pub async fn stop_recording<R: Runtime>(
 
     // Perform final cleanup with the manager if available
     let mut audio_save_error: Option<String> = None;
-    let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
+    let (meeting_folder, meeting_name, audio_save_enabled) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
         // Extract meeting info BEFORE async operations
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
+        let audio_save_enabled = manager.audio_saving_enabled();
 
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
@@ -1227,10 +1222,10 @@ pub async fn stop_recording<R: Runtime>(
             }
         }
 
-        (meeting_folder, meeting_name)
+        (meeting_folder, meeting_name, audio_save_enabled)
     } else {
         info!("ℹ️ No recording manager available for cleanup");
-        (None, None)
+        (None, None, false)
     };
 
     // Set recording flag to false
@@ -1252,9 +1247,11 @@ pub async fn stop_recording<R: Runtime>(
         _ => (None, None),
     };
 
-    info!("📤 Preparing recording metadata for frontend save");
-    info!("   folder_path: {:?}", folder_path_str);
-    info!("   meeting_name: {:?}", meeting_name_str);
+    info!(
+        "📤 Preparing recording metadata for frontend save (folder: {}, meeting name: {})",
+        folder_path_str.is_some(),
+        meeting_name_str.is_some()
+    );
 
     // Database save removed - frontend will handle this after receiving all transcripts
     info!("ℹ️ Skipping database save in Rust - frontend will save after all transcripts received");
@@ -1276,6 +1273,7 @@ pub async fn stop_recording<R: Runtime>(
             "message": "Recording stopped - frontend will save after all transcripts received",
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str,
+            "audio_save_enabled": audio_save_enabled,
             "realtime_transcription_enabled": realtime_transcription_was_active,
             "audio_save_error": audio_save_error
         }),

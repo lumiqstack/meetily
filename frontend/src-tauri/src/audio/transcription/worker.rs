@@ -503,8 +503,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     }
 
                     info!(
-                        "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
-                        chunk.chunk_id, cleaned_text, confidence, is_partial
+                        "Whisper transcription complete for chunk {}: {} characters (confidence: {:.2}, partial: {})",
+                        chunk.chunk_id, cleaned_text.chars().count(), confidence, is_partial
                     );
 
                     Ok((cleaned_text, Some(confidence), is_partial))
@@ -539,8 +539,8 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     }
 
                     info!(
-                        "Parakeet transcription complete for chunk {}: '{}'",
-                        chunk.chunk_id, cleaned_text
+                        "Parakeet transcription complete for chunk {}: {} characters",
+                        chunk.chunk_id, cleaned_text.chars().count()
                     );
 
                     // Parakeet doesn't provide confidence or partial results
@@ -584,10 +584,10 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     };
 
                     info!(
-                        "{} transcription complete for chunk {}: '{}' ({}, partial: {})",
+                        "{} transcription complete for chunk {}: {} characters ({}, partial: {})",
                         provider.provider_name(),
                         chunk.chunk_id,
-                        cleaned_text,
+                        cleaned_text.chars().count(),
                         confidence_str,
                         result.is_partial
                     );

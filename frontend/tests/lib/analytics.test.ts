@@ -16,7 +16,7 @@ describe('summary generation analytics', () => {
     invokeMock.mockClear();
 
     await Analytics.trackSummaryGenerationCompleted('ollama', 'model', true, 1.999);
-    await Analytics.trackSummaryGenerationCompleted('ollama', 'model', false, undefined, 'cancelled');
+    await Analytics.trackSummaryGenerationCompleted('ollama', 'model', false, undefined);
 
     expect(invokeMock.mock.calls).toEqual([
       [
@@ -26,7 +26,6 @@ describe('summary generation analytics', () => {
           modelName: 'model',
           success: true,
           durationSeconds: 1,
-          errorMessage: undefined,
         },
       ],
       [
@@ -36,7 +35,23 @@ describe('summary generation analytics', () => {
           modelName: 'model',
           success: false,
           durationSeconds: undefined,
-          errorMessage: 'cancelled',
+        },
+      ],
+    ]);
+  });
+
+  test('error analytics omits raw error text', async () => {
+    await Analytics.init();
+    invokeMock.mockClear();
+
+    await Analytics.trackError('import_audio_failed', 'SYNTHETIC_PRIVATE_SENTINEL');
+
+    expect(invokeMock.mock.calls).toEqual([
+      [
+        'track_event',
+        {
+          eventName: 'error',
+          properties: { error_type: 'import_audio_failed' },
         },
       ],
     ]);

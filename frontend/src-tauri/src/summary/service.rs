@@ -488,7 +488,7 @@ impl SummaryService {
             if provider == LLMProvider::CustomOpenAI {
                 match SettingsRepository::get_custom_openai_config(&pool).await {
                     Ok(Some(config)) => {
-                        info!("✓ Using custom OpenAI endpoint: {}", config.endpoint);
+                        info!("✓ Using custom OpenAI endpoint");
                         (
                             Some(config.endpoint),
                             config.api_key,
@@ -852,10 +852,7 @@ impl SummaryService {
         started_at: DateTime<Utc>,
         error_msg: &str,
     ) {
-        error!(
-            "Processing failed for meeting_id {}: {}",
-            meeting_id, error_msg
-        );
+        error!("Summary generation failed for meeting_id {}", meeting_id);
         match SummaryProcessesRepository::update_process_failed(
             pool,
             meeting_id,

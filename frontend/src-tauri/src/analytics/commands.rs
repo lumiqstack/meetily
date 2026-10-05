@@ -220,14 +220,14 @@ pub async fn track_summary_generation_started(model_provider: String, model_name
 }
 
 #[command]
-pub async fn track_summary_generation_completed(model_provider: String, model_name: String, success: bool, duration_seconds: Option<u64>, error_message: Option<String>) -> Result<(), String> {
+pub async fn track_summary_generation_completed(model_provider: String, model_name: String, success: bool, duration_seconds: Option<u64>) -> Result<(), String> {
     let client = {
         let guard = ANALYTICS_CLIENT.lock().unwrap();
         guard.as_ref().cloned()
     };
     
     if let Some(client) = client {
-        client.track_summary_generation_completed(&model_provider, &model_name, success, duration_seconds, error_message.as_deref()).await
+        client.track_summary_generation_completed(&model_provider, &model_name, success, duration_seconds).await
     } else {
         Err("Analytics client not initialized".to_string())
     }

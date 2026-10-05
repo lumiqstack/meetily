@@ -8,7 +8,7 @@
 use super::pcm::encode_wav_pcm16;
 use super::provider::{TranscriptionError, TranscriptionProvider, TranscriptResult};
 use async_trait::async_trait;
-use log::{info, warn};
+use log::info;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -166,21 +166,19 @@ impl TranscriptionProvider for OpenAICompatibleProvider {
             request = request.bearer_auth(key);
         }
 
-        let response = request.send().await.map_err(|e| {
-            TranscriptionError::EngineFailed(format!(
-                "Request to {} failed: {}",
-                self.endpoint, e
-            ))
+        let response = request.send().await.map_err(|error| {
+            let message = if error.is_timeout() {
+                "Remote transcription request timed out"
+            } else if error.is_connect() {
+                "Could not connect to the remote transcription server"
+            } else {
+                "Remote transcription request failed"
+            };
+            TranscriptionError::EngineFailed(message.to_string())
         })?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(300).collect();
-            warn!(
-                "Remote transcription failed - status: {}, body: {}",
-                status, snippet
-            );
             // A server that does not accept `prompt` must not be treated as if
             // the vocabulary were in use: say so, and how to turn it off.
             if self.prompt.is_some()
@@ -190,13 +188,13 @@ impl TranscriptionProvider for OpenAICompatibleProvider {
                 return Err(TranscriptionError::EngineFailed(format!(
                     "The remote transcription server rejected the request ({}) while the vocabulary prompt was enabled; \
                      it may not support the `prompt` field. Turn off \"Send vocabulary to the remote server\" in \
-                     transcription settings and retry. Server said: {}",
-                    status, snippet
+                     transcription settings and retry.",
+                    status
                 )));
             }
             return Err(TranscriptionError::EngineFailed(format!(
-                "Server returned {}: {}",
-                status, snippet
+                "Remote transcription server returned {}",
+                status
             )));
         }
 
@@ -308,11 +306,13 @@ mod prompt_tests {
 
     #[tokio::test]
     async fn a_server_rejecting_the_prompt_gets_an_actionable_error() {
-        let (base, _seen) = server(400, r#"{"error":"unknown field prompt"}"#).await;
+        let (base, _seen) =
+            server(400, r#"{"error":"SYNTHETIC_PRIVATE_SENTINEL: unknown field prompt"}"#).await;
         let provider = OpenAICompatibleProvider::new(&base, "m".into(), None)
             .unwrap()
             .with_prompt(Some("Acme".to_string()));
         let error = provider.transcribe(audio(), None).await.unwrap_err().to_string();
         assert!(error.contains("Send vocabulary to the remote server"), "{error}");
+        assert!(!error.contains("SYNTHETIC_PRIVATE_SENTINEL"));
     }
 }

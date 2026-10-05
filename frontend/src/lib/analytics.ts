@@ -605,11 +605,8 @@ export class Analytics {
     await this.track(`button_click_${buttonName}`, properties);
   }
 
-  static async trackError(errorType: string, errorMessage: string): Promise<void> {
-    await this.track('error', { 
-      error_type: errorType, 
-      error_message: errorMessage 
-    });
+  static async trackError(errorType: string, _errorMessage: string): Promise<void> {
+    await this.track('error', { error_type: errorType });
   }
 
   static async trackAppStarted(): Promise<void> {
@@ -775,8 +772,7 @@ export class Analytics {
     modelProvider: string, 
     modelName: string, 
     success: boolean, 
-    durationSeconds?: number, 
-    errorMessage?: string
+    durationSeconds?: number
   ) {
     if (!this.initialized) {
       console.warn('Analytics not initialized, skipping summary generation completed tracking');
@@ -784,13 +780,12 @@ export class Analytics {
     }
 
     try {
-      console.log('Tracking summary generation completed event:', { modelProvider, modelName, success, durationSeconds, errorMessage });
+      console.log('Tracking summary generation completed event:', { modelProvider, modelName, success, durationSeconds });
       await invoke('track_summary_generation_completed', {
         modelProvider,
         modelName,
         success,
-        durationSeconds: durationSeconds === undefined ? undefined : Math.floor(durationSeconds),
-        errorMessage
+        durationSeconds: durationSeconds === undefined ? undefined : Math.floor(durationSeconds)
       });
       console.log('Summary generation completed event tracked successfully');
     } catch (error) {

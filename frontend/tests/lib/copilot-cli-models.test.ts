@@ -22,6 +22,12 @@ describe('Copilot CLI model catalog', () => {
 
   test('catalog always offers auto and has no duplicates', () => {
     expect(COPILOT_CLI_MODELS[0]).toBe('auto');
+    expect(COPILOT_CLI_MODELS).toEqual([
+      'auto',
+      'claude-haiku-4.5',
+      'gemini-3.8-flash',
+      'claude-opus-5.5',
+    ]);
     expect(new Set(COPILOT_CLI_MODELS).size).toBe(COPILOT_CLI_MODELS.length);
   });
 

@@ -16,9 +16,9 @@ use super::gemini_batch::{
 };
 use super::hermes_endpoints::resolve_rest_endpoint;
 use super::pcm::encode_wav_pcm16;
-use super::provider::{TranscriptionError, TranscriptionProvider, TranscriptResult};
+use super::provider::{TranscriptResult, TranscriptionError, TranscriptionProvider};
 use async_trait::async_trait;
-use log::{info, warn};
+use log::info;
 use serde::Deserialize;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -214,7 +214,7 @@ impl GeminiTranscribeProvider {
 
         if !status.is_success() {
             let error = classify_status(status.as_u16(), &body);
-            warn!("Gemini batch upload failed: {}", error);
+            log::warn!("Gemini batch upload failed: {}", error);
             return Err(error);
         }
 
@@ -227,18 +227,16 @@ fn parse_batch_response(
     body: &str,
     options: &GeminiBatchOptions,
 ) -> Result<BatchUploadResult, GeminiBatchError> {
-    let parsed: BatchResponse = serde_json::from_str(body).map_err(|e| {
-        GeminiBatchError::MalformedResponse(format!("{} (body: {})", e, snippet(body)))
-    })?;
+    let parsed: BatchResponse = serde_json::from_str(body)
+        .map_err(|e| GeminiBatchError::MalformedResponse(e.to_string()))?;
 
     let text = parsed
         .text
         .or(parsed.transcript)
         .ok_or_else(|| {
-            GeminiBatchError::MalformedResponse(format!(
-                "no 'text' or 'transcript' field (body: {})",
-                snippet(body)
-            ))
+            GeminiBatchError::MalformedResponse(
+                "no 'text' or 'transcript' field in the response".to_string(),
+            )
         })?
         .trim()
         .to_string();
@@ -273,17 +271,12 @@ fn parse_batch_response(
 ///
 /// Verified against the live gateway: it answers
 /// `{"text": "...", "model": "gemini-3.5-transcribe"}`. `transcript` is
-/// accepted as a fallback spelling, and anything else fails loudly with the
-/// body — a schema drift must be obvious, not silently transcribe every
+/// accepted as a fallback spelling, and anything else fails loudly without
+/// echoing the response body, which may contain transcript content.
 /// segment as empty.
 fn extract_transcript(body: &str) -> Result<String, TranscriptionError> {
-    let parsed: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        TranscriptionError::EngineFailed(format!(
-            "Invalid response JSON: {} (body: {})",
-            e,
-            snippet(body)
-        ))
-    })?;
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| TranscriptionError::EngineFailed(format!("Invalid response JSON: {}", e)))?;
 
     for key in ["text", "transcript"] {
         if let Some(text) = parsed.get(key).and_then(|v| v.as_str()) {
@@ -292,13 +285,8 @@ fn extract_transcript(body: &str) -> Result<String, TranscriptionError> {
     }
 
     Err(TranscriptionError::EngineFailed(format!(
-        "Response contained no 'text' or 'transcript' field (body: {})",
-        snippet(body)
+        "Response contained no 'text' or 'transcript' field"
     )))
-}
-
-fn snippet(body: &str) -> String {
-    body.chars().take(300).collect()
 }
 
 #[async_trait]
@@ -337,22 +325,15 @@ impl TranscriptionProvider for GeminiTranscribeProvider {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
-                TranscriptionError::EngineFailed(format!(
-                    "Request to {} failed: {}",
-                    self.endpoint, e
-                ))
+            .map_err(|error| {
+                TranscriptionError::EngineFailed(classify_transport(&error).to_string())
             })?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            warn!(
-                "Gemini transcription failed - status: {}, body: {}",
-                status,
-                snippet(&body)
-            );
+            log::warn!("Gemini transcription failed with HTTP status {}", status);
             // 401/403 almost always means the proxy bearer token is wrong;
             // say so rather than surfacing a bare status code.
             let hint = if status == reqwest::StatusCode::UNAUTHORIZED
@@ -363,10 +344,8 @@ impl TranscriptionProvider for GeminiTranscribeProvider {
                 ""
             };
             return Err(TranscriptionError::EngineFailed(format!(
-                "Server returned {}{}: {}",
-                status,
-                hint,
-                snippet(&body)
+                "Server returned {}{}",
+                status, hint
             )));
         }
 
@@ -435,18 +414,28 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognized_shape_fails_loudly_with_the_body() {
+    fn an_unrecognized_shape_fails_without_echoing_the_body() {
         // Silently returning "" here would transcribe whole meetings as empty.
-        let err = extract_transcript(r#"{"result":{"output":"hello"}}"#).unwrap_err();
+        let err = extract_transcript(r#"{"result":{"output":"SYNTHETIC_PRIVATE_SENTINEL"}}"#)
+            .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("no 'text' or 'transcript'"), "{}", message);
-        assert!(message.contains("output"), "{}", message);
+        assert!(
+            !message.contains("SYNTHETIC_PRIVATE_SENTINEL"),
+            "{}",
+            message
+        );
     }
 
     #[test]
-    fn non_json_fails_with_the_body() {
-        let err = extract_transcript("<html>502 Bad Gateway</html>").unwrap_err();
-        assert!(err.to_string().contains("502"), "{}", err);
+    fn non_json_fails_without_echoing_the_body() {
+        let err = extract_transcript("SYNTHETIC_PRIVATE_SENTINEL").unwrap_err();
+        assert!(err.to_string().contains("Invalid response JSON"), "{}", err);
+        assert!(
+            !err.to_string().contains("SYNTHETIC_PRIVATE_SENTINEL"),
+            "{}",
+            err
+        );
     }
 
     #[test]
