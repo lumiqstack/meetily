@@ -1,8 +1,22 @@
 "use client"
 import { useSidebar } from "@/components/Sidebar/SidebarProvider";
 import { useState, useEffect, useCallback, Suspense } from "react";
-import { MeetingSummary, SummaryProcessResponse, Transcript } from "@/types";
+import { MeetingSummary, SummaryProcessResponse, SummaryProvenance, Transcript } from "@/types";
 import PageContent from "./page-content";
+
+/** The generation stamp stored alongside a summary, if it has one. */
+function readSummaryProvenance(data: unknown): SummaryProvenance | null {
+  let value = data;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  const provenance = (value as { provenance?: SummaryProvenance } | null)?.provenance;
+  return provenance && typeof provenance === 'object' ? provenance : null;
+}
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
@@ -30,6 +44,8 @@ function MeetingDetailsContent() {
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
   const [summaryResponse, setSummaryResponse] = useState<SummaryProcessResponse | null>(null);
   const [meetingSummary, setMeetingSummary] = useState<MeetingSummary | null>(null);
+  // Stamped at generation time; null for summaries generated before provenance existed.
+  const [summaryProvenance, setSummaryProvenance] = useState<SummaryProvenance | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
@@ -167,6 +183,7 @@ function MeetingDetailsContent() {
     setMeetingDetails(null);
     setMeetingSummary(null);
     setSummaryResponse(null);
+    setSummaryProvenance(null);
     setError(null);
     setIsLoading(true);
     // Reset auto-generation state to allow new meeting to be checked
@@ -190,6 +207,7 @@ function MeetingDetailsContent() {
     setMeetingDetails(null);
     setMeetingSummary(null);
     setSummaryResponse(null);
+    setSummaryProvenance(null);
     setError(null);
     setIsLoading(true);
 
@@ -203,6 +221,7 @@ function MeetingDetailsContent() {
         setSummaryResponse(response);
         const summary = parseSummaryContent(response.data);
         setMeetingSummary(response.status === 'idle' ? null : summary);
+        setSummaryProvenance(readSummaryProvenance(response.data));
       } catch (error) {
         if (cancelled) return;
         console.error('FETCH SUMMARY: Error fetching meeting summary:', error);
@@ -275,6 +294,8 @@ function MeetingDetailsContent() {
     initialSummary={summaryResponse}
     meeting={meetingDetails}
     summaryData={meetingSummary}
+    summaryProvenance={summaryProvenance}
+    onSummaryProvenanceChange={setSummaryProvenance}
     shouldAutoGenerate={shouldAutoGenerate}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {

@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { MeetingSummary, SummaryProcessResponse } from '@/types';
+import { MeetingSummary, SummaryProcessResponse, SummaryProvenance } from '@/types';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
@@ -23,6 +23,8 @@ export default function PageContent({
   meeting,
   summaryData,
   initialSummary,
+  summaryProvenance = null,
+  onSummaryProvenanceChange,
   shouldAutoGenerate = false,
   onAutoGenerateComplete,
   onMeetingUpdated,
@@ -38,6 +40,8 @@ export default function PageContent({
   meeting: any;
   summaryData: MeetingSummary | null;
   initialSummary: SummaryProcessResponse | null;
+  summaryProvenance?: SummaryProvenance | null;
+  onSummaryProvenanceChange?: (provenance: SummaryProvenance | null) => void;
   shouldAutoGenerate?: boolean;
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
@@ -126,6 +130,7 @@ export default function PageContent({
     onMeetingUpdated,
     updateMeetingTitle: meetingData.updateMeetingTitle,
     setAiSummary: meetingData.setAiSummary,
+    setSummaryProvenance: onSummaryProvenanceChange,
     onOpenModelSettings: handleOpenModelSettings,
   });
 
@@ -231,6 +236,8 @@ export default function PageContent({
               onCopySummary={copyOperations.handleCopySummary}
               onSaveToObsidian={copyOperations.handleSaveToObsidian}
               aiSummary={meetingData.aiSummary}
+              summaryProvenance={summaryProvenance}
+              onTitleSaved={meetingData.updateMeetingTitle}
               summaryStatus={summaryGeneration.summaryStatus}
               transcripts={meetingData.transcripts}
               modelConfig={modelConfig}

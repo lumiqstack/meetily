@@ -18,7 +18,10 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{
+    create_transcript_segments, create_transcript_segments_with_speakers, split_segment_at_silence,
+    write_transcripts_json,
+};
 use super::constants::AUDIO_EXTENSIONS;
 use super::job_registry::{JobGuard, JobRegistry};
 use super::recording_preferences::get_default_recordings_folder;
@@ -57,7 +60,7 @@ fn is_url_download_active(import_id: &str) -> bool {
 /// every import id is a fresh UUID, so a directory from an earlier process can
 /// never be picked up again.
 pub fn sweep_orphaned_work_dirs() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = std::fs::read_dir(crate::storage::tmp_dir()) else {
         return;
     };
     for entry in entries.flatten() {
@@ -397,7 +400,7 @@ pub async fn start_import<R: Runtime>(
     provider: Option<String>,
 ) -> Result<ImportResult> {
     let import_id = format!("import-{}", Uuid::new_v4());
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = IMPORT_JOBS
         .acquire(import_id.clone(), use_remote)
         .map_err(|e| anyhow!(e))?;
@@ -433,7 +436,7 @@ async fn start_import_with_guard<R: Runtime>(
     _guard: JobGuard<'static>,
 ) -> Result<ImportResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
     // Journal the job so a crash mid-import is detected (and its orphaned
     // folder cleaned up) on the next launch. See job_persistence.rs.
@@ -451,6 +454,10 @@ async fn start_import_with_guard<R: Runtime>(
             language: language.clone(),
             model: model.clone(),
             provider: provider.clone(),
+            // Imports and recovery run unannotated: one long segment per
+            // upload, the cheapest option against the daily quota.
+            diarization: false,
+            word_timestamps: false,
             created_at: chrono::Utc::now().to_rfc3339(),
         },
     )
@@ -522,6 +529,11 @@ async fn run_import<R: Runtime>(
     source_url: Option<String>,
 ) -> Result<ImportResult> {
     let source = PathBuf::from(&source_path);
+    let origin = ImportOrigin {
+        source_path: source_path.clone(),
+        source_url,
+        meeting_date,
+    };
 
     // Validate source file
     if !source.exists() {
@@ -535,7 +547,7 @@ async fn run_import<R: Runtime>(
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
     emit_progress(&app, &import_id, "copying", 5, "Creating meeting folder...");
 
@@ -585,6 +597,24 @@ async fn run_import<R: Runtime>(
         return Err(anyhow!("Import cancelled"));
     }
 
+    // Gemini uploads the file whole rather than one request per VAD segment,
+    // so it skips decode, resample and VAD entirely. Imports run unannotated
+    // by default: one long segment per upload, the cheapest option against the
+    // 100 requests/day quota.
+    if provider.as_deref() == Some(crate::config::PROVIDER_GEMINI_TRANSCRIBE) {
+        return run_gemini_import(
+            app,
+            import_id,
+            title,
+            meeting_folder,
+            dest_path,
+            dest_filename,
+            language,
+            origin,
+        )
+        .await;
+    }
+
     emit_progress(&app, &import_id, "decoding", 15, "Decoding audio file...");
 
     // Decode the audio file with progress updates
@@ -627,10 +657,10 @@ async fn run_import<R: Runtime>(
     });
 
     let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format_with_progress(Some(resample_progress))
+        decoded.into_whisper_format_with_progress(Some(resample_progress))
     })
     .await
-    .map_err(|e| anyhow!("Resample task join error: {}", e))?;
+    .map_err(|e| anyhow!("Resample task join error: {}", e))??;
     info!(
         "Converted to 16kHz mono format: {} samples",
         audio_samples.len()
@@ -740,8 +770,9 @@ async fn run_import<R: Runtime>(
     };
     let remote_provider = if use_remote && total_segments > 0 {
         Some(
-            crate::audio::transcription::OpenAICompatibleProvider::from_saved_settings(
+            crate::audio::transcription::engine::build_remote_provider(
                 &app,
+                provider.as_deref().unwrap_or_default(),
                 model.clone(),
             )
             .await
@@ -813,7 +844,6 @@ async fn run_import<R: Runtime>(
 
         // Transcribe
         let (text, conf) = if use_remote {
-            use crate::audio::transcription::TranscriptionProvider;
             let engine = remote_provider.as_ref().unwrap();
             let result = engine
                 .transcribe(segment.samples.clone(), language.clone())
@@ -868,17 +898,173 @@ async fn run_import<R: Runtime>(
         return Err(anyhow!("Import cancelled"));
     }
 
-    emit_progress(&app, &import_id, "saving", 85, "Creating meeting...");
-
     // Create transcript segments
     let segments = create_transcript_segments(&all_transcripts);
+
+    finish_import(
+        &app,
+        import_id,
+        title,
+        &meeting_folder,
+        &dest_filename,
+        duration_seconds,
+        segments,
+        &origin,
+    )
+    .await
+}
+
+/// Import via a whole-file Gemini upload.
+///
+/// Unannotated by design: the caller gets one long segment per upload rather
+/// than manufactured interior timestamps, and it costs a single request for an
+/// hour of audio instead of ~144.
+#[allow(clippy::too_many_arguments)]
+async fn run_gemini_import<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: String,
+    title: String,
+    meeting_folder: PathBuf,
+    audio_path: PathBuf,
+    dest_filename: String,
+    language: Option<String>,
+    origin: ImportOrigin,
+) -> Result<ImportResult> {
+    use crate::audio::transcription::gemini_batch::{self, GeminiBatchOptions};
+
+    let options = GeminiBatchOptions::unannotated(language);
+
+    emit_progress(&app, &import_id, "preparing", 15, "Preparing audio for upload...");
+
+    let cleanup = |e: anyhow::Error| -> anyhow::Error {
+        // Match the cancellation paths, which remove the half-built folder.
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+        e
+    };
+
+    let duration_ms = match crate::audio::ffmpeg::probe_duration_ms(&audio_path) {
+        Ok(ms) => ms,
+        Err(e) => {
+            return Err(cleanup(anyhow!(
+                "Could not read the audio file's duration: {}",
+                e
+            )))
+        }
+    };
+    let duration_seconds = duration_ms as f64 / 1000.0;
+
+    let provider =
+        match crate::audio::transcription::GeminiTranscribeProvider::from_saved_settings(&app, None)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return Err(cleanup(anyhow!(e))),
+        };
+
+    // Bridge the cooperative cancel registry onto a token so an in-flight
+    // transcode or upload is interrupted, not merely checked between chunks.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let watcher = {
+        let cancel = cancel.clone();
+        let import_id = import_id.clone();
+        tokio::spawn(async move {
+            while !cancel.is_cancelled() {
+                if is_import_cancelled(&import_id) {
+                    cancel.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        })
+    };
+
+    let result = {
+        let app = app.clone();
+        let import_id = import_id.clone();
+        let mut on_progress = |index: usize, total: usize, stage: &str| {
+            // Same 30..80 band the per-segment loop used.
+            let fraction = index as f32 / total.max(1) as f32;
+            let percentage = 30 + (fraction * 50.0) as u32;
+            let message = match stage {
+                "preparing" => format!("Preparing chunk {} of {}...", index + 1, total),
+                _ => format!("Transcribing chunk {} of {}...", index + 1, total),
+            };
+            emit_progress(&app, &import_id, stage, percentage, &message);
+        };
+
+        gemini_batch::run_batch(
+            &provider,
+            &audio_path,
+            duration_ms,
+            &options,
+            &cancel,
+            &mut on_progress,
+        )
+        .await
+    };
+
+    watcher.abort();
+
+    // `anyhow::Error::new` preserves the concrete type for downcast-based
+    // classification in the pipeline stage.
+    let batch_segments = match result {
+        Ok(segments) => segments,
+        Err(e) => return Err(cleanup(anyhow::Error::new(e))),
+    };
+
+    let segments = create_transcript_segments_with_speakers(
+        batch_segments
+            .into_iter()
+            .map(|s| (s.text, s.start_ms, s.end_ms, s.speaker)),
+    );
+
+    finish_import(
+        &app,
+        import_id,
+        title,
+        &meeting_folder,
+        &dest_filename,
+        duration_seconds,
+        segments,
+        &origin,
+    )
+    .await
+}
+
+/// Where an import came from: dates the meeting and records its source.
+#[derive(Clone)]
+struct ImportOrigin {
+    /// Local file the importer read (a temp download for URL imports).
+    source_path: String,
+    /// Link the recording was downloaded from, for URL imports.
+    source_url: Option<String>,
+    /// Date hint from the caller (e.g. SharePoint's file creation time).
+    meeting_date: Option<String>,
+}
+
+/// Create the meeting, store its transcripts and write the sidecar files.
+///
+/// Shared by the local VAD path and the Gemini batch path so both produce an
+/// identical meeting, differing only in how the segments were obtained.
+async fn finish_import<R: Runtime>(
+    app: &AppHandle<R>,
+    import_id: String,
+    title: String,
+    meeting_folder: &Path,
+    dest_filename: &str,
+    duration_seconds: f64,
+    segments: Vec<crate::api::TranscriptSegment>,
+    origin: &ImportOrigin,
+) -> Result<ImportResult> {
+    emit_progress(app, &import_id, "saving", 85, "Creating meeting...");
+    let ImportOrigin { source_path, source_url, meeting_date } = origin;
 
     // Save to database
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
 
-    let created_at = resolve_meeting_date(&title, Some(&source_path), meeting_date.as_deref());
+    let created_at = resolve_meeting_date(&title, Some(source_path), meeting_date.as_deref());
     let import_source = source_url
         .as_deref()
         .map(crate::database::repositories::meeting_sources::url_import_source)
@@ -887,7 +1073,7 @@ async fn run_import<R: Runtime>(
         import_source,
         &title,
         source_url.as_deref(),
-        Some(&source_path),
+        Some(source_path),
         Some(duration_seconds),
     );
     let meeting_id = create_meeting_with_transcripts(
@@ -901,25 +1087,25 @@ async fn run_import<R: Runtime>(
     .await?;
 
     // Write transcripts.json and metadata.json to the meeting folder
-    emit_progress(&app, &import_id, "saving", 90, "Writing transcript files...");
+    emit_progress(app, &import_id, "saving", 90, "Writing transcript files...");
 
-    if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
+    if let Err(e) = write_transcripts_json(meeting_folder, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
     }
 
     if let Err(e) = write_import_metadata(
-        &meeting_folder,
+        meeting_folder,
         &meeting_id,
         &title,
         duration_seconds,
-        &dest_filename,
+        dest_filename,
         "import",
         &created_at.to_rfc3339(),
     ) {
         warn!("Failed to write metadata.json: {}", e);
     }
 
-    emit_progress(&app, &import_id, "complete", 100, "Import complete");
+    emit_progress(app, &import_id, "complete", 100, "Import complete");
 
     Ok(ImportResult {
         import_id,
@@ -1367,7 +1553,7 @@ pub async fn start_import_audio_command<R: Runtime>(
     provider: Option<String>,
 ) -> Result<ImportStarted, String> {
     let import_id = import_id.unwrap_or_else(|| format!("import-{}", Uuid::new_v4()));
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = IMPORT_JOBS.acquire(import_id.clone(), use_remote)?;
 
     let import_id_for_task = import_id.clone();
@@ -1593,12 +1779,16 @@ async fn run_url_import<R: Runtime>(
             language: language.clone(),
             model: model.clone(),
             provider: provider.clone(),
+            // Imports and recovery run unannotated: one long segment per
+            // upload, the cheapest option against the daily quota.
+            diarization: false,
+            word_timestamps: false,
             created_at: chrono::Utc::now().to_rfc3339(),
         },
     )
     .await;
 
-    let work_dir = std::env::temp_dir().join(format!("meetily-url-{}", import_id));
+    let work_dir = crate::storage::tmp_dir().join(format!("meetily-url-{}", import_id));
 
     // Direct-download path: URLs pointing straight at a media file on a
     // SharePoint host (the sync scan's file URLs, or a stream.aspx link
@@ -1778,7 +1968,7 @@ async fn run_url_import<R: Runtime>(
 
     // Phase 4: claim the shared engine guard now (after the long download) and
     // hand off to the normal pipeline, which journals + emits its own events.
-    let use_remote = provider.as_deref() == Some("openaiCompatible");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = match IMPORT_JOBS.acquire(import_id.clone(), use_remote) {
         Ok(g) => g,
         Err(e) => {
@@ -1827,7 +2017,7 @@ async fn run_transcript_import<R: Runtime>(
 ) -> Result<()> {
     emit_progress(app, import_id, "downloading", 10, "Fetching Teams transcript…");
 
-    let work_dir = std::env::temp_dir().join(format!("meetily-vtt-{}", import_id));
+    let work_dir = crate::storage::tmp_dir().join(format!("meetily-vtt-{}", import_id));
     let vtt_path = match super::url_import::fetch_transcript(
         ytdlp_path,
         ffmpeg_path,
@@ -2445,7 +2635,8 @@ mod tests {
 
         // Step 2: Resample to 16kHz mono
         println!("Resampling to 16kHz mono...");
-        let samples = decoded.to_whisper_format();
+        let source_duration = decoded.duration_seconds;
+        let samples = decoded.into_whisper_format().expect("resample to 16kHz mono");
         println!("Resampled: {} samples ({:.2}s at 16kHz)", samples.len(), samples.len() as f64 / 16000.0);
 
         // Step 3: Run VAD with both redemption times and compare
@@ -2478,8 +2669,8 @@ mod tests {
                     "Stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s/{:.1}s ({:.0}%)",
                     avg, min, max,
                     total_speech / 1000.0,
-                    decoded.duration_seconds,
-                    (total_speech / 1000.0 / decoded.duration_seconds) * 100.0
+                    source_duration,
+                    (total_speech / 1000.0 / source_duration) * 100.0
                 );
 
                 // Segments over 25s that would be split

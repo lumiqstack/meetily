@@ -39,41 +39,14 @@ impl Default for RecordingPreferences {
     }
 }
 
-/// Get the default recordings folder based on platform
+/// Get the default recordings folder.
+///
+/// This now hangs off the configured data root rather than the platform's
+/// Music/Movies folder, so recordings follow the rest of the app's data when it
+/// is moved to another drive. Users who set an explicit `save_folder` still win
+/// — this is only the default.
 pub fn get_default_recordings_folder() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        // Windows: %USERPROFILE%\Music\meetily-recordings
-        if let Some(music_dir) = dirs::audio_dir() {
-            music_dir.join("meetily-recordings")
-        } else {
-            // Fallback to Documents if Music folder is not available
-            dirs::document_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("meetily-recordings")
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // macOS: ~/Movies/meetily-recordings
-        if let Some(movies_dir) = dirs::video_dir() {
-            movies_dir.join("meetily-recordings")
-        } else {
-            // Fallback to Documents if Movies folder is not available
-            dirs::document_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("meetily-recordings")
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        // Linux/Others: ~/Documents/meetily-recordings
-        dirs::document_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("meetily-recordings")
-    }
+    crate::storage::default_recordings_dir()
 }
 
 /// Ensure the recordings directory exists
@@ -243,15 +216,100 @@ pub async fn open_recordings_folder<R: Runtime>(app: AppHandle<R>) -> Result<(),
     Ok(())
 }
 
+/// Prompt for a recordings folder. Returns `None` when the user cancels.
+///
+/// The dialog plugin's callback fires on the main thread, so this bridges it
+/// back to the awaiting async command through a oneshot channel.
 #[tauri::command]
 pub async fn select_recording_folder<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
 ) -> Result<Option<String>, String> {
-    // Use Tauri's dialog to select folder
-    // For now, return None - this would need to be implemented with tauri-plugin-dialog
-    // when it's available in the Cargo.toml
-    warn!("Folder selection not yet implemented - using dialog plugin");
-    Ok(None)
+    use tauri_plugin_dialog::DialogExt;
+
+    let current = load_recording_preferences(&app)
+        .await
+        .map(|p| p.save_folder)
+        .unwrap_or_else(|_| get_default_recordings_folder());
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    app.dialog()
+        .file()
+        .set_title("Choose where to save recordings")
+        .set_directory(&current)
+        .pick_folder(move |picked| {
+            let _ = tx.send(picked);
+        });
+
+    let picked = rx
+        .await
+        .map_err(|_| "Folder selection was cancelled unexpectedly".to_string())?;
+
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+
+    let path = path
+        .into_path()
+        .map_err(|e| format!("Selected folder is not a local path: {}", e))?;
+
+    ensure_recordings_directory(&path).map_err(|e| format!("Cannot use that folder: {}", e))?;
+
+    // Persist immediately: the picker returning a path the app then forgets is
+    // the behaviour this command replaced.
+    let mut preferences = load_recording_preferences(&app)
+        .await
+        .unwrap_or_else(|_| RecordingPreferences::default());
+    preferences.save_folder = path.clone();
+    save_recording_preferences(&app, &preferences)
+        .await
+        .map_err(|e| format!("Failed to save folder preference: {}", e))?;
+
+    info!("Recordings folder set to: {}", path.display());
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+/// Current data root — where models, the database, logs, and scratch space live.
+#[tauri::command]
+pub async fn get_data_root() -> Result<String, String> {
+    Ok(crate::storage::root().to_string_lossy().to_string())
+}
+
+/// Prompt for a new data root and persist it. Returns `None` on cancel.
+///
+/// Takes effect on the next launch; the caller is expected to tell the user to
+/// restart. Rebinding model directories, an open SQLite pool, and a live
+/// WebView2 profile at runtime is not worth the complexity.
+#[tauri::command]
+pub async fn select_data_root<R: Runtime>(app: AppHandle<R>) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let current = crate::storage::root();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    app.dialog()
+        .file()
+        .set_title("Choose where Meetily stores its data")
+        .set_directory(&current)
+        .pick_folder(move |picked| {
+            let _ = tx.send(picked);
+        });
+
+    let picked = rx
+        .await
+        .map_err(|_| "Folder selection was cancelled unexpectedly".to_string())?;
+
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+
+    let path = path
+        .into_path()
+        .map_err(|e| format!("Selected folder is not a local path: {}", e))?;
+
+    crate::storage::set_root(&path).map_err(|e| e.to_string())?;
+
+    Ok(Some(path.to_string_lossy().to_string()))
 }
 
 // Backend selection commands

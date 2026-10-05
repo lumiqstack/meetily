@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, ReactNode, useRef, useState, createContext } from 'react';
+import React, { useEffect, ReactNode, useRef, useState, useMemo, createContext } from 'react';
 import Analytics from '@/lib/analytics';
 import { load } from '@tauri-apps/plugin-store';
 
@@ -147,5 +147,12 @@ export default function AnalyticsProvider({ children }: AnalyticsProviderProps) 
     }
   }, [isAnalyticsOptedIn]);
 
-  return <AnalyticsContext.Provider value={{ isAnalyticsOptedIn, setIsAnalyticsOptedIn }}>{children}</AnalyticsContext.Provider>;
+  // This is the outermost provider in the tree; a fresh value object here
+  // re-renders everything below it.
+  const value = useMemo(
+    () => ({ isAnalyticsOptedIn, setIsAnalyticsOptedIn }),
+    [isAnalyticsOptedIn]
+  );
+
+  return <AnalyticsContext.Provider value={value}>{children}</AnalyticsContext.Provider>;
 }

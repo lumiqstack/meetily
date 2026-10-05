@@ -209,25 +209,62 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Column holding the base URL for a remote provider, or `None` for
+    /// providers that have no configurable endpoint.
+    fn base_url_column(provider: &str) -> Option<&'static str> {
+        match provider {
+            crate::config::PROVIDER_OPENAI_COMPATIBLE => Some("openaiCompatibleBaseUrl"),
+            crate::config::PROVIDER_GEMINI_TRANSCRIBE => Some("geminiTranscribeBaseUrl"),
+            _ => None,
+        }
+    }
+
     pub async fn save_transcript_base_url(
         pool: &SqlitePool,
+        provider: &str,
         base_url: &str,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query(
+        let column = Self::base_url_column(provider).ok_or_else(|| {
+            sqlx::Error::Protocol(
+                format!("Provider '{}' has no configurable base URL", provider).into(),
+            )
+        })?;
+
+        // Column name comes from the match above, never from caller input.
+        let query = format!(
             r#"
-            INSERT INTO transcript_settings (id, provider, model, openaiCompatibleBaseUrl, whisperVocabularyHint)
+            INSERT INTO transcript_settings (id, provider, model, "{}", whisperVocabularyHint)
             VALUES ('1', 'parakeet', $1, $2, $3)
             ON CONFLICT(id) DO UPDATE SET
-                openaiCompatibleBaseUrl = excluded.openaiCompatibleBaseUrl
+                "{}" = excluded."{}"
             "#,
-        )
-        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
-        .bind(base_url)
-        .bind(crate::config::DEFAULT_WHISPER_VOCABULARY_HINT)
-        .execute(pool)
-        .await?;
+            column, column, column
+        );
+
+        sqlx::query(&query)
+            .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+            .bind(base_url)
+            .bind(crate::config::DEFAULT_WHISPER_VOCABULARY_HINT)
+            .execute(pool)
+            .await?;
 
         Ok(())
+    }
+
+    pub async fn get_transcript_base_url(
+        pool: &SqlitePool,
+        provider: &str,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let Some(column) = Self::base_url_column(provider) else {
+            return Ok(None);
+        };
+
+        let query = format!(
+            "SELECT {} FROM transcript_settings WHERE id = '1' LIMIT 1",
+            column
+        );
+        let base_url = sqlx::query_scalar(&query).fetch_optional(pool).await?;
+        Ok(base_url.flatten())
     }
 
     pub async fn save_transcript_api_key(
@@ -243,6 +280,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "openai" => "openaiApiKey",
             "openaiCompatible" => "openaiCompatibleApiKey",
+            "geminiTranscribe" => "geminiTranscribeApiKey",
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -280,6 +318,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "openai" => "openaiApiKey",
             "openaiCompatible" => "openaiCompatibleApiKey",
+            "geminiTranscribe" => "geminiTranscribeApiKey",
             _ => {
                 return Err(sqlx::Error::Protocol(
                     format!("Invalid provider: {}", provider).into(),
@@ -522,7 +561,7 @@ mod vocabulary_default_tests {
         assert_eq!(hint(&pool).await, "");
 
         let pool = migrated_pool().await;
-        SettingsRepository::save_transcript_base_url(&pool, "http://127.0.0.1:8000").await.unwrap();
+        SettingsRepository::save_transcript_base_url(&pool, crate::config::PROVIDER_OPENAI_COMPATIBLE, "http://127.0.0.1:8000").await.unwrap();
         assert_eq!(hint(&pool).await, "");
 
         let pool = migrated_pool().await;
@@ -537,7 +576,7 @@ mod vocabulary_default_tests {
         SettingsRepository::save_whisper_vocabulary_hint(&pool, "Acme, Zephyr").await.unwrap();
 
         SettingsRepository::save_transcript_config(&pool, "localWhisper", "large-v3", true).await.unwrap();
-        SettingsRepository::save_transcript_base_url(&pool, "http://127.0.0.1:8000").await.unwrap();
+        SettingsRepository::save_transcript_base_url(&pool, crate::config::PROVIDER_OPENAI_COMPATIBLE, "http://127.0.0.1:8000").await.unwrap();
         SettingsRepository::save_transcript_api_key(&pool, "openaiCompatible", "k").await.unwrap();
         assert_eq!(hint(&pool).await, "Acme, Zephyr");
     }

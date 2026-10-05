@@ -1,6 +1,7 @@
 "use client";
 
-import { MeetingSummary, Summary, Transcript } from '@/types';
+import { MeetingSummary, Summary, Transcript, SummaryProvenance } from '@/types';
+import { SummaryMetaHeader } from './SummaryMetaHeader';
 import { BlockNoteSummaryView, BlockNoteSummaryViewRef } from '@/components/AISummary/BlockNoteSummaryView';
 import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
@@ -10,6 +11,7 @@ import { MeetingTags } from './MeetingTags';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
+import { invoke } from '@tauri-apps/api/core';
 import { Languages, ChevronDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
@@ -37,6 +39,10 @@ interface SummaryPanelProps {
   onCopySummary: () => Promise<void>;
   onSaveToObsidian: () => Promise<void>;
   aiSummary: MeetingSummary | null;
+  /** Stamped at generation time; null for summaries generated before that existed. */
+  summaryProvenance?: SummaryProvenance | null;
+  /** Called after a title edit in the header has been saved. */
+  onTitleSaved?: (title: string) => void;
   summaryStatus: 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
   transcripts: Transcript[];
   modelConfig: ModelConfig;
@@ -68,6 +74,7 @@ export function SummaryPanel({
   onCopySummary,
   onSaveToObsidian,
   aiSummary,
+  summaryProvenance = null,
   summaryStatus,
   transcripts,
   modelConfig,
@@ -87,7 +94,29 @@ export function SummaryPanel({
   onTemplateSelect,
   isModelConfigLoading = false,
   onOpenModelSettings,
+  onTitleSaved,
 }: SummaryPanelProps) {
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(meetingTitle);
+  useEffect(() => {
+    if (!isEditingTitle) setTitleDraft(meetingTitle);
+  }, [meetingTitle, isEditingTitle]);
+
+  const handleFinishEditTitle = async () => {
+    setIsEditingTitle(false);
+    const next = titleDraft.trim();
+    if (!next || next === meetingTitle) {
+      setTitleDraft(meetingTitle);
+      return;
+    }
+    try {
+      await invoke('api_save_meeting_title', { meetingId: meeting.id, title: next });
+      onTitleSaved?.(next);
+    } catch (error) {
+      setTitleDraft(meetingTitle);
+      toast.error('Failed to rename meeting', { description: String(error) });
+    }
+  };
   const [summaryLang, setSummaryLang] = useState<string | null>(null);
   const [summaryLangStorage, setSummaryLangStorage] = useState<SummaryLanguageStorage>('metadata');
   const [langPickerOpen, setLangPickerOpen] = useState(false);
@@ -248,6 +277,17 @@ export function SummaryPanel({
     <div className="flex-1 min-w-0 flex flex-col bg-white overflow-hidden h-full w-full @container">
       {/* Top-level actions — always visible, same pattern as TranscriptPanel */}
       <div className="p-4 border-b border-gray-200">
+        <SummaryMetaHeader
+          title={titleDraft}
+          isEditingTitle={isEditingTitle}
+          onStartEditTitle={() => setIsEditingTitle(true)}
+          onFinishEditTitle={handleFinishEditTitle}
+          onTitleChange={setTitleDraft}
+          createdAt={meeting.created_at}
+          transcripts={transcripts}
+          provenance={summaryProvenance}
+          availableTemplates={availableTemplates}
+        />
         <div className="flex items-center justify-center w-full min-w-0 gap-2 flex-wrap">
           <div className="flex-shrink-0 min-w-0">
             <SummaryGeneratorButtonGroup

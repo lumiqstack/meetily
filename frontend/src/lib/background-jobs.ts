@@ -34,6 +34,13 @@ export interface InterruptedJobInfo {
   language: string | null;
   model: string | null;
   provider: string | null;
+  /**
+   * Gemini annotation options the job was started with. Retrying must reuse
+   * them: silently re-running an authoritative pass without word timestamps
+   * would replace a segmented transcript with one long block.
+   */
+  diarization: boolean;
+  wordTimestamps: boolean;
   created_at: string;
 }
 
@@ -332,6 +339,7 @@ export class BackgroundJobStore {
           language: info.language,
           model: info.model,
           provider: info.provider,
+          diarization: info.diarization ?? false,
         });
         freshId = info.meeting_id ?? id;
       }

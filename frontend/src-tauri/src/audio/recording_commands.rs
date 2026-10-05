@@ -225,6 +225,24 @@ async fn is_realtime_transcription_enabled<R: Runtime>(app: &AppHandle<R>) -> bo
     }
 }
 
+/// Unregister the `transcript-update` listener, if one is registered.
+///
+/// Idempotent and safe on any path. Registration and teardown are not
+/// symmetric in practice — a recording can fail to stop cleanly — so this is
+/// called both before registering a new listener and on every exit from
+/// `stop_recording`.
+///
+/// Clearing the stored id *without* unlistening is the trap here: the handler
+/// stays live for the rest of the process, and the next recording registers a
+/// second one beside it, so every segment gets persisted twice.
+fn remove_transcript_listener<R: Runtime>(app: &AppHandle<R>) {
+    use tauri::Listener;
+    if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
+        app.unlisten(listener_id);
+        info!("✅ Transcript-update listener removed");
+    }
+}
+
 // ============================================================================
 // DEVICE RESOLUTION
 // ============================================================================
@@ -394,12 +412,16 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let _start_guard = StartingGuard::acquire()?;
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    // Gemini Live streams to the gateway and never loads a local model, so it
+    // takes neither the engine claim nor the VAD path.
+    let streaming_live = realtime_transcription_enabled
+        && transcription::engine::is_gemini_live_configured(&app).await;
     // Realtime transcription shares the global Whisper/Parakeet engines with
     // local imports/retranscriptions, so claim them for the whole recording
     // (see audio/engine_coordinator.rs). Held as an RAII value so any failed
     // start below releases it; parked once the recording is actually running
     // and released in stop_recording.
-    let engine_claim = if realtime_transcription_enabled {
+    let engine_claim = if realtime_transcription_enabled && !streaming_live {
         // A background pipeline transcription holds the engine at a lower
         // priority than the user starting a meeting: ask it to stop first.
         // User-started jobs are untouched and still fail the claim below.
@@ -438,16 +460,24 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     })).map_err(|e| e.to_string())?;
 
     // Load recording preferences to get auto_save AND device preferences
-    let (auto_save, preferred_mic_name, preferred_system_name) =
+    let (auto_save, preferred_mic_name, preferred_system_name, save_folder) =
         match super::recording_preferences::load_recording_preferences(&app).await {
             Ok(prefs) => {
-                info!("📋 Loaded recording preferences: auto_save={}, preferred_mic={:?}, preferred_system={:?}",
-                      prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device);
-                (prefs.auto_save, prefs.preferred_mic_device, prefs.preferred_system_device)
+                info!("📋 Loaded recording preferences: auto_save={}, save_folder={:?}, preferred_mic={:?}, preferred_system={:?}",
+                      prefs.auto_save, prefs.save_folder, prefs.preferred_mic_device, prefs.preferred_system_device);
+                (
+                    prefs.auto_save,
+                    prefs.preferred_mic_device,
+                    prefs.preferred_system_device,
+                    Some(prefs.save_folder),
+                )
             }
             Err(e) => {
-                warn!("Failed to load recording preferences, using defaults: {}", e);
-                (true, None, None)
+                warn!(
+                    "Failed to load recording preferences, using defaults: {}",
+                    e
+                );
+                (true, None, None, None)
             }
         };
 
@@ -467,6 +497,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Create new recording manager only after startup validation succeeds
     let mut manager = RecordingManager::new();
+    manager.set_save_folder(save_folder);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -487,7 +518,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
-        .start_recording(microphone_device, system_device, auto_save)
+        .start_recording(microphone_device, system_device, auto_save, realtime_transcription_enabled, streaming_live)
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
@@ -516,6 +547,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
 
     REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
+    // A previous recording that failed to stop cleanly can leave its listener
+    // registered. Clear it before adding another, so a bad stop degrades into
+    // one extra event dispatch rather than permanently doubled transcripts.
+    remove_transcript_listener(&app);
     if realtime_transcription_enabled {
         let task_handle =
             transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -560,6 +595,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     } else {
         drop(transcription_receiver);
         *TRANSCRIPTION_TASK.lock().unwrap() = None;
+        // The listener was already cleared above, via remove_transcript_listener.
     }
 
     // Emit success event
@@ -605,12 +641,16 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let _start_guard = StartingGuard::acquire()?;
 
     let realtime_transcription_enabled = is_realtime_transcription_enabled(&app).await;
+    // Gemini Live streams to the gateway and never loads a local model, so it
+    // takes neither the engine claim nor the VAD path.
+    let streaming_live = realtime_transcription_enabled
+        && transcription::engine::is_gemini_live_configured(&app).await;
     // Realtime transcription shares the global Whisper/Parakeet engines with
     // local imports/retranscriptions, so claim them for the whole recording
     // (see audio/engine_coordinator.rs). Held as an RAII value so any failed
     // start below releases it; parked once the recording is actually running
     // and released in stop_recording.
-    let engine_claim = if realtime_transcription_enabled {
+    let engine_claim = if realtime_transcription_enabled && !streaming_live {
         // A background pipeline transcription holds the engine at a lower
         // priority than the user starting a meeting: ask it to stop first.
         // User-started jobs are untouched and still fail the claim below.
@@ -665,17 +705,25 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Create new recording manager
     let mut manager = RecordingManager::new();
 
-    // Load recording preferences to check auto_save setting
-    let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
-        Ok(prefs) => {
-            info!("📋 Loaded recording preferences: auto_save={}", prefs.auto_save);
-            prefs.auto_save
-        }
-        Err(e) => {
-            warn!("Failed to load recording preferences, defaulting to auto_save=true: {}", e);
-            true // Default to saving if preferences can't be loaded
-        }
-    };
+    // Load recording preferences to check auto_save and the save folder
+    let (auto_save, save_folder) =
+        match super::recording_preferences::load_recording_preferences(&app).await {
+            Ok(prefs) => {
+                info!(
+                    "📋 Loaded recording preferences: auto_save={}, save_folder={:?}",
+                    prefs.auto_save, prefs.save_folder
+                );
+                (prefs.auto_save, Some(prefs.save_folder))
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to load recording preferences, defaulting to auto_save=true: {}",
+                    e
+                );
+                (true, None) // Default to saving if preferences can't be loaded
+            }
+        };
+    manager.set_save_folder(save_folder);
 
     // Always ensure a meeting name is set so incremental saver initializes
     let effective_meeting_name = meeting_name.clone().unwrap_or_else(|| {
@@ -695,7 +743,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Start recording with specified devices and auto_save setting
     let transcription_receiver = manager
-        .start_recording(mic_device, system_device, auto_save)
+        .start_recording(mic_device, system_device, auto_save, realtime_transcription_enabled, streaming_live)
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
@@ -724,6 +772,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
 
     REALTIME_TRANSCRIPTION_ACTIVE.store(realtime_transcription_enabled, Ordering::SeqCst);
+    // A previous recording that failed to stop cleanly can leave its listener
+    // registered. Clear it before adding another, so a bad stop degrades into
+    // one extra event dispatch rather than permanently doubled transcripts.
+    remove_transcript_listener(&app);
     if realtime_transcription_enabled {
         let task_handle =
             transcription::start_transcription_task(app.clone(), transcription_receiver);
@@ -768,6 +820,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     } else {
         drop(transcription_receiver);
         *TRANSCRIPTION_TASK.lock().unwrap() = None;
+        // The listener was already cleared above, via remove_transcript_listener.
     }
 
     // Emit success event
@@ -854,17 +907,9 @@ pub async fn stop_recording<R: Runtime>(
         }
         Err(e) => {
             error!("❌ Failed to stop audio streams: {}", e);
+            // Bailing out early must not leave the listener registered.
+            remove_transcript_listener(&app);
             return Err(format!("Failed to stop audio streams: {}", e)); // _stopping_guard clears on return
-        }
-    }
-
-    // Step 1.5: Clean up transcript listener to release microphone
-    // Unlisten transcript-update event to prevent lingering references
-    {
-        use tauri::Listener;
-        if let Some(listener_id) = TRANSCRIPT_LISTENER_ID.lock().unwrap().take() {
-            app.unlisten(listener_id);
-            info!("✅ Transcript-update listener removed");
         }
     }
 
@@ -933,6 +978,18 @@ pub async fn stop_recording<R: Runtime>(
     } else {
         info!("ℹ️ No transcription task found to wait for");
     }
+
+    // Step 2.5: Remove the transcript listener only now that the drain is done.
+    //
+    // It has to outlive the wait above. Stopping the streams force-flushes the
+    // pipeline, and the transcription task goes on emitting `transcript-update`
+    // for that tail; Gemini Live likewise emits whatever the gateway returns
+    // between `stop` and `session.finished`. Unlistening before the drain
+    // silently dropped those closing segments from the recording manager's
+    // history, which is what reload-sync and crash recovery read back. The
+    // frontend listener is separate and always saw them, so the saved meeting
+    // was intact and the loss was invisible.
+    remove_transcript_listener(&app);
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(

@@ -172,4 +172,12 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "remoteVocabularyEnabled")]
     #[serde(rename = "remoteVocabularyEnabled")]
     pub remote_vocabulary_enabled: bool,
+    /// Full hermes proxy base, including the gateway path segment.
+    #[sqlx(rename = "geminiTranscribeBaseUrl")]
+    #[serde(rename = "geminiTranscribeBaseUrl")]
+    pub gemini_transcribe_base_url: Option<String>,
+    /// Proxy bearer token — not a Google credential.
+    #[sqlx(rename = "geminiTranscribeApiKey")]
+    #[serde(rename = "geminiTranscribeApiKey")]
+    pub gemini_transcribe_api_key: Option<String>,
 }

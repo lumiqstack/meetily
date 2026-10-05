@@ -322,7 +322,7 @@ const Sidebar: React.FC = () => {
         })
         .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
     }
-  }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
+  }, [sidebarItems, searchQuery, searchResults]);
 
 
   const handleDelete = async (itemId: string) => {
@@ -391,7 +391,7 @@ const Sidebar: React.FC = () => {
     }
 
     try {
-      await invoke('api_save_meeting_title', {
+      const result = await invoke<{ obsidian_note?: string | null }>('api_save_meeting_title', {
         meetingId: meetingId,
         title: newTitle,
       });
@@ -410,7 +410,15 @@ const Sidebar: React.FC = () => {
       // Track the edit
       Analytics.trackButtonClick('edit_meeting_title', 'sidebar');
 
-      toast.success("Meeting title updated successfully");
+      // The vault note is renamed outside Obsidian, so Obsidian will not
+      // rewrite [[wiki-links]] that point at the old filename.
+      if (result?.obsidian_note) {
+        toast.success("Meeting title updated successfully", {
+          description: `Obsidian note renamed to ${result.obsidian_note}. Links to its old name won't follow.`,
+        });
+      } else {
+        toast.success("Meeting title updated successfully");
+      }
 
       // Close modal and reset state
       setEditModalState({ isOpen: false, meetingId: null, currentTitle: '' });
@@ -551,10 +559,16 @@ const Sidebar: React.FC = () => {
     );
   };
 
+  // renderItem asks for a snippet once per meeting, so index the results
+  const searchResultsById = useMemo(
+    () => new Map(searchResults.map(result => [result.id, result] as const)),
+    [searchResults]
+  );
+
   // Find matching transcript snippet for a meeting item
   const findMatchingSnippet = (itemId: string) => {
     if (!searchQuery.trim() || !searchResults.length) return null;
-    return searchResults.find(result => result.id === itemId);
+    return searchResultsById.get(itemId);
   };
 
   const renderItem = (item: SidebarItem, depth = 0) => {

@@ -11,7 +11,7 @@ use crate::summary::language_detection::{
     detect_summary_language, SummaryLanguageDetection,
 };
 use crate::summary::processor::{clean_llm_markdown_detailed, contains_reasoning_marker};
-use crate::summary::service::SummaryService;
+use crate::summary::service::{SummaryService, PRESERVED_RESULT_FIELDS};
 use log::{error as log_error, info as log_info, warn as log_warn};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -278,6 +278,10 @@ pub async fn api_save_meeting_summary<R: Runtime>(
     }
     let pool = state.db_manager.pool();
 
+    // The editor only ever sends {markdown, summary_json}, but it overwrites the
+    // whole `result` column. Carry the generation-owned fields across so saving
+    // an edit does not discard the provenance stamp or the English cache.
+    let summary = carry_forward_preserved_result_fields(pool, &meeting_id, summary).await;
 
     match SummaryProcessesRepository::update_meeting_summary(pool, &meeting_id, &summary).await {
         Ok(true) => {
@@ -298,6 +302,71 @@ pub async fn api_save_meeting_summary<R: Runtime>(
             Err(e.to_string())
         }
     }
+}
+
+/// Copies the generation-owned fields of the stored `result` blob into an
+/// incoming editor payload, for any field the payload does not already set.
+///
+/// Best-effort: if the existing row is missing or unparseable there is nothing
+/// to preserve, and the save proceeds with the payload as given.
+async fn carry_forward_preserved_result_fields(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    summary: serde_json::Value,
+) -> serde_json::Value {
+    let existing_raw = match SummaryProcessesRepository::get_summary_data(pool, meeting_id).await {
+        Ok(Some(process)) => process.result,
+        Ok(None) => None,
+        Err(e) => {
+            log_warn!(
+                "Failed to load existing summary result for {} ({}); saving without preserved fields",
+                meeting_id,
+                e
+            );
+            None
+        }
+    };
+
+    merge_preserved_result_fields(summary, existing_raw.as_deref())
+}
+
+/// Pure half of [`carry_forward_preserved_result_fields`]: merges the preserved
+/// fields of a previously stored `result` blob into an incoming editor payload.
+///
+/// The payload wins wherever it sets a field itself, so a later generation pass
+/// can still replace the stamp.
+fn merge_preserved_result_fields(
+    mut summary: serde_json::Value,
+    existing_raw: Option<&str>,
+) -> serde_json::Value {
+    let Some(existing_raw) = existing_raw else {
+        return summary;
+    };
+    let Some(incoming) = summary.as_object_mut() else {
+        return summary;
+    };
+
+    let existing: serde_json::Value = match serde_json::from_str(existing_raw) {
+        Ok(value) => value,
+        Err(e) => {
+            log_warn!(
+                "Existing summary result is not valid JSON ({}); saving without preserved fields",
+                e
+            );
+            return summary;
+        }
+    };
+
+    for field in PRESERVED_RESULT_FIELDS {
+        if incoming.contains_key(*field) {
+            continue;
+        }
+        if let Some(value) = existing.get(*field) {
+            incoming.insert((*field).to_string(), value.clone());
+        }
+    }
+
+    summary
 }
 
 /// Gets the per-meeting summary language override from metadata.json.
@@ -832,5 +901,65 @@ mod tests {
         }));
         assert_eq!(redacted["markdown"], "Visible\n\nTail");
         assert_eq!(redacted["reasoning_stripped"], true);
+    }
+}
+
+#[cfg(test)]
+mod preserved_field_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn stored_result() -> String {
+        json!({
+            "markdown": "old body",
+            "english_cache": { "markdown": "english body" },
+            "provenance": { "provider": "anthropic", "model": "claude-opus-5" },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn editor_save_keeps_provenance_and_english_cache() {
+        let payload = json!({ "markdown": "edited body", "summary_json": [] });
+
+        let merged = merge_preserved_result_fields(payload, Some(&stored_result()));
+
+        assert_eq!(merged["markdown"], "edited body");
+        assert_eq!(merged["provenance"]["model"], "claude-opus-5");
+        assert_eq!(merged["english_cache"]["markdown"], "english body");
+    }
+
+    #[test]
+    fn incoming_payload_wins_over_stored_preserved_fields() {
+        let payload = json!({
+            "markdown": "regenerated",
+            "provenance": { "provider": "ollama", "model": "llama3" },
+        });
+
+        let merged = merge_preserved_result_fields(payload, Some(&stored_result()));
+
+        assert_eq!(merged["provenance"]["model"], "llama3");
+    }
+
+    #[test]
+    fn missing_or_unparseable_existing_result_leaves_payload_untouched() {
+        let payload = json!({ "markdown": "edited body" });
+        assert_eq!(
+            merge_preserved_result_fields(payload.clone(), None),
+            payload
+        );
+        assert_eq!(
+            merge_preserved_result_fields(payload.clone(), Some("{not json")),
+            payload
+        );
+    }
+
+    #[test]
+    fn non_object_payload_is_passed_through() {
+        let payload = json!("just a string");
+        assert_eq!(
+            merge_preserved_result_fields(payload.clone(), Some(&stored_result())),
+            payload
+        );
     }
 }

@@ -426,7 +426,9 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Calculate model options based on available models
-  const modelOptions: Record<ModelConfig['provider'], string[]> = {
+  // Memoized: this is listed in the deps of the context value below, so a fresh
+  // object here would defeat that memo for all useConfig() consumers.
+  const modelOptions: Record<ModelConfig['provider'], string[]> = useMemo(() => ({
     ollama: models.map(model => model.name),
     claude: ['claude-3-5-sonnet-latest'],
     groq: ['llama-3.3-70b-versatile'],
@@ -435,7 +437,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     'builtin-ai': [],
     'custom-openai': [],
     'copilot-cli': COPILOT_CLI_MODELS,
-  };
+  }), [models]);
 
   // Toggle confidence indicator with localStorage persistence
   const toggleConfidenceIndicator = useCallback((checked: boolean) => {

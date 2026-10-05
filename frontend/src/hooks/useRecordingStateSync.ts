@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { recordingService } from '@/services/recordingService';
 
 interface UseRecordingStateSyncReturn {
@@ -9,12 +9,17 @@ interface UseRecordingStateSyncReturn {
 
 /**
  * Custom hook for synchronizing frontend recording state with backend.
- * Polls backend every 1 second to detect recording state changes.
  *
- * Features:
- * - Backend state synchronization (1-second polling)
- * - Recording disabled flag management (prevents re-recording during processing)
+ * This is a desync safety net (backend recording but UI unaware, e.g. after a
+ * reload), not the primary state source — RecordingStateContext polls at 500ms
+ * while a recording is active. So a slow poll is enough here.
+ *
+ * The interval is installed once and reads its inputs through refs. Depending
+ * on the caller's props instead would tear down and rebuild the interval on
+ * every render of the page, firing an extra IPC round-trip each time.
  */
+const POLL_INTERVAL_MS = 2000;
+
 export function useRecordingStateSync(
   isRecording: boolean,
   setIsRecording: (value: boolean) => void,
@@ -22,46 +27,48 @@ export function useRecordingStateSync(
 ): UseRecordingStateSyncReturn {
   const [isRecordingDisabled, setIsRecordingDisabled] = useState(false);
 
+  const isRecordingRef = useRef(isRecording);
+  const setIsRecordingRef = useRef(setIsRecording);
+  const setIsMeetingActiveRef = useRef(setIsMeetingActive);
+
+  isRecordingRef.current = isRecording;
+  setIsRecordingRef.current = setIsRecording;
+  setIsMeetingActiveRef.current = setIsMeetingActive;
+
   useEffect(() => {
-    console.log('Setting up recording state check effect, current isRecording:', isRecording);
+    if (typeof window === 'undefined' || !(window as any).__TAURI__) {
+      return;
+    }
+
+    let cancelled = false;
 
     const checkRecordingState = async () => {
       try {
-        console.log('checkRecordingState called');
-        console.log('About to call is_recording command');
         const isCurrentlyRecording = await recordingService.isRecording();
-        console.log('checkRecordingState: backend recording =', isCurrentlyRecording, 'UI recording =', isRecording);
+        if (cancelled) return;
 
-        if (isCurrentlyRecording && !isRecording) {
-          console.log('Recording is active in backend but not in UI, synchronizing state...');
-          setIsRecording(true);
-          setIsMeetingActive(true);
-        } else if (!isCurrentlyRecording && isRecording) {
-          console.log('Recording is inactive in backend but active in UI, synchronizing state...');
-          setIsRecording(false);
+        const uiRecording = isRecordingRef.current;
+        if (isCurrentlyRecording && !uiRecording) {
+          console.log('Recording active in backend but not in UI, synchronizing state...');
+          setIsRecordingRef.current(true);
+          setIsMeetingActiveRef.current(true);
+        } else if (!isCurrentlyRecording && uiRecording) {
+          console.log('Recording inactive in backend but active in UI, synchronizing state...');
+          setIsRecordingRef.current(false);
         }
       } catch (error) {
         console.error('Failed to check recording state:', error);
       }
     };
 
-    // Test if Tauri is available
-    console.log('Testing Tauri availability...');
-    if (typeof window !== 'undefined' && (window as any).__TAURI__) {
-      console.log('Tauri is available, starting state check');
-      checkRecordingState();
+    checkRecordingState();
+    const interval = setInterval(checkRecordingState, POLL_INTERVAL_MS);
 
-      // Set up a polling interval to periodically check recording state
-      const interval = setInterval(checkRecordingState, 1000); // Check every 1 second
-
-      return () => {
-        console.log('Cleaning up recording state check interval');
-        clearInterval(interval);
-      };
-    } else {
-      console.log('Tauri is not available, skipping state check');
-    }
-  }, [isRecording, setIsRecording, setIsMeetingActive]);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
 
   return {
     isBackendRecording: isRecording,

@@ -33,6 +33,11 @@ struct AudioMixerRingBuffer {
     system_buffer: VecDeque<f32>,
     window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
     max_buffer_size: usize,  // Safety limit (e.g., 100ms)
+    /// Counts `add_samples` calls so diagnostics can be rate-limited. An
+    /// overflow persists across many calls, and logging it on each one turns a
+    /// stream hiccup into a ~200 lines/second write storm that makes the
+    /// underlying stall worse.
+    add_calls: u64,
 }
 
 impl AudioMixerRingBuffer {
@@ -56,18 +61,18 @@ impl AudioMixerRingBuffer {
             system_buffer: VecDeque::with_capacity(max_buffer_size),
             window_size_samples,
             max_buffer_size,
+            add_calls: 0,
         }
     }
 
     fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
+        self.add_calls += 1;
+        let should_report = self.add_calls % 200 == 0;
+
         // Log buffer health periodically for diagnostics
-        static mut SAMPLE_COUNTER: u64 = 0;
-        unsafe {
-            SAMPLE_COUNTER += 1;
-            if SAMPLE_COUNTER % 200 == 0 {
-                debug!("📊 Ring buffer status: mic={} samples, sys={} samples (max={})",
-                       self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
-            }
+        if should_report {
+            debug!("📊 Ring buffer status: mic={} samples, sys={} samples (max={})",
+                   self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
         }
 
         match device_type {
@@ -77,15 +82,17 @@ impl AudioMixerRingBuffer {
 
         // CRITICAL FIX: Add warnings before dropping samples
         // This helps diagnose timing issues in production
-        if self.mic_buffer.len() > self.max_buffer_size {
-            warn!("⚠️ Microphone buffer overflow: {} > {} samples, dropping oldest {} samples",
-                  self.mic_buffer.len(), self.max_buffer_size,
-                  self.mic_buffer.len() - self.max_buffer_size);
-        }
-        if self.system_buffer.len() > self.max_buffer_size {
-            error!("🔴 SYSTEM AUDIO BUFFER OVERFLOW: {} > {} samples, dropping {} samples - THIS CAUSES DISTORTION!",
-                  self.system_buffer.len(), self.max_buffer_size,
-                  self.system_buffer.len() - self.max_buffer_size);
+        if should_report {
+            if self.mic_buffer.len() > self.max_buffer_size {
+                warn!("⚠️ Microphone buffer overflow: {} > {} samples, dropping oldest {} samples",
+                      self.mic_buffer.len(), self.max_buffer_size,
+                      self.mic_buffer.len() - self.max_buffer_size);
+            }
+            if self.system_buffer.len() > self.max_buffer_size {
+                error!("🔴 SYSTEM AUDIO BUFFER OVERFLOW: {} > {} samples, dropping {} samples - THIS CAUSES DISTORTION!",
+                      self.system_buffer.len(), self.max_buffer_size,
+                      self.system_buffer.len() - self.max_buffer_size);
+            }
         }
 
         // Safety: prevent buffer overflow (keep only last 200ms)
@@ -102,57 +109,35 @@ impl AudioMixerRingBuffer {
         self.system_buffer.len() >= self.window_size_samples
     }
 
-    fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+    /// Fill `mic_out` and `sys_out` with the next aligned window.
+    ///
+    /// Writes into caller-owned buffers that the pipeline reuses across windows.
+    /// The previous version returned two freshly-allocated `Vec`s, which — with
+    /// the mixer's own output buffer — meant three allocations and three full
+    /// copies for every 600 ms of audio.
+    ///
+    /// Both outputs are always exactly `window_size_samples` long, zero-padded
+    /// when a stream is short. Zero-padding (silence) is preferred over
+    /// last-sample-hold to prevent repetition artifacts, and is inaudible.
+    fn extract_window_into(&mut self, mic_out: &mut Vec<f32>, sys_out: &mut Vec<f32>) -> bool {
         if !self.can_mix() {
-            return None;
+            return false;
         }
 
-        // Extract mic window with zero-padding for incomplete buffers
-        // Zero-padding (silence) is preferred over last-sample-hold to prevent artifacts
-
-        // Extract mic window (or pad with zeros if insufficient data)
-        let mic_window = if self.mic_buffer.len() >= self.window_size_samples {
-            // Enough mic data - drain window
-            self.mic_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.mic_buffer.is_empty() {
-            // Some mic data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.mic_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No mic data - return silence
-            vec![0.0; self.window_size_samples]
-        };
-
-        // Extract system window (or pad with zeros if insufficient data)
-        let sys_window = if self.system_buffer.len() >= self.window_size_samples {
-            // Enough system data - drain window
-            self.system_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.system_buffer.is_empty() {
-            // Some system data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.system_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No system data - return silence
-            vec![0.0; self.window_size_samples]
-        };
-
-        Some((mic_window, sys_window))
+        drain_window(&mut self.mic_buffer, self.window_size_samples, mic_out);
+        drain_window(&mut self.system_buffer, self.window_size_samples, sys_out);
+        true
     }
+}
 
+/// Move up to `window` samples out of `src` into `dst`, zero-padding the tail.
+fn drain_window(src: &mut VecDeque<f32>, window: usize, dst: &mut Vec<f32>) {
+    dst.clear();
+    dst.reserve(window);
+
+    let take = src.len().min(window);
+    dst.extend(src.drain(0..take));
+    dst.resize(window, 0.0);
 }
 
 /// Simple audio mixer without aggressive ducking
@@ -164,42 +149,41 @@ impl ProfessionalAudioMixer {
         Self
     }
 
-    fn mix_window(&mut self, mic_window: &[f32], sys_window: &[f32]) -> Vec<f32> {
-        // Handle different lengths (already padded by extract_window, but defensive)
-        let max_len = mic_window.len().max(sys_window.len());
-        let mut mixed = Vec::with_capacity(max_len);
+    /// Mix into a caller-owned buffer the pipeline reuses across windows.
+    ///
+    /// `extract_window_into` guarantees both inputs are the same length, so this
+    /// zips the slices instead of doing two bounds-checked `get(i)` lookups per
+    /// sample (96,000 of them a second).
+    fn mix_window_into(&mut self, mic_window: &[f32], sys_window: &[f32], out: &mut Vec<f32>) {
+        debug_assert_eq!(mic_window.len(), sys_window.len());
 
-        // Professional mixing with soft scaling to prevent distortion
-        // Uses proportional scaling instead of hard clamping to avoid artifacts
-        for i in 0..max_len {
-            let mic = mic_window.get(i).copied().unwrap_or(0.0);
-            let sys = sys_window.get(i).copied().unwrap_or(0.0);
+        out.clear();
+        out.reserve(mic_window.len());
 
-            // Pre-scale system audio to 70% to leave headroom
-            // This prevents constant soft scaling which can cause pumping artifacts
-            // Mic is normalized to -23 LUFS (already optimal), system needs reduction
-            let sys_scaled = sys * 1.0;
-            let _mic_scaled = mic * 0.8;  // Reserved for future mic scaling
+        // Sum without ducking — mic is already normalized to -23 LUFS by the
+        // capture chain, system audio stays at its natural level.
+        for (&mic, &sys) in mic_window.iter().zip(sys_window.iter()) {
+            let sum = mic + sys;
 
-            // Sum without ducking - mic stays at full volume, system slightly reduced
-            let sum = mic + sys_scaled;
-
-            // CRITICAL FIX: Soft scaling prevents distortion artifacts
-            // If the sum would exceed ±1.0, scale down PROPORTIONALLY
-            // This avoids hard clipping distortion that sounds like "radio breaks"
+            // Soft scaling prevents distortion artifacts: if the sum would
+            // exceed ±1.0, scale down PROPORTIONALLY rather than hard clipping,
+            // which sounds like "radio breaks".
             let sum_abs = sum.abs();
-            let mixed_sample = if sum_abs > 1.0 {
-                // Scale down to fit within ±1.0
-                sum / sum_abs
-            } else {
-                sum
-            };
-
-            mixed.push(mixed_sample);
+            out.push(if sum_abs > 1.0 { sum / sum_abs } else { sum });
         }
-
-        mixed
     }
+}
+
+/// Per-callback state for the microphone enhancement chain.
+///
+/// These were three separate `Arc<Mutex<Option<_>>>` fields, which cost three
+/// lock acquisitions on the realtime audio thread for work that is inherently
+/// sequential. One mutex covers the whole chain, and `scratch` lets the downmix
+/// reuse a buffer instead of allocating one per callback.
+struct MicChain {
+    noise_suppressor: Option<NoiseSuppressionProcessor>,
+    high_pass_filter: Option<HighPassFilter>,
+    normalizer: Option<LoudnessNormalizer>,
 }
 
 /// Simplified audio capture without broadcast channels
@@ -211,18 +195,14 @@ pub struct AudioCapture {
     channels: u16,
     chunk_counter: Arc<std::sync::atomic::AtomicU64>,
     device_type: DeviceType,
-    recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
     needs_resampling: bool,  // Flag if resampling is required
     // CRITICAL FIX: Persistent resampler to preserve energy across chunks
     resampler: Arc<std::sync::Mutex<Option<SincFixedIn<f32>>>>,
     // Buffering for variable-size chunks → fixed-size resampler input
     resampler_input_buffer: Arc<std::sync::Mutex<Vec<f32>>>,
     resampler_chunk_size: usize,  // Fixed chunk size for resampler (512 samples)
-    // Audio enhancement processors (microphone only)
-    noise_suppressor: Arc<std::sync::Mutex<Option<NoiseSuppressionProcessor>>>,
-    high_pass_filter: Arc<std::sync::Mutex<Option<HighPassFilter>>>,
-    // EBU R128 normalizer for microphone audio (per-device, stateful)
-    normalizer: Arc<std::sync::Mutex<Option<LoudnessNormalizer>>>,
+    /// Microphone-only enhancement chain; `None` for system audio.
+    mic_chain: Option<Arc<std::sync::Mutex<MicChain>>>,
     // Note: Using global recording timestamp for synchronization
 }
 
@@ -376,6 +356,21 @@ impl AudioCapture {
             None
         };
 
+        // Raw capture is never sent straight to the recording saver — only the
+        // mixed output from AudioPipeline is (see the note in
+        // process_audio_data). The parameter is kept for call-site symmetry.
+        let _ = recording_sender;
+
+        let mic_chain = if matches!(device_type, DeviceType::Microphone) {
+            Some(Arc::new(std::sync::Mutex::new(MicChain {
+                noise_suppressor,
+                high_pass_filter,
+                normalizer,
+            })))
+        } else {
+            None
+        };
+
         Self {
             device,
             state,
@@ -383,14 +378,11 @@ impl AudioCapture {
             channels,
             chunk_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             device_type,
-            recording_sender,
             needs_resampling,
             resampler: Arc::new(std::sync::Mutex::new(resampler)),
             resampler_input_buffer: Arc::new(std::sync::Mutex::new(Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2))),
             resampler_chunk_size: RESAMPLER_CHUNK_SIZE,
-            noise_suppressor: Arc::new(std::sync::Mutex::new(noise_suppressor)),
-            high_pass_filter: Arc::new(std::sync::Mutex::new(high_pass_filter)),
-            normalizer: Arc::new(std::sync::Mutex::new(normalizer)),
+            mic_chain,
             // Using global recording time for sync
         }
     }
@@ -402,7 +394,9 @@ impl AudioCapture {
             return;
         }
 
-        // Convert to mono if needed
+        // Convert to mono if needed. This buffer is eventually moved into the
+        // AudioChunk, so it has to be owned — but the filter and normalizer
+        // below now reuse it rather than each allocating their own copy.
         let mut mono_data = if self.channels > 1 {
             audio_to_mono(data, self.channels)
         } else {
@@ -418,8 +412,19 @@ impl AudioCapture {
         // Buffering handles variable chunk sizes (320, 512, 1024, etc.) by accumulating to fixed 512-sample chunks
         const TARGET_SAMPLE_RATE: u32 = 48000;
         if self.needs_resampling {
+            // The counter only advances at the end of this callback, so this is
+            // the same id the logging block below reads.
+            let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
+            // Release caps the log level at Info, so these `debug!`s never emit
+            // there — and the RMS pass and buffer lock that feed them must not
+            // run on the realtime thread either.
+            let will_log_resampling = cfg!(debug_assertions) && chunk_id % 100 == 0;
+
             let before_len = mono_data.len();
-            let before_rms = if !mono_data.is_empty() {
+            // Sum-of-squares over the whole buffer, on the realtime thread, for
+            // a diagnostic printed once every 100 chunks — so only pay for it
+            // on the chunks that actually log.
+            let before_rms = if will_log_resampling && !mono_data.is_empty() {
                 (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt()
             } else {
                 0.0
@@ -486,8 +491,7 @@ impl AudioCapture {
             }
 
             // Log resampling only occasionally to avoid spam
-            let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
-            if chunk_id % 100 == 0 && has_resampled_output {
+            if will_log_resampling && has_resampled_output {
                 let after_len = mono_data.len();
                 let after_rms = if !mono_data.is_empty() {
                     (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt()
@@ -503,14 +507,14 @@ impl AudioCapture {
                     0
                 };
 
-                info!(
+                debug!(
                     "🔄 [{:?}] Persistent buffered resampler: {}Hz → {}Hz (ratio: {:.2}x)",
                     self.device_type,
                     self.sample_rate,
                     TARGET_SAMPLE_RATE,
                     ratio
                 );
-                info!(
+                debug!(
                     "   Chunk {}: {} → {} samples, RMS preservation: {:.1}%, buffer: {}",
                     chunk_id,
                     before_len,
@@ -524,33 +528,35 @@ impl AudioCapture {
         // AUDIO ENHANCEMENT PIPELINE (Microphone Only)
         // Processing order is critical: high-pass → noise suppression → normalization
         // This ensures noise is removed before being amplified by the normalizer
-        if matches!(self.device_type, DeviceType::Microphone) {
-            // STEP 1: Apply high-pass filter to remove low-frequency rumble (< 80 Hz)
-            if let Ok(mut hpf_lock) = self.high_pass_filter.lock() {
-                if let Some(ref mut filter) = *hpf_lock {
-                    mono_data = filter.process(&mono_data);
+        //
+        // All three stages live behind one mutex now: they always run together
+        // on the same buffer, so three separate lock/unlock pairs per callback
+        // bought nothing. The filter and normalizer also work in place, leaving
+        // the mono downmix above as the only allocation on this path.
+        if let Some(chain) = &self.mic_chain {
+            if let Ok(mut chain) = chain.lock() {
+                // STEP 1: Apply high-pass filter to remove low-frequency rumble (< 80 Hz)
+                if let Some(ref mut filter) = chain.high_pass_filter {
+                    filter.process_in_place(&mut mono_data);
                 }
-            }
 
-            // STEP 2: Apply RNNoise noise suppression (10-15 dB reduction) - CONDITIONAL
-            if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
-                if let Ok(mut ns_lock) = self.noise_suppressor.lock() {
-                    if let Some(ref mut suppressor) = *ns_lock {
+                // STEP 2: Apply RNNoise noise suppression (10-15 dB reduction) - CONDITIONAL
+                // Still allocating: RNNoise buffers into 480-sample frames, so its
+                // output length differs from its input and it cannot work in place.
+                if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
+                    if let Some(ref mut suppressor) = chain.noise_suppressor {
                         let before_len = mono_data.len();
                         mono_data = suppressor.process(&mono_data);
                         let after_len = mono_data.len();
 
                         // CRITICAL MONITORING: Track buffer health
-                        let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
+                        let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::Relaxed);
                         if chunk_id % 100 == 0 {
                             let buffered = suppressor.buffered_samples();
                             let length_delta = (before_len as i32 - after_len as i32).abs();
 
-                            debug!("🔇 Noise suppression health: in={}, out={}, delta={}, buffered={}, RMS={:.4}",
-                                   before_len, after_len, length_delta, buffered,
-                                   if !mono_data.is_empty() {
-                                       (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt()
-                                   } else { 0.0 });
+                            debug!("🔇 Noise suppression health: in={}, out={}, delta={}, buffered={}",
+                                   before_len, after_len, length_delta, buffered);
 
                             // WARN if accumulating samples (potential latency buildup)
                             if buffered > 1000 {
@@ -566,20 +572,10 @@ impl AudioCapture {
                         }
                     }
                 }
-            }
 
-            // STEP 3: Apply EBU R128 normalization (professional loudness standard)
-            if let Ok(mut normalizer_lock) = self.normalizer.lock() {
-                if let Some(ref mut normalizer) = *normalizer_lock {
-                    mono_data = normalizer.normalize_loudness(&mono_data);
-
-                    // Log normalization occasionally for debugging
-                    let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::SeqCst);
-                    if chunk_id % 200 == 0 && !mono_data.is_empty() {
-                        let rms = (mono_data.iter().map(|&x| x * x).sum::<f32>() / mono_data.len() as f32).sqrt();
-                        let peak = mono_data.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
-                        debug!("🎤 After normalization chunk {}: RMS={:.4}, Peak={:.4}", chunk_id, rms, peak);
-                    }
+                // STEP 3: Apply EBU R128 normalization (professional loudness standard)
+                if let Some(ref mut normalizer) = chain.normalizer {
+                    normalizer.normalize_in_place(&mut mono_data);
                 }
             }
         }
@@ -654,7 +650,9 @@ impl AudioCapture {
             };
             self.state.report_error(error);
         } else {
-            debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
+            // ~200 calls/second on the realtime audio thread; compiled out of
+            // release builds entirely.
+            perf_trace!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
         }
     }
 
@@ -695,7 +693,11 @@ pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
     state: Arc<RecordingState>,
-    vad_processor: ContinuousVadProcessor,
+    /// `None` when realtime transcription is off. VAD is only useful for
+    /// producing transcription segments, and Silero runs a neural inference per
+    /// 30ms frame — so with transcription disabled we skip building it at all
+    /// rather than feed a channel whose receiver has already been dropped.
+    vad_processor: Option<ContinuousVadProcessor>,
     sample_rate: u32,
     chunk_id_counter: u64,
     // Performance optimization: reduce logging frequency
@@ -708,10 +710,22 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    /// Continuous mixed audio for a streaming transcription provider (Gemini
+    /// Live). Deliberately fed from the mixed stream rather than the VAD
+    /// segments: a streaming recognizer runs its own endpointing and needs
+    /// unbroken audio, and silence-stripped segments would delay every interim
+    /// caption until after the utterance had already finished. `None` for
+    /// every non-streaming provider.
+    live_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
     // Me/Others speaker attribution: label each pre-mix window by dominant
     // source, aggregate across the windows behind each VAD segment.
     window_labeler: super::source_attribution::WindowLabeler,
     segment_aggregator: super::source_attribution::SegmentAggregator,
+    /// Reused across mix windows so the hot loop allocates nothing. The mixed
+    /// buffer is still moved out per window (it becomes the recording chunk),
+    /// but these two no longer are.
+    mic_window: Vec<f32>,
+    sys_window: Vec<f32>,
 }
 
 impl AudioPipeline {
@@ -725,6 +739,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        vad_enabled: bool,
     ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
@@ -760,12 +775,20 @@ impl AudioPipeline {
         // indefinitely and withheld live transcript emission, so live and batch
         // deliberately diverge. Bounded live segments under continuous speech
         // are tracked in #756.
-        let vad_processor =
-            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
-        info!(
-            "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
-            VAD_REDEMPTION_TIME_MS
-        );
+        //
+        // Silero runs an inference per 30ms frame, so the processor (and speaker
+        // attribution with it) is only built when realtime transcription is on.
+        let vad_processor = if vad_enabled {
+            let processor = ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+            info!(
+                "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
+                VAD_REDEMPTION_TIME_MS
+            );
+            Some(processor)
+        } else {
+            info!("Realtime transcription disabled: skipping VAD, speaker attribution, and segment dispatch (recording/mixing unaffected)");
+            None
+        };
 
         // Initialize professional audio mixing components
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
@@ -784,14 +807,20 @@ impl AudioPipeline {
             // Performance optimization: reduce logging frequency
             last_summary_time: std::time::Instant::now(),
             processed_chunks: 0,
-            // Initialize metrics batcher for smart batching
-            metrics_batcher: Some(AudioMetricsBatcher::new()),
+            // Disabled: the batcher costs a full-buffer pass, an Instant::now()
+            // and an unbounded-channel send on every chunk (~200/s), and the
+            // summaries it accumulates have no reader — get_summaries() and
+            // clear_summaries() are never called. Re-enable alongside a consumer.
+            metrics_batcher: None,
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            live_sender_for_mixed: None,       // Will be set by manager
             window_labeler: super::source_attribution::WindowLabeler::new(),
             segment_aggregator: super::source_attribution::SegmentAggregator::new(),
+            mic_window: Vec::new(),
+            sys_window: Vec::new(),
         })
     }
 
@@ -804,12 +833,12 @@ impl AudioPipeline {
         // Previous bug: Loop checked `while self.state.is_recording()` which caused early exit when
         // stop_recording() was called, losing flush signals and remaining chunks in the pipeline
         loop {
-            // Receive audio chunks with timeout
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50), // Shorter timeout for responsiveness
-                self.receiver.recv()
-            ).await {
-                Ok(Some(chunk)) => {
+            // Block until the next chunk. There is no periodic work to do here —
+            // VAD drives all segmentation — so the previous 50ms timeout only
+            // armed and cancelled a timer per chunk (~200/s) and woke this task
+            // 20x/s through silence.
+            match self.receiver.recv().await {
+                Some(chunk) => {
                     // PERFORMANCE: Check for flush signal (special chunk with ID >= u64::MAX - 10)
                     // Multiple flush signals may be sent to ensure processing
                     if chunk.chunk_id >= u64::MAX - 10 {
@@ -846,6 +875,21 @@ impl AudioPipeline {
                         self.last_summary_time = std::time::Instant::now();
                     }
 
+                    // Nobody downstream: no VAD to feed, no encoder to write to,
+                    // and no live stream to send. Mixing here would be pure heat
+                    // — drop the samples and keep draining so the capture
+                    // threads never block.
+                    //
+                    // The live sender must be part of this test: with Gemini
+                    // Live the VAD processor is deliberately absent, so omitting
+                    // it here would skip mixing entirely and stream silence.
+                    if self.vad_processor.is_none()
+                        && self.recording_sender_for_mixed.is_none()
+                        && self.live_sender_for_mixed.is_none()
+                    {
+                        continue;
+                    }
+
                     // STEP 1: Add raw audio to ring buffer for mixing
                     // Microphone audio is already normalized at capture level (AudioCapture)
                     // System audio remains raw
@@ -853,29 +897,52 @@ impl AudioPipeline {
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
-                        if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
-                            // Speaker attribution: decide the window's dominant
-                            // source while mic and system are still separate.
-                            let window_label = self.window_labeler.label(&mic_window, &sys_window);
+                        // `mic_window`/`sys_window` are reused buffers owned by
+                        // self; move them out for the duration of the body so
+                        // the mixer and labeler can borrow self mutably.
+                        let mut mic_window = std::mem::take(&mut self.mic_window);
+                        let mut sys_window = std::mem::take(&mut self.sys_window);
 
-                            // Simple mixing without aggressive ducking
-                            let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
+                        let extracted = self
+                            .ring_buffer
+                            .extract_window_into(&mut mic_window, &mut sys_window);
+
+                        if extracted {
+                            // Speaker attribution only labels transcript segments,
+                            // so it costs two RMS passes we can skip when there
+                            // will be no transcripts.
+                            let window_label = if self.vad_processor.is_some() {
+                                Some(self.window_labeler.label(&mic_window, &sys_window))
+                            } else {
+                                None
+                            };
+
+                            // Simple mixing without aggressive ducking.
+                            // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
+                            // (broadcast-standard loudness); system audio at natural levels.
+                            let mut mixed_with_gain = Vec::new();
+                            self.mixer
+                                .mix_window_into(&mic_window, &sys_window, &mut mixed_with_gain);
 
                             // Weight the window's label by its (mixed) energy so
                             // loud speech outvotes quiet crosstalk per segment.
-                            let window_energy: f32 =
-                                mixed_clean.iter().map(|s| s * s).sum();
-                            self.segment_aggregator.add(window_label, window_energy);
+                            if let Some(window_label) = window_label {
+                                let window_energy: f32 =
+                                    mixed_with_gain.iter().map(|s| s * s).sum();
+                                self.segment_aggregator.add(window_label, window_energy);
+                            }
 
-                            // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
-                            // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
-                            // System audio at natural levels
-                            // Previous 2x gain was causing excessive limiting/distortion
-                            let mixed_with_gain = mixed_clean;
+                            // STEP 3: Send mixed audio for transcription (VAD + Whisper).
+                            // Skipped entirely when realtime transcription is off.
+                            // `map` ends the borrow of `self.vad_processor` before
+                            // the body touches `self.segment_aggregator`.
+                            let vad_result = self
+                                .vad_processor
+                                .as_mut()
+                                .map(|vad| vad.process_audio(&mixed_with_gain));
 
-                            // STEP 3: Send mixed audio for transcription (VAD + Whisper)
-                            match self.vad_processor.process_audio(&mixed_with_gain) {
-                                Ok(speech_segments) => {
+                            match vad_result {
+                                Some(Ok(speech_segments)) => {
                                     // One label per emission batch: the windows
                                     // accumulated since the last VAD segment(s)
                                     // back everything emitted now. (VAD segment
@@ -913,15 +980,39 @@ impl AudioPipeline {
                                         }
                                     }
                                 }
-                                Err(e) => {
+                                Some(Err(e)) => {
                                     warn!("⚠️ VAD error: {}", e);
                                 }
+                                // Realtime transcription disabled — no VAD.
+                                None => {}
                             }
 
-                            // STEP 4: Send mixed audio for recording (WAV file)
+                            // STEP 3b: Send the continuous mixed window to a
+                            // streaming transcription provider. Read by
+                            // reference — STEP 4 still needs to move the buffer
+                            // — and resampled by the live session, which owns
+                            // the wire format.
+                            if let Some(ref sender) = self.live_sender_for_mixed {
+                                let live_chunk = AudioChunk {
+                                    data: mixed_with_gain.clone(),
+                                    sample_rate: self.sample_rate,
+                                    timestamp: chunk.timestamp,
+                                    chunk_id: self.chunk_id_counter,
+                                    device_type: DeviceType::Microphone,  // Mixed audio
+                                    // Mixed audio has no trustworthy per-window
+                                    // attribution, and the streaming provider
+                                    // does not use one.
+                                    dominant_source: None,
+                                };
+                                let _ = sender.send(live_chunk);
+                            }
+
+                            // STEP 4: Send mixed audio to the encoder.
+                            // Last use of the window, so move it instead of
+                            // cloning another 115 KB per window.
                             if let Some(ref sender) = self.recording_sender_for_mixed {
                                 let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
+                                    data: mixed_with_gain,
                                     sample_rate: self.sample_rate,
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
@@ -931,15 +1022,20 @@ impl AudioPipeline {
                                 let _ = sender.send(recording_chunk);
                             }
                         }
+
+                        // Hand the window buffers back for the next iteration.
+                        // Their capacity is what makes this loop allocation-free.
+                        self.mic_window = mic_window;
+                        self.sys_window = sys_window;
+
+                        if !extracted {
+                            break;
+                        }
                     }
                 }
-                Ok(None) => {
+                None => {
                     info!("Audio pipeline: sender closed after processing {} chunks", self.processed_chunks);
                     break;
-                }
-                Err(_) => {
-                    // Timeout - just continue, VAD handles all segmentation
-                    continue;
                 }
             }
         }
@@ -954,8 +1050,14 @@ impl AudioPipeline {
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
 
-        // Flush any remaining audio from VAD processor and send segments to transcription
-        match self.vad_processor.flush() {
+        // Flush any remaining audio from VAD processor and send segments to
+        // transcription. No VAD means no pending segments to flush.
+        let flushed = self.vad_processor.as_mut().map(|vad| vad.flush());
+        let Some(flushed) = flushed else {
+            return Ok(());
+        };
+
+        match flushed {
             Ok(final_segments) => {
                 let batch_source = if final_segments.is_empty() {
                     None
@@ -1026,6 +1128,8 @@ impl AudioPipelineManager {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        vad_enabled: bool,
+        streaming_live: bool,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
@@ -1036,10 +1140,15 @@ impl AudioPipelineManager {
         let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
 
+        // A streaming provider runs its own endpointing on continuous audio, so
+        // local VAD is both unnecessary and harmful (it would strip the silence
+        // the recognizer uses to detect utterance boundaries).
+        let vad_enabled = vad_enabled && !streaming_live;
+
         // Create and start pipeline with device information for adaptive mixing
         let mut pipeline = AudioPipeline::new(
             audio_receiver,
-            transcription_sender,
+            transcription_sender.clone(),
             state.clone(),
             target_chunk_duration_ms,
             sample_rate,
@@ -1047,12 +1156,21 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
+            vad_enabled,
         )?;
         state.set_audio_sender(audio_sender.clone());
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings
         pipeline.recording_sender_for_mixed = recording_sender;
+
+        // In streaming mode the transcription channel carries the continuous
+        // mixed stream instead of VAD segments; the consumer
+        // (start_transcription_task) branches on the same configuration.
+        if streaming_live {
+            info!("🔊 Streaming transcription: feeding continuous mixed audio to the live session (VAD bypassed)");
+            pipeline.live_sender_for_mixed = Some(transcription_sender);
+        }
 
         let handle = tokio::spawn(async move {
             pipeline.run().await

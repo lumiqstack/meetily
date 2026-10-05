@@ -20,7 +20,9 @@ impl TranscriptConfig {
     /// Remote transcription does not use the shared local engines, so it is
     /// exempt from idle gating and recording preemption.
     pub fn is_remote(&self) -> bool {
-        self.provider.as_deref() == Some("openaiCompatible")
+        self.provider
+            .as_deref()
+            .is_some_and(crate::config::is_remote_transcription_provider)
     }
 }
 
@@ -69,6 +71,9 @@ pub async fn run_transcribe_stage<R: Runtime>(
         None,
         config.model.clone(),
         config.provider.clone(),
+        // The automatic pipeline does not ask for diarization; the user opts
+        // into it per job from the retranscribe dialog.
+        false,
     )
     .await;
 
@@ -85,6 +90,20 @@ pub async fn run_transcribe_stage<R: Runtime>(
             Ok(())
         }
         Err(e) => {
+            // Gemini batch failures carry their own type, so quota, timeouts,
+            // transport drops and 5xx are classified structurally rather than
+            // by matching on message text.
+            if let Some(batch) =
+                e.downcast_ref::<crate::audio::transcription::gemini_batch::GeminiBatchError>()
+            {
+                let message = batch.to_string();
+                return if batch.is_transient() || batch.is_cancellation() {
+                    Err(StageError::transient(message))
+                } else {
+                    Err(StageError::hard(message))
+                };
+            }
+
             let message = e.to_string();
             // Cancellation is how the pipeline yields the engine to a live
             // recording, and engine contention means "someone else is using
@@ -105,22 +124,23 @@ pub async fn run_transcribe_stage<R: Runtime>(
 mod tests {
     use super::*;
 
+    fn config_for(provider: Option<&str>) -> TranscriptConfig {
+        TranscriptConfig {
+            provider: provider.map(str::to_string),
+            model: None,
+        }
+    }
+
     #[test]
-    fn only_openai_compatible_counts_as_remote() {
-        let remote = TranscriptConfig {
-            provider: Some("openaiCompatible".to_string()),
-            model: None,
-        };
-        let local = TranscriptConfig {
-            provider: Some("localWhisper".to_string()),
-            model: None,
-        };
-        let unset = TranscriptConfig {
-            provider: None,
-            model: None,
-        };
-        assert!(remote.is_remote());
-        assert!(!local.is_remote());
-        assert!(!unset.is_remote());
+    fn every_remote_provider_counts_as_remote() {
+        assert!(config_for(Some("openaiCompatible")).is_remote());
+        assert!(config_for(Some("geminiTranscribe")).is_remote());
+    }
+
+    #[test]
+    fn local_engines_and_unset_do_not_count_as_remote() {
+        assert!(!config_for(Some("localWhisper")).is_remote());
+        assert!(!config_for(Some("parakeet")).is_remote());
+        assert!(!config_for(None).is_remote());
     }
 }

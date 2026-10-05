@@ -9,7 +9,7 @@ export interface RawModelInfo {
 }
 
 export interface ModelOption {
-  provider: 'whisper' | 'parakeet' | 'openaiCompatible';
+  provider: 'whisper' | 'parakeet' | 'openaiCompatible' | 'geminiTranscribe';
   name: string;
   displayName: string;
   size_mb: number;
@@ -90,6 +90,17 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
       });
     }
 
+    // Batch Gemini runs over REST even though live recording streams; imports
+    // and re-transcription always take the batch path.
+    if (transcriptModelConfig?.provider === 'geminiTranscribe' && transcriptModelConfig?.model) {
+      allModels.unshift({
+        provider: 'geminiTranscribe',
+        name: transcriptModelConfig.model,
+        displayName: `✨ Gemini: ${transcriptModelConfig.model}`,
+        size_mb: 0,
+      });
+    }
+
     setAvailableModels(allModels);
 
     // Set default model based on user's saved configuration
@@ -102,7 +113,8 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
       (m) =>
         (configuredProvider === 'localWhisper' && m.provider === 'whisper' && m.name === configuredModel) ||
         (configuredProvider === 'parakeet' && m.provider === 'parakeet' && m.name === configuredModel) ||
-        (configuredProvider === 'openaiCompatible' && m.provider === 'openaiCompatible' && m.name === configuredModel)
+        (configuredProvider === 'openaiCompatible' && m.provider === 'openaiCompatible' && m.name === configuredModel) ||
+        (configuredProvider === 'geminiTranscribe' && m.provider === 'geminiTranscribe' && m.name === configuredModel)
     );
 
     // Only set default model if user hasn't manually selected one

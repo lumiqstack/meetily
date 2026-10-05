@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo, ReactNode, MutableRefObject } from 'react';
 import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
@@ -21,6 +21,16 @@ interface TranscriptContextType {
   clearTranscripts: () => void;
   currentMeetingId: string | null;
   markMeetingAsSaved: () => Promise<void>;
+  /**
+   * In-progress hypothesis from a streaming provider (Gemini Live), replaced
+   * on every update and cleared when the matching final arrives.
+   *
+   * Deliberately kept out of `transcripts`: that list is ordered and deduped
+   * by `sequence_id` and is what gets persisted, so a caption that changes
+   * text under a stable id would either be dropped as a duplicate or saved as
+   * a partial segment. Empty string means "no caption right now".
+   */
+  liveCaption: string;
 }
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
@@ -29,57 +39,22 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
   const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
+  const [liveCaption, setLiveCaption] = useState('');
 
   // Recording state context - provides backend-synced state
   const recordingState = useRecordingState();
 
   // Refs for transcript management
   const transcriptsRef = useRef<Transcript[]>(transcripts);
-  const isUserAtBottomRef = useRef<boolean>(true);
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
+  // Sequence IDs already merged into `transcripts`; kept across flushes so a
+  // flush doesn't have to rescan the whole list to dedupe.
+  const seenSequenceIdsRef = useRef<Set<number>>(new Set());
   const finalFlushRef = useRef<(() => void) | null>(null);
 
   // Keep ref updated with current transcripts
   useEffect(() => {
     transcriptsRef.current = transcripts;
-  }, [transcripts]);
-
-  // Smart auto-scroll: Track user scroll position
-  useEffect(() => {
-    const handleScroll = () => {
-      const container = transcriptContainerRef.current;
-      if (!container) return;
-
-      const { scrollTop, scrollHeight, clientHeight } = container;
-      const isAtBottom = scrollTop + clientHeight >= scrollHeight - 10; // 10px tolerance
-      isUserAtBottomRef.current = isAtBottom;
-    };
-
-    const container = transcriptContainerRef.current;
-    if (container) {
-      container.addEventListener('scroll', handleScroll);
-      return () => container.removeEventListener('scroll', handleScroll);
-    }
-  }, []);
-
-  // Auto-scroll when transcripts change (only if user is at bottom)
-  useEffect(() => {
-    // Only auto-scroll if user was at the bottom before new content
-    if (isUserAtBottomRef.current && transcriptContainerRef.current) {
-      // Wait for Framer Motion animation to complete (150ms) before scrolling
-      // This ensures scrollHeight includes the full rendered height of the new transcript
-      const scrollTimeout = setTimeout(() => {
-        const container = transcriptContainerRef.current;
-        if (container) {
-          container.scrollTo({
-            top: container.scrollHeight,
-            behavior: 'smooth'
-          });
-        }
-      }, 150); // Match Framer Motion transition duration
-
-      return () => clearTimeout(scrollTimeout);
-    }
   }, [transcripts]);
 
   // Initialize IndexedDB and listen for recording-started/stopped events
@@ -229,13 +204,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       }
 
       // Sort both stale and recent transcripts by chunk_start_time, then by sequence_id
-      const sortTranscripts = (transcripts: Transcript[]) => {
-        return transcripts.sort((a, b) => {
-          const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
-          if (chunkTimeDiff !== 0) return chunkTimeDiff;
-          return (a.sequence_id || 0) - (b.sequence_id || 0);
-        });
+      const compareTranscripts = (a: Transcript, b: Transcript) => {
+        const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
+        if (chunkTimeDiff !== 0) return chunkTimeDiff;
+        return (a.sequence_id || 0) - (b.sequence_id || 0);
       };
+
+      const sortTranscripts = (transcripts: Transcript[]) => transcripts.sort(compareTranscripts);
 
       const sortedStaleTranscripts = sortTranscripts(staleTranscripts);
       const sortedRecentTranscripts = sortTranscripts(recentTranscripts);
@@ -244,33 +219,35 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       const allNewTranscripts = [...sortedTranscripts, ...sortedRecentTranscripts, ...sortedStaleTranscripts, ...sortedForceFlushTranscripts];
 
       if (allNewTranscripts.length > 0) {
-        setTranscripts(prev => {
-          // Create a set of existing sequence_ids for deduplication
-          const existingSequenceIds = new Set(prev.map(t => t.sequence_id).filter(id => id !== undefined));
+        const existingSequenceIds = seenSequenceIdsRef.current;
 
-          // Filter out any new transcripts that already exist
-          const uniqueNewTranscripts = allNewTranscripts.filter(transcript =>
-            transcript.sequence_id !== undefined && !existingSequenceIds.has(transcript.sequence_id)
-          );
+        // Transcripts without a sequence_id are dropped, as they always were
+        const uniqueNewTranscripts = allNewTranscripts.filter(transcript =>
+          transcript.sequence_id !== undefined && !existingSequenceIds.has(transcript.sequence_id)
+        );
 
-          // Only combine if we have unique new transcripts
-          if (uniqueNewTranscripts.length === 0) {
-            console.log('No unique transcripts to add - all were duplicates');
-            return prev; // No new unique transcripts to add
-          }
-
+        if (uniqueNewTranscripts.length === 0) {
+          console.log('No unique transcripts to add - all were duplicates');
+        } else {
           console.log(`Adding ${uniqueNewTranscripts.length} unique transcripts out of ${allNewTranscripts.length} received`);
 
-          // Merge with existing transcripts, maintaining chronological order
-          const combined = [...prev, ...uniqueNewTranscripts];
+          for (const transcript of uniqueNewTranscripts) {
+            existingSequenceIds.add(transcript.sequence_id!);
+          }
 
-          // Sort by chunk_start_time first, then by sequence_id
-          return combined.sort((a, b) => {
-            const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
-            if (chunkTimeDiff !== 0) return chunkTimeDiff;
-            return (a.sequence_id || 0) - (b.sequence_id || 0);
+          // The existing list is already in order, so only the batch needs sorting
+          sortTranscripts(uniqueNewTranscripts);
+          setTranscripts(prev => {
+            const merged = prev.concat(uniqueNewTranscripts);
+            // A stale transcript can flush in a later batch than a newer one,
+            // which would land it out of order. Re-sort only when that happens,
+            // so the ordinary in-order case stays linear.
+            const last = prev[prev.length - 1];
+            return !last || compareTranscripts(last, uniqueNewTranscripts[0]) <= 0
+              ? merged
+              : merged.sort(compareTranscripts);
           });
-        });
+        }
 
         // Log the processing summary
         const logMessage = forceFlush
@@ -319,6 +296,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             speaker: update.speaker ?? null,
           };
 
+          // A final supersedes whatever caption was on screen.
+          setLiveCaption('');
+
           // Add to buffer
           transcriptBuffer.set(update.sequence_id, newTranscript);
           console.log(`✅ MAIN LISTENER: Buffered transcript with sequence_id ${update.sequence_id}. Buffer size: ${transcriptBuffer.size}, Last processed: ${lastProcessedSequence}`);
@@ -347,6 +327,17 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     setupListener();
     console.log('Started enhanced listener setup');
 
+    // Interim captions from a streaming provider. Separate event from
+    // `transcript-update` so they never reach the persistence listener in the
+    // Rust layer, which stores every update it sees.
+    let unlistenInterim: (() => void) | undefined;
+    transcriptService
+      .onTranscriptInterim((caption) => setLiveCaption(caption.text))
+      .then((unlisten) => {
+        unlistenInterim = unlisten;
+      })
+      .catch((error) => console.error('Failed to set up interim caption listener:', error));
+
     return () => {
       console.log('🧹 CLEANUP: Cleaning up MAIN transcript listener...');
       if (processingTimer) {
@@ -356,6 +347,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       if (unlistenFn) {
         unlistenFn();
         console.log('🧹 CLEANUP: MAIN transcript listener cleaned up');
+      }
+      if (unlistenInterim) {
+        unlistenInterim();
       }
     };
   }, [currentMeetingId]); // Add currentMeetingId dependency
@@ -388,6 +382,11 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             speaker: segment.speaker ?? null,
           }));
 
+          seenSequenceIdsRef.current = new Set(
+            formattedTranscripts
+              .map(t => t.sequence_id)
+              .filter((id): id is number => id !== undefined)
+          );
           setTranscripts(formattedTranscripts);
           console.log('[Reload Sync] ✅ Transcript history synced successfully');
 
@@ -429,6 +428,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       duration: update.duration,
       speaker: update.speaker ?? null,
     };
+
+    seenSequenceIdsRef.current.add(newTranscript.sequence_id!);
 
     setTranscripts(prev => {
       console.log('📊 Current transcripts count before update:', prev.length);
@@ -489,7 +490,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
 
   // Clear transcripts (used when starting new recording)
   const clearTranscripts = useCallback(() => {
+    seenSequenceIdsRef.current = new Set();
     setTranscripts([]);
+    setLiveCaption('');
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -516,7 +519,10 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, [currentMeetingId]);
 
-  const value: TranscriptContextType = {
+  // Memoized: this provider consumes useRecordingState(), so without this the
+  // 500ms recording-state poll allocated a new context value on every tick and
+  // re-rendered every useTranscripts() consumer.
+  const value: TranscriptContextType = useMemo(() => ({
     transcripts,
     transcriptsRef,
     addTranscript,
@@ -528,7 +534,21 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     clearTranscripts,
     currentMeetingId,
     markMeetingAsSaved,
-  };
+    liveCaption,
+  }), [
+    transcripts,
+    transcriptsRef,
+    addTranscript,
+    copyTranscript,
+    flushBuffer,
+    transcriptContainerRef,
+    meetingTitle,
+    setMeetingTitle,
+    clearTranscripts,
+    currentMeetingId,
+    markMeetingAsSaved,
+    liveCaption,
+  ]);
 
   return (
     <TranscriptContext.Provider value={value}>

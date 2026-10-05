@@ -128,7 +128,13 @@ impl TruePeakLimiter {
             self.gain_reduction[self.current_position] = 1.0;
         }
 
-        let output_position = (self.current_position + 1) % self.lookahead_samples;
+        // Wrap with a compare instead of `%`: this runs 48,000 times a second
+        // on the realtime audio thread, and an integer division per sample is
+        // the most expensive thing in the loop.
+        let mut output_position = self.current_position + 1;
+        if output_position >= self.lookahead_samples {
+            output_position = 0;
+        }
         let output_sample = self.buffer[output_position] * self.gain_reduction[output_position];
 
         self.current_position = output_position;
@@ -150,6 +156,8 @@ pub struct LoudnessNormalizer {
     gain_linear: f32,
     loudness_buffer: Vec<f32>,
     true_peak_limit: f32,
+    /// Analysis chunks seen since the last `loudness_global()` call.
+    chunks_since_gain_update: u32,
 }
 
 impl LoudnessNormalizer {
@@ -162,7 +170,10 @@ impl LoudnessNormalizer {
         const TRUE_PEAK_LIMIT: f64 = -1.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
 
-        let ebur128 = ebur128::EbuR128::new(channels, sample_rate, ebur128::Mode::I | ebur128::Mode::TRUE_PEAK)
+        // Mode::I only. TRUE_PEAK makes ebur128 oversample every frame
+        // internally, and nothing here ever reads `true_peak()` — peak control
+        // is done by the separate TruePeakLimiter below.
+        let ebur128 = ebur128::EbuR128::new(channels, sample_rate, ebur128::Mode::I)
             .map_err(|e| anyhow::anyhow!("Failed to create EBU R128 normalizer: {}", e))?;
 
         let true_peak_limit = 10_f32.powf(TRUE_PEAK_LIMIT as f32 / 20.0);
@@ -171,8 +182,9 @@ impl LoudnessNormalizer {
             ebur128,
             limiter: TruePeakLimiter::new(sample_rate),
             gain_linear: 1.0,
-            loudness_buffer: Vec::with_capacity(ANALYZE_CHUNK_SIZE),
+            loudness_buffer: Vec::with_capacity(ANALYZE_CHUNK_SIZE * 2),
             true_peak_limit,
+            chunks_since_gain_update: 0,
         })
     }
 
@@ -183,30 +195,47 @@ impl LoudnessNormalizer {
     ///
     /// Target: -23 LUFS (professional broadcast standard for speech/dialog)
     /// Applies sample-by-sample with 10ms lookahead limiter to prevent clipping
+    /// Allocating wrapper for offline callers. The realtime capture path uses
+    /// [`normalize_in_place`](Self::normalize_in_place).
     pub fn normalize_loudness(&mut self, samples: &[f32]) -> Vec<f32> {
+        let mut out = samples.to_vec();
+        self.normalize_in_place(&mut out);
+        out
+    }
+
+    /// Same normalization, applied in place — no allocation per audio callback.
+    pub fn normalize_in_place(&mut self, samples: &mut [f32]) {
         if samples.is_empty() {
-            return Vec::new();
+            return;
         }
 
         const TARGET_LUFS: f64 = -23.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
+        // `loudness_global()` integrates the whole gated histogram. The gain it
+        // produces is a slow-moving normalization target, so recomputing it on
+        // every 512-sample chunk (~94x/s) is wasted work; ~2x/s tracks it just
+        // as well.
+        const GAIN_UPDATE_EVERY_CHUNKS: u32 = 48;
 
-        let mut normalized_samples = Vec::with_capacity(samples.len());
+        for block in samples.chunks_mut(ANALYZE_CHUNK_SIZE) {
+            // Accumulate samples for loudness analysis in bulk rather than
+            // pushing one at a time.
+            self.loudness_buffer.extend_from_slice(block);
 
-        for &sample in samples {
-            // Accumulate samples for loudness analysis
-            self.loudness_buffer.push(sample);
-
-            // Analyze loudness every 512 samples
             if self.loudness_buffer.len() >= ANALYZE_CHUNK_SIZE {
                 if let Err(e) = self.ebur128.add_frames_f32(&self.loudness_buffer) {
                     warn!("Failed to add frames to EBU R128: {}", e);
                 } else {
-                    // Update gain based on cumulative loudness
-                    if let Ok(current_lufs) = self.ebur128.loudness_global() {
-                        if current_lufs.is_finite() && current_lufs < 0.0 {
-                            let gain_db = TARGET_LUFS - current_lufs;
-                            self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
+                    self.chunks_since_gain_update += 1;
+                    if self.chunks_since_gain_update >= GAIN_UPDATE_EVERY_CHUNKS {
+                        self.chunks_since_gain_update = 0;
+
+                        // Update gain based on cumulative loudness
+                        if let Ok(current_lufs) = self.ebur128.loudness_global() {
+                            if current_lufs.is_finite() && current_lufs < 0.0 {
+                                let gain_db = TARGET_LUFS - current_lufs;
+                                self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
+                            }
                         }
                     }
                 }
@@ -214,13 +243,12 @@ impl LoudnessNormalizer {
             }
 
             // Apply gain and true peak limiting
-            let amplified = sample * self.gain_linear;
-            let limited = self.limiter.process(amplified, self.true_peak_limit);
-
-            normalized_samples.push(limited);
+            let gain = self.gain_linear;
+            let limit = self.true_peak_limit;
+            for sample in block.iter_mut() {
+                *sample = self.limiter.process(*sample * gain, limit);
+            }
         }
-
-        normalized_samples
     }
 }
 
@@ -378,21 +406,27 @@ impl HighPassFilter {
 
     /// Apply high-pass filter to audio samples
     /// Uses first-order IIR (Infinite Impulse Response) filter
+    ///
+    /// Allocating wrapper for offline callers (decoder, import). The realtime
+    /// capture path uses [`process_in_place`](Self::process_in_place).
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
-        let mut output = Vec::with_capacity(samples.len());
+        let mut output = samples.to_vec();
+        self.process_in_place(&mut output);
+        output
+    }
 
-        for &sample in samples {
+    /// Same filter, applied in place — no allocation per audio callback.
+    pub fn process_in_place(&mut self, samples: &mut [f32]) {
+        for sample in samples.iter_mut() {
             // First-order high-pass IIR filter formula:
             // y[n] = alpha * (y[n-1] + x[n] - x[n-1])
-            let filtered = self.alpha * (self.prev_output + sample - self.prev_input);
+            let filtered = self.alpha * (self.prev_output + *sample - self.prev_input);
 
-            self.prev_input = sample;
+            self.prev_input = *sample;
             self.prev_output = filtered;
 
-            output.push(filtered);
+            *sample = filtered;
         }
-
-        output
     }
 
     /// Reset filter state (call when starting new recording)
@@ -476,27 +510,36 @@ pub fn average_noise_spectrum(audio: &[f32]) -> f32 {
 }
 
 pub fn audio_to_mono(audio: &[f32], channels: u16) -> Vec<f32> {
-    let mut mono_samples = Vec::with_capacity(audio.len() / channels as usize);
+    let mut mono_samples = Vec::with_capacity(audio.len() / channels.max(1) as usize);
+    audio_to_mono_into(audio, channels, &mut mono_samples);
+    mono_samples
+}
+
+/// Downmix into a caller-owned buffer, which the realtime capture path reuses
+/// across callbacks instead of allocating one per chunk. `out` is cleared first.
+pub fn audio_to_mono_into(audio: &[f32], channels: u16, out: &mut Vec<f32>) {
+    out.clear();
+
+    if channels <= 1 {
+        out.extend_from_slice(audio);
+        return;
+    }
+
+    out.reserve(audio.len() / channels as usize);
 
     // For microphone arrays (> 2 channels), only use first 2 channels
     // Many microphone arrays have auxiliary channels for beam-forming/noise cancellation
     // that can contain anti-phase signals. Averaging all channels can cause destructive
     // interference resulting in near-zero output.
     let effective_channels = if channels > 2 { 2 } else { channels };
+    let scale = 1.0 / effective_channels as f32;
 
     // Iterate over the audio slice in chunks, each containing `channels` samples
     for chunk in audio.chunks(channels as usize) {
         // Sum only the first effective_channels (typically 1-2 for mic arrays)
         let sum: f32 = chunk.iter().take(effective_channels as usize).sum();
-
-        // Calculate the average mono sample using effective channel count
-        let mono_sample = sum / effective_channels as f32;
-
-        // Store the computed mono sample
-        mono_samples.push(mono_sample);
+        out.push(sum * scale);
     }
-
-    mono_samples
 }
 
 /// High-quality audio resampling with adaptive parameters based on sample rate ratio
