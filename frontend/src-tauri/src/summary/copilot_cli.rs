@@ -186,6 +186,59 @@ fn output_snippet(text: &str) -> String {
     snippet
 }
 
+/// Prefer the CLI's structured failure over earlier warnings in its JSONL stream.
+/// In particular, an MCP policy warning can precede an unrelated quota error.
+fn extract_cli_error(jsonl: &str) -> Option<String> {
+    let mut model_failure = None;
+    for line in jsonl.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(data) = event.get("data") else {
+            continue;
+        };
+        match event.get("type").and_then(|value| value.as_str()) {
+            Some("session.error") => {
+                if data.get("errorCode").and_then(|value| value.as_str()) == Some("quota_exceeded")
+                    || data.get("errorType").and_then(|value| value.as_str()) == Some("quota")
+                {
+                    return Some(
+                        "GitHub Copilot monthly quota exceeded. Check your Copilot usage or choose a model available under your plan."
+                            .to_string(),
+                    );
+                }
+                if let Some(message) = data.get("message").and_then(|value| value.as_str()) {
+                    return Some(output_snippet(message));
+                }
+            }
+            Some("model.call_failure") => {
+                if let Some(message) = data.get("errorMessage").and_then(|value| value.as_str()) {
+                    let parsed = serde_json::from_str::<serde_json::Value>(message).ok();
+                    let code = parsed
+                        .as_ref()
+                        .and_then(|value| value.get("code"))
+                        .and_then(|value| value.as_str());
+                    if code == Some("quota_exceeded") {
+                        model_failure = Some(
+                            "GitHub Copilot monthly quota exceeded. Check your Copilot usage or choose a model available under your plan."
+                                .to_string(),
+                        );
+                    } else {
+                        let detail = parsed
+                            .as_ref()
+                            .and_then(|value| value.get("message"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(message);
+                        model_failure = Some(output_snippet(detail));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    model_failure
+}
+
 /// Generates a summary by running the GitHub Copilot CLI as a subprocess
 ///
 /// # Arguments
@@ -321,23 +374,30 @@ async fn run_copilot(
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if !output.status.success() {
+        if let Some(detail) = extract_cli_error(&stdout).or_else(|| extract_cli_error(&stderr)) {
+            return Err(format!("GitHub Copilot CLI failed: {}", detail));
+        }
         let detail = if !stderr.trim().is_empty() {
             output_snippet(&stderr)
         } else {
             output_snippet(&stdout)
         };
         return Err(format!(
-            "GitHub Copilot CLI failed ({}): {}. If you are not signed in, run `copilot login` \
-             or set a GitHub token in Settings.",
+            "GitHub Copilot CLI failed ({}): {}",
             output.status, detail
         ));
     }
 
     extract_final_message(&stdout).ok_or_else(|| {
-        format!(
-            "GitHub Copilot CLI returned no assistant response. Output: {}",
-            output_snippet(&stdout)
-        )
+        extract_cli_error(&stdout)
+            .or_else(|| extract_cli_error(&stderr))
+            .map(|detail| format!("GitHub Copilot CLI failed: {}", detail))
+            .unwrap_or_else(|| {
+                format!(
+                    "GitHub Copilot CLI returned no assistant response. Output: {}",
+                    output_snippet(&stdout)
+                )
+            })
     })
 }
 
@@ -423,5 +483,27 @@ mod tests {
     fn configured_binary_path_must_exist() {
         let err = resolve_copilot_binary(Some("/nonexistent/path/to/copilot")).unwrap_err();
         assert!(err.contains("not found at"));
+    }
+
+    #[test]
+    fn reports_quota_error_after_mcp_policy_warning() {
+        let jsonl = concat!(
+            r#"{"type":"session.warning","data":{"message":"Third-party MCP servers are disabled by your organization's Copilot policy. Only built-in servers are available."},"ephemeral":true}"#,
+            "\n",
+            r#"{"type":"model.call_failure","data":{"errorMessage":"{\"message\":\"You have exceeded your monthly quota\",\"code\":\"quota_exceeded\"}"}}"#,
+            "\n",
+            r#"{"type":"session.error","data":{"errorType":"quota","message":"You have exceeded your monthly quota (Request ID: example)","errorCode":"quota_exceeded"}}"#,
+        );
+
+        let detail = extract_cli_error(jsonl).unwrap();
+        assert!(detail.contains("monthly quota exceeded"));
+        assert!(!detail.contains("MCP"));
+        assert!(!detail.contains("Request ID"));
+    }
+
+    #[test]
+    fn ignores_warning_without_a_structured_failure() {
+        let jsonl = r#"{"type":"session.warning","data":{"message":"Third-party MCP servers are disabled"}}"#;
+        assert_eq!(extract_cli_error(jsonl), None);
     }
 }
