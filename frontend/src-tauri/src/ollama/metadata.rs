@@ -363,4 +363,67 @@ mod tests {
         let metadata = get_fallback_metadata("phi4:latest");
         assert_eq!(metadata.context_size, 2048);
     }
+
+    /// Serves one HTTP/1.1 200 response with `body` on a localhost port.
+    async fn serve_json_once(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    /// H5-F1: the Modelfile's `PARAMETER num_ctx` is what Ollama actually
+    /// allocates, but `model_info.*.context_length` (the training maximum) is
+    /// consulted first and wins.
+    #[tokio::test]
+    async fn h5_f1_modelfile_num_ctx_beats_model_info_training_max() {
+        let endpoint = serve_json_once(
+            r#"{"modelfile":"PARAMETER num_ctx 8192","details":{"family":"llama"},"model_info":{"llama.context_length":131072}}"#,
+        )
+        .await;
+        let metadata = fetch_model_info("llama3.1:8b", Some(&endpoint)).await.unwrap();
+        assert_eq!(metadata.context_size, 8192);
+    }
+
+    /// Without a Modelfile num_ctx, Ollama applies its server default
+    /// (OLLAMA_CONTEXT_LENGTH) rather than the model's training maximum.
+    #[tokio::test]
+    async fn h5_f1_no_modelfile_num_ctx_uses_server_default_not_training_max() {
+        let endpoint = serve_json_once(
+            r#"{"modelfile":"FROM /path/to/model\nPARAMETER temperature 0.7","details":{"family":"llama"},"model_info":{"llama.context_length":131072}}"#,
+        )
+        .await;
+        let metadata = fetch_model_info("llama3.1:8b", Some(&endpoint)).await.unwrap();
+        assert_eq!(metadata.context_size, 4096);
+    }
 }
