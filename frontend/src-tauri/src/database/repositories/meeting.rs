@@ -1,4 +1,4 @@
-use crate::api::{MeetingDetails, MeetingTranscript};
+use crate::api::{Meeting, MeetingDetails, MeetingTranscript};
 use crate::database::models::{MeetingModel, PendingMeetingModel, Transcript};
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqliteConnection, SqlitePool};
@@ -38,15 +38,25 @@ const PENDING_MEETINGS_SQL: &str = r#"
     ORDER BY m.created_at DESC
 "#;
 
+/// `transcribed` excludes a transcript saved before live transcription
+/// finished, so it agrees with [`PENDING_MEETINGS_SQL`] on what still needs
+/// transcribing.
+const MEETING_LIST_SQL: &str = r#"
+    SELECT m.id, m.title,
+           (m.transcription_incomplete = 0
+            AND EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id)) AS transcribed,
+           EXISTS (SELECT 1 FROM summary_processes sp
+                   WHERE sp.meeting_id = m.id AND sp.status = 'completed') AS summarized,
+           EXISTS (SELECT 1 FROM obsidian_exports oe WHERE oe.meeting_id = m.id) AS obsidian_exported
+    FROM meetings m
+    ORDER BY m.created_at DESC
+"#;
+
 impl MeetingsRepository {
-    pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingModel>, sqlx::Error> {
-        let meetings = sqlx::query_as::<_, MeetingModel>(
-            "SELECT id, title, created_at, updated_at, folder_path
-             FROM meetings ORDER BY created_at DESC",
-        )
-        .fetch_all(pool)
-        .await?;
-        Ok(meetings)
+    pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<Meeting>, sqlx::Error> {
+        sqlx::query_as::<_, Meeting>(MEETING_LIST_SQL)
+            .fetch_all(pool)
+            .await
     }
 
     /// Meetings with outstanding work: a recording folder but no transcripts
@@ -445,6 +455,49 @@ mod tests {
         assert_eq!(
             by_id("failed-summary").summary_status.as_deref(),
             Some("failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn meeting_list_reports_finished_stages() {
+        let pool = test_pool().await;
+
+        insert_meeting(&pool, "recorded", Some("C:/rec/a")).await;
+
+        insert_meeting(&pool, "partial", Some("C:/rec/p")).await;
+        insert_transcript(&pool, "partial").await;
+        mark_incomplete(&pool, "partial").await;
+
+        insert_meeting(&pool, "summary-running", None).await;
+        insert_transcript(&pool, "summary-running").await;
+        insert_summary_process(&pool, "summary-running", "PENDING").await;
+
+        insert_meeting(&pool, "done", None).await;
+        insert_transcript(&pool, "done").await;
+        insert_transcript(&pool, "done").await;
+        insert_summary_process(&pool, "done", "completed").await;
+        sqlx::query(
+            "INSERT INTO obsidian_exports (meeting_id, filename, exported_at)
+             VALUES ('done', 'done.md', '2026-07-24T10:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let meetings = MeetingsRepository::get_meetings(&pool).await.unwrap();
+        let mut stages: Vec<(&str, bool, bool, bool)> = meetings
+            .iter()
+            .map(|m| (m.id.as_str(), m.transcribed, m.summarized, m.obsidian_exported))
+            .collect();
+        stages.sort();
+        assert_eq!(
+            stages,
+            vec![
+                ("done", true, true, true),
+                ("partial", false, false, false),
+                ("recorded", false, false, false),
+                ("summary-running", true, false, false),
+            ]
         );
     }
 
