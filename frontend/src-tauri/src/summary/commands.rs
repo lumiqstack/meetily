@@ -738,6 +738,8 @@ pub async fn api_process_transcript<R: Runtime>(
     SummaryProcessesRepository::create_or_reset_process(&pool, &m_id, started_at)
         .await
         .map_err(|e| format!("Failed to initialize process: {}", e))?;
+    // The reset row is pending, so the meeting no longer counts as summarized.
+    crate::api::emit_meetings_changed(&app, &m_id);
 
     let chunk_size = _chunk_size.unwrap_or(40000);
     let overlap = _overlap.unwrap_or(1000);
