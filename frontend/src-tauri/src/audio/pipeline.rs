@@ -1268,4 +1268,103 @@ mod tests {
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
     }
+
+    /// A partial mixer window left in the ring buffer when the stream closes
+    /// must still reach the recording channel.
+    #[tokio::test]
+    async fn partial_window_is_flushed_on_stop() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.5f32; 14_400],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut total_samples = 0usize;
+        while let Ok(chunk) = recording_rx.try_recv() {
+            total_samples += chunk.data.len();
+        }
+        assert_eq!(total_samples, 14_400);
+    }
+
+    /// Mic and system audio that both stop short of a full window are mixed
+    /// together and flushed on stop. The final window is as long as the longer
+    /// stream, and the shorter stream is zero-padded to it.
+    #[tokio::test]
+    async fn partial_mic_and_system_windows_are_flushed_together_on_stop() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 14_400],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 9_600],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 1,
+                device_type: DeviceType::System,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut total_samples = 0usize;
+        while let Ok(chunk) = recording_rx.try_recv() {
+            total_samples += chunk.data.len();
+        }
+        assert_eq!(total_samples, 14_400);
+    }
 }
