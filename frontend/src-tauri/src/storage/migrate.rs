@@ -932,4 +932,101 @@ mod tests {
         assert_eq!(value["preferences"]["auto_save"], false);
         assert_eq!(value["preferences"]["file_format"], "mp4");
     }
+
+    /// H6-F5: `split_at` panics when `prefix.len()` lands inside a multibyte char.
+    /// "abó" is bytes [61 62 C3 B3]; prefix "abx" has len 3, which is inside ó.
+    #[test]
+    fn strip_prefix_ci_does_not_panic_on_multibyte_boundary() {
+        assert_eq!(strip_prefix_ci("abó", "abx"), None);
+    }
+
+    #[test]
+    fn strip_prefix_ci_requires_a_path_boundary() {
+        assert_eq!(strip_prefix_ci(r"D:\rec-old\M1", r"D:\rec"), None);
+        assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec"), Some(r"\M1"));
+    }
+
+    /// H6-F4: the user-picked recordings folder (save_folder) can hold unrelated
+    /// files; migrate_recordings moves every entry, not just meeting folders.
+    /// All paths are under a tempdir; MEETILY_DATA_DIR pins root() into it.
+    #[test]
+    fn recordings_migration_leaves_unrelated_files_in_place() {
+        let tmp = tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let _ = crate::storage::DATA_ROOT.set(data);
+        assert!(
+            root().starts_with(std::env::temp_dir()),
+            "refusing to run: root {} is not a temp dir",
+            root().display()
+        );
+
+        let legacy = tmp.path().join("legacy");
+        let old = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        write(&old.join("unrelated.txt"), b"not a meeting");
+        write(&old.join("Meeting_x/audio.mp4"), b"audio");
+
+        let mut state = State {
+            old_recordings_root: Some(old.clone()),
+            ..State::default()
+        };
+        let mut report = MigrationReport::default();
+        migrate_recordings(&legacy, &new_root, &mut state, &mut report)
+            .expect("migration setup: data root must be writable");
+
+        assert!(
+            old.join("unrelated.txt").exists(),
+            "unrelated file in the user's recordings folder was moved away"
+        );
+        assert_eq!(
+            std::fs::read(new_root.join("recordings/Meeting_x/audio.mp4")).unwrap(),
+            b"audio",
+            "meeting folder must move to <new>/recordings"
+        );
+    }
+
+    /// The destination can sit inside the folder being migrated (old/data). The
+    /// meeting folder must still end up under the new root exactly once.
+    #[test]
+    fn recordings_migration_never_recurses_into_its_own_destination() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let old = tmp.path().join("old");
+        let new_root = old.join("data");
+        std::fs::create_dir_all(&new_root).unwrap();
+        write(&old.join("Meeting_x/audio.mp4"), b"audio");
+
+        let mut state = State {
+            old_recordings_root: Some(old.clone()),
+            ..State::default()
+        };
+        let mut report = MigrationReport::default();
+        migrate_recordings(&legacy, &new_root, &mut state, &mut report).unwrap();
+
+        assert_eq!(
+            std::fs::read(new_root.join("recordings/Meeting_x/audio.mp4")).unwrap(),
+            b"audio"
+        );
+        assert_eq!(
+            count_files_named(tmp.path(), "audio.mp4"),
+            1,
+            "meeting folder must exist exactly once"
+        );
+    }
+
+    fn count_files_named(dir: &Path, name: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| {
+                if p.is_dir() {
+                    count_files_named(&p, name)
+                } else {
+                    usize::from(p.file_name().and_then(|n| n.to_str()) == Some(name))
+                }
+            })
+            .sum()
+    }
 }
