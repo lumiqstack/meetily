@@ -149,16 +149,36 @@ impl DatabaseManager {
 
         // Copy legacy database to the data root as meeting_minutes.db
         let target_legacy_path = app_data_dir.join("meeting_minutes.db");
-        log::info!(
-            "Copying legacy database from {} to {}",
-            legacy_db_path,
-            target_legacy_path.display()
-        );
 
-        fs::copy(legacy_db_path, &target_legacy_path).map_err(|e| sqlx::Error::Io(e))?;
+        // Onboarding passes the default location itself, which is already the
+        // target. `fs::copy` onto the same file truncates it to zero bytes on
+        // Unix, so the file is initialized in place instead.
+        if Self::is_same_file(Path::new(legacy_db_path), &target_legacy_path) {
+            log::info!(
+                "Legacy database is already at {}; initializing it in place",
+                target_legacy_path.display()
+            );
+        } else {
+            log::info!(
+                "Copying legacy database from {} to {}",
+                legacy_db_path,
+                target_legacy_path.display()
+            );
+            fs::copy(legacy_db_path, &target_legacy_path).map_err(|e| sqlx::Error::Io(e))?;
+        }
 
         // Now use the standard initialization which will detect and migrate the legacy db
         Self::new_from_app_handle(app_handle).await
+    }
+
+    /// True only when both paths exist and resolve to the same file. Compared
+    /// after canonicalization so that symlinks and differently spelled paths
+    /// are caught too.
+    fn is_same_file(a: &Path, b: &Path) -> bool {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
     }
 
     async fn reconcile_orphaned_cloud_transcript_provider_migration(
