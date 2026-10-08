@@ -670,6 +670,10 @@ mod legacy_import_tests {
     /// H6-F1: onboarding passes the default legacy path (the data root's
     /// `meeting_minutes.db`) back into `import_legacy_database`, which copies
     /// it onto itself and truncates it.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn import_from_default_location_keeps_meetings() {
         let root = tempfile::tempdir().unwrap();
