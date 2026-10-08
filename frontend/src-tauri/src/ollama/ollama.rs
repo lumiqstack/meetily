@@ -432,6 +432,16 @@ pub async fn pull_ollama_model<R: Runtime>(
     Ok(())
 }
 
+// Test seam for the stream idle limit; the body is still the pre-fix pull.
+async fn pull_model_stream<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    model_name: &str,
+    endpoint: Option<&str>,
+    _idle_timeout: Duration,
+) -> Result<(), String> {
+    pull_ollama_model(app_handle.clone(), model_name.to_string(), endpoint.map(str::to_string)).await
+}
+
 #[command]
 pub async fn delete_ollama_model(
     model_name: String,
@@ -510,5 +520,85 @@ pub async fn get_ollama_model_context(
             // Return default instead of error for better UX
             Ok(4000)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const IDLE_LIMIT: Duration = Duration::from_millis(500);
+
+    async fn read_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Serves one NDJSON pull response: each line is written after its delay,
+    /// then the connection closes (the body ends at EOF, as Ollama's does).
+    async fn serve_pull_script(script: Vec<(Duration, &'static str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                .await;
+            for (delay, line) in script {
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(format!("{line}\n").as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn h5_f4_pull_survives_slow_stream_with_gaps_under_idle_limit() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling manifest"}"#),
+            (Duration::from_millis(200), r#"{"status":"pulling","completed":10,"total":100}"#),
+            (Duration::from_millis(200), r#"{"status":"pulling","completed":50,"total":100}"#),
+            (Duration::from_millis(200), r#"{"status":"pulling","completed":100,"total":100}"#),
+            (Duration::from_millis(200), r#"{"status":"success"}"#),
+        ])
+        .await;
+        let result = pull_model_stream(app.handle(), "h5-f4-slow-model", Some(&endpoint), IDLE_LIMIT).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn h5_f4_pull_fails_when_stream_stalls_past_idle_limit() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling manifest"}"#),
+            (Duration::from_millis(1500), r#"{"status":"success"}"#),
+        ])
+        .await;
+        let result = pull_model_stream(app.handle(), "h5-f4-stall-model", Some(&endpoint), IDLE_LIMIT).await;
+        let error = result.expect_err("a pull whose stream stalls past the idle limit must fail");
+        assert!(error.contains("stalled"), "unexpected error: {error}");
     }
 }
