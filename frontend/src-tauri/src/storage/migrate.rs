@@ -86,7 +86,7 @@ pub struct MigrationReport {
 
 /// Phase 1: move files. Returns immediately when no relocation is configured.
 pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
-    run_files_in(&legacy_root(), &root(), |payload| {
+    run_files_in(&legacy_root(), &root(), legacy_logs_dir(), |payload| {
         let _ = app.emit("storage-migration", payload);
     })
 }
@@ -100,6 +100,9 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
 fn run_files_in(
     legacy: &Path,
     root: &Path,
+    // The platform log dir lives outside the app-data dir, so it is passed in:
+    // tests must never reach the real user's log folder.
+    legacy_logs: Option<PathBuf>,
     emit: impl Fn(serde_json::Value),
 ) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
@@ -170,7 +173,7 @@ fn run_files_in(
     // migration's own error output on the first run.
     if !state.done("logs") {
         let mut ok = true;
-        for old_logs in [legacy_logs_dir(), Some(source.join("logs"))]
+        for old_logs in [legacy_logs.clone(), Some(source.join("logs"))]
             .into_iter()
             .flatten()
         {
@@ -1000,6 +1003,21 @@ mod tests {
     /// H6-F3: switching the data root a second time must migrate from the root
     /// the user switched away from (root1), not from the legacy directory.
     #[test]
+    fn first_move_archives_logs_from_the_given_platform_log_dir() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("root");
+        let platform_logs = tmp.path().join("platform-logs");
+        write(&platform_logs.join("meetily.log"), b"old log");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        run_files_in(&legacy, &root, Some(platform_logs.clone()), |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(root.join("logs/meetily.log")).unwrap(), b"old log");
+        assert!(!platform_logs.join("meetily.log").exists());
+    }
+
+    #[test]
     fn second_root_change_migrates_the_database_from_the_previous_root() {
         let tmp = tempdir().unwrap();
         let legacy = tmp.path().join("legacy");
@@ -1014,7 +1032,7 @@ mod tests {
                 .as_bytes(),
         );
 
-        run_files_in(&legacy, &root2, |_| {}).unwrap();
+        run_files_in(&legacy, &root2, None, |_| {}).unwrap();
 
         assert!(
             root2.join("meeting_minutes.sqlite").exists(),
@@ -1038,7 +1056,7 @@ mod tests {
         )
         .unwrap();
 
-        run_files_in(&legacy, &root2, |_| {}).unwrap();
+        run_files_in(&legacy, &root2, None, |_| {}).unwrap();
 
         assert_eq!(
             std::fs::read(root2.join("meeting_minutes.sqlite")).unwrap(),
@@ -1061,7 +1079,7 @@ mod tests {
         )
         .unwrap();
 
-        run_files_in(&legacy, &legacy, |_| {}).unwrap();
+        run_files_in(&legacy, &legacy, None, |_| {}).unwrap();
 
         assert_eq!(
             std::fs::read(legacy.join("meeting_minutes.sqlite")).unwrap(),
@@ -1099,7 +1117,7 @@ mod tests {
         )
         .unwrap();
 
-        run_files_in(&legacy, &root2, |_| {}).unwrap();
+        run_files_in(&legacy, &root2, None, |_| {}).unwrap();
 
         assert_eq!(
             std::fs::read(root2.join("meeting_minutes.sqlite")).unwrap(),
@@ -1133,7 +1151,7 @@ mod tests {
         )
         .unwrap();
 
-        run_files_in(&legacy, &root, |_| {}).unwrap();
+        run_files_in(&legacy, &root, None, |_| {}).unwrap();
 
         assert_eq!(load_state(&root).old_recordings_root, Some(old_recordings));
     }
@@ -1153,11 +1171,11 @@ mod tests {
         };
 
         write_pointer(&legacy, &pending()).unwrap();
-        run_files_in(&legacy, &root2, |_| {}).unwrap();
+        run_files_in(&legacy, &root2, None, |_| {}).unwrap();
 
         // A crash before the pointer was cleared leaves the same request pending.
         write_pointer(&legacy, &pending()).unwrap();
-        let report = run_files_in(&legacy, &root2, |_| {}).unwrap();
+        let report = run_files_in(&legacy, &root2, None, |_| {}).unwrap();
 
         assert_eq!(report.files_moved, 0);
         assert!(report.skipped.is_empty());
