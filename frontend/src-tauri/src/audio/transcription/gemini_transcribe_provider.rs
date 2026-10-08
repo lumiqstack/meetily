@@ -254,8 +254,12 @@ fn parse_batch_response(
 
     // Silently degrading an authoritative pass to one undifferentiated blob is
     // worse than failing it: the caller asked for segmentation and would get
-    // an hour-long row with no way to tell something went wrong.
-    if options.word_timestamps && words.as_ref().map_or(true, |w| w.is_empty()) {
+    // an hour-long row with no way to tell something went wrong. Silence is
+    // the exception: it legitimately comes back as empty text with no words.
+    if options.word_timestamps
+        && !text.is_empty()
+        && words.as_ref().map_or(true, |w| w.is_empty())
+    {
         return Err(GeminiBatchError::MissingAnnotations);
     }
 
