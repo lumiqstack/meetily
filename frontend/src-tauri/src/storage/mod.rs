@@ -184,6 +184,11 @@ pub fn is_relocated() -> bool {
     root() != legacy_root()
 }
 
+/// Whether two paths name the same folder, whatever their spelling.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
 fn subdir(name: &str) -> PathBuf {
     let path = root().join(name);
     if let Err(e) = std::fs::create_dir_all(&path) {
@@ -417,5 +422,44 @@ mod tests {
     #[test]
     fn set_root_rejects_relative_paths() {
         assert!(set_root(Path::new("relative/path")).is_err());
+    }
+
+    #[test]
+    fn same_dir_ignores_trailing_separators_and_dot_components() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Meetily");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(same_dir(&dir, Path::new(&format!("{}/", dir.display()))));
+        assert!(same_dir(&dir, &dir.join(".")));
+        assert!(same_dir(&dir, &dir.join("..").join("Meetily")));
+    }
+
+    #[test]
+    fn same_dir_is_false_for_different_folders() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        assert!(!same_dir(&a, &b));
+        // Neither side of this comparison may need to exist for the answer to be known.
+        assert!(same_dir(&tmp.path().join("missing").join("..").join("a"), &a));
+    }
+
+    #[test]
+    fn same_dir_matches_the_same_folder_in_another_case() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("meetily");
+        std::fs::create_dir_all(&dir).unwrap();
+        let upper = PathBuf::from(dir.to_string_lossy().to_uppercase());
+
+        // Only meaningful where the volume ignores case (macOS and Windows defaults).
+        if !upper.exists() {
+            eprintln!("skipped: the volume is case-sensitive");
+            return;
+        }
+        assert!(same_dir(&dir, &upper));
     }
 }

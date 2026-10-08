@@ -1189,4 +1189,77 @@ mod tests {
         );
         assert_eq!(std::fs::read(root2.join("notes/extra.txt")).unwrap(), b"keep");
     }
+
+    /// A pointer naming the current root with a trailing separator is the same
+    /// folder: nothing may move, and no progress may be recorded.
+    #[test]
+    fn run_files_treats_a_root_with_a_trailing_separator_as_already_there() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("root");
+        write(&root.join("sentinel.txt"), b"keep");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root.clone()),
+                previous_root: Some(PathBuf::from(format!("{}/", root.display()))),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root, None, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(root.join("sentinel.txt")).unwrap(), b"keep");
+        assert!(!root.join(STATE_FILE).exists());
+    }
+
+    /// The same folder spelled through `..` must not be migrated onto itself.
+    #[test]
+    fn run_files_treats_a_root_spelled_with_dot_dot_as_already_there() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("root");
+        write(&root.join("sentinel.txt"), b"keep");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root.clone()),
+                previous_root: Some(root.join("..").join("root")),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root, None, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(root.join("sentinel.txt")).unwrap(), b"keep");
+        assert!(!root.join(STATE_FILE).exists());
+    }
+
+    /// On a case-insensitive volume (macOS and Windows defaults) the other
+    /// spelling of the same folder is still the same folder.
+    #[test]
+    fn run_files_treats_a_root_spelled_in_another_case_as_already_there() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("meetily-root");
+        write(&root.join("sentinel.txt"), b"keep");
+        let upper = PathBuf::from(root.to_string_lossy().to_uppercase());
+        if !upper.exists() {
+            eprintln!("skipped: the volume is case-sensitive");
+            return;
+        }
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root.clone()),
+                previous_root: Some(upper),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root, None, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(root.join("sentinel.txt")).unwrap(), b"keep");
+        assert!(!root.join(STATE_FILE).exists());
+    }
 }
