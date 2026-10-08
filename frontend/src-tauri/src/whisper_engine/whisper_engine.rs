@@ -476,7 +476,14 @@ impl WhisperEngine {
 
     // Check for obviously meaningless patterns
     fn is_meaningless_output(text: &str) -> bool {
-        let text_lower = text.to_lowercase();
+        // Only the whole output counts: real speech can contain these words
+        // ("slaughterhouse" contains "laughter", "the applause was loud").
+        let normalized = text
+            .trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         // Check for common meaningless patterns
         let meaningless_patterns = [
@@ -491,10 +498,8 @@ impl WhisperEngine {
             "ah ah ah",
         ];
 
-        for pattern in &meaningless_patterns {
-            if text_lower.contains(pattern) {
-                return true;
-            }
+        if meaningless_patterns.contains(&normalized.as_str()) {
+            return true;
         }
 
         // Check if text is mostly the same character or very short repetitive patterns
@@ -520,8 +525,8 @@ impl WhisperEngine {
                 repeat_count += 1;
             }
 
-            // Be more aggressive: if word is repeated 2+ times, only keep one instance
-            if repeat_count >= 2 {
+            // Collapse only 3+ repeats: Whisper loops, while doubles ("that that") are often grammatical
+            if repeat_count >= 3 {
                 cleaned_words.push(current_word);
                 i += repeat_count;
             } else {
