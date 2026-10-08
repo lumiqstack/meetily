@@ -211,15 +211,23 @@ pub async fn run_scan_stage(
     Ok(imported)
 }
 
-/// New `last_sync_date` after a scan. `outcomes` is `(created, imported)` for
-/// each attempted item, oldest first.
-fn next_watermark(outcomes: &[(String, bool)], _current: Option<&str>) -> Option<String> {
-    outcomes
+/// New `last_sync_date` after a scan, or None to leave it unchanged. `outcomes`
+/// is `(created, imported)` for each attempted item, oldest first.
+///
+/// The watermark is a "created after" filter, so it may only pass the leading
+/// run of successes: moving it beyond a failed recording would hide that
+/// recording from every later scan.
+fn next_watermark(outcomes: &[(String, bool)], current: Option<&str>) -> Option<String> {
+    let candidate = outcomes
         .iter()
-        .filter(|(_, ok)| *ok)
+        .take_while(|(_, ok)| *ok)
         .map(|(created, _)| created.as_str())
-        .max()
-        .map(str::to_string)
+        .filter(|created| !created.is_empty())
+        .last()?;
+    match current {
+        Some(current) if candidate <= current => None,
+        _ => Some(candidate.to_string()),
+    }
 }
 
 #[cfg(test)]
