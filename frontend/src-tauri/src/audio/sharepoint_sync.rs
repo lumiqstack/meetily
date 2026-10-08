@@ -295,18 +295,26 @@ fn has_media_extension(path: &str) -> bool {
     DIRECT_MEDIA_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
-/// Decode %XX sequences in a URL path component (no `+`-as-space).
+/// Decode %XX sequences in a URL path component (no `+`-as-space). Works on
+/// the bytes only: slicing the str after a `%` can split a multi-byte char.
 pub(crate) fn percent_decode_component(input: &str) -> String {
     let bytes = input.as_bytes();
+    let hex = |b: u8| match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => b - b'A' + 10,
+    };
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push((hex(bytes[i + 1]) << 4) | hex(bytes[i + 2]));
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
