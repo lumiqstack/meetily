@@ -55,19 +55,15 @@ impl State {
     }
 }
 
-fn state_path() -> PathBuf {
-    root().join(STATE_FILE)
-}
-
-fn load_state() -> State {
-    std::fs::read_to_string(state_path())
+fn load_state(root: &Path) -> State {
+    std::fs::read_to_string(root.join(STATE_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-fn save_state(state: &State) -> Result<()> {
-    let path = state_path();
+fn save_state(root: &Path, state: &State) -> Result<()> {
+    let path = root.join(STATE_FILE);
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
     std::fs::rename(&tmp, &path)?;
@@ -83,22 +79,32 @@ pub struct MigrationReport {
 
 /// Phase 1: move files. Returns immediately when no relocation is configured.
 pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
+    run_files_in(&legacy_root(), &root(), |payload| {
+        let _ = app.emit("storage-migration", payload);
+    })
+}
+
+/// [`run_files`] with the paths and event sink passed in, so the startup path can
+/// be exercised without a live `AppHandle` or the process-wide data root.
+fn run_files_in(
+    legacy: &Path,
+    root: &Path,
+    emit: impl Fn(serde_json::Value),
+) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
 
-    if !super::is_relocated() {
+    if root == legacy {
         return Ok(report);
     }
 
-    let legacy = legacy_root();
-    let root = root();
-    let mut state = load_state();
+    let mut state = load_state(root);
 
     log::info!(
         "Storage migration: {} -> {}",
         legacy.display(),
         root.display()
     );
-    let _ = app.emit("storage-migration", serde_json::json!({ "phase": "start" }));
+    emit(serde_json::json!({ "phase": "start" }));
 
     // Plain subdirectory moves, in increasing order of "how bad is it if this is
     // the step that gets interrupted".
@@ -106,14 +112,11 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
         if state.done(name) {
             continue;
         }
-        let _ = app.emit(
-            "storage-migration",
-            serde_json::json!({ "phase": "step", "step": name }),
-        );
+        emit(serde_json::json!({ "phase": "step", "step": name }));
         match move_tree(&legacy.join(name), &root.join(name), &mut report) {
             Ok(0) => {
                 state.mark(name);
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             // Some files stayed behind; retry on the next launch rather than
             // declaring the step done.
@@ -151,25 +154,22 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
         }
         if ok {
             state.mark("logs");
-            let _ = save_state(&state);
+            let _ = save_state(root, &state);
         }
     }
 
     if !state.done("recordings") {
-        let _ = app.emit(
-            "storage-migration",
-            serde_json::json!({ "phase": "step", "step": "recordings" }),
-        );
+        emit(serde_json::json!({ "phase": "step", "step": "recordings" }));
         match migrate_recordings(&legacy, &root, &mut state, &mut report) {
             Ok(true) => {
                 state.mark("recordings");
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             // Partial: state already holds old_recordings_root, so
             // rewrite_db_paths can repoint whatever did move, and the next
             // launch resumes the rest.
             Ok(false) => {
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             Err(e) => {
                 log::error!("Storage migration step 'recordings' failed: {:#}", e);
@@ -181,14 +181,11 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
     // The database goes last: it is the one file whose loss would be
     // unrecoverable, and by now everything it references has already moved.
     if !state.done("db") {
-        let _ = app.emit(
-            "storage-migration",
-            serde_json::json!({ "phase": "step", "step": "database" }),
-        );
+        emit(serde_json::json!({ "phase": "step", "step": "database" }));
         match migrate_database(&legacy, &root, &mut report) {
             Ok(()) => {
                 state.mark("db");
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             Err(e) => {
                 log::error!("Storage migration step 'db' failed: {:#}", e);
@@ -207,10 +204,7 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
             format!(" ({} step(s) skipped)", report.skipped.len())
         }
     );
-    let _ = app.emit(
-        "storage-migration",
-        serde_json::json!({ "phase": "complete", "report": &report }),
-    );
+    emit(serde_json::json!({ "phase": "complete", "report": &report }));
 
     Ok(report)
 }
@@ -224,7 +218,8 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
 /// at the destination. Idempotent, and safe to run on every launch until the
 /// move finishes.
 pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
-    let mut state = load_state();
+    let root = root();
+    let mut state = load_state(&root);
 
     if state.db_paths_rewritten {
         return Ok(0);
@@ -233,10 +228,10 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
         return Ok(0);
     };
 
-    let new_root = root().join("recordings");
+    let new_root = root.join("recordings");
     if old_root == new_root {
         state.db_paths_rewritten = true;
-        let _ = save_state(&state);
+        let _ = save_state(&root, &state);
         return Ok(0);
     }
 
@@ -289,7 +284,7 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
     } else if pending > 0 {
         log::info!("{} meeting folder path(s) still awaiting their files", pending);
     }
-    save_state(&state)?;
+    save_state(&root, &state)?;
 
     Ok(total)
 }
@@ -297,11 +292,15 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
 /// Windows paths compare case-insensitively; a stored path may differ in case
 /// from the one we computed (drive letter, OneDrive folder name).
 fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
-    }
-    let (head, rest) = value.split_at(prefix.len());
-    if head.eq_ignore_ascii_case(prefix) {
+    // `get` returns None off a char boundary, where slicing would panic.
+    let head = value.get(..prefix.len())?;
+    let rest = value.get(prefix.len()..)?;
+    // Whole path components only: "rec-old" is not inside "rec".
+    if head.eq_ignore_ascii_case(prefix)
+        && (rest.is_empty()
+            || rest.starts_with(['\\', '/'])
+            || prefix.ends_with(['\\', '/']))
+    {
         Some(rest)
     } else {
         None
@@ -494,7 +493,7 @@ fn migrate_recordings(
     // Persist first, and point the stored preference at the destination now so
     // new recordings land there even if this run only gets partway.
     state.old_recordings_root = Some(old_root.clone());
-    save_state(state)?;
+    save_state(root, state)?;
     if let Err(e) = rewrite_stored_recordings_folder(legacy, &new_root) {
         log::warn!("Could not update save_folder in recording_preferences.json: {:#}", e);
     }
@@ -503,7 +502,26 @@ fn migrate_recordings(
         return Ok(true);
     }
 
-    let failures = move_tree(&old_root, &new_root, report)?;
+    // The user-picked folder can hold unrelated files, so only Meetily's meeting
+    // folders move; everything else stays where it is.
+    let mut failures = 0;
+    for entry in std::fs::read_dir(&old_root)
+        .with_context(|| format!("reading {}", old_root.display()))?
+    {
+        let Ok(entry) = entry else {
+            failures += 1;
+            continue;
+        };
+        let from = entry.path();
+        // Never move a folder that contains the destination: that recurses into itself.
+        if !is_meeting_folder(&from) || new_root.starts_with(&from) {
+            continue;
+        }
+        failures += move_tree(&from, &new_root.join(entry.file_name()), report)?;
+    }
+    // Only succeeds when nothing unrelated was left behind.
+    let _ = std::fs::remove_dir(&old_root);
+
     if failures > 0 {
         log::warn!(
             "{} recording file(s) could not be moved yet — most likely OneDrive \
@@ -513,6 +531,15 @@ fn migrate_recordings(
         );
     }
     Ok(failures == 0)
+}
+
+/// Files a meeting folder holds (see recording_saver.rs), or `.checkpoints/` from
+/// builds that wrote incremental checkpoints.
+fn is_meeting_folder(dir: &Path) -> bool {
+    dir.is_dir()
+        && ["metadata.json", "transcripts.json", "audio.mp4", ".checkpoints"]
+            .iter()
+            .any(|f| dir.join(f).exists())
 }
 
 /// tauri-plugin-store keeps its files in app_data_dir under a flat key/value
@@ -936,5 +963,108 @@ mod tests {
         assert_eq!(value["preferences"]["save_folder"], r"D:\new");
         assert_eq!(value["preferences"]["auto_save"], false);
         assert_eq!(value["preferences"]["file_format"], "mp4");
+    }
+
+    /// H6-F5: `split_at` panics when `prefix.len()` lands inside a multibyte char.
+    /// "abó" is bytes [61 62 C3 B3]; prefix "abx" has len 3, which is inside ó.
+    #[test]
+    fn strip_prefix_ci_does_not_panic_on_multibyte_boundary() {
+        assert_eq!(strip_prefix_ci("abó", "abx"), None);
+    }
+
+    #[test]
+    fn strip_prefix_ci_requires_a_path_boundary() {
+        assert_eq!(strip_prefix_ci(r"D:\rec-old\M1", r"D:\rec"), None);
+        assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec"), Some(r"\M1"));
+    }
+
+    #[test]
+    fn strip_prefix_ci_accepts_a_prefix_ending_in_a_separator() {
+        assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec\"), Some("M1"));
+        assert_eq!(strip_prefix_ci("/Users/m/rec/M1", "/Users/m/rec/"), Some("M1"));
+    }
+
+    /// H6-F4: the user-picked recordings folder (save_folder) can hold unrelated
+    /// files; migrate_recordings moves every entry, not just meeting folders.
+    /// All paths are under a tempdir.
+    #[test]
+    fn recordings_migration_leaves_unrelated_files_in_place() {
+        let tmp = tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let _ = crate::storage::DATA_ROOT.set(data);
+        assert!(
+            root().starts_with(std::env::temp_dir()),
+            "refusing to run: root {} is not a temp dir",
+            root().display()
+        );
+
+        let legacy = tmp.path().join("legacy");
+        let old = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        write(&old.join("unrelated.txt"), b"not a meeting");
+        write(&old.join("Meeting_x/audio.mp4"), b"audio");
+
+        let mut state = State {
+            old_recordings_root: Some(old.clone()),
+            ..State::default()
+        };
+        let mut report = MigrationReport::default();
+        migrate_recordings(&legacy, &new_root, &mut state, &mut report)
+            .expect("migration setup: data root must be writable");
+
+        assert!(
+            old.join("unrelated.txt").exists(),
+            "unrelated file in the user's recordings folder was moved away"
+        );
+        assert_eq!(
+            std::fs::read(new_root.join("recordings/Meeting_x/audio.mp4")).unwrap(),
+            b"audio",
+            "meeting folder must move to <new>/recordings"
+        );
+    }
+
+    /// The destination can sit inside the folder being migrated (old/data). The
+    /// meeting folder must still end up under the new root exactly once.
+    #[test]
+    fn recordings_migration_never_recurses_into_its_own_destination() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let old = tmp.path().join("old");
+        let new_root = old.join("data");
+        std::fs::create_dir_all(&new_root).unwrap();
+        write(&old.join("Meeting_x/audio.mp4"), b"audio");
+
+        let mut state = State {
+            old_recordings_root: Some(old.clone()),
+            ..State::default()
+        };
+        let mut report = MigrationReport::default();
+        migrate_recordings(&legacy, &new_root, &mut state, &mut report).unwrap();
+
+        assert_eq!(
+            std::fs::read(new_root.join("recordings/Meeting_x/audio.mp4")).unwrap(),
+            b"audio"
+        );
+        assert_eq!(
+            count_files_named(tmp.path(), "audio.mp4"),
+            1,
+            "meeting folder must exist exactly once"
+        );
+    }
+
+    fn count_files_named(dir: &Path, name: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| {
+                if p.is_dir() {
+                    count_files_named(&p, name)
+                } else {
+                    usize::from(p.file_name().and_then(|n| n.to_str()) == Some(name))
+                }
+            })
+            .sum()
     }
 }
