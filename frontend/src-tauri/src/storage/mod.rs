@@ -366,6 +366,12 @@ fn set_root_in(legacy: &Path, current: &Path, path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // One move at a time: replacing previous_root, or the state file below,
+    // while an earlier move is unfinished would strand whatever it had left.
+    if let Some(reason) = migrate::unfinished_move(legacy, current) {
+        return Err(anyhow!(reason));
+    }
+
     // The data stays where it is until restart, so the root in effect now is
     // the one the next launch has to move from.
     let previous_root = (!same_dir(current, path)).then(|| current.to_path_buf());

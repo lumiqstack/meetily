@@ -27,6 +27,14 @@ use super::{legacy_root, read_pointer, root, same_dir, write_pointer};
 
 pub(super) const STATE_FILE: &str = ".migration-state.json";
 
+/// Every step of a move, in the order [`run_files_in`] runs them. The move is
+/// finished once all of them are recorded as done.
+const STEPS: [&str; 7] = ["bin", "sp-webview", "models", "config", "logs", "recordings", "db"];
+
+/// Settings files that lived in `dirs::config_dir()/meetily` before they moved
+/// under the data root.
+const CONFIG_FILES: [&str; 2] = ["notifications.json", "meeting_detection.json"];
+
 /// Above this size we verify by length alone. Hashing a 3 GB model file adds
 /// minutes to a startup that is already copying it once.
 const HASH_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
@@ -86,9 +94,16 @@ pub struct MigrationReport {
 
 /// Phase 1: move files. Returns immediately when no relocation is configured.
 pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
-    run_files_in(&legacy_root(), &root(), legacy_logs_dir(), |payload| {
+    let report = run_files_in(&legacy_root(), &root(), legacy_logs_dir(), |payload| {
         let _ = app.emit("storage-migration", payload);
-    })
+    });
+    // After the move, so the files land in the root's config folder wherever
+    // that now is. Runs whether or not a root was ever chosen.
+    migrate_old_config(
+        dirs::config_dir().map(|d| d.join("meetily")).as_deref(),
+        &root().join("config"),
+    );
+    report
 }
 
 /// [`run_files`] with the paths and event sink passed in, so the startup path can
@@ -141,7 +156,7 @@ fn run_files_in(
 
     // Plain subdirectory moves, in increasing order of "how bad is it if this is
     // the step that gets interrupted".
-    for name in ["bin", "sp-webview", "models"] {
+    for name in ["bin", "sp-webview", "models", "config"] {
         if state.done(name) {
             continue;
         }
@@ -227,10 +242,7 @@ fn run_files_in(
         }
     }
 
-    if ["bin", "sp-webview", "models", "logs", "recordings", "db"]
-        .iter()
-        .all(|step| state.done(step))
-    {
+    if STEPS.iter().all(|step| state.done(step)) {
         let _ = clear_previous_root(legacy);
     }
 
@@ -249,7 +261,92 @@ fn run_files_in(
     Ok(report)
 }
 
-fn migrate_old_config(_old: Option<&Path>, _new: &Path) {}
+/// Bring settings from `dirs::config_dir()/meetily` into `<root>/config`.
+///
+/// Only fills in files that are missing at the new location: one that exists
+/// there was written by this version and is newer than the old copy. `old` is a
+/// parameter so tests never reach the real user's config folder.
+fn migrate_old_config(old: Option<&Path>, new: &Path) {
+    let Some(old) = old else { return };
+    if same_dir(old, new) {
+        return;
+    }
+    let mut report = MigrationReport::default();
+    for name in CONFIG_FILES {
+        let (from, to) = (old.join(name), new.join(name));
+        if !from.is_file() || to.exists() {
+            continue;
+        }
+        match move_file(&from, &to, &mut report) {
+            Ok(()) => log::info!("Moved {} to {}", from.display(), to.display()),
+            Err(e) => log::warn!("Could not move {}: {:#}", from.display(), e),
+        }
+    }
+    // Only succeeds once nothing is left in it.
+    let _ = std::fs::remove_dir(old);
+}
+
+/// Describe an earlier move that has not finished, or `None` when the data is
+/// settled in `current`, the root this process is using.
+///
+/// Starting another move on top of an unfinished one would lose track of it:
+/// the pointer holds a single `previous_root`, and the state file in `current`
+/// holds the only record of which meetings still point at the old recordings
+/// folder. So a new root is refused until this returns `None`.
+pub(super) fn unfinished_move(legacy: &Path, current: &Path) -> Option<String> {
+    // previous_root equal to the live root is a request nothing has acted on
+    // yet (the move runs at the next launch); replacing it loses nothing.
+    if let Some(previous) = read_pointer(legacy)
+        .and_then(|p| p.previous_root)
+        .filter(|p| !same_dir(p, current))
+    {
+        return Some(format!(
+            "Meetily has not finished moving your data from {} to {}. Restart Meetily \
+             to let the move finish, then choose the new location. If it still does not \
+             finish, make sure every file in {} is available on this computer (for \
+             OneDrive, \"Always keep on this device\").",
+            previous.display(),
+            current.display(),
+            previous.display()
+        ));
+    }
+
+    if !current.join(STATE_FILE).exists() {
+        return None;
+    }
+    let state = load_state(current);
+    // A move recorded before the pointer kept previous_root.
+    let files_pending = !STEPS.iter().all(|step| state.done(step));
+    let paths_pending = state.old_recordings_root.is_some() && !state.db_paths_rewritten;
+    if !files_pending && !paths_pending {
+        return None;
+    }
+    let from = state
+        .source
+        .as_deref()
+        .or(state.old_recordings_root.as_deref())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "its previous location".into());
+    Some(if files_pending {
+        format!(
+            "Meetily has not finished moving your data from {} to {}. Restart Meetily \
+             to let the move finish, then choose the new location.",
+            from,
+            current.display()
+        )
+    } else {
+        format!(
+            "Meetily has moved your data to {} but some meetings still point at {}. \
+             Restart Meetily to let it update them, then choose the new location. If it \
+             still does not finish, make sure every meeting folder in {} is available \
+             on this computer.",
+            current.display(),
+            from,
+            from
+        )
+    })
+}
+
 
 /// Forget a finished move so later launches do not run it again.
 fn clear_previous_root(legacy: &Path) -> Result<()> {
@@ -324,8 +421,13 @@ async fn rewrite_db_paths_in(pool: &SqlitePool, legacy: &Path, root: &Path) -> R
             };
             let candidate = new_root.join(rest.trim_start_matches(['\\', '/']));
             if !candidate.exists() {
-                pending += 1;
-                continue; // Not moved yet — leave it pointing at the old copy.
+                // Not moved yet — leave it pointing at the old copy. A folder that
+                // exists at neither end will never arrive, so it is not waited on:
+                // that would keep the rewrite, and every later root change, pending.
+                if Path::new(&folder).exists() {
+                    pending += 1;
+                }
+                continue;
             }
 
             let update = format!("UPDATE {table} SET folder_path = ?1 WHERE rowid = ?2");
