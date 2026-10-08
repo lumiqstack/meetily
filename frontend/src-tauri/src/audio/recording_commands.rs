@@ -227,7 +227,10 @@ async fn is_realtime_transcription_enabled<R: Runtime>(app: &AppHandle<R>) -> bo
 
 /// Register the `transcript-update` listener that persists each segment into
 /// the active recording manager's history.
-fn register_transcript_listener<R: Runtime>(app: &AppHandle<R>) -> tauri::EventId {
+fn register_transcript_listener<R: Runtime>(
+    app: &AppHandle<R>,
+    transcript_sink: crate::audio::recording_saver::TranscriptSink,
+) -> tauri::EventId {
     use tauri::Listener;
     app.listen("transcript-update", move |event: tauri::Event| {
         // Parse the transcript update from the event payload
@@ -245,12 +248,9 @@ fn register_transcript_listener<R: Runtime>(app: &AppHandle<R>) -> tauri::EventI
                 speaker: update.speaker.clone(),
             };
 
-            // Save to recording manager
-            if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                if let Some(manager) = manager_guard.as_ref() {
-                    manager.add_transcript_segment(segment);
-                }
-            }
+            // Captured at registration: stop_recording empties RECORDING_MANAGER
+            // before the transcription drain, and segments emitted then must be kept.
+            transcript_sink.add_segment(segment);
         }
     })
 }
@@ -554,6 +554,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let device_event_receiver = manager.take_device_event_receiver();
     let session = manager.get_state().clone();
 
+    let transcript_sink = manager.transcript_sink();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -590,7 +592,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         // This enables transcript history persistence for page reload sync
         // Store listener ID for cleanup during stop_recording to ensure microphone is released
         {
-            let listener_id = register_transcript_listener(&app);
+            let listener_id = register_transcript_listener(&app, transcript_sink);
             let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
             *global_listener = Some(listener_id);
             info!("✅ Transcript-update event listener registered for history persistence");
@@ -752,6 +754,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let device_event_receiver = manager.take_device_event_receiver();
     let session = manager.get_state().clone();
 
+    let transcript_sink = manager.transcript_sink();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -788,7 +792,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         // This enables transcript history persistence for page reload sync
         // Store listener ID for cleanup during stop_recording to ensure microphone is released
         {
-            let listener_id = register_transcript_listener(&app);
+            let listener_id = register_transcript_listener(&app, transcript_sink);
             let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
             *global_listener = Some(listener_id);
             info!("✅ Transcript-update event listener registered for history persistence");
@@ -1998,8 +2002,10 @@ mod transcript_listener_tests {
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
 
-        *RECORDING_MANAGER.lock().unwrap() = Some(RecordingManager::new());
-        let listener_id = register_transcript_listener(&handle);
+        let manager = RecordingManager::new();
+        let transcript_sink = manager.transcript_sink();
+        *RECORDING_MANAGER.lock().unwrap() = Some(manager);
+        let listener_id = register_transcript_listener(&handle, transcript_sink);
 
         let taken = RECORDING_MANAGER
             .lock()
