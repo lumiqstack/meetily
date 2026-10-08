@@ -78,6 +78,12 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
 }, ref) => {
   const { format, data } = detectSummaryFormat(summaryData);
   const [isDirty, setIsDirty] = useState(false);
+  // The dirty flag can also be set by BlockNote normalizing loaded content, so the
+  // unmount autosave additionally requires real input from the user.
+  const userEditedRef = useRef(false);
+  const markUserEdit = useCallback(() => {
+    userEditedRef.current = true;
+  }, []);
   const [currentBlocks, setCurrentBlocks] = useState<Block[]>([]);
   const [isSaving, setIsSaving] = useState(false);
   const isContentLoaded = useRef(false);
@@ -176,7 +182,7 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
   useEffect(() => {
     return () => {
       const { isDirty: dirtyOnExit, handleSave: saveOnExit } = unmountSaveRef.current;
-      if (!dirtyOnExit) return;
+      if (!dirtyOnExit || !userEditedRef.current) return;
       saveOnExit().catch((error) => {
         toast.error('Failed to save changes', { description: String(error) });
       });
@@ -255,7 +261,13 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
   if (format === 'blocknote') {
     console.log('🎨 Rendering BLOCKNOTE format (direct)');
     return (
-      <div className="flex flex-col w-full">
+      <div
+        className="flex flex-col w-full"
+        onKeyDownCapture={markUserEdit}
+        onPasteCapture={markUserEdit}
+        onCutCapture={markUserEdit}
+        onDropCapture={markUserEdit}
+      >
         <div className="w-full">
           <Editor
             initialContent={data.summary_json}
@@ -274,7 +286,13 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
   if (format === 'markdown') {
     console.log('🎨 Rendering MARKDOWN format (parsed to BlockNote)');
     return (
-      <div className="flex flex-col w-full">
+      <div
+        className="flex flex-col w-full"
+        onKeyDownCapture={markUserEdit}
+        onPasteCapture={markUserEdit}
+        onCutCapture={markUserEdit}
+        onDropCapture={markUserEdit}
+      >
         <div className="w-full">
           <BlockNoteView
             editor={editor}

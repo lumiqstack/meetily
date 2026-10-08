@@ -81,6 +81,10 @@ async function mountSummary() {
 
 async function editSummary() {
   await act(async () => {
+    renderer!.root
+      .find((node) => typeof node.props.onKeyDownCapture === 'function')
+      .props.onKeyDownCapture();
+
     emitEditorChange!([{ ...summaryBlocks[0], content: [{ type: 'text', text: 'edited', styles: {} }] }]);
   });
 }
