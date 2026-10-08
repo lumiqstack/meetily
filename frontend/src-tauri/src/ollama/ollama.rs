@@ -270,19 +270,13 @@ pub async fn pull_ollama_model<R: Runtime>(
     model_name: String,
     endpoint: Option<String>,
 ) -> Result<(), String> {
-    // Check if model is already being downloaded
+    // Check and mark under one write lock so two concurrent pulls cannot both pass the check.
     {
-        let downloading = DOWNLOADING_MODELS.read().await;
-        if downloading.contains(&model_name) {
+        let mut downloading = DOWNLOADING_MODELS.write().await;
+        if !downloading.insert(model_name.clone()) {
             log::warn!("Model {} is already being downloaded, ignoring duplicate request", model_name);
             return Err(format!("Model {} is already being downloaded", model_name));
         }
-    }
-
-    // Mark model as downloading
-    {
-        let mut downloading = DOWNLOADING_MODELS.write().await;
-        downloading.insert(model_name.clone());
         log::info!("Started download tracking for model: {}", model_name);
     }
 
