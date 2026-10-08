@@ -36,7 +36,7 @@ const ENV_OVERRIDE: &str = "MEETILY_DATA_DIR";
 /// lived historically. Kept separately from [`DATA_ROOT`] because the migration
 /// needs to know where to move things *from*.
 static LEGACY_ROOT: OnceLock<PathBuf> = OnceLock::new();
-static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+pub(crate) static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Pointer {

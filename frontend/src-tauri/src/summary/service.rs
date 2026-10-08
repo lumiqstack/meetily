@@ -351,7 +351,7 @@ impl SummaryService {
         }
     }
 
-    async fn read_detected_summary_language(
+    pub(crate) async fn read_detected_summary_language(
         pool: &SqlitePool,
         meeting_id: &str,
     ) -> Option<String> {
@@ -386,7 +386,7 @@ impl SummaryService {
         }
     }
 
-    fn detect_summary_language_from_text(text: &str) -> Option<String> {
+    pub(crate) fn detect_summary_language_from_text(text: &str) -> Option<String> {
         let transcript_texts = [text.to_string()];
         let detection = detect_summary_language(&transcript_texts);
         match &detection.language {

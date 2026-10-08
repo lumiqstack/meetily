@@ -68,7 +68,9 @@ pub async fn run_transcribe_stage<R: Runtime>(
         app.clone(),
         meeting_id.to_string(),
         folder_path.to_string(),
-        None,
+        // The same preference live transcription uses, so an automatic run
+        // honours the language the user chose.
+        crate::get_language_preference_internal(),
         config.model.clone(),
         config.provider.clone(),
         // The automatic pipeline does not ask for diarization; the user opts

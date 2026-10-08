@@ -185,13 +185,7 @@ fn sanitize_filename(input: &str) -> String {
         .to_string();
 
     if filename.len() > MAX_SANITIZED_FILENAME_BYTES {
-        // `String::truncate` panics inside a multi-byte character, so back
-        // off to the nearest char boundary first (accented/CJK/emoji titles).
-        let mut end = MAX_SANITIZED_FILENAME_BYTES;
-        while !filename.is_char_boundary(end) {
-            end -= 1;
-        }
-        filename.truncate(end);
+        crate::utils::truncate_to_char_boundary(&mut filename, MAX_SANITIZED_FILENAME_BYTES);
         filename = filename.trim_matches(['.', ' ', '-']).to_string();
     }
 

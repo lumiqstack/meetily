@@ -353,11 +353,15 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
 /// Windows paths compare case-insensitively; a stored path may differ in case
 /// from the one we computed (drive letter, OneDrive folder name).
 fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
-    }
-    let (head, rest) = value.split_at(prefix.len());
-    if head.eq_ignore_ascii_case(prefix) {
+    // `get` returns None off a char boundary, where slicing would panic.
+    let head = value.get(..prefix.len())?;
+    let rest = value.get(prefix.len()..)?;
+    // Whole path components only: "rec-old" is not inside "rec".
+    if head.eq_ignore_ascii_case(prefix)
+        && (rest.is_empty()
+            || rest.starts_with(['\\', '/'])
+            || prefix.ends_with(['\\', '/']))
+    {
         Some(rest)
     } else {
         None
@@ -566,7 +570,26 @@ fn migrate_recordings(
         return Ok(true);
     }
 
-    let failures = move_tree(&old_root, &new_root, report)?;
+    // The user-picked folder can hold unrelated files, so only Meetily's meeting
+    // folders move; everything else stays where it is.
+    let mut failures = 0;
+    for entry in std::fs::read_dir(&old_root)
+        .with_context(|| format!("reading {}", old_root.display()))?
+    {
+        let Ok(entry) = entry else {
+            failures += 1;
+            continue;
+        };
+        let from = entry.path();
+        // Never move a folder that contains the destination: that recurses into itself.
+        if !is_meeting_folder(&from) || new_root.starts_with(&from) {
+            continue;
+        }
+        failures += move_tree(&from, &new_root.join(entry.file_name()), report)?;
+    }
+    // Only succeeds when nothing unrelated was left behind.
+    let _ = std::fs::remove_dir(&old_root);
+
     if failures > 0 {
         log::warn!(
             "{} recording file(s) could not be moved yet — most likely OneDrive \
@@ -576,6 +599,15 @@ fn migrate_recordings(
         );
     }
     Ok(failures == 0)
+}
+
+/// Files a meeting folder holds (see recording_saver.rs), or `.checkpoints/` from
+/// builds that wrote incremental checkpoints.
+fn is_meeting_folder(dir: &Path) -> bool {
+    dir.is_dir()
+        && ["metadata.json", "transcripts.json", "audio.mp4", ".checkpoints"]
+            .iter()
+            .any(|f| dir.join(f).exists())
 }
 
 /// tauri-plugin-store keeps its files in app_data_dir under a flat key/value
@@ -697,6 +729,12 @@ fn move_file(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
         return Ok(());
     }
 
+    // Same file under another spelling (symlink, alias): the "already copied"
+    // branch below would verify it equal to itself and delete the only copy.
+    if same_file(src, dst) {
+        return Ok(());
+    }
+
     let len = std::fs::metadata(src)?.len();
 
     // Resuming a previous run: the destination may already hold a good copy.
@@ -740,6 +778,14 @@ fn move_file(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
     report.bytes_moved += len;
     log::info!("Moved {} ({:.1} MB)", dst.display(), len as f64 / (1024.0 * 1024.0));
     Ok(())
+}
+
+/// True only when both paths exist and resolve to the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Length always; SHA-256 as well for anything small enough that hashing is not
@@ -810,6 +856,33 @@ mod tests {
 
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"same");
+    }
+
+    #[test]
+    fn move_file_onto_itself_keeps_the_file() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("meeting_minutes.sqlite");
+        write(&src, b"only copy");
+
+        let mut report = MigrationReport::default();
+        move_file(&src, &src, &mut report).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"only copy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_file_onto_a_symlink_to_itself_keeps_the_file() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("meeting_minutes.sqlite");
+        let alias = dir.path().join("alias.sqlite");
+        write(&src, b"only copy");
+        std::os::unix::fs::symlink(&src, &alias).unwrap();
+
+        let mut report = MigrationReport::default();
+        move_file(&src, &alias, &mut report).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"only copy");
     }
 
     #[test]
@@ -1002,8 +1075,109 @@ mod tests {
         assert_eq!(value["preferences"]["file_format"], "mp4");
     }
 
-    /// H6-F3: switching the data root a second time must migrate from the root
-    /// the user switched away from (root1), not from the legacy directory.
+    /// H6-F5: `split_at` panics when `prefix.len()` lands inside a multibyte char.
+    /// "abó" is bytes [61 62 C3 B3]; prefix "abx" has len 3, which is inside ó.
+    #[test]
+    fn strip_prefix_ci_does_not_panic_on_multibyte_boundary() {
+        assert_eq!(strip_prefix_ci("abó", "abx"), None);
+    }
+
+    #[test]
+    fn strip_prefix_ci_requires_a_path_boundary() {
+        assert_eq!(strip_prefix_ci(r"D:\rec-old\M1", r"D:\rec"), None);
+        assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec"), Some(r"\M1"));
+    }
+
+    #[test]
+    fn strip_prefix_ci_accepts_a_prefix_ending_in_a_separator() {
+        assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec\"), Some("M1"));
+        assert_eq!(strip_prefix_ci("/Users/m/rec/M1", "/Users/m/rec/"), Some("M1"));
+    }
+
+    /// H6-F4: the user-picked recordings folder (save_folder) can hold unrelated
+    /// files; migrate_recordings moves every entry, not just meeting folders.
+    /// All paths are under a tempdir.
+    #[test]
+    fn recordings_migration_leaves_unrelated_files_in_place() {
+        let tmp = tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let _ = crate::storage::DATA_ROOT.set(data);
+        assert!(
+            root().starts_with(std::env::temp_dir()),
+            "refusing to run: root {} is not a temp dir",
+            root().display()
+        );
+
+        let legacy = tmp.path().join("legacy");
+        let old = tmp.path().join("old");
+        let new_root = tmp.path().join("new");
+        std::fs::create_dir_all(&new_root).unwrap();
+        write(&old.join("unrelated.txt"), b"not a meeting");
+        write(&old.join("Meeting_x/audio.mp4"), b"audio");
+
+        let mut state = State {
+            old_recordings_root: Some(old.clone()),
+            ..State::default()
+        };
+        let mut report = MigrationReport::default();
+        migrate_recordings(&legacy, &legacy, &new_root, &mut state, &mut report)
+            .expect("migration setup: data root must be writable");
+
+        assert!(
+            old.join("unrelated.txt").exists(),
+            "unrelated file in the user's recordings folder was moved away"
+        );
+        assert_eq!(
+            std::fs::read(new_root.join("recordings/Meeting_x/audio.mp4")).unwrap(),
+            b"audio",
+            "meeting folder must move to <new>/recordings"
+        );
+    }
+
+    /// The destination can sit inside the folder being migrated (old/data). The
+    /// meeting folder must still end up under the new root exactly once.
+    #[test]
+    fn recordings_migration_never_recurses_into_its_own_destination() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let old = tmp.path().join("old");
+        let new_root = old.join("data");
+        std::fs::create_dir_all(&new_root).unwrap();
+        write(&old.join("Meeting_x/audio.mp4"), b"audio");
+
+        let mut state = State {
+            old_recordings_root: Some(old.clone()),
+            ..State::default()
+        };
+        let mut report = MigrationReport::default();
+        migrate_recordings(&legacy, &legacy, &new_root, &mut state, &mut report).unwrap();
+
+        assert_eq!(
+            std::fs::read(new_root.join("recordings/Meeting_x/audio.mp4")).unwrap(),
+            b"audio"
+        );
+        assert_eq!(
+            count_files_named(tmp.path(), "audio.mp4"),
+            1,
+            "meeting folder must exist exactly once"
+        );
+    }
+
+    fn count_files_named(dir: &Path, name: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| {
+                if p.is_dir() {
+                    count_files_named(&p, name)
+                } else {
+                    usize::from(p.file_name().and_then(|n| n.to_str()) == Some(name))
+                }
+            })
+            .sum()
+    }
+
     #[test]
     fn first_move_archives_logs_from_the_given_platform_log_dir() {
         let tmp = tempdir().unwrap();
@@ -1019,6 +1193,8 @@ mod tests {
         assert!(!platform_logs.join("meetily.log").exists());
     }
 
+    /// H6-F3: switching the data root a second time must migrate from the root
+    /// the user switched away from (root1), not from the legacy directory.
     #[test]
     fn second_root_change_migrates_the_database_from_the_previous_root() {
         let tmp = tempdir().unwrap();
