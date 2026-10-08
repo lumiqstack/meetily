@@ -932,4 +932,29 @@ mod tests {
         assert_eq!(value["preferences"]["auto_save"], false);
         assert_eq!(value["preferences"]["file_format"], "mp4");
     }
+
+    /// H6-F3: switching the data root a second time must migrate from the root
+    /// the user switched away from (root1), not from the legacy directory.
+    #[test]
+    fn second_root_change_migrates_the_database_from_the_previous_root() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(&root1.join("meeting_minutes.sqlite"), b"meetings");
+        // The pointer as set_root() leaves it when root2 is picked while root1 is live.
+        write(
+            &legacy.join(crate::storage::POINTER_FILE),
+            serde_json::json!({ "data_root": root2, "previous_root": root1 })
+                .to_string()
+                .as_bytes(),
+        );
+
+        run_files_in(&legacy, &root2, |_| {}).unwrap();
+
+        assert!(
+            root2.join("meeting_minutes.sqlite").exists(),
+            "database was left at the previous data root"
+        );
+    }
 }
