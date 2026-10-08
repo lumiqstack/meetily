@@ -1664,19 +1664,22 @@ pub async fn start_import_from_url_command<R: Runtime>(
         super::job_persistence::try_clear_job(&app_task, &id_task).await;
 
         if let Err(e) = result {
-            error!("URL import {} failed: {}", id_task, e);
-            // The import pipeline (once reached) emits its own import-error and
-            // journals cleanup, and always returns Ok here, so this emit covers
-            // only pre-pipeline failures (auth/download/engine acquisition).
-            // A user cancel is emitted too: the frontend job stays in
-            // 'cancelling' until an import-error arrives to end it.
-            let _ = app_task.emit(
-                "import-error",
-                ImportError {
-                    import_id: id_task.clone(),
-                    error: e.to_string(),
-                },
-            );
+            error!("URL import {} failed: {:#}", id_task, match &e {
+                UrlImportError::BeforePipeline(e) | UrlImportError::InPipeline(e) => e,
+            });
+            // The pipeline (once reached) emits its own import-error, so this
+            // emit covers only pre-pipeline failures (auth/download/engine
+            // acquisition). A user cancel is emitted too: the frontend job
+            // stays in 'cancelling' until an import-error arrives to end it.
+            if needs_import_error_event(&e) {
+                let _ = app_task.emit(
+                    "import-error",
+                    ImportError {
+                        import_id: id_task.clone(),
+                        error: e.into_inner().to_string(),
+                    },
+                );
+            }
         }
     });
 
@@ -1727,13 +1730,45 @@ pub async fn import_from_url_internal<R: Runtime>(
     // survive to be reported as interrupted on the next launch.
     super::job_persistence::try_clear_job(&app, &import_id).await;
 
-    result
+    result.map_err(UrlImportError::into_inner)
+}
+
+/// Why a URL import failed, and who has already told the user.
+#[derive(Debug)]
+enum UrlImportError {
+    /// Failed before the shared import pipeline took over (sign-in, download,
+    /// cancel, engine acquisition). Nothing has been reported yet.
+    BeforePipeline(anyhow::Error),
+    /// The pipeline ran and failed. It already emitted `import-error`.
+    InPipeline(anyhow::Error),
+}
+
+impl From<anyhow::Error> for UrlImportError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::BeforePipeline(e)
+    }
+}
+
+impl UrlImportError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::BeforePipeline(e) | Self::InPipeline(e) => e,
+        }
+    }
+}
+
+/// Whether the caller must emit `import-error`: the frontend's error handler
+/// is not idempotent, so a failure the pipeline already reported must not be
+/// emitted a second time.
+fn needs_import_error_event(error: &UrlImportError) -> bool {
+    matches!(error, UrlImportError::BeforePipeline(_))
 }
 
 /// Orchestrate a URL import: authenticate → download → hand off to the shared
-/// import pipeline. Returns `Ok(())` once the download has been handed to the
-/// pipeline (which then owns success/error reporting); returns `Err` only for
-/// failures that occur before the pipeline takes over.
+/// import pipeline. Returns `Ok(())` once the pipeline has imported the
+/// recording. A failure before the hand-off is `BeforePipeline` (nobody has
+/// told the user); a pipeline failure is `InPipeline` (it already emitted
+/// `import-error`).
 #[allow(clippy::too_many_arguments)]
 async fn run_url_import<R: Runtime>(
     app: AppHandle<R>,
@@ -1747,7 +1782,7 @@ async fn run_url_import<R: Runtime>(
     meeting_date: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
     auth_mode: super::sharepoint::AuthMode,
-) -> Result<()> {
+) -> Result<(), UrlImportError> {
     use super::{sharepoint, url_import, ytdlp};
 
     // The downloaded file may not keep the recording's name, so date the
@@ -1827,7 +1862,7 @@ async fn run_url_import<R: Runtime>(
         )
         .await?;
         if cancel.is_cancelled() {
-            return Err(anyhow!("Import cancelled"));
+            return Err(anyhow!("Import cancelled").into());
         }
         let cookies = auth
             .host_cookies
@@ -1872,7 +1907,7 @@ async fn run_url_import<R: Runtime>(
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&work_dir);
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
@@ -1896,14 +1931,14 @@ async fn run_url_import<R: Runtime>(
                 Ok(a) => a,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&work_dir);
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         };
 
         if cancel.is_cancelled() {
             auth.cleanup();
-            return Err(anyhow!("Import cancelled"));
+            return Err(anyhow!("Import cancelled").into());
         }
 
         // Phase 2: locate yt-dlp (downloaded on first use).
@@ -1912,7 +1947,7 @@ async fn run_url_import<R: Runtime>(
             Ok(p) => p,
             Err(e) => {
                 auth.cleanup();
-                return Err(e);
+                return Err(e.into());
             }
         };
         let ffmpeg_path = super::ffmpeg::find_ffmpeg_path();
@@ -1924,7 +1959,7 @@ async fn run_url_import<R: Runtime>(
                 run_transcript_import(&app, &import_id, &ytdlp_url, &title, meeting_date.as_deref(), &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
                     .await;
             auth.cleanup();
-            return result;
+            return result.map_err(Into::into);
         }
 
         // Phase 3: download into a dedicated working directory. Progress is
@@ -1959,7 +1994,7 @@ async fn run_url_import<R: Runtime>(
             Ok(p) => p,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&work_dir);
-                return Err(e);
+                return Err(e.into());
             }
         }
     };
@@ -1987,13 +2022,13 @@ async fn hand_off_to_pipeline<R: Runtime>(
     meeting_date: Option<String>,
     media_path: PathBuf,
     work_dir: PathBuf,
-) -> Result<()> {
+) -> Result<(), UrlImportError> {
     let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = match IMPORT_JOBS.acquire(import_id.clone(), use_remote) {
         Ok(g) => g,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&work_dir);
-            return Err(anyhow!(e));
+            return Err(anyhow!(e).into());
         }
     };
 
@@ -2001,7 +2036,7 @@ async fn hand_off_to_pipeline<R: Runtime>(
     URL_DOWNLOADS.remove(&import_id);
 
     let media_path_str = media_path.to_string_lossy().to_string();
-    let _ = start_import_with_guard(
+    let result = start_import_with_guard(
         app.clone(),
         import_id.clone(),
         media_path_str,
@@ -2017,7 +2052,7 @@ async fn hand_off_to_pipeline<R: Runtime>(
     .await;
 
     let _ = std::fs::remove_dir_all(&work_dir);
-    Ok(())
+    result.map(|_| ()).map_err(UrlImportError::InPipeline)
 }
 
 /// Build a meeting directly from a Teams transcript (VTT) — no audio download,
@@ -2388,7 +2423,19 @@ mod tests {
             work_dir.path().join("work"),
         )
         .await;
-        assert!(result.is_err(), "pipeline failure was reported as success");
+        assert!(
+            matches!(result, Err(UrlImportError::InPipeline(_))),
+            "expected InPipeline failure, got {result:?}"
+        );
+    }
+
+    /// The manual wrapper emits `import-error` only for failures the pipeline
+    /// has not already reported (the frontend handler is not idempotent).
+    #[test]
+    fn import_error_event_is_emitted_only_for_pre_pipeline_failures() {
+        assert!(needs_import_error_event(&UrlImportError::BeforePipeline(anyhow!("download failed"))));
+        assert!(needs_import_error_event(&UrlImportError::BeforePipeline(anyhow!("Import cancelled"))));
+        assert!(!needs_import_error_event(&UrlImportError::InPipeline(anyhow!("decode failed"))));
     }
 
     /// H4-F4: a local import whose decode fails after the audio copy must not
