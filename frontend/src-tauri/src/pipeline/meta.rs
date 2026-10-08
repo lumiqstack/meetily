@@ -386,6 +386,48 @@ mod tests {
         assert!(!load(&pool, "m-retry").await.unwrap().suppressed());
     }
 
+    const TRANSCRIBE_TIMEOUT_ERROR: &str = "Remote transcription request timed out";
+    const TRANSCRIBE_TIMEOUT_REASON: &str =
+        "Transcription timed out 3 times. Check the transcription provider, then retry.";
+
+    #[tokio::test]
+    async fn three_consecutive_transcription_timeouts_suppress_with_a_transcription_reason() {
+        let pool = test_pool().await;
+        for _ in 0..3 {
+            record_failure(
+                &pool,
+                "m-transcribe-timeout",
+                "transcribe",
+                TRANSCRIBE_TIMEOUT_ERROR,
+                FailureKind::Timeout,
+                3,
+            )
+            .await;
+        }
+        let row = load(&pool, "m-transcribe-timeout").await.unwrap();
+        assert!(row.suppressed(), "three transcription timeouts must suppress");
+        assert_eq!(row.last_error.as_deref(), Some(TRANSCRIBE_TIMEOUT_REASON));
+    }
+
+    /// `pipeline_meta` is keyed by meeting alone, so the timeout run is shared
+    /// across stages: two transcription timeouts followed by one summary
+    /// timeout suppress the meeting, and the reason names the stage of the
+    /// timeout that tripped the limit.
+    #[tokio::test]
+    async fn timeout_runs_are_counted_per_meeting_across_stages() {
+        let pool = test_pool().await;
+        for _ in 0..2 {
+            record_failure(&pool, "m-mixed", "transcribe", TRANSCRIBE_TIMEOUT_ERROR, FailureKind::Timeout, 3)
+                .await;
+        }
+        assert!(!load(&pool, "m-mixed").await.unwrap().suppressed());
+
+        record_failure(&pool, "m-mixed", "summarize", TIMEOUT_ERROR, FailureKind::Timeout, 3).await;
+        let row = load(&pool, "m-mixed").await.unwrap();
+        assert!(row.suppressed());
+        assert_eq!(row.last_error.as_deref(), Some(TIMEOUT_REASON));
+    }
+
     #[tokio::test]
     async fn success_clears_previous_failures() {
         let pool = test_pool().await;
