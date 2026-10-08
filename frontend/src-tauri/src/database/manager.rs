@@ -1,7 +1,8 @@
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
-use sqlx::{migrate::MigrateDatabase, Result, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::migrate::{MigrateDatabase, Migrator};
+use sqlx::{Result, Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -9,6 +10,13 @@ use std::time::Duration;
 const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION: i64 = 20260618000000;
 const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION: &str =
     "add cloud transcript provider keys";
+/// Name prefix for a legacy column parked while migrations run; see
+/// `park_legacy_columns_that_migrations_add`.
+const PARKED_COLUMN_PREFIX: &str = "__legacy_park_";
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 #[derive(Clone)]
 pub struct DatabaseManager {
@@ -56,7 +64,12 @@ impl DatabaseManager {
 
         let initialized = async {
             Self::reconcile_orphaned_cloud_transcript_provider_migration(&pool).await?;
-            sqlx::migrate!("./migrations").run(&pool).await?;
+            let migrator = sqlx::migrate!("./migrations");
+            if !Self::table_exists(&pool, "_sqlx_migrations").await? {
+                Self::park_legacy_columns_that_migrations_add(&pool, &migrator).await?;
+            }
+            migrator.run(&pool).await?;
+            Self::restore_parked_legacy_columns(&pool).await?;
             Self::ensure_cloud_transcript_provider_columns(&pool).await
         }
         .await;
@@ -249,6 +262,133 @@ impl DatabaseManager {
         Self::ensure_transcript_settings_column(pool, "openRouterApiKey", "TEXT").await?;
 
         Ok(())
+    }
+
+    /// Databases written by the archived Python backend (backend/app/db.py
+    /// `_legacy_init_db`) have no `_sqlx_migrations` table, so sqlx runs every
+    /// migration on them. Some migrations `ADD COLUMN` a column the backend
+    /// already created (e.g. `meetings.folder_path`), and that statement fails
+    /// with "duplicate column name" on every launch.
+    ///
+    /// The colliding columns are renamed out of the way before migrating and
+    /// copied back afterwards. A rename keeps the values in the file, so a
+    /// migration that fails leaves them recoverable; the next successful open
+    /// restores them. The migration files themselves are never touched.
+    async fn park_legacy_columns_that_migrations_add(
+        pool: &SqlitePool,
+        migrator: &Migrator,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        for (table, column) in Self::migration_added_columns(migrator) {
+            if !Self::table_columns(&mut *tx, &table)
+                .await?
+                .contains(&column)
+            {
+                continue;
+            }
+            log::warn!(
+                "Legacy database already has {}.{}; parking it so migrations can add it",
+                table,
+                column
+            );
+            let parked = format!("{PARKED_COLUMN_PREFIX}{column}");
+            sqlx::query(&format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                quote_identifier(&table),
+                quote_identifier(&column),
+                quote_identifier(&parked)
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Copy every parked column back into the column a migration re-added, then
+    /// drop the parked copy. Runs after each successful migration pass, so it
+    /// also finishes a restore that an earlier failed open left behind.
+    async fn restore_parked_legacy_columns(pool: &SqlitePool) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&mut *tx)
+                .await?;
+        for table in tables {
+            let columns = Self::table_columns(&mut *tx, &table).await?;
+            for parked in columns
+                .iter()
+                .filter(|c| c.starts_with(PARKED_COLUMN_PREFIX))
+            {
+                let column = &parked[PARKED_COLUMN_PREFIX.len()..];
+                if !columns.iter().any(|c| c == column) {
+                    return Err(sqlx::Error::Configuration(
+                        format!("parked column {table}.{parked} has no migrated replacement")
+                            .into(),
+                    ));
+                }
+                log::info!("Restoring legacy values for {}.{}", table, column);
+                sqlx::query(&format!(
+                    "UPDATE {} SET {} = {}",
+                    quote_identifier(&table),
+                    quote_identifier(column),
+                    quote_identifier(parked)
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(&format!(
+                    "ALTER TABLE {} DROP COLUMN {}",
+                    quote_identifier(&table),
+                    quote_identifier(parked)
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await
+    }
+
+    /// `(table, column)` for every `ADD COLUMN` in the bundled migrations.
+    /// Parsed from the SQL so that future migrations are covered without a list
+    /// to maintain.
+    fn migration_added_columns(migrator: &Migrator) -> Vec<(String, String)> {
+        let mut added = Vec::new();
+        for migration in migrator.iter() {
+            let code: String = migration
+                .sql
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let spaced = code.replace(';', " ; ").replace(',', " ");
+            let tokens: Vec<&str> = spaced.split_whitespace().collect();
+            let mut table: Option<&str> = None;
+            for (i, token) in tokens.iter().enumerate() {
+                if *token == ";" {
+                    table = None;
+                } else if token.eq_ignore_ascii_case("TABLE")
+                    && i > 0
+                    && tokens[i - 1].eq_ignore_ascii_case("ALTER")
+                {
+                    table = tokens.get(i + 1).copied();
+                } else if token.eq_ignore_ascii_case("ADD")
+                    && tokens
+                        .get(i + 1)
+                        .is_some_and(|next| next.eq_ignore_ascii_case("COLUMN"))
+                {
+                    if let (Some(table), Some(column)) = (table, tokens.get(i + 2)) {
+                        added.push((table.to_string(), column.to_string()));
+                    }
+                }
+            }
+        }
+        added
+    }
+
+    async fn table_columns(conn: &mut SqliteConnection, table: &str) -> Result<Vec<String>> {
+        sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+            .bind(table)
+            .fetch_all(conn)
+            .await
     }
 
     async fn table_exists(pool: &SqlitePool, table_name: &str) -> Result<bool> {
@@ -581,5 +721,22 @@ mod legacy_import_tests {
             .unwrap();
         assert_eq!(meetings, 2);
         db.cleanup().await.unwrap();
+    }
+
+    #[test]
+    fn migration_column_parser_finds_every_add_column_form() {
+        let migrator = sqlx::migrate!("./migrations");
+        let added = DatabaseManager::migration_added_columns(&migrator);
+        let has = |table: &str, column: &str| {
+            added.iter().any(|(t, c)| t == table && c == column)
+        };
+        // Single-line ALTERs, a multi-line ALTER with the ADD on its own line,
+        // and a column whose default contains commas.
+        assert!(has("meetings", "folder_path"));
+        assert!(has("transcripts", "duration"));
+        assert!(has("summary_processes", "result_backup"));
+        assert!(has("transcript_settings", "openaiCompatibleBaseUrl"));
+        assert!(has("background_jobs", "wordTimestamps"));
+        assert!(has("transcript_settings", "whisperVocabularyHint"));
     }
 }
