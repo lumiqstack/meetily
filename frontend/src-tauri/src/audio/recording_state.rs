@@ -443,3 +443,94 @@ impl Clone for RecordingStats {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    const SEC: u64 = 1_000_000_000;
+
+    /// Records every `stopped` flag the error callback is handed.
+    fn capture_callback(state: &RecordingState) -> Arc<StdMutex<Vec<bool>>> {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink = seen.clone();
+        state.set_error_callback(move |_error, stopped| sink.lock().unwrap().push(stopped));
+        seen
+    }
+
+    /// The threshold is intentional: ten recoverable errors with no recovery
+    /// and no quiet period between them still stop the session, and the
+    /// callback is told so on exactly the error that stopped it.
+    #[test]
+    fn burst_of_recoverable_errors_stops_and_reports_the_stop() {
+        let state = RecordingState::new();
+        let seen = capture_callback(&state);
+        state.start_recording().unwrap();
+        for i in 0..10 {
+            state.report_error_at(AudioError::DeviceDisconnected, i * SEC);
+        }
+        assert!(!state.is_recording());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.iter().filter(|s| **s).count(), 1);
+        assert!(seen[9]);
+    }
+
+    /// H1-F3: a successful hot-swap ends the error episode, so recoverable
+    /// errors from separate disconnects do not add up across the session.
+    #[test]
+    fn successful_recovery_resets_recoverable_count() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let mut t = 0;
+        for _ in 0..3 {
+            for _ in 0..9 {
+                state.report_error_at(AudioError::DeviceDisconnected, t);
+                t += SEC;
+            }
+            state.note_recovery();
+        }
+        // 27 errors in total: neither the recoverable (10) nor the total (15)
+        // fallback may fire.
+        assert!(state.is_recording());
+    }
+
+    /// H1-F3: a quiet period since the previous recoverable error also starts
+    /// a fresh count.
+    #[test]
+    fn quiet_period_resets_recoverable_count() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        for i in 0..9 {
+            state.report_error_at(AudioError::StreamFailed, i * SEC);
+        }
+        let later = 8 * SEC + RECOVERABLE_ERROR_QUIET_PERIOD.as_nanos() as u64 + SEC;
+        for i in 0..9 {
+            state.report_error_at(AudioError::StreamFailed, later + i * SEC);
+        }
+        assert!(state.is_recording());
+        assert_eq!(state.get_recoverable_error_count(), 9);
+    }
+
+    #[test]
+    fn non_recoverable_error_stops_immediately_and_reports_the_stop() {
+        let state = RecordingState::new();
+        let seen = capture_callback(&state);
+        state.start_recording().unwrap();
+        state.report_error_at(AudioError::PermissionDenied, 0);
+        assert!(!state.is_recording());
+        assert_eq!(*seen.lock().unwrap(), vec![true]);
+    }
+
+    /// The `recording-error` payload shape is a contract with the frontend
+    /// (frontend/src/lib/recording-error.ts and its test use this literal).
+    #[test]
+    fn recording_error_payload_json_shape() {
+        let payload = RecordingErrorPayload::new(&AudioError::DeviceDisconnected, true);
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap(),
+            r#"{"message":"Audio device was disconnected","recoverable":true,"recording_stopped":true}"#
+        );
+    }
+}
