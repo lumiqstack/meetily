@@ -634,6 +634,12 @@ fn move_file(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
         return Ok(());
     }
 
+    // Same file under another spelling (symlink, alias): the "already copied"
+    // branch below would verify it equal to itself and delete the only copy.
+    if same_file(src, dst) {
+        return Ok(());
+    }
+
     let len = std::fs::metadata(src)?.len();
 
     // Resuming a previous run: the destination may already hold a good copy.
@@ -677,6 +683,14 @@ fn move_file(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
     report.bytes_moved += len;
     log::info!("Moved {} ({:.1} MB)", dst.display(), len as f64 / (1024.0 * 1024.0));
     Ok(())
+}
+
+/// True only when both paths exist and resolve to the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Length always; SHA-256 as well for anything small enough that hashing is not
@@ -746,6 +760,33 @@ mod tests {
 
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"same");
+    }
+
+    #[test]
+    fn move_file_onto_itself_keeps_the_file() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("meeting_minutes.sqlite");
+        write(&src, b"only copy");
+
+        let mut report = MigrationReport::default();
+        move_file(&src, &src, &mut report).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"only copy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_file_onto_a_symlink_to_itself_keeps_the_file() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("meeting_minutes.sqlite");
+        let alias = dir.path().join("alias.sqlite");
+        write(&src, b"only copy");
+        std::os::unix::fs::symlink(&src, &alias).unwrap();
+
+        let mut report = MigrationReport::default();
+        move_file(&src, &alias, &mut report).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"only copy");
     }
 
     #[test]
