@@ -55,19 +55,15 @@ impl State {
     }
 }
 
-fn state_path() -> PathBuf {
-    root().join(STATE_FILE)
-}
-
-fn load_state() -> State {
-    std::fs::read_to_string(state_path())
+fn load_state(root: &Path) -> State {
+    std::fs::read_to_string(root.join(STATE_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-fn save_state(state: &State) -> Result<()> {
-    let path = state_path();
+fn save_state(root: &Path, state: &State) -> Result<()> {
+    let path = root.join(STATE_FILE);
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
     std::fs::rename(&tmp, &path)?;
@@ -83,22 +79,32 @@ pub struct MigrationReport {
 
 /// Phase 1: move files. Returns immediately when no relocation is configured.
 pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
+    run_files_in(&legacy_root(), &root(), |payload| {
+        let _ = app.emit("storage-migration", payload);
+    })
+}
+
+/// [`run_files`] with the paths and event sink passed in, so the startup path can
+/// be exercised without a live `AppHandle` or the process-wide data root.
+fn run_files_in(
+    legacy: &Path,
+    root: &Path,
+    emit: impl Fn(serde_json::Value),
+) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
 
-    if !super::is_relocated() {
+    if root == legacy {
         return Ok(report);
     }
 
-    let legacy = legacy_root();
-    let root = root();
-    let mut state = load_state();
+    let mut state = load_state(root);
 
     log::info!(
         "Storage migration: {} -> {}",
         legacy.display(),
         root.display()
     );
-    let _ = app.emit("storage-migration", serde_json::json!({ "phase": "start" }));
+    emit(serde_json::json!({ "phase": "start" }));
 
     // Plain subdirectory moves, in increasing order of "how bad is it if this is
     // the step that gets interrupted".
@@ -106,14 +112,11 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
         if state.done(name) {
             continue;
         }
-        let _ = app.emit(
-            "storage-migration",
-            serde_json::json!({ "phase": "step", "step": name }),
-        );
+        emit(serde_json::json!({ "phase": "step", "step": name }));
         match move_tree(&legacy.join(name), &root.join(name), &mut report) {
             Ok(0) => {
                 state.mark(name);
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             // Some files stayed behind; retry on the next launch rather than
             // declaring the step done.
@@ -151,25 +154,22 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
         }
         if ok {
             state.mark("logs");
-            let _ = save_state(&state);
+            let _ = save_state(root, &state);
         }
     }
 
     if !state.done("recordings") {
-        let _ = app.emit(
-            "storage-migration",
-            serde_json::json!({ "phase": "step", "step": "recordings" }),
-        );
+        emit(serde_json::json!({ "phase": "step", "step": "recordings" }));
         match migrate_recordings(&legacy, &root, &mut state, &mut report) {
             Ok(true) => {
                 state.mark("recordings");
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             // Partial: state already holds old_recordings_root, so
             // rewrite_db_paths can repoint whatever did move, and the next
             // launch resumes the rest.
             Ok(false) => {
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             Err(e) => {
                 log::error!("Storage migration step 'recordings' failed: {:#}", e);
@@ -181,14 +181,11 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
     // The database goes last: it is the one file whose loss would be
     // unrecoverable, and by now everything it references has already moved.
     if !state.done("db") {
-        let _ = app.emit(
-            "storage-migration",
-            serde_json::json!({ "phase": "step", "step": "database" }),
-        );
+        emit(serde_json::json!({ "phase": "step", "step": "database" }));
         match migrate_database(&legacy, &root, &mut report) {
             Ok(()) => {
                 state.mark("db");
-                let _ = save_state(&state);
+                let _ = save_state(root, &state);
             }
             Err(e) => {
                 log::error!("Storage migration step 'db' failed: {:#}", e);
@@ -207,10 +204,7 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
             format!(" ({} step(s) skipped)", report.skipped.len())
         }
     );
-    let _ = app.emit(
-        "storage-migration",
-        serde_json::json!({ "phase": "complete", "report": &report }),
-    );
+    emit(serde_json::json!({ "phase": "complete", "report": &report }));
 
     Ok(report)
 }
@@ -224,7 +218,8 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
 /// at the destination. Idempotent, and safe to run on every launch until the
 /// move finishes.
 pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
-    let mut state = load_state();
+    let root = root();
+    let mut state = load_state(&root);
 
     if state.db_paths_rewritten {
         return Ok(0);
@@ -233,10 +228,10 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
         return Ok(0);
     };
 
-    let new_root = root().join("recordings");
+    let new_root = root.join("recordings");
     if old_root == new_root {
         state.db_paths_rewritten = true;
-        let _ = save_state(&state);
+        let _ = save_state(&root, &state);
         return Ok(0);
     }
 
@@ -289,7 +284,7 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
     } else if pending > 0 {
         log::info!("{} meeting folder path(s) still awaiting their files", pending);
     }
-    save_state(&state)?;
+    save_state(&root, &state)?;
 
     Ok(total)
 }
@@ -494,7 +489,7 @@ fn migrate_recordings(
     // Persist first, and point the stored preference at the destination now so
     // new recordings land there even if this run only gets partway.
     state.old_recordings_root = Some(old_root.clone());
-    save_state(state)?;
+    save_state(root, state)?;
     if let Err(e) = rewrite_stored_recordings_folder(legacy, &new_root) {
         log::warn!("Could not update save_folder in recording_preferences.json: {:#}", e);
     }
