@@ -2471,10 +2471,10 @@ mod tests {
     #[tokio::test]
     async fn failed_local_import_leaves_no_meeting_folder() {
         let _serial = global_coordinator_test_lock();
-        let data = tempfile::tempdir().unwrap();
-        // Another test may already own the process-wide data root; never write
-        // anywhere but a tempdir.
-        let _ = crate::storage::DATA_ROOT.set(data.path().to_path_buf());
+        // The data root is process-wide and may be claimed first by this test
+        // or another one, so the directory must outlive the test.
+        let data = tempfile::tempdir().unwrap().keep();
+        let _ = crate::storage::DATA_ROOT.set(data);
         assert!(
             crate::storage::default_recordings_dir().starts_with(std::env::temp_dir()),
             "recordings dir is not sandboxed; this test cannot run safely"

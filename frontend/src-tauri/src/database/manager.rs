@@ -677,15 +677,13 @@ mod legacy_import_tests {
     #[tokio::test]
     async fn import_from_default_location_keeps_meetings() {
         let root = tempfile::tempdir().unwrap();
-        // Another test may already own the process-wide data root; never write
-        // anywhere but the tempdir.
-        let _ = crate::storage::DATA_ROOT.set(root.path().to_path_buf());
-        assert_eq!(
-            crate::storage::root(),
-            root.path(),
-            "storage::DATA_ROOT is claimed by a different path; this test cannot sandbox its writes"
+        // Another test may already own the process-wide data root; accept any
+        // tempdir-backed root, never write anywhere else.
+        let _ = crate::storage::DATA_ROOT.set(root.keep());
+        assert!(
+            crate::storage::root().starts_with(std::env::temp_dir()),
+            "storage::DATA_ROOT is outside the temp dir; this test cannot sandbox its writes"
         );
-        assert!(root.path().starts_with(std::env::temp_dir()));
 
         let legacy_db = crate::storage::db_dir().join("meeting_minutes.db");
         let legacy = SqlitePool::connect_with(
