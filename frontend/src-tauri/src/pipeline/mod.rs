@@ -39,27 +39,82 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
+/// How the retry policy treats a failed stage attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Counts against the attempt budget; gives up after `max_attempts`.
+    Hard,
+    /// The endpoint is down, busy, or yielded to a recording: back off and
+    /// never give up.
+    Transient,
+    /// The stage ran out of time. Backs off like `Transient`, but gives up
+    /// after a run of consecutive timeouts so the same meeting cannot burn
+    /// GPU time forever.
+    Timeout,
+}
+
+/// Phrases that mean the endpoint is unreachable, busy, or rate limiting. They
+/// say nothing about the meeting. Checked before the timeout phrases so that
+/// "504 Gateway Timeout" stays an outage.
+const OUTAGE_NEEDLES: &[&str] = &[
+    "connection",
+    "connect",
+    "network",
+    "unreachable",
+    "refused",
+    "dns",
+    "temporarily",
+    "503",
+    "502",
+    "504",
+    "429",
+    "rate limit",
+    "overloaded",
+];
+
+const TIMEOUT_NEEDLES: &[&str] = &["timed out", "timeout"];
+
+/// Classify a stage failure from its message. `stage_transient` holds phrases
+/// a stage treats as retry-later on top of the shared outage list (e.g.
+/// cancellation, engine contention). They are checked first.
+pub(crate) fn classify_message(error: &str, stage_transient: &[&str]) -> FailureKind {
+    let error = error.to_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
+    if mentions(stage_transient) || mentions(OUTAGE_NEEDLES) {
+        FailureKind::Transient
+    } else if mentions(TIMEOUT_NEEDLES) {
+        FailureKind::Timeout
+    } else {
+        FailureKind::Hard
+    }
+}
+
 /// A stage failure, classified for the retry policy.
 #[derive(Debug, Clone)]
 pub struct StageError {
     pub message: String,
-    /// Transient errors back off and retry forever; hard errors count
-    /// against the attempt budget and eventually stop.
-    pub transient: bool,
+    pub kind: FailureKind,
 }
 
 impl StageError {
     pub fn hard(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            transient: false,
+            kind: FailureKind::Hard,
         }
     }
 
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            transient: true,
+            kind: FailureKind::Transient,
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: FailureKind::Timeout,
         }
     }
 }
@@ -275,8 +330,9 @@ mod tests {
 
     #[test]
     fn stage_errors_carry_their_retry_class() {
-        assert!(StageError::transient("endpoint down").transient);
-        assert!(!StageError::hard("bad config").transient);
+        assert_eq!(StageError::transient("endpoint down").kind, FailureKind::Transient);
+        assert_eq!(StageError::hard("bad config").kind, FailureKind::Hard);
+        assert_eq!(StageError::timeout("too slow").kind, FailureKind::Timeout);
         assert_eq!(StageError::hard("boom").to_string(), "boom");
     }
 

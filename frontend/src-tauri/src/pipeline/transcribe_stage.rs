@@ -6,7 +6,8 @@
 //! and runs whenever there is work.
 
 use crate::audio::retranscription::start_retranscription;
-use crate::pipeline::{StageError, PIPELINE_RETRANSCRIPTION};
+use crate::audio::transcription::gemini_batch::GeminiBatchError;
+use crate::pipeline::{classify_message, FailureKind, StageError, PIPELINE_RETRANSCRIPTION};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Runtime};
 
@@ -92,34 +93,37 @@ pub async fn run_transcribe_stage<R: Runtime>(
             Ok(())
         }
         Err(e) => {
-            // Gemini batch failures carry their own type, so quota, timeouts,
-            // transport drops and 5xx are classified structurally rather than
-            // by matching on message text.
-            if let Some(batch) =
-                e.downcast_ref::<crate::audio::transcription::gemini_batch::GeminiBatchError>()
-            {
-                let message = batch.to_string();
-                return if batch.is_transient() || batch.is_cancellation() {
-                    Err(StageError::transient(message))
-                } else {
-                    Err(StageError::hard(message))
-                };
-            }
-
             let message = e.to_string();
-            // Cancellation is how the pipeline yields the engine to a live
-            // recording, and engine contention means "someone else is using
-            // it right now" — both should simply be retried later.
-            let transient = message.to_lowercase().contains("cancel")
-                || message.contains("on-device transcription engine")
-                || message.contains("already in progress");
-            if transient {
-                Err(StageError::transient(message))
-            } else {
-                Err(StageError::hard(message))
+            match classify_transcription_failure(&e) {
+                FailureKind::Transient => Err(StageError::transient(message)),
+                FailureKind::Timeout => Err(StageError::timeout(message)),
+                FailureKind::Hard => Err(StageError::hard(message)),
             }
         }
     }
+}
+
+/// Phrases a transcription stage treats as retry-later: cancellation (how the
+/// pipeline yields the engine to a live recording) and engine contention
+/// ("someone else is using it right now").
+const TRANSCRIBE_RETRY_LATER: &[&str] = &[
+    "cancel",
+    "on-device transcription engine",
+    "already in progress",
+];
+
+/// Retry class for a failed transcription attempt. Gemini batch failures carry
+/// their own type and are classified structurally; other engines only surface
+/// text, which goes through the same classifier as summaries.
+pub(crate) fn classify_transcription_failure(error: &anyhow::Error) -> FailureKind {
+    if let Some(batch) = error.downcast_ref::<GeminiBatchError>() {
+        return match batch {
+            GeminiBatchError::Timeout => FailureKind::Timeout,
+            _ if batch.is_transient() || batch.is_cancellation() => FailureKind::Transient,
+            _ => FailureKind::Hard,
+        };
+    }
+    classify_message(&error.to_string(), TRANSCRIBE_RETRY_LATER)
 }
 
 #[cfg(test)]
@@ -144,5 +148,88 @@ mod tests {
         assert!(!config_for(Some("localWhisper")).is_remote());
         assert!(!config_for(Some("parakeet")).is_remote());
         assert!(!config_for(None).is_remote());
+    }
+
+    fn gemini(error: GeminiBatchError) -> anyhow::Error {
+        anyhow::Error::new(error)
+    }
+
+    #[test]
+    fn gemini_timeout_is_a_timeout() {
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::Timeout)),
+            FailureKind::Timeout
+        );
+    }
+
+    #[test]
+    fn remote_request_timeout_is_a_timeout() {
+        let error = anyhow::anyhow!(
+            "Remote transcription failed on segment 3: Transcription engine failed: Remote transcription request timed out"
+        );
+        assert_eq!(classify_transcription_failure(&error), FailureKind::Timeout);
+    }
+
+    #[test]
+    fn gateway_network_and_quota_failures_stay_transient() {
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::Transport(
+                "Could not connect to the transcription gateway".to_string()
+            ))),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::ServerError(503))),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::QuotaExceeded)),
+            FailureKind::Transient
+        );
+        for message in [
+            "Could not connect to the remote transcription server",
+            "Remote transcription server returned 429 Too Many Requests",
+            "Remote transcription server returned 502 Bad Gateway",
+            "Remote transcription server returned 503 Service Unavailable",
+            "Remote transcription server returned 504 Gateway Timeout",
+        ] {
+            assert_eq!(
+                classify_transcription_failure(&anyhow::anyhow!(message)),
+                FailureKind::Transient,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_stays_transient() {
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::Cancelled)),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_transcription_failure(&anyhow::anyhow!("Retranscription cancelled")),
+            FailureKind::Transient
+        );
+    }
+
+    #[test]
+    fn rejections_and_bad_configuration_stay_hard() {
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::Auth)),
+            FailureKind::Hard
+        );
+        assert_eq!(
+            classify_transcription_failure(&gemini(GeminiBatchError::InvalidRequest(
+                "HTTP 400".to_string()
+            ))),
+            FailureKind::Hard
+        );
+        assert_eq!(
+            classify_transcription_failure(&anyhow::anyhow!(
+                "Remote transcription server returned 401 Unauthorized"
+            )),
+            FailureKind::Hard
+        );
     }
 }

@@ -8,7 +8,7 @@ use crate::database::repositories::setting::SettingsRepository;
 use crate::database::repositories::summary::SummaryProcessesRepository;
 use crate::database::repositories::transcript_chunk::TranscriptChunksRepository;
 use crate::pipeline::settings::PipelineSettings;
-use crate::pipeline::StageError;
+use crate::pipeline::{classify_message, FailureKind, StageError};
 use crate::summary::SummaryService;
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -49,30 +49,10 @@ pub fn build_summary_transcript_text(segments: &[Transcript]) -> String {
         .join("\n")
 }
 
-/// Provider failures worth retrying later rather than counting against the
-/// attempt budget: the summariser being unreachable says nothing about the
-/// meeting.
-fn is_transient_provider_error(error: &str) -> bool {
-    let error = error.to_lowercase();
-    [
-        "connection",
-        "connect",
-        "timed out",
-        "timeout",
-        "network",
-        "unreachable",
-        "refused",
-        "dns",
-        "temporarily",
-        "503",
-        "502",
-        "504",
-        "429",
-        "rate limit",
-        "overloaded",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
+/// How a failed summary attempt is retried. Outages never give up, and
+/// timeouts give up after a run of consecutive ones (see `meta.rs`).
+fn classify_summary_failure(error: &str) -> FailureKind {
+    classify_message(error, &[])
 }
 
 /// The summary language for this run: the user's per-meeting choice, else the
@@ -192,10 +172,10 @@ pub async fn run_summary_stage<R: Runtime>(
             .flatten()
             .unwrap_or_else(|| "Summary generation failed".to_string());
 
-            if is_transient_provider_error(&error) {
-                Err(StageError::transient(error))
-            } else {
-                Err(StageError::hard(error))
+            match classify_summary_failure(&error) {
+                FailureKind::Transient => Err(StageError::transient(error)),
+                FailureKind::Timeout => Err(StageError::timeout(error)),
+                FailureKind::Hard => Err(StageError::hard(error)),
             }
         }
     }
@@ -246,12 +226,26 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_outages_are_transient_but_bad_config_is_not() {
-        assert!(is_transient_provider_error("error sending request: connection refused"));
-        assert!(is_transient_provider_error("HTTP 503 Service Unavailable"));
-        assert!(is_transient_provider_error("Request timed out"));
-        assert!(!is_transient_provider_error("Failed to load template 'nope'"));
-        assert!(!is_transient_provider_error("invalid api key"));
+    fn summary_failures_are_classified_by_retry_class() {
+        assert_eq!(
+            classify_summary_failure("error sending request: connection refused"),
+            FailureKind::Transient
+        );
+        assert_eq!(classify_summary_failure("HTTP 503 Service Unavailable"), FailureKind::Transient);
+        assert_eq!(classify_summary_failure("HTTP 504 Gateway Timeout"), FailureKind::Transient);
+        assert_eq!(
+            classify_summary_failure("LLM request timed out after 300 seconds"),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify_summary_failure("GitHub Copilot CLI timed out after 300 seconds"),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify_summary_failure("Failed to load template 'nope'"),
+            FailureKind::Hard
+        );
+        assert_eq!(classify_summary_failure("invalid api key"), FailureKind::Hard);
     }
 
     async fn repro_test_pool() -> SqlitePool {
