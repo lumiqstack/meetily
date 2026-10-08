@@ -39,6 +39,20 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
+/// How the retry policy treats a failed stage attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Counts against the attempt budget; gives up after `max_attempts`.
+    Hard,
+    /// The endpoint is down, busy, or yielded to a recording: back off and
+    /// never give up.
+    Transient,
+    /// The stage ran out of time. Backs off like `Transient`, but gives up
+    /// after a run of consecutive timeouts so the same meeting cannot burn
+    /// GPU time forever.
+    Timeout,
+}
+
 /// A stage failure, classified for the retry policy.
 #[derive(Debug, Clone)]
 pub struct StageError {

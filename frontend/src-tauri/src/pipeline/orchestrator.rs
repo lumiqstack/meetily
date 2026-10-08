@@ -7,7 +7,7 @@ use crate::database::repositories::setting::SettingsRepository;
 use crate::pipeline::settings::{self, PipelineRunState, PipelineSettings};
 use crate::pipeline::transcribe_stage;
 use crate::pipeline::{
-    handle, idle, meta, scan_stage, summary_stage, CurrentItem, StageError,
+    handle, idle, meta, scan_stage, summary_stage, CurrentItem, FailureKind, StageError,
 };
 use crate::state::AppState;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -245,7 +245,7 @@ async fn process_one(
                         &item.meeting_id,
                         "transcribe",
                         "Meeting has no recording folder",
-                        false,
+                        FailureKind::Hard,
                         config.max_attempts,
                     )
                     .await;
@@ -350,12 +350,17 @@ async fn process_one(
                 item.meeting_id,
                 e.message
             );
+            let kind = if e.transient {
+                FailureKind::Transient
+            } else {
+                FailureKind::Hard
+            };
             meta::record_failure(
                 pool,
                 &item.meeting_id,
                 item.stage.as_str(),
                 &e.message,
-                e.transient,
+                kind,
                 config.max_attempts,
             )
             .await;

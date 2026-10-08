@@ -4,6 +4,7 @@
 //! table only answers "should I try this meeting right now, or is it backing
 //! off / given up?". Advisory by design: wiping it just retries everything.
 
+use super::FailureKind;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -162,17 +163,17 @@ pub async fn begin_attempt(
 
 /// Record a failed attempt and schedule the next one.
 ///
-/// `retryable` marks transient conditions (endpoint unreachable, engine busy,
-/// cancelled to yield to a recording). Those back off but are never
-/// suppressed, so a summariser that is down for a day simply resumes when it
-/// returns. Hard failures give up after `max_attempts` and wait for a manual
-/// retry.
+/// `FailureKind::Transient` marks transient conditions (endpoint unreachable,
+/// engine busy, cancelled to yield to a recording). Those back off but are
+/// never suppressed, so a summariser that is down for a day simply resumes
+/// when it returns. Hard failures give up after `max_attempts` and wait for a
+/// manual retry.
 pub async fn record_failure(
     pool: &SqlitePool,
     meeting_id: &str,
     stage: &str,
     error: &str,
-    retryable: bool,
+    kind: FailureKind,
     max_attempts: i64,
 ) {
     let existing = load(pool, meeting_id).await;
@@ -186,7 +187,10 @@ pub async fn record_failure(
     let attempts = if in_flight { previous.max(1) } else { previous + 1 };
 
     let next_retry_at = (Utc::now() + backoff_for(attempts)).to_rfc3339();
-    let suppressed = if retryable { 0 } else { i64::from(attempts >= max_attempts) };
+    let suppressed = match kind {
+        FailureKind::Transient | FailureKind::Timeout => 0,
+        FailureKind::Hard => i64::from(attempts >= max_attempts),
+    };
     // Keep stored errors bounded; some provider errors embed whole payloads.
     let error: String = error.chars().take(500).collect();
 
@@ -251,7 +255,7 @@ mod tests {
     async fn a_begun_attempt_that_reports_failure_counts_once() {
         let pool = test_pool().await;
         begin_attempt(&pool, "m-once", "transcribe", 3).await;
-        record_failure(&pool, "m-once", "transcribe", "boom", false, 3).await;
+        record_failure(&pool, "m-once", "transcribe", "boom", FailureKind::Hard, 3).await;
 
         let row = load(&pool, "m-once").await.unwrap();
         assert_eq!(row.attempts, 1, "begin + fail is one attempt, not two");
@@ -269,7 +273,7 @@ mod tests {
         assert!(load(&pool, "m-transient").await.unwrap().suppressed());
 
         begin_attempt(&pool, "m-transient", "summarize", 3).await;
-        record_failure(&pool, "m-transient", "summarize", "connection refused", true, 3).await;
+        record_failure(&pool, "m-transient", "summarize", "connection refused", FailureKind::Transient, 3).await;
 
         assert!(!load(&pool, "m-transient").await.unwrap().suppressed());
     }
@@ -278,7 +282,7 @@ mod tests {
     async fn hard_failures_suppress_after_max_attempts() {
         let pool = test_pool().await;
         for _ in 0..3 {
-            record_failure(&pool, "m1", "summarize", "bad template", false, 3).await;
+            record_failure(&pool, "m1", "summarize", "bad template", FailureKind::Hard, 3).await;
         }
         let row = load(&pool, "m1").await.unwrap();
         assert_eq!(row.attempts, 3);
@@ -290,7 +294,7 @@ mod tests {
     async fn transient_failures_back_off_but_never_give_up() {
         let pool = test_pool().await;
         for _ in 0..10 {
-            record_failure(&pool, "m2", "summarize", "connection refused", true, 3).await;
+            record_failure(&pool, "m2", "summarize", "connection refused", FailureKind::Transient, 3).await;
         }
         let row = load(&pool, "m2").await.unwrap();
         assert!(!row.suppressed());
@@ -299,10 +303,66 @@ mod tests {
         assert!(row.eligible_at(Utc::now() + Duration::minutes(61)));
     }
 
+    const TIMEOUT_ERROR: &str = "LLM request timed out after 300 seconds";
+    const TIMEOUT_REASON: &str =
+        "Summary timed out 3 times. Try a smaller or faster model, then retry.";
+
+    /// A summariser that always runs out of time would otherwise be retried
+    /// hourly forever, each attempt burning minutes of GPU. Three in a row
+    /// stop the meeting with a reason the user can act on.
+    #[tokio::test]
+    async fn three_consecutive_timeouts_suppress_with_a_plain_reason() {
+        let pool = test_pool().await;
+        for _ in 0..3 {
+            record_failure(&pool, "m-timeout", "summarize", TIMEOUT_ERROR, FailureKind::Timeout, 3)
+                .await;
+        }
+        let row = load(&pool, "m-timeout").await.unwrap();
+        assert!(row.suppressed(), "three timeouts in a row must suppress");
+        assert_eq!(row.last_error.as_deref(), Some(TIMEOUT_REASON));
+        assert!(!row.eligible_at(Utc::now() + Duration::days(365)));
+    }
+
+    /// Only an unbroken run counts: a network error in between starts the
+    /// count over, because the timeouts were not all the same meeting problem.
+    #[tokio::test]
+    async fn a_network_error_breaks_the_timeout_run() {
+        let pool = test_pool().await;
+        for _ in 0..2 {
+            record_failure(&pool, "m-broken", "summarize", TIMEOUT_ERROR, FailureKind::Timeout, 3)
+                .await;
+        }
+        record_failure(&pool, "m-broken", "summarize", "connection refused", FailureKind::Transient, 3)
+            .await;
+        for _ in 0..2 {
+            record_failure(&pool, "m-broken", "summarize", TIMEOUT_ERROR, FailureKind::Timeout, 3)
+                .await;
+        }
+        assert!(!load(&pool, "m-broken").await.unwrap().suppressed());
+    }
+
+    /// The manual "Process now" path calls `reset`, which must lift a timeout
+    /// suppression and forget the run, so one fresh timeout is not final.
+    #[tokio::test]
+    async fn manual_retry_clears_timeout_suppression_and_run() {
+        let pool = test_pool().await;
+        for _ in 0..3 {
+            record_failure(&pool, "m-retry", "summarize", TIMEOUT_ERROR, FailureKind::Timeout, 3)
+                .await;
+        }
+        assert!(load(&pool, "m-retry").await.unwrap().suppressed());
+
+        reset(&pool, "m-retry").await;
+        assert!(load(&pool, "m-retry").await.is_none());
+
+        record_failure(&pool, "m-retry", "summarize", TIMEOUT_ERROR, FailureKind::Timeout, 3).await;
+        assert!(!load(&pool, "m-retry").await.unwrap().suppressed());
+    }
+
     #[tokio::test]
     async fn success_clears_previous_failures() {
         let pool = test_pool().await;
-        record_failure(&pool, "m3", "transcribe", "boom", false, 3).await;
+        record_failure(&pool, "m3", "transcribe", "boom", FailureKind::Hard, 3).await;
         record_success(&pool, "m3").await;
         assert!(load(&pool, "m3").await.is_none());
     }
@@ -310,11 +370,11 @@ mod tests {
     #[tokio::test]
     async fn backoff_grows_with_consecutive_failures() {
         let pool = test_pool().await;
-        record_failure(&pool, "m4", "summarize", "boom", true, 3).await;
+        record_failure(&pool, "m4", "summarize", "boom", FailureKind::Transient, 3).await;
         let first = load(&pool, "m4").await.unwrap();
         assert!(first.eligible_at(Utc::now() + Duration::minutes(2)));
 
-        record_failure(&pool, "m4", "summarize", "boom", true, 3).await;
+        record_failure(&pool, "m4", "summarize", "boom", FailureKind::Transient, 3).await;
         let second = load(&pool, "m4").await.unwrap();
         // Second failure waits longer than the first.
         assert!(!second.eligible_at(Utc::now() + Duration::minutes(2)));
