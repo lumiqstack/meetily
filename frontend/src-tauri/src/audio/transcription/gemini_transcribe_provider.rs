@@ -653,6 +653,22 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn omits_language_for_auto_translate() {
+            let server = server_returning(200, OK_BODY).await;
+            let options = GeminiBatchOptions {
+                diarization: false,
+                word_timestamps: true,
+                language: Some("auto-translate".to_string()),
+            };
+            upload(&server, &options).await.unwrap();
+
+            let requests = server.received_requests().await.unwrap();
+            let body = String::from_utf8_lossy(&requests[0].body);
+            assert!(!body.contains("name=\"language\""), "{body}");
+            assert!(!body.contains("auto-translate"), "{body}");
+        }
+
+        #[tokio::test]
         async fn http_statuses_map_to_typed_errors() {
             let cases: Vec<(u16, &str, fn(&GeminiBatchError) -> bool)> = vec![
                 (429, r#"{"detail":"Google transcription rate limit exceeded; retry later"}"#,

@@ -178,6 +178,13 @@ mod tests {
     }
 
     #[test]
+    fn auto_translate_means_gateway_detection() {
+        let json = ClientMessage::start("m", 16000, Some("auto-translate")).to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["language_codes"], serde_json::json!([]), "{json}");
+    }
+
+    #[test]
     fn stop_frame_is_just_a_type() {
         assert_eq!(ClientMessage::Stop.to_json().unwrap(), r#"{"type":"stop"}"#);
     }
