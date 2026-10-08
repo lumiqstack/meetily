@@ -292,11 +292,13 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
 /// Windows paths compare case-insensitively; a stored path may differ in case
 /// from the one we computed (drive letter, OneDrive folder name).
 fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
-    }
-    let (head, rest) = value.split_at(prefix.len());
-    if head.eq_ignore_ascii_case(prefix) {
+    // `get` returns None off a char boundary, where slicing would panic.
+    let head = value.get(..prefix.len())?;
+    let rest = value.get(prefix.len()..)?;
+    // Whole path components only: "rec-old" is not inside "rec".
+    if head.eq_ignore_ascii_case(prefix)
+        && (rest.is_empty() || rest.starts_with(['\\', '/']))
+    {
         Some(rest)
     } else {
         None
@@ -498,7 +500,26 @@ fn migrate_recordings(
         return Ok(true);
     }
 
-    let failures = move_tree(&old_root, &new_root, report)?;
+    // The user-picked folder can hold unrelated files, so only Meetily's meeting
+    // folders move; everything else stays where it is.
+    let mut failures = 0;
+    for entry in std::fs::read_dir(&old_root)
+        .with_context(|| format!("reading {}", old_root.display()))?
+    {
+        let Ok(entry) = entry else {
+            failures += 1;
+            continue;
+        };
+        let from = entry.path();
+        // Never move a folder that contains the destination: that recurses into itself.
+        if !is_meeting_folder(&from) || new_root.starts_with(&from) {
+            continue;
+        }
+        failures += move_tree(&from, &new_root.join(entry.file_name()), report)?;
+    }
+    // Only succeeds when nothing unrelated was left behind.
+    let _ = std::fs::remove_dir(&old_root);
+
     if failures > 0 {
         log::warn!(
             "{} recording file(s) could not be moved yet — most likely OneDrive \
@@ -508,6 +529,15 @@ fn migrate_recordings(
         );
     }
     Ok(failures == 0)
+}
+
+/// Files a meeting folder holds (see recording_saver.rs), or `.checkpoints/` from
+/// builds that wrote incremental checkpoints.
+fn is_meeting_folder(dir: &Path) -> bool {
+    dir.is_dir()
+        && ["metadata.json", "transcripts.json", "audio.mp4", ".checkpoints"]
+            .iter()
+            .any(|f| dir.join(f).exists())
 }
 
 /// tauri-plugin-store keeps its files in app_data_dir under a flat key/value
