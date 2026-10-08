@@ -664,6 +664,16 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn silent_chunk_with_empty_words_is_not_an_error() {
+            // A silent chunk legitimately has no words: the gateway answers
+            // with empty text and an empty (present) words array.
+            let server = server_returning(200, r#"{"text":"","words":[]}"#).await;
+            let result = upload(&server, &GeminiBatchOptions::authoritative(false, None)).await;
+            assert!(result.is_ok(), "silent chunk failed the pass: {:?}", result.err());
+            assert_eq!(result.unwrap().text, "");
+        }
+
+        #[tokio::test]
         async fn http_statuses_map_to_typed_errors() {
             let cases: Vec<(u16, &str, fn(&GeminiBatchError) -> bool)> = vec![
                 (429, r#"{"detail":"Google transcription rate limit exceeded; retry later"}"#,
