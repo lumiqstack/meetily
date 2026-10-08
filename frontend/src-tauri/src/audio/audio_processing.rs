@@ -6,7 +6,7 @@ use realfft::RealFftPlanner;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use nnnoiseless::DenoiseState;
 
 use super::encode::encode_single_audio; // Correct path to encode module
@@ -24,6 +24,40 @@ pub fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
+/// Longest folder name we create: well under the 255-byte limit of common
+/// filesystems, leaving room for the timestamp and a collision suffix.
+const MAX_FOLDER_NAME_BYTES: usize = 200;
+const TIMESTAMP_SUFFIX_BYTES: usize = "_YYYY-MM-DD_HH-MM".len();
+const COLLISION_SUFFIX_BYTES: usize = "_1000".len();
+const MAX_SANITIZED_NAME_BYTES: usize =
+    MAX_FOLDER_NAME_BYTES - TIMESTAMP_SUFFIX_BYTES - COLLISION_SUFFIX_BYTES;
+const MAX_FOLDER_ATTEMPTS: u32 = 1000;
+
+/// Creates `base_path/<base_name>`, or `<base_name>_2`, `_3`, ... if that name is
+/// taken. `create_dir` (not `create_dir_all`) is what makes the claim exclusive,
+/// so two imports or recordings with the same name never share a folder.
+fn create_unique_dir(base_path: &Path, base_name: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(base_path)?;
+    for attempt in 1..=MAX_FOLDER_ATTEMPTS {
+        let name = if attempt == 1 {
+            base_name.to_string()
+        } else {
+            format!("{}_{}", base_name, attempt)
+        };
+        let candidate = base_path.join(name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no free meeting folder name for '{}' after {} attempts",
+        base_name,
+        MAX_FOLDER_ATTEMPTS
+    ))
+}
+
 /// Create a meeting folder with timestamp and return the path
 /// Creates structure: base_path/MeetingName_YYYY-MM-DD_HH-MM/
 ///                    ├── .checkpoints/  (for incremental saves, optional)
@@ -38,12 +72,12 @@ pub fn create_meeting_folder(
     create_checkpoints_dir: bool,
 ) -> Result<PathBuf> {
     let timestamp = Utc::now().format("%Y-%m-%d_%H-%M").to_string();
-    let sanitized_name = sanitize_filename(meeting_name);
-    let folder_name = format!("{}_{}", sanitized_name, timestamp);
-    let meeting_folder = base_path.join(folder_name);
+    let mut sanitized_name = sanitize_filename(meeting_name);
+    crate::utils::truncate_to_char_boundary(&mut sanitized_name, MAX_SANITIZED_NAME_BYTES);
+    let base_name = format!("{}_{}", sanitized_name, timestamp);
 
     // Create main meeting folder
-    std::fs::create_dir_all(&meeting_folder)?;
+    let meeting_folder = create_unique_dir(base_path, &base_name)?;
 
     // Only create .checkpoints subdirectory if requested (when auto_save is true)
     if create_checkpoints_dir {
@@ -779,4 +813,39 @@ pub fn write_transcript_json_to_file(
     std::fs::write(&file_path, json_string)?;
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_title_same_minute_gets_separate_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let first = create_meeting_folder(&base, "Weekly Sync", false).unwrap();
+        let second = create_meeting_folder(&base, "Weekly Sync", false).unwrap();
+        assert_ne!(first, second, "two imports of the same title got the same folder");
+    }
+
+    #[test]
+    fn long_title_folder_stays_within_filename_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        // 250 ASCII bytes + "_YYYY-MM-DD_HH-MM" (17 bytes) = 267 bytes, over the 255-byte
+        // NAME_MAX of ext4 and the 255-character APFS/NTFS limits. (85 CJK chars
+        // are only 85 characters on APFS/NTFS, so they do not hit the limit there.)
+        let result = create_meeting_folder(&base, &"a".repeat(250), false);
+        assert!(result.is_ok(), "create_meeting_folder failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn long_multibyte_title_folder_is_created_within_byte_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let folder = create_meeting_folder(&base, &"会".repeat(85), false).unwrap();
+        assert!(folder.is_dir());
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 200, "folder name is {} bytes", name.len());
+    }
 }
