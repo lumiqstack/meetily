@@ -214,24 +214,30 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // The actual recording start/stop is handled in the Home component
   }, [isRecording, pathname, router]);
 
-  // Function to search through meeting transcripts
+  // Function to search through meeting transcripts. Responses can arrive out of
+  // order, so only the most recent request may update the results.
+  const searchRequestIdRef = React.useRef(0);
   const searchTranscripts = React.useCallback(async (query: string) => {
+    const requestId = ++searchRequestIdRef.current;
     if (!query.trim()) {
       setSearchResults([]);
+      setIsSearching(false);
       return;
     }
 
     try {
       setIsSearching(true);
-
-
       const results = await invoke('api_search_transcripts', { query }) as TranscriptSearchResult[];
+      if (requestId !== searchRequestIdRef.current) return;
       setSearchResults(results);
     } catch (error) {
+      if (requestId !== searchRequestIdRef.current) return;
       console.error('Error searching transcripts:', error);
       setSearchResults([]);
     } finally {
-      setIsSearching(false);
+      if (requestId === searchRequestIdRef.current) {
+        setIsSearching(false);
+      }
     }
   }, []);
 
