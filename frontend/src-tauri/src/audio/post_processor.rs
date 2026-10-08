@@ -154,13 +154,12 @@ impl PostProcessor {
         while i < words.len() {
             let current_word = words[i];
 
-            // Check for immediate repetitions (same word repeated)
-            if i + 1 < words.len() && words[i + 1] == current_word {
+            // Collapse only 3+ repeats: doubles ("that that", "had had") are often grammatical
+            let run = words[i..].iter().take_while(|w| **w == current_word).count();
+            if run >= 3 {
                 result.push(current_word);
                 // Skip repeated instances
-                while i + 1 < words.len() && words[i + 1] == current_word {
-                    i += 1;
-                }
+                i += run - 1;
             }
             // Check for phrase repetitions
             else if i + 3 < words.len() {
@@ -272,5 +271,17 @@ impl PostProcessor {
 impl Default for PostProcessor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PostProcessor;
+
+    #[test]
+    fn word_repetition_collapses_loops_but_keeps_grammatical_doubles() {
+        assert_eq!(PostProcessor::clean_repetitive_text("the the the the the the"), "the");
+        assert_eq!(PostProcessor::clean_repetitive_text("I think that that is fine"), "I think that that is fine");
+        assert_eq!(PostProcessor::clean_repetitive_text("She had had enough"), "She had had enough");
     }
 }

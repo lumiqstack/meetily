@@ -37,3 +37,33 @@ pub use worker::{
     reset_speech_detected_flag,
     TranscriptUpdate
 };
+
+/// The language code a remote server should receive for the stored
+/// preference. "auto" and "auto-translate" are Meetily modes rather than ISO
+/// codes, so like a blank value they mean "let the server detect".
+pub fn remote_language_code(preference: Option<&str>) -> Option<String> {
+    preference
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !matches!(*l, "auto" | "auto-translate"))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod remote_language_tests {
+    use super::remote_language_code;
+
+    #[test]
+    fn a_language_code_is_forwarded() {
+        assert_eq!(remote_language_code(Some("es")), Some("es".to_string()));
+        assert_eq!(remote_language_code(Some(" en-US ")), Some("en-US".to_string()));
+    }
+
+    #[test]
+    fn modes_and_blanks_mean_server_detection() {
+        assert_eq!(remote_language_code(Some("auto")), None);
+        assert_eq!(remote_language_code(Some("auto-translate")), None);
+        assert_eq!(remote_language_code(Some("")), None);
+        assert_eq!(remote_language_code(Some("   ")), None);
+        assert_eq!(remote_language_code(None), None);
+    }
+}

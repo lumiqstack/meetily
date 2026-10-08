@@ -154,7 +154,7 @@ impl TranscriptionProvider for OpenAICompatibleProvider {
             .text("model", self.model.clone())
             .text("response_format", "json");
 
-        if let Some(lang) = language.filter(|l| !l.is_empty() && l != "auto") {
+        if let Some(lang) = super::remote_language_code(language.as_deref()) {
             form = form.text("language", lang);
         }
         if let Some(prompt) = &self.prompt {
@@ -279,6 +279,20 @@ mod prompt_tests {
         assert_eq!(remote_vocabulary_prompt(false, "Acme, Zephyr"), None);
         assert_eq!(remote_vocabulary_prompt(true, "   "), None);
         assert_eq!(remote_vocabulary_prompt(true, " Acme, Zephyr "), Some("Acme, Zephyr".to_string()));
+    }
+
+    #[tokio::test]
+    async fn auto_translate_is_not_sent_as_a_language_code() {
+        // "auto-translate" is the app's default language preference and is
+        // passed straight through by worker.rs; it is not an ISO code.
+        let (base, seen) = server(200, r#"{"text":"hello"}"#).await;
+        let provider = OpenAICompatibleProvider::new(&base, "m".into(), None).unwrap();
+        provider
+            .transcribe(audio(), Some("auto-translate".to_string()))
+            .await
+            .unwrap();
+        let body = seen.lock().unwrap()[0].clone();
+        assert!(!body.contains("name=\"language\""), "{body}");
     }
 
     #[tokio::test]

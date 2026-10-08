@@ -55,13 +55,12 @@ pub enum ClientMessage {
 impl ClientMessage {
     /// The `start` frame for a live session.
     ///
-    /// `language` is Meetily's preference: `None` or "auto" is sent as an empty
-    /// list so the gateway detects the language itself.
+    /// `language` is Meetily's preference: `None`, blank, "auto" or
+    /// "auto-translate" is sent as an empty list so the gateway detects the
+    /// language itself.
     pub fn start(model: impl Into<String>, sample_rate: u32, language: Option<&str>) -> Self {
-        let language_codes = language
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && *l != "auto")
-            .map(|l| vec![l.to_string()])
+        let language_codes = super::remote_language_code(language)
+            .map(|l| vec![l])
             .unwrap_or_default();
 
         Self::Start {
@@ -175,6 +174,13 @@ mod tests {
                 language
             );
         }
+    }
+
+    #[test]
+    fn auto_translate_means_gateway_detection() {
+        let json = ClientMessage::start("m", 16000, Some("auto-translate")).to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["language_codes"], serde_json::json!([]), "{json}");
     }
 
     #[test]
