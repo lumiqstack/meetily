@@ -793,7 +793,7 @@ async fn export_note<R: Runtime>(
     if let Some(pool) = pool.as_ref() {
         record_exported_filename(pool, meeting_id, &filename).await;
     }
-    let _ = app.emit("obsidian-exported", meeting_id);
+    crate::api::emit_meetings_changed(app, meeting_id);
 
     info!(
         "Exported meeting {} to Obsidian: {:?}",

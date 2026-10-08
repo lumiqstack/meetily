@@ -123,22 +123,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchMeetings();
   }, [serverAddress, fetchMeetings]);
 
-  // Manual and automatic Obsidian exports both emit this; flag the meeting
-  // without refetching the whole list.
-  useTauriEvent<string>('obsidian-exported', (meetingId) => {
-    setMeetings(prev => prev.map(m => m.id === meetingId ? { ...m, obsidianExported: true } : m));
-  });
-
-  // The pipeline re-emits its status on every tick while work is deferred;
-  // only a change of the item it is working on can mean a stage finished.
-  const lastPipelineItemRef = React.useRef<string | null>(null);
-  useTauriEvent<{ current: unknown }>('pipeline-status', ({ current }) => {
-    const item = JSON.stringify(current ?? null);
-    if (item === lastPipelineItemRef.current) return;
-    lastPipelineItemRef.current = item;
-    void fetchMeetings();
-  });
-  useTauriEvent('retranscription-complete', () => { void fetchMeetings(); });
+  // Rust emits this wherever the list or a meeting's transcribed / summarized
+  // / Obsidian-exported flags change (pipeline, summaries, imports, exports,
+  // retranscription, rename, delete).
+  useTauriEvent('meetings-changed', () => { void fetchMeetings(); });
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -314,9 +302,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           return;
         }
         if (summaryPollsRef.current.get(meetingId) !== entry) return;
-        if (result.status === 'completed') {
-          setMeetings(prev => prev.map(m => m.id === meetingId ? { ...m, summarized: true } : m));
-        }
         if (
           result.status === 'completed'
           || result.status === 'error'

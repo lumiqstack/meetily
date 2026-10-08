@@ -30,12 +30,10 @@ let backendMeetings = [
   { id: 'transcribed', title: 'Transcribed', transcribed: true, summarized: false, obsidian_exported: false },
   { id: 'done', title: 'Done', transcribed: true, summarized: true, obsidian_exported: true },
 ];
-let listFetches = 0;
 mock.module('@tauri-apps/api/core', () => ({
   ...originalCore,
   invoke: async (command: string) => {
     if (command === 'api_get_meetings') {
-      listFetches += 1;
       return backendMeetings;
     }
     throw new Error(`Unexpected command: ${command}`);
@@ -54,7 +52,7 @@ const shown = (stage: Parameters<typeof missingStage>[1]) =>
   missingStage(context.sidebarItems, stage)[0].children!.map(item => item.id);
 
 describe('sidebar missing-stage filter', () => {
-  test('shows meetings missing each stage and refreshes when a stage can have finished', async () => {
+  test('shows meetings missing each stage and refreshes on meetings-changed', async () => {
     let renderer: ReturnType<typeof create> | undefined;
     await act(async () => { renderer = create(<SidebarProvider><Probe /></SidebarProvider>); });
     await flush();
@@ -64,26 +62,17 @@ describe('sidebar missing-stage filter', () => {
     expect(shown('summarized')).toEqual(['recorded', 'transcribed']);
     expect(shown('obsidianExported')).toEqual(['recorded', 'transcribed']);
 
-    const working = { payload: { current: { meeting_id: 'transcribed', stage: 'summarize' } } };
-    await act(async () => { handlers.get('pipeline-status')!(working); });
-    await flush();
-    const fetchesWhileWorking = listFetches;
-    await act(async () => { handlers.get('pipeline-status')!(working); });
-    await flush();
-    expect(listFetches).toBe(fetchesWhileWorking);
-
     backendMeetings = backendMeetings.map(m => m.id === 'transcribed' ? { ...m, summarized: true } : m);
-    await act(async () => { handlers.get('pipeline-status')!({ payload: { current: null } }); });
+    await act(async () => { handlers.get('meetings-changed')!({ payload: { meeting_id: 'transcribed' } }); });
     await flush();
     expect(shown('summarized')).toEqual(['recorded']);
 
     backendMeetings = backendMeetings.map(m => m.id === 'recorded' ? { ...m, transcribed: true } : m);
-    await act(async () => { handlers.get('retranscription-complete')!({ payload: {} }); });
+    await act(async () => { handlers.get('meetings-changed')!({ payload: { meeting_id: 'recorded' } }); });
     await flush();
     expect(shown('transcribed')).toEqual([]);
 
     await act(async () => { renderer!.unmount(); });
-    expect(handlers.has('pipeline-status')).toBe(false);
-    expect(handlers.has('retranscription-complete')).toBe(false);
+    expect(handlers.has('meetings-changed')).toBe(false);
   });
 });

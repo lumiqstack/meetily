@@ -156,6 +156,8 @@ pub async fn run_summary_stage<R: Runtime>(
         attempt,
     )
     .await;
+    // Completed, failed, cancelled or crashed: the process row is terminal.
+    crate::api::emit_meetings_changed(app, meeting_id);
 
     // The service reports outcomes through the process row.
     let status = sqlx::query_scalar::<_, String>(

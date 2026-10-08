@@ -24,13 +24,14 @@ mock.module('@tauri-apps/api/event', () => ({
     return () => handlers.delete(name);
   },
 }));
+let exported = new Set(['meeting-a']);
 mock.module('@tauri-apps/api/core', () => ({
   ...originalCore,
   invoke: async (command: string) => {
     if (command === 'api_get_meetings') {
       return [
-        { id: 'meeting-a', title: 'Exported', obsidian_exported: true },
-        { id: 'meeting-b', title: 'Not yet', obsidian_exported: false },
+        { id: 'meeting-a', title: 'Exported', obsidian_exported: exported.has('meeting-a') },
+        { id: 'meeting-b', title: 'Not yet', obsidian_exported: exported.has('meeting-b') },
       ];
     }
     throw new Error(`Unexpected command: ${command}`);
@@ -48,16 +49,18 @@ const flags = () =>
   Object.fromEntries(context.sidebarItems[0].children!.map((item) => [item.id, item.obsidianExported]));
 
 describe('sidebar Obsidian indicator', () => {
-  test('carries the exported flag from the backend and flips it on an export event', async () => {
+  test('carries the exported flag from the backend and refetches it when meetings change', async () => {
     let renderer: ReturnType<typeof create> | undefined;
     await act(async () => { renderer = create(<SidebarProvider><Probe /></SidebarProvider>); });
     await flush();
     expect(flags()).toEqual({ 'meeting-a': true, 'meeting-b': false });
 
-    await act(async () => { handlers.get('obsidian-exported')!({ payload: 'meeting-b' }); });
+    exported.add('meeting-b');
+    await act(async () => { handlers.get('meetings-changed')!({ payload: { meeting_id: 'meeting-b' } }); });
+    await flush();
     expect(flags()).toEqual({ 'meeting-a': true, 'meeting-b': true });
 
     await act(async () => { renderer!.unmount(); });
-    expect(handlers.has('obsidian-exported')).toBe(false);
+    expect(handlers.has('meetings-changed')).toBe(false);
   });
 });

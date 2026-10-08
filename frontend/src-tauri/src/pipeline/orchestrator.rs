@@ -327,6 +327,9 @@ async fn process_one(
     };
 
     pipeline.set_current(None).await;
+    if item.stage == Stage::Transcribe {
+        crate::api::emit_meetings_changed(app, &item.meeting_id);
+    }
 
     match result {
         Ok(()) => {
