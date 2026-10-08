@@ -976,9 +976,15 @@ mod tests {
         assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec"), Some(r"\M1"));
     }
 
+    #[test]
+    fn strip_prefix_ci_accepts_a_prefix_ending_in_a_separator() {
+        assert_eq!(strip_prefix_ci(r"D:\rec\M1", r"D:\rec\"), Some("M1"));
+        assert_eq!(strip_prefix_ci("/Users/m/rec/M1", "/Users/m/rec/"), Some("M1"));
+    }
+
     /// H6-F4: the user-picked recordings folder (save_folder) can hold unrelated
     /// files; migrate_recordings moves every entry, not just meeting folders.
-    /// All paths are under a tempdir; MEETILY_DATA_DIR pins root() into it.
+    /// All paths are under a tempdir.
     #[test]
     fn recordings_migration_leaves_unrelated_files_in_place() {
         let tmp = tempdir().unwrap();
