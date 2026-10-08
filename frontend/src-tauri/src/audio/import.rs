@@ -494,6 +494,7 @@ async fn start_import_with_guard<R: Runtime>(
                     "duration_seconds": res.duration_seconds
                 }),
             );
+            crate::api::emit_meetings_changed(&app, &res.meeting_id);
             // A freshly imported meeting is pending a summary; let the
             // automatic pipeline pick it up without waiting for its tick.
             crate::pipeline::wake();

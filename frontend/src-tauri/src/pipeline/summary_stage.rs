@@ -111,6 +111,8 @@ pub async fn run_summary_stage<R: Runtime>(
     SummaryProcessesRepository::create_or_reset_process(pool, meeting_id, started_at)
         .await
         .map_err(|e| StageError::hard(format!("Failed to initialize summary process: {}", e)))?;
+    // The reset row is pending, so the meeting no longer counts as summarized.
+    crate::api::emit_meetings_changed(app, meeting_id);
 
     TranscriptChunksRepository::save_transcript_data(
         pool,
@@ -147,6 +149,8 @@ pub async fn run_summary_stage<R: Runtime>(
         attempt,
     )
     .await;
+    // Completed, failed, cancelled or crashed: the process row is terminal.
+    crate::api::emit_meetings_changed(app, meeting_id);
 
     // The service reports outcomes through the process row.
     let status = sqlx::query_scalar::<_, String>(
