@@ -58,6 +58,12 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 6;
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(8);
 
+/// A session that stays up this long has proven itself even if no transcript
+/// arrived (a silent meeting). Until then — or until the gateway sends a
+/// transcript — a successful handshake does not refund the retry budget: a
+/// gateway can accept every upgrade and still reject every `start`.
+const HEALTHY_AFTER: Duration = Duration::from_secs(30);
+
 /// Interim caption payload. Deliberately *not* a `TranscriptUpdate`: interims
 /// must never reach the persistence listener, which stores every
 /// `transcript-update` it sees.
@@ -242,10 +248,7 @@ async fn run_live_transcription<R: Runtime>(
 
     loop {
         let socket = match connect(&config).await {
-            Ok(socket) => {
-                attempt = 0;
-                socket
-            }
+            Ok(socket) => socket,
             Err(e) => {
                 // A rejected upgrade is a configuration problem, not a blip:
                 // retrying cannot fix a bad token or a wrong URL.
@@ -291,6 +294,8 @@ async fn run_live_transcription<R: Runtime>(
             }
         };
 
+        let connected_at = Instant::now();
+        let mut transcribed = false;
         let outcome = run_session(
             &app,
             socket,
@@ -298,8 +303,14 @@ async fn run_live_transcription<R: Runtime>(
             &config,
             &mut ledger,
             &mut pending,
+            &mut transcribed,
         )
         .await;
+
+        // Only a session that actually worked refunds the retry budget.
+        if transcribed || connected_at.elapsed() >= HEALTHY_AFTER {
+            attempt = 0;
+        }
 
         match outcome {
             SessionOutcome::InputClosed => {
@@ -314,20 +325,27 @@ async fn run_live_transcription<R: Runtime>(
                 // Interims belong to a session that no longer exists.
                 clear_interim(&app);
                 warn!("Gemini Live disconnected: {}", reason);
-                emit_warning(
-                    &app,
-                    "Live transcription reconnected — the live transcript may have a gap. The full recording was saved and can be re-transcribed.",
-                );
 
                 attempt += 1;
                 if attempt > MAX_RECONNECT_ATTEMPTS {
-                    error!("Gemini Live: giving up after {} attempts", MAX_RECONNECT_ATTEMPTS);
+                    error!(
+                        "Gemini Live: giving up after {} attempts: {}",
+                        MAX_RECONNECT_ATTEMPTS, reason
+                    );
                     emit_error(
                         &app,
-                        "Live transcription stopped after repeated disconnects. The recording is still being saved and can be transcribed afterwards.",
+                        &format!(
+                            "Live transcription stopped after repeated disconnects ({}). The recording is still being saved and can be transcribed afterwards.",
+                            reason
+                        ),
                     );
                     break;
                 }
+
+                emit_warning(
+                    &app,
+                    "Live transcription dropped — reconnecting. The live transcript may have a gap; the full recording is still being saved and can be re-transcribed.",
+                );
 
                 let delay = backoff_delay(attempt);
                 if !sleep_while_buffering(&mut receiver, &mut pending, &mut ledger, delay).await {
@@ -461,6 +479,7 @@ async fn run_session<R: Runtime>(
     config: &LiveSessionConfig,
     ledger: &mut TimelineLedger,
     pending: &mut PendingFrames,
+    transcribed: &mut bool,
 ) -> SessionOutcome {
     let start_frame = match ClientMessage::start(
         config.model.clone(),
@@ -522,9 +541,11 @@ async fn run_session<R: Runtime>(
                     Some(Ok(Message::Text(payload))) => {
                         match ServerMessage::parse(&payload) {
                             Ok(ServerMessage::TranscriptInterim { text, language_code }) => {
+                                *transcribed = true;
                                 emit_interim(app, InterimCaption { text, language_code });
                             }
                             Ok(ServerMessage::TranscriptFinal { text, speaker, .. }) => {
+                                *transcribed = true;
                                 emit_final(app, ledger, &text, speaker);
                                 // Rotate at an utterance boundary, where a seam
                                 // costs nothing.
@@ -930,5 +951,69 @@ mod tests {
             }
             other => panic!("unexpected outcome: {:?}", other),
         }
+    }
+
+    // ---- reconnect budget -------------------------------------------------
+
+    /// A gateway that accepts the upgrade and then rejects `start` must not be
+    /// treated as a successful reconnect: the handshake alone proves nothing,
+    /// so the retry budget has to run out instead of looping forever.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_gateway_that_rejects_every_session_exhausts_the_retry_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+
+        let server_accepted = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let accepted = server_accepted.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    let _ = ws
+                        .send(Message::Text(r#"{"type":"error","message":"x"}"#.to_string()))
+                        .await;
+                    // Hold the socket until the client goes away.
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let config = LiveSessionConfig {
+            endpoint: format!("ws://{}", addr),
+            bearer_token: "test".to_string(),
+            model: "test-model".to_string(),
+            language: None,
+        };
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_live_transcription(handle, receiver, config));
+
+        // The recording keeps going; only the live path is failing.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(20), task).await;
+        server.abort();
+
+        let connections = accepted.load(Ordering::SeqCst);
+        assert!(
+            connections <= MAX_RECONNECT_ATTEMPTS as usize + 1,
+            "reconnected {} times; the budget is {} retries",
+            connections,
+            MAX_RECONNECT_ATTEMPTS
+        );
     }
 }
