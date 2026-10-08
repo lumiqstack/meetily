@@ -2102,4 +2102,34 @@ Content-Length: 1000
         let err = outcome.expect_err("silent server must fail the download");
         assert!(err.to_string().contains("did not answer"), "unexpected error: {err}");
     }
+
+    #[tokio::test]
+    async fn direct_download_removes_partial_file_when_stream_closes_early() {
+        use std::io::{Read, Write};
+        // Headers promise 1000 bytes; the server sends 10 and closes the socket.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 1000\r\n\r\n0123456789",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/sites/x/Shared%20Documents/rec.mp4")).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_direct_file_with_stall(&url, "", tmp.path(), |_| {}, &cancel, Duration::from_secs(5)),
+        )
+        .await
+        .expect("a closed stream must fail promptly");
+        assert!(outcome.is_err(), "a stream cut short of Content-Length must fail");
+        assert!(!tmp.path().join("rec.mp4").exists(), "partial file must be removed");
+    }
 }
