@@ -29,7 +29,7 @@ static DOWNLOAD_PCT: Lazy<Regex> =
 /// progress emit. The pipes are drained by dedicated tasks now, but a genuine
 /// network freeze is still possible, and a false positive merely costs a
 /// resume — so keep this tight.
-const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A stalled attempt is not fatal: yt-dlp records per-fragment progress in a
 /// `.ytdl` sidecar, so the next attempt re-extracts (fresh manifest token) and

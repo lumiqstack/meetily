@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
+use std::time::Duration;
+
+use super::url_import::STALL_TIMEOUT;
 
 /// One recording found on SharePoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,6 +491,8 @@ async fn fetch_media_bytes(
     client: &reqwest::Client,
     candidate: &url::Url,
     cookie_header: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+    stall: Duration,
 ) -> FetchOutcome {
     let mut current = candidate.clone();
     // Storage-CDN hops carry their own token in the URL; sending SharePoint
@@ -505,13 +510,22 @@ async fn fetch_media_bytes(
             request = request.header("Cookie", cookie_header);
         }
 
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(e) => {
-                return FetchOutcome::Fatal(
-                    anyhow!(e).context("The download request to SharePoint failed"),
-                )
-            }
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return FetchOutcome::Fatal(anyhow!("Import cancelled")),
+            sent = tokio::time::timeout(stall, request.send()) => match sent {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => {
+                    return FetchOutcome::Fatal(
+                        anyhow!(e).context("The download request to SharePoint failed"),
+                    )
+                }
+                Err(_) => {
+                    return FetchOutcome::Fatal(anyhow!(
+                        "SharePoint did not answer the download request within {}s",
+                        stall.as_secs()
+                    ))
+                }
+            },
         };
 
         let status = response.status();
@@ -583,6 +597,27 @@ pub(crate) async fn download_direct_file<F: Fn(u32)>(
     on_progress: F,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<std::path::PathBuf> {
+    download_direct_file_with_stall(
+        file_url,
+        cookie_header,
+        work_dir,
+        on_progress,
+        cancel,
+        STALL_TIMEOUT,
+    )
+    .await
+}
+
+/// `stall` bounds the wait for the response headers and for each body chunk,
+/// so a connection that goes quiet fails instead of hanging the import.
+async fn download_direct_file_with_stall<F: Fn(u32)>(
+    file_url: &url::Url,
+    cookie_header: &str,
+    work_dir: &std::path::Path,
+    on_progress: F,
+    cancel: &tokio_util::sync::CancellationToken,
+    stall: Duration,
+) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(work_dir)
         .with_context(|| format!("Could not create work dir {}", work_dir.display()))?;
 
@@ -594,7 +629,7 @@ pub(crate) async fn download_direct_file<F: Fn(u32)>(
     let mut denied = false;
 
     for (idx, candidate) in candidates.iter().enumerate() {
-        let outcome = fetch_media_bytes(&client, candidate, cookie_header).await;
+        let outcome = fetch_media_bytes(&client, candidate, cookie_header, cancel, stall).await;
         let reason = match outcome {
             FetchOutcome::Bytes(response) => {
                 accepted = Some(response);
@@ -653,16 +688,29 @@ pub(crate) async fn download_direct_file<F: Fn(u32)>(
         .with_context(|| format!("Could not create {}", dest.display()))?;
     let mut downloaded: u64 = 0;
     let mut last_pct: u32 = 0;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .context("The download stream from SharePoint failed")?
-    {
-        if cancel.is_cancelled() {
-            drop(file);
-            let _ = tokio::fs::remove_file(&dest).await;
-            return Err(anyhow!("Import cancelled"));
-        }
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            chunk = tokio::time::timeout(stall, response.chunk()) => Some(chunk),
+        };
+        let chunk = match next {
+            None => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(anyhow!("Import cancelled"));
+            }
+            Some(Err(_)) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err(anyhow!(
+                    "The download from SharePoint stalled: no data for {}s",
+                    stall.as_secs()
+                ));
+            }
+            Some(Ok(chunk)) => chunk.context("The download stream from SharePoint failed")?,
+        };
+        let Some(chunk) = chunk else { break };
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
             .await
             .context("Could not write the downloaded recording to disk")?;
@@ -1992,5 +2040,66 @@ mod tests {
             outcome.is_ok(),
             "download_direct_file did not return within 5s of start although cancel fired at 1s (stalled stream, no timeout)"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_download_fails_when_body_stalls_without_cancel() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK
+Content-Type: video/mp4
+Content-Length: 1000
+
+0123456789",
+                );
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/sites/x/Shared%20Documents/rec.mp4")).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_direct_file_with_stall(&url, "", tmp.path(), |_| {}, &cancel, Duration::from_secs(1)),
+        )
+        .await
+        .expect("stalled download must give up within 10s without a cancel");
+        let err = outcome.expect_err("stalled download must fail");
+        assert!(err.to_string().contains("stalled"), "unexpected error: {err}");
+        assert!(!tmp.path().join("rec.mp4").exists(), "partial file must be removed");
+    }
+
+    #[tokio::test]
+    async fn direct_download_fails_when_no_response_headers_without_cancel() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/sites/x/Shared%20Documents/rec.mp4")).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_direct_file_with_stall(&url, "", tmp.path(), |_| {}, &cancel, Duration::from_secs(1)),
+        )
+        .await
+        .expect("silent server must time out within 10s without a cancel");
+        let err = outcome.expect_err("silent server must fail the download");
+        assert!(err.to_string().contains("did not answer"), "unexpected error: {err}");
     }
 }
