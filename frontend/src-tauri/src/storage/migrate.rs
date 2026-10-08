@@ -297,7 +297,9 @@ fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = value.get(prefix.len()..)?;
     // Whole path components only: "rec-old" is not inside "rec".
     if head.eq_ignore_ascii_case(prefix)
-        && (rest.is_empty() || rest.starts_with(['\\', '/']))
+        && (rest.is_empty()
+            || rest.starts_with(['\\', '/'])
+            || prefix.ends_with(['\\', '/']))
     {
         Some(rest)
     } else {
