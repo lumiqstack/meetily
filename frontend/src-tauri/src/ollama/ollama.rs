@@ -650,11 +650,14 @@ mod tests {
         });
 
         let model = "concurrent-pull-model".to_string();
-        let (first, second) = tokio::join!(
-            pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint.clone())),
-            pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint)),
-        );
-        let results = [first, second];
+        // Hold the lock so both pulls are parked on it when it is released; without
+        // that, join! would run the first pull's check and insert before the second polls.
+        let gate = DOWNLOADING_MODELS.write().await;
+        let first = tokio::spawn(pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint.clone())));
+        let second = tokio::spawn(pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(gate);
+        let results = [first.await.unwrap(), second.await.unwrap()];
         let rejected = results
             .iter()
             .filter(|r| r.as_ref().err().is_some_and(|e| e.contains("already being downloaded")))
