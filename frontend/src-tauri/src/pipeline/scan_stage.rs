@@ -116,8 +116,8 @@ pub async fn run_scan_stage(
         // Never configured; nothing to do (not an error).
         return Ok(0);
     };
-    let since_iso = sync_state
-        .last_sync_date
+    let last_sync = sync_state.last_sync_date;
+    let since_iso = last_sync
         .clone()
         .unwrap_or_else(|| (Utc::now() - chrono::Duration::days(30)).to_rfc3339());
 
@@ -160,7 +160,8 @@ pub async fn run_scan_stage(
 
     let transcript_config = transcribe_stage::load_transcript_config(pool).await;
     let mut imported = 0usize;
-    let mut newest_imported: Option<String> = None;
+    // (created, imported) per attempted item, in processing order.
+    let mut outcomes: Vec<(String, bool)> = Vec::new();
 
     for item in to_import.into_iter().take(MAX_IMPORTS_PER_SCAN) {
         let file_url = item.recording.file_url.clone();
@@ -187,9 +188,7 @@ pub async fn run_scan_stage(
                 // download is retried on the next scan.
                 mark_imported_public(app, &file_url);
                 imported += 1;
-                if newest_imported.as_deref().map_or(true, |n| created.as_str() > n) {
-                    newest_imported = Some(created);
-                }
+                outcomes.push((created, true));
                 crate::pipeline::wake();
             }
             Err(e) => {
@@ -197,6 +196,7 @@ pub async fn run_scan_stage(
                 if is_auth_required_error(&message) {
                     return Err(ScanError::from_message(message));
                 }
+                outcomes.push((created, false));
                 log::warn!("[pipeline] import of \"{}\" failed: {}", title, message);
             }
         }
@@ -204,9 +204,52 @@ pub async fn run_scan_stage(
 
     // Advance the watermark only past recordings that actually imported; the
     // ledger stays authoritative for individual files either way.
-    if let Some(newest) = newest_imported {
+    if let Some(newest) = next_watermark(&outcomes, last_sync.as_deref()) {
         set_last_sync_date(app, &newest);
     }
 
     Ok(imported)
+}
+
+/// New `last_sync_date` after a scan. `outcomes` is `(created, imported)` for
+/// each attempted item, oldest first.
+fn next_watermark(outcomes: &[(String, bool)], _current: Option<&str>) -> Option<String> {
+    outcomes
+        .iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(created, _)| created.as_str())
+        .max()
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcomes(items: &[(&str, bool)]) -> Vec<(String, bool)> {
+        items.iter().map(|(c, ok)| (c.to_string(), *ok)).collect()
+    }
+
+    const A: &str = "2026-07-20T09:00:00Z";
+    const B: &str = "2026-07-21T09:00:00Z";
+    const C: &str = "2026-07-22T09:00:00Z";
+
+    #[test]
+    fn watermark_advances_to_newest_when_every_import_succeeds() {
+        let o = outcomes(&[(A, true), (B, true)]);
+        assert_eq!(next_watermark(&o, None), Some(B.to_string()));
+    }
+
+    #[test]
+    fn watermark_does_not_move_when_the_oldest_import_failed() {
+        let o = outcomes(&[(A, false), (B, true)]);
+        assert_eq!(next_watermark(&o, None), None);
+        assert_eq!(next_watermark(&o, Some("2026-07-01T00:00:00Z")), None);
+    }
+
+    #[test]
+    fn watermark_stops_at_the_last_success_before_a_failure() {
+        let o = outcomes(&[(A, true), (B, false), (C, true)]);
+        assert_eq!(next_watermark(&o, None), Some(A.to_string()));
+    }
 }

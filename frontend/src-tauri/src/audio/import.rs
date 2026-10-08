@@ -1964,8 +1964,30 @@ async fn run_url_import<R: Runtime>(
         }
     };
 
-    // Phase 4: claim the shared engine guard now (after the long download) and
-    // hand off to the normal pipeline, which journals + emits its own events.
+    hand_off_to_pipeline(
+        &app, import_id, url, title, language, model, provider, mode, meeting_date, media_path,
+        work_dir,
+    )
+    .await
+}
+
+/// Phase 4 of a URL import: claim the shared engine guard (after the long
+/// download) and hand the file to the normal pipeline, which journals and
+/// emits its own events.
+#[allow(clippy::too_many_arguments)]
+async fn hand_off_to_pipeline<R: Runtime>(
+    app: &AppHandle<R>,
+    import_id: String,
+    url: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: Option<String>,
+    meeting_date: Option<String>,
+    media_path: PathBuf,
+    work_dir: PathBuf,
+) -> Result<()> {
     let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = match IMPORT_JOBS.acquire(import_id.clone(), use_remote) {
         Ok(g) => g,
@@ -2337,6 +2359,84 @@ mod tests {
             "local import must not be blocked by the remote cap: {:?}",
             local.err()
         );
+    }
+
+    /// H4-F2: the automatic SharePoint sync marks a recording imported when
+    /// the hand-off returns Ok. A pipeline failure must come back as Err so
+    /// the item is retried. Drives the real pipeline with a media file that
+    /// does not exist, which fails before any folder is created.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn url_hand_off_reports_a_pipeline_failure() {
+        let _serial = global_coordinator_test_lock();
+        let work_dir = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_app();
+        let result = hand_off_to_pipeline(
+            app.handle(),
+            "import-hand-off-failure".to_string(),
+            "https://contoso-my.sharepoint.com/x.mp4".to_string(),
+            "Hand off failure".to_string(),
+            None,
+            None,
+            None,
+            Some("audio".to_string()),
+            None,
+            work_dir.path().join("missing.mp4"),
+            work_dir.path().join("work"),
+        )
+        .await;
+        assert!(result.is_err(), "pipeline failure was reported as success");
+    }
+
+    /// H4-F4: a local import whose decode fails after the audio copy must not
+    /// leave the meeting folder (with the full audio copy) behind.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn failed_local_import_leaves_no_meeting_folder() {
+        let _serial = global_coordinator_test_lock();
+        let data = tempfile::tempdir().unwrap();
+        // Another test may already own the process-wide data root; never write
+        // anywhere but a tempdir.
+        let _ = crate::storage::DATA_ROOT.set(data.path().to_path_buf());
+        assert!(
+            crate::storage::default_recordings_dir().starts_with(std::env::temp_dir()),
+            "recordings dir is not sandboxed; this test cannot run safely"
+        );
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let source = src_dir.path().join("not-audio.wav");
+        std::fs::write(&source, vec![0x5Au8; 4096]).unwrap();
+
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let title = format!("Cleanup {unique}");
+        let app = tauri::test::mock_app();
+        let result = run_import(
+            app.handle().clone(),
+            "import-failed-local-cleanup".to_string(),
+            source.to_string_lossy().to_string(),
+            title,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "random bytes must not decode");
+
+        let leftovers: Vec<_> = std::fs::read_dir(crate::storage::default_recordings_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(&unique))
+            .map(|e| e.path())
+            .collect();
+        assert!(leftovers.is_empty(), "meeting folder left behind: {leftovers:?}");
     }
 
     #[test]
