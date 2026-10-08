@@ -350,21 +350,16 @@ async fn process_one(
                 item.meeting_id,
                 e.message
             );
-            let kind = if e.transient {
-                FailureKind::Transient
-            } else {
-                FailureKind::Hard
-            };
             meta::record_failure(
                 pool,
                 &item.meeting_id,
                 item.stage.as_str(),
                 &e.message,
-                kind,
+                e.kind,
                 config.max_attempts,
             )
             .await;
-            if !e.transient {
+            if e.kind == FailureKind::Hard {
                 pipeline.clear_forced(&item.meeting_id);
             }
             false

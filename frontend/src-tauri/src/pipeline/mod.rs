@@ -57,23 +57,28 @@ pub enum FailureKind {
 #[derive(Debug, Clone)]
 pub struct StageError {
     pub message: String,
-    /// Transient errors back off and retry forever; hard errors count
-    /// against the attempt budget and eventually stop.
-    pub transient: bool,
+    pub kind: FailureKind,
 }
 
 impl StageError {
     pub fn hard(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            transient: false,
+            kind: FailureKind::Hard,
         }
     }
 
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            transient: true,
+            kind: FailureKind::Transient,
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: FailureKind::Timeout,
         }
     }
 }
@@ -289,8 +294,9 @@ mod tests {
 
     #[test]
     fn stage_errors_carry_their_retry_class() {
-        assert!(StageError::transient("endpoint down").transient);
-        assert!(!StageError::hard("bad config").transient);
+        assert_eq!(StageError::transient("endpoint down").kind, FailureKind::Transient);
+        assert_eq!(StageError::hard("bad config").kind, FailureKind::Hard);
+        assert_eq!(StageError::timeout("too slow").kind, FailureKind::Timeout);
         assert_eq!(StageError::hard("boom").to_string(), "boom");
     }
 

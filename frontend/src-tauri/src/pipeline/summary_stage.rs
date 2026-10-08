@@ -8,7 +8,7 @@ use crate::database::repositories::setting::SettingsRepository;
 use crate::database::repositories::summary::SummaryProcessesRepository;
 use crate::database::repositories::transcript_chunk::TranscriptChunksRepository;
 use crate::pipeline::settings::PipelineSettings;
-use crate::pipeline::StageError;
+use crate::pipeline::{FailureKind, StageError};
 use crate::summary::SummaryService;
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -49,16 +49,18 @@ pub fn build_summary_transcript_text(segments: &[Transcript]) -> String {
         .join("\n")
 }
 
-/// Provider failures worth retrying later rather than counting against the
-/// attempt budget: the summariser being unreachable says nothing about the
-/// meeting.
-fn is_transient_provider_error(error: &str) -> bool {
+/// How a failed summary attempt is retried. Outages (the summariser is
+/// unreachable, busy, or rate limiting) say nothing about the meeting, so they
+/// never give up. A timeout is different: the provider was reachable but did
+/// not finish, which tends to repeat for the same meeting, so it is capped.
+/// Outage needles are checked first so that "504 Gateway Timeout" stays an
+/// outage.
+fn classify_summary_failure(error: &str) -> FailureKind {
     let error = error.to_lowercase();
-    [
+    let mentions = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
+    if mentions(&[
         "connection",
         "connect",
-        "timed out",
-        "timeout",
         "network",
         "unreachable",
         "refused",
@@ -70,9 +72,13 @@ fn is_transient_provider_error(error: &str) -> bool {
         "429",
         "rate limit",
         "overloaded",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
+    ]) {
+        FailureKind::Transient
+    } else if mentions(&["timed out", "timeout"]) {
+        FailureKind::Timeout
+    } else {
+        FailureKind::Hard
+    }
 }
 
 /// Read the user's explicit per-meeting summary language, if they set one.
@@ -181,10 +187,10 @@ pub async fn run_summary_stage<R: Runtime>(
             .flatten()
             .unwrap_or_else(|| "Summary generation failed".to_string());
 
-            if is_transient_provider_error(&error) {
-                Err(StageError::transient(error))
-            } else {
-                Err(StageError::hard(error))
+            match classify_summary_failure(&error) {
+                FailureKind::Transient => Err(StageError::transient(error)),
+                FailureKind::Timeout => Err(StageError::timeout(error)),
+                FailureKind::Hard => Err(StageError::hard(error)),
             }
         }
     }
@@ -235,11 +241,25 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_outages_are_transient_but_bad_config_is_not() {
-        assert!(is_transient_provider_error("error sending request: connection refused"));
-        assert!(is_transient_provider_error("HTTP 503 Service Unavailable"));
-        assert!(is_transient_provider_error("Request timed out"));
-        assert!(!is_transient_provider_error("Failed to load template 'nope'"));
-        assert!(!is_transient_provider_error("invalid api key"));
+    fn summary_failures_are_classified_by_retry_class() {
+        assert_eq!(
+            classify_summary_failure("error sending request: connection refused"),
+            FailureKind::Transient
+        );
+        assert_eq!(classify_summary_failure("HTTP 503 Service Unavailable"), FailureKind::Transient);
+        assert_eq!(classify_summary_failure("HTTP 504 Gateway Timeout"), FailureKind::Transient);
+        assert_eq!(
+            classify_summary_failure("LLM request timed out after 300 seconds"),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify_summary_failure("GitHub Copilot CLI timed out after 300 seconds"),
+            FailureKind::Timeout
+        );
+        assert_eq!(
+            classify_summary_failure("Failed to load template 'nope'"),
+            FailureKind::Hard
+        );
+        assert_eq!(classify_summary_failure("invalid api key"), FailureKind::Hard);
     }
 }

@@ -13,6 +13,11 @@ use std::collections::HashMap;
 /// Backoff ladder applied after each consecutive failure.
 const BACKOFF_MINUTES: [i64; 4] = [1, 5, 15, 60];
 
+/// Consecutive summary timeouts after which a meeting is suppressed until the
+/// user retries it by hand. A summariser that never finishes this meeting is
+/// not going to finish it on the next hourly tick either.
+const MAX_CONSECUTIVE_TIMEOUTS: i64 = 3;
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MetaRow {
     pub meeting_id: String,
@@ -20,6 +25,7 @@ pub struct MetaRow {
     pub last_stage: Option<String>,
     pub last_error: Option<String>,
     pub next_retry_at: Option<String>,
+    pub consecutive_timeouts: i64,
     #[sqlx(rename = "suppressed")]
     pub suppressed_raw: i64,
 }
@@ -52,7 +58,7 @@ fn backoff_for(attempts: i64) -> Duration {
 
 pub async fn load_all(pool: &SqlitePool) -> HashMap<String, MetaRow> {
     match sqlx::query_as::<_, MetaRow>(
-        "SELECT meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed FROM pipeline_meta",
+        "SELECT meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed, consecutive_timeouts FROM pipeline_meta",
     )
     .fetch_all(pool)
     .await
@@ -70,7 +76,7 @@ pub async fn load_all(pool: &SqlitePool) -> HashMap<String, MetaRow> {
 
 pub async fn load(pool: &SqlitePool, meeting_id: &str) -> Option<MetaRow> {
     sqlx::query_as::<_, MetaRow>(
-        "SELECT meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed \
+        "SELECT meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed, consecutive_timeouts \
          FROM pipeline_meta WHERE meeting_id = ?",
     )
     .bind(meeting_id)
@@ -96,6 +102,7 @@ pub async fn record_success(pool: &SqlitePool, meeting_id: &str) {
 /// counted, and it is what the user sees if the process never got that far.
 const ATTEMPT_IN_FLIGHT: &str = "attempt started — the process exited before it finished";
 
+#[allow(clippy::too_many_arguments)]
 async fn write_meta(
     pool: &SqlitePool,
     meeting_id: &str,
@@ -104,14 +111,16 @@ async fn write_meta(
     error: &str,
     next_retry_at: &str,
     suppressed: i64,
+    consecutive_timeouts: i64,
 ) {
     if let Err(e) = sqlx::query(
-        "INSERT INTO pipeline_meta (meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO pipeline_meta (meeting_id, attempts, last_stage, last_error, next_retry_at, suppressed, consecutive_timeouts, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(meeting_id) DO UPDATE SET \
             attempts = excluded.attempts, last_stage = excluded.last_stage, \
             last_error = excluded.last_error, next_retry_at = excluded.next_retry_at, \
-            suppressed = excluded.suppressed, updated_at = excluded.updated_at",
+            suppressed = excluded.suppressed, consecutive_timeouts = excluded.consecutive_timeouts, \
+            updated_at = excluded.updated_at",
     )
     .bind(meeting_id)
     .bind(attempts)
@@ -119,6 +128,7 @@ async fn write_meta(
     .bind(error)
     .bind(next_retry_at)
     .bind(suppressed)
+    .bind(consecutive_timeouts)
     .bind(Utc::now().to_rfc3339())
     .execute(pool)
     .await
@@ -142,8 +152,9 @@ pub async fn begin_attempt(
     stage: &str,
     max_attempts: i64,
 ) -> i64 {
-    let previous = load(pool, meeting_id).await.map(|r| r.attempts).unwrap_or(0);
-    let attempts = previous + 1;
+    let previous = load(pool, meeting_id).await;
+    let consecutive_timeouts = previous.as_ref().map(|r| r.consecutive_timeouts).unwrap_or(0);
+    let attempts = previous.map(|r| r.attempts).unwrap_or(0) + 1;
     let next_retry_at = (Utc::now() + backoff_for(attempts)).to_rfc3339();
     let suppressed = i64::from(attempts >= max_attempts);
 
@@ -155,10 +166,15 @@ pub async fn begin_attempt(
         ATTEMPT_IN_FLIGHT,
         &next_retry_at,
         suppressed,
+        consecutive_timeouts,
     )
     .await;
 
     attempts
+}
+
+fn timeout_limit_reason() -> String {
+    format!("Summary timed out {MAX_CONSECUTIVE_TIMEOUTS} times. Try a smaller or faster model, then retry.")
 }
 
 /// Record a failed attempt and schedule the next one.
@@ -183,13 +199,23 @@ pub async fn record_failure(
         .as_ref()
         .and_then(|r| r.last_error.as_deref())
         == Some(ATTEMPT_IN_FLIGHT);
+    let previous_timeouts = existing.as_ref().map(|r| r.consecutive_timeouts).unwrap_or(0);
     let previous = existing.map(|r| r.attempts).unwrap_or(0);
     let attempts = if in_flight { previous.max(1) } else { previous + 1 };
 
     let next_retry_at = (Utc::now() + backoff_for(attempts)).to_rfc3339();
-    let suppressed = match kind {
-        FailureKind::Transient | FailureKind::Timeout => 0,
-        FailureKind::Hard => i64::from(attempts >= max_attempts),
+    // Only an unbroken run of timeouts counts; any other outcome starts over.
+    let consecutive_timeouts = match kind {
+        FailureKind::Timeout => previous_timeouts + 1,
+        FailureKind::Transient | FailureKind::Hard => 0,
+    };
+    let (suppressed, error) = match kind {
+        FailureKind::Transient => (0, error.to_string()),
+        FailureKind::Hard => (i64::from(attempts >= max_attempts), error.to_string()),
+        FailureKind::Timeout if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS => {
+            (1, timeout_limit_reason())
+        }
+        FailureKind::Timeout => (0, error.to_string()),
     };
     // Keep stored errors bounded; some provider errors embed whole payloads.
     let error: String = error.chars().take(500).collect();
@@ -202,6 +228,7 @@ pub async fn record_failure(
         &error,
         &next_retry_at,
         suppressed,
+        consecutive_timeouts,
     )
     .await;
 }
