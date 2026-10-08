@@ -780,3 +780,38 @@ pub fn write_transcript_json_to_file(
 
     Ok(file_path.to_string_lossy().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_title_same_minute_gets_separate_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let first = create_meeting_folder(&base, "Weekly Sync", false).unwrap();
+        let second = create_meeting_folder(&base, "Weekly Sync", false).unwrap();
+        assert_ne!(first, second, "two imports of the same title got the same folder");
+    }
+
+    #[test]
+    fn long_title_folder_stays_within_filename_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        // 250 ASCII bytes + "_YYYY-MM-DD_HH-MM" (17 bytes) = 267 bytes, over the 255-byte
+        // NAME_MAX of ext4 and the 255-character APFS/NTFS limits. (85 CJK chars
+        // are only 85 characters on APFS/NTFS, so they do not hit the limit there.)
+        let result = create_meeting_folder(&base, &"a".repeat(250), false);
+        assert!(result.is_ok(), "create_meeting_folder failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn long_multibyte_title_folder_is_created_within_byte_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        let folder = create_meeting_folder(&base, &"会".repeat(85), false).unwrap();
+        assert!(folder.is_dir());
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() <= 200, "folder name is {} bytes", name.len());
+    }
+}

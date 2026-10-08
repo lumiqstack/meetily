@@ -1954,4 +1954,26 @@ mod tests {
         assert_eq!(items[3].recording.name, "Old Sync.mp4");
         assert!(items[3].already_imported);
     }
+
+    #[test]
+    fn percent_decode_keeps_multibyte_after_percent() {
+        // A literal '%' followed by a multi-byte char: slicing input[i+1..i+3]
+        // by byte lands inside the char and panics.
+        assert_eq!(percent_decode_component("50% über"), "50% über");
+    }
+
+    #[test]
+    fn percent_decode_keeps_en_dash_after_percent() {
+        assert_eq!(percent_decode_component("Growth 5%–10%"), "Growth 5%–10%");
+    }
+
+    #[test]
+    fn percent_decode_only_consumes_two_ascii_hex_digits() {
+        assert_eq!(percent_decode_component("a%20b"), "a b");
+        assert_eq!(percent_decode_component("100%"), "100%");
+        assert_eq!(percent_decode_component("%zz"), "%zz");
+        assert_eq!(percent_decode_component("%E2%80%93"), "–");
+        // from_str_radix accepts a leading '+', so "%+1" must not decode to 0x01.
+        assert_eq!(percent_decode_component("a%+1"), "a%+1");
+    }
 }
