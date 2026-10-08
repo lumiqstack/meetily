@@ -256,30 +256,78 @@ pub struct DownloadProgress {
     pub total: u64,
 }
 
+/// Longest silence tolerated between pull progress lines. Ollama can go quiet
+/// while it verifies a large layer's digest, so this is looser than the
+/// 30s per-chunk limit used for direct file downloads.
+const PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Limit on establishing the connection to the Ollama server.
+const PULL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[command]
 pub async fn pull_ollama_model<R: Runtime>(
     app_handle: AppHandle<R>,
     model_name: String,
     endpoint: Option<String>,
 ) -> Result<(), String> {
-    // Check if model is already being downloaded
+    // Check and mark under one write lock so two concurrent pulls cannot both pass the check.
     {
-        let downloading = DOWNLOADING_MODELS.read().await;
-        if downloading.contains(&model_name) {
+        let mut downloading = DOWNLOADING_MODELS.write().await;
+        if !downloading.insert(model_name.clone()) {
             log::warn!("Model {} is already being downloaded, ignoring duplicate request", model_name);
             return Err(format!("Model {} is already being downloaded", model_name));
         }
-    }
-
-    // Mark model as downloading
-    {
-        let mut downloading = DOWNLOADING_MODELS.write().await;
-        downloading.insert(model_name.clone());
         log::info!("Started download tracking for model: {}", model_name);
     }
 
-    let client = Client::new();
-    let base_url = endpoint.as_deref().unwrap_or("http://localhost:11434");
+    let result = pull_model_stream(&app_handle, &model_name, endpoint.as_deref(), PULL_IDLE_TIMEOUT).await;
+
+    // Clear on every outcome so a failed pull can be retried without a restart
+    {
+        let mut downloading = DOWNLOADING_MODELS.write().await;
+        downloading.remove(&model_name);
+    }
+
+    if let Err(error_msg) = &result {
+        let _ = app_handle.emit(
+            "ollama-model-download-error",
+            serde_json::json!({
+                "modelName": model_name,
+                "error": error_msg
+            }),
+        );
+        return result;
+    }
+
+    log::info!("Removed {} from downloading set", model_name);
+
+    // Emit completion event
+    let _ = app_handle.emit(
+        "ollama-model-download-complete",
+        serde_json::json!({
+            "modelName": model_name
+        }),
+    );
+
+    log::info!("Ollama model {} downloaded successfully", model_name);
+
+    Ok(())
+}
+
+/// Streams `/api/pull` progress, failing if Ollama goes quiet for `idle_timeout`.
+/// A total request timeout would bound the whole body, which fails any pull
+/// longer than that limit, so only connection setup and per-chunk silence are bounded.
+async fn pull_model_stream<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    model_name: &str,
+    endpoint: Option<&str>,
+    idle_timeout: Duration,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .connect_timeout(PULL_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let base_url = endpoint.unwrap_or("http://localhost:11434");
     let url = format!("{}/api/pull", base_url);
 
     let payload = serde_json::json!({
@@ -287,13 +335,9 @@ pub async fn pull_ollama_model<R: Runtime>(
         "stream": true
     });
 
-    let response = client
-        .post(&url)
-        .json(&payload)
-        .timeout(Duration::from_secs(600)) // 10 minutes timeout for pulling
-        .send()
-        .await
-        .map_err(|e| {
+    let response = match timeout(idle_timeout, client.post(&url).json(&payload).send()).await {
+        Err(_) => return Err(pull_stall_error(idle_timeout)),
+        Ok(response) => response.map_err(|e| {
             if e.is_timeout() {
                 format!("Download timed out. The model may be large, please try using the Ollama CLI: ollama pull {}", model_name)
             } else if e.is_connect() {
@@ -301,27 +345,12 @@ pub async fn pull_ollama_model<R: Runtime>(
             } else {
                 format!("Failed to download model: {}", e)
             }
-        })?;
+        })?,
+    };
 
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-
-        // Remove from downloading set on error
-        {
-            let mut downloading = DOWNLOADING_MODELS.write().await;
-            downloading.remove(&model_name);
-        }
-
-        // Emit error event
-        let _ = app_handle.emit(
-            "ollama-model-download-error",
-            serde_json::json!({
-                "modelName": model_name,
-                "error": format!("HTTP {}: {}", status, error_text)
-            }),
-        );
-
         return Err(format!("Failed to pull model (HTTP {}): {}", status, error_text));
     }
 
@@ -330,26 +359,12 @@ pub async fn pull_ollama_model<R: Runtime>(
     let mut buffer = String::new();
     let mut last_progress = 0u8;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            let error_msg = format!("Failed to read stream: {}", e);
-
-            // Remove from downloading set on stream error
-            let model_name_clone = model_name.clone();
-            tokio::spawn(async move {
-                let mut downloading = DOWNLOADING_MODELS.write().await;
-                downloading.remove(&model_name_clone);
-            });
-
-            let _ = app_handle.emit(
-                "ollama-model-download-error",
-                serde_json::json!({
-                    "modelName": model_name,
-                    "error": error_msg
-                }),
-            );
-            error_msg
-        })?;
+    loop {
+        let chunk = match timeout(idle_timeout, stream.next()).await {
+            Err(_) => return Err(pull_stall_error(idle_timeout)),
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk.map_err(|e| format!("Failed to read stream: {}", e))?,
+        };
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -372,8 +387,9 @@ pub async fn pull_ollama_model<R: Runtime>(
                     if total > 0 {
                         let progress = ((completed as f64 / total as f64) * 100.0) as u8;
 
-                        // Only emit if progress changed significantly (reduces event spam)
-                        if progress != last_progress && (progress - last_progress >= 1 || progress == 100) {
+                        // Progress is per layer and can drop when a new layer starts, so
+                        // any change is emitted; a signed/unsigned difference would underflow.
+                        if progress != last_progress {
                             log::info!("Ollama download progress for {}: {}%", model_name, progress);
 
                             let _ = app_handle.emit(
@@ -391,45 +407,17 @@ pub async fn pull_ollama_model<R: Runtime>(
 
                 // Check for error status
                 if let Some(error) = json.get("error").and_then(|v| v.as_str()) {
-                    let error_msg = format!("Ollama error: {}", error);
-
-                    // Remove from downloading set on Ollama error
-                    {
-                        let mut downloading = DOWNLOADING_MODELS.write().await;
-                        downloading.remove(&model_name);
-                    }
-
-                    let _ = app_handle.emit(
-                        "ollama-model-download-error",
-                        serde_json::json!({
-                            "modelName": model_name,
-                            "error": error_msg
-                        }),
-                    );
-                    return Err(error_msg);
+                    return Err(format!("Ollama error: {}", error));
                 }
             }
         }
     }
 
-    // Remove from downloading set before emitting completion
-    {
-        let mut downloading = DOWNLOADING_MODELS.write().await;
-        downloading.remove(&model_name);
-        log::info!("Removed {} from downloading set", model_name);
-    }
-
-    // Emit completion event
-    let _ = app_handle.emit(
-        "ollama-model-download-complete",
-        serde_json::json!({
-            "modelName": model_name
-        }),
-    );
-
-    log::info!("Ollama model {} downloaded successfully", model_name);
-
     Ok(())
+}
+
+fn pull_stall_error(idle_timeout: Duration) -> String {
+    format!("Model download stalled: Ollama sent no data for {:?}", idle_timeout)
 }
 
 #[command]
@@ -510,5 +498,170 @@ pub async fn get_ollama_model_context(
             // Return default instead of error for better UX
             Ok(4000)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const IDLE_LIMIT: Duration = Duration::from_millis(500);
+
+    async fn read_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map(|v| v.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Serves one NDJSON pull response: each line is written after its delay,
+    /// then the connection closes (the body ends at EOF, as Ollama's does).
+    async fn serve_pull_script(script: Vec<(Duration, &'static str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                .await;
+            for (delay, line) in script {
+                tokio::time::sleep(delay).await;
+                let _ = stream.write_all(format!("{line}\n").as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn h5_f4_pull_survives_slow_stream_with_gaps_under_idle_limit() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling manifest"}"#),
+            (Duration::from_millis(200), r#"{"status":"pulling","completed":10,"total":100}"#),
+            (Duration::from_millis(200), r#"{"status":"pulling","completed":50,"total":100}"#),
+            (Duration::from_millis(200), r#"{"status":"pulling","completed":100,"total":100}"#),
+            (Duration::from_millis(200), r#"{"status":"success"}"#),
+        ])
+        .await;
+        let result = pull_model_stream(app.handle(), "h5-f4-slow-model", Some(&endpoint), IDLE_LIMIT).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn h5_f4_pull_fails_when_stream_stalls_past_idle_limit() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling manifest"}"#),
+            (Duration::from_millis(1500), r#"{"status":"success"}"#),
+        ])
+        .await;
+        let result = pull_model_stream(app.handle(), "h5-f4-stall-model", Some(&endpoint), IDLE_LIMIT).await;
+        let error = result.expect_err("a pull whose stream stalls past the idle limit must fail");
+        assert!(error.contains("stalled"), "unexpected error: {error}");
+    }
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn h5_f5_new_layer_progress_reset_does_not_panic() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling","completed":100,"total":100}"#),
+            (Duration::ZERO, r#"{"status":"pulling","completed":0,"total":50}"#),
+            (Duration::ZERO, r#"{"status":"success"}"#),
+        ])
+        .await;
+        let result = pull_ollama_model(app.handle().clone(), "h5-f5-layer-reset-model".to_string(), Some(endpoint)).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn h5_f5_failed_pull_clears_downloading_state_so_it_can_retry() {
+        let app = tauri::test::mock_app();
+        let closed_port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let endpoint = format!("http://{closed_port}");
+        let model = "h5-f5-retry-model".to_string();
+
+        let first = pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint.clone())).await;
+        assert!(first.is_err());
+
+        let second = pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint)).await;
+        let error = second.expect_err("connection to a closed port must fail");
+        assert!(!error.contains("already being downloaded"), "unexpected error: {error}");
+    }
+
+    /// Two pulls of one model started together: only the first may run, the
+    /// second must be rejected as already downloading.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn concurrent_pulls_of_same_model_only_one_is_accepted() {
+        let app = tauri::test::mock_app();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    read_request(&mut stream).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = stream.write_all(b"{\"status\":\"success\"}\n").await;
+                });
+            }
+        });
+
+        let model = "concurrent-pull-model".to_string();
+        // Hold the lock so both pulls are parked on it when it is released; without
+        // that, join! would run the first pull's check and insert before the second polls.
+        let gate = DOWNLOADING_MODELS.write().await;
+        let first = tokio::spawn(pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint.clone())));
+        let second = tokio::spawn(pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(gate);
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        let rejected = results
+            .iter()
+            .filter(|r| r.as_ref().err().is_some_and(|e| e.contains("already being downloaded")))
+            .count();
+        assert_eq!(rejected, 1, "results: {results:?}");
     }
 }
