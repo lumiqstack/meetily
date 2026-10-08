@@ -27,12 +27,16 @@ pub struct ApiResponse<T> {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// A sidebar row: the meeting plus which pipeline stages it has finished.
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    /// Has a transcript that live transcription finished writing.
+    pub transcribed: bool,
+    /// Has a completed AI summary.
+    pub summarized: bool,
     /// The meeting has a note in the Obsidian vault.
-    #[serde(default)]
     pub obsidian_exported: bool,
 }
 
@@ -357,31 +361,10 @@ pub async fn api_get_meetings<R: Runtime>(
         auth_token.is_some()
     );
     let pool = state.db_manager.pool();
-    let meetings: Result<Vec<MeetingModel>, sqlx::Error> =
-        MeetingsRepository::get_meetings(pool).await;
-
-    match meetings {
-        Ok(meeting_models) => {
-            log_info!("Successfully got {} meetings", meeting_models.len());
-
-            // Best-effort: a failed lookup only hides the sidebar indicator.
-            let exported: std::collections::HashSet<String> =
-                sqlx::query_scalar::<_, String>("SELECT meeting_id FROM obsidian_exports")
-                    .fetch_all(pool)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-
-            let result: Vec<Meeting> = meeting_models
-                .into_iter()
-                .map(|m| Meeting {
-                    obsidian_exported: exported.contains(&m.id),
-                    id: m.id,
-                    title: m.title,
-                })
-                .collect();
-            Ok(result)
+    match MeetingsRepository::get_meetings(pool).await {
+        Ok(meetings) => {
+            log_info!("Successfully got {} meetings", meetings.len());
+            Ok(meetings)
         }
         Err(e) => {
             log_error!("Error getting meetings: {}", e);

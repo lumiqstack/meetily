@@ -4,25 +4,23 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
+import type { MeetingStages } from './meetingStages';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 
 
 
-interface SidebarItem {
+export interface SidebarItem extends Partial<MeetingStages> {
   id: string;
   title: string;
   type: 'folder' | 'file';
   children?: SidebarItem[];
-  /** The meeting has a note in the Obsidian vault. */
-  obsidianExported?: boolean;
 }
 
-export interface CurrentMeeting {
+export interface CurrentMeeting extends Partial<MeetingStages> {
   id: string;
   title: string;
-  obsidianExported?: boolean;
 }
 
 // Search result type for transcript search
@@ -104,11 +102,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, obsidian_exported?: boolean }>;
-        const transformedMeetings = meetings.map((meeting) => ({
-          id: meeting.id,
-          title: meeting.title,
-          obsidianExported: !!meeting.obsidian_exported,
+        const meetings = await invoke('api_get_meetings') as Array<{
+          id: string, title: string, transcribed: boolean, summarized: boolean, obsidian_exported: boolean
+        }>;
+        const transformedMeetings = meetings.map(({ obsidian_exported, ...meeting }) => ({
+          ...meeting,
+          obsidianExported: obsidian_exported,
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -126,22 +125,20 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
   // Manual and automatic Obsidian exports both emit this; flag the meeting
   // without refetching the whole list.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    listen<string>('obsidian-exported', (event) => {
-      setMeetings(prev => prev.map(m => m.id === event.payload ? { ...m, obsidianExported: true } : m));
-    })
-      .then(fn => {
-        if (disposed) fn();
-        else unlisten = fn;
-      })
-      .catch(error => console.warn('Could not listen for Obsidian exports:', error));
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
+  useTauriEvent<string>('obsidian-exported', (meetingId) => {
+    setMeetings(prev => prev.map(m => m.id === meetingId ? { ...m, obsidianExported: true } : m));
+  });
+
+  // The pipeline re-emits its status on every tick while work is deferred;
+  // only a change of the item it is working on can mean a stage finished.
+  const lastPipelineItemRef = React.useRef<string | null>(null);
+  useTauriEvent<{ current: unknown }>('pipeline-status', ({ current }) => {
+    const item = JSON.stringify(current ?? null);
+    if (item === lastPipelineItemRef.current) return;
+    lastPipelineItemRef.current = item;
+    void fetchMeetings();
+  });
+  useTauriEvent('retranscription-complete', () => { void fetchMeetings(); });
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -157,7 +154,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       title: 'Meeting Notes',
       type: 'folder' as const,
       children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const, obsidianExported: meeting.obsidianExported }))
+        ...meetings.map(meeting => ({ ...meeting, type: 'file' as const }))
       ]
     },
   ];
@@ -317,6 +314,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           return;
         }
         if (summaryPollsRef.current.get(meetingId) !== entry) return;
+        if (result.status === 'completed') {
+          setMeetings(prev => prev.map(m => m.id === meetingId ? { ...m, summarized: true } : m));
+        }
         if (
           result.status === 'completed'
           || result.status === 'error'
