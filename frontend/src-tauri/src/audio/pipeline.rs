@@ -945,7 +945,9 @@ impl AudioPipeline {
             }
         }
 
-        // Flush any remaining VAD segments
+        // Channel closed: mix the partial window once, then flush VAD segments.
+        // Doing this on flush signals would split streams that arrive after one.
+        self.flush_partial_window();
         self.flush_remaining_audio()?;
 
         info!("VAD-driven audio pipeline ended");
@@ -1083,10 +1085,6 @@ impl AudioPipeline {
 
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
-
-        // Mix the partial window first so its audio reaches the recording sender
-        // and the VAD, and the VAD flush below finalizes it.
-        self.flush_partial_window();
 
         // Flush any remaining audio from VAD processor and send segments to
         // transcription. No VAD means no pending segments to flush.
