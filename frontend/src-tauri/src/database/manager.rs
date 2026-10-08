@@ -74,7 +74,7 @@ impl DatabaseManager {
     // after they can just delete the existing .sqlite file and then copy the existing .db file to
     // the current app dir, So the system detects legacy db and copy it and starts with that data
     // (Newly created .sqlite with the copied content from .db)
-    pub async fn new_from_app_handle(_app_handle: &tauri::AppHandle) -> Result<Self> {
+    pub async fn new_from_app_handle<R: tauri::Runtime>(_app_handle: &tauri::AppHandle<R>) -> Result<Self> {
         // Resolve the configured data root (falls back to app_data_dir)
         let app_data_dir = crate::storage::db_dir();
 
@@ -141,8 +141,8 @@ impl DatabaseManager {
     }
 
     /// Import a legacy database from the specified path and initialize
-    pub async fn import_legacy_database(
-        app_handle: &tauri::AppHandle,
+    pub async fn import_legacy_database<R: tauri::Runtime>(
+        app_handle: &tauri::AppHandle<R>,
         legacy_db_path: &str,
     ) -> Result<Self> {
         let app_data_dir = crate::storage::db_dir();
@@ -434,5 +434,132 @@ mod open_failure_tests {
         assert_eq!(rows, 3);
         check.close().await;
         drop(writer);
+    }
+
+    /// H6-F2: a legacy backend DB (backend/app/db.py `_legacy_init_db`) already
+    /// has `meetings.folder_path`; migration 20251006000000 then runs
+    /// `ALTER TABLE meetings ADD COLUMN folder_path` and fails.
+    #[tokio::test]
+    async fn legacy_db_with_folder_path_opens_and_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        // Legacy backend DB is copied in by open_in_dir when meeting_minutes.sqlite is absent.
+        let legacy_db = dir.path().join("meeting_minutes.db");
+        let legacy = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&legacy_db)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, folder_path TEXT)",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m1', 'Standup', '2025-01-01', '2025-01-01', NULL)")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m2', 'Review', '2025-01-02', '2025-01-02', '/x/y')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        // Migration 20251006000000 also ADD COLUMNs three audio fields on transcripts.
+        sqlx::query(
+            "CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, \
+             transcript TEXT NOT NULL, timestamp TEXT NOT NULL, audio_start_time REAL, \
+             audio_end_time REAL, duration REAL)",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO transcripts VALUES ('t1', 'm2', 'hello', '2025-01-02', 1.5, 2.25, 0.75)")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        legacy.close().await;
+
+        let db = match DatabaseManager::open_in_dir(dir.path()).await {
+            Ok(db) => db,
+            Err(e) => panic!("open_in_dir on legacy DB failed: {e}"),
+        };
+        let folder_path: Option<String> =
+            sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = 'm2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(folder_path.as_deref(), Some("/x/y"));
+        let audio: (Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+            "SELECT audio_start_time, audio_end_time, duration FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(audio, (Some(1.5), Some(2.25), Some(0.75)));
+        db.cleanup().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod legacy_import_tests {
+    use super::*;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    /// H6-F1: onboarding passes the default legacy path (the data root's
+    /// `meeting_minutes.db`) back into `import_legacy_database`, which copies
+    /// it onto itself and truncates it.
+    #[tokio::test]
+    async fn import_from_default_location_keeps_meetings() {
+        let root = tempfile::tempdir().unwrap();
+        // Another test may already own the process-wide data root; never write
+        // anywhere but the tempdir.
+        let _ = crate::storage::DATA_ROOT.set(root.path().to_path_buf());
+        assert_eq!(
+            crate::storage::root(),
+            root.path(),
+            "storage::DATA_ROOT is claimed by a different path; this test cannot sandbox its writes"
+        );
+        assert!(root.path().starts_with(std::env::temp_dir()));
+
+        let legacy_db = crate::storage::db_dir().join("meeting_minutes.db");
+        let legacy = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&legacy_db)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m1', 'Standup', '2025-01-01', '2025-01-01')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m2', 'Review', '2025-01-02', '2025-01-02')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        legacy.close().await;
+
+        let app = tauri::test::mock_app();
+        let db = DatabaseManager::import_legacy_database(
+            app.handle(),
+            legacy_db.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let meetings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(meetings, 2);
+        db.cleanup().await.unwrap();
     }
 }
