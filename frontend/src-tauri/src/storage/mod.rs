@@ -17,7 +17,7 @@
 //! The pointer file necessarily stays on the system drive: it is how we find the
 //! relocated root in the first place.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
@@ -42,6 +42,10 @@ pub(crate) static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 struct Pointer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_root: Option<PathBuf>,
+    /// The root the data was in before the latest change. Set until the move
+    /// out of it has finished, so a launch can resume that move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_root: Option<PathBuf>,
 }
 
 /// Reconstruct Tauri's `app_data_dir()` without an `AppHandle`.
@@ -83,7 +87,7 @@ fn resolve(legacy: &Path) -> PathBuf {
         return legacy.to_path_buf();
     };
 
-    if candidate == legacy {
+    if same_dir(&candidate, legacy) {
         return legacy.to_path_buf();
     }
 
@@ -116,6 +120,15 @@ fn read_pointer(legacy: &Path) -> Option<Pointer> {
             None
         }
     }
+}
+
+fn write_pointer(legacy: &Path, pointer: &Pointer) -> Result<()> {
+    std::fs::create_dir_all(legacy)?;
+    let target = pointer_path(legacy);
+    let tmp = legacy.join(".storage.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(pointer)?)?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(())
 }
 
 /// Initialise from the environment, before the Tauri runtime exists.
@@ -168,7 +181,56 @@ pub fn root() -> PathBuf {
 /// True when the data root has been moved off `app_data_dir()`, i.e. there is
 /// something for [`migrate`] to do.
 pub fn is_relocated() -> bool {
-    root() != legacy_root()
+    !same_dir(&root(), &legacy_root())
+}
+
+/// Whether two paths name the same folder, whatever their spelling. Trailing
+/// separators, `.` and `..` components, and letter case on case-insensitive
+/// volumes must not make one folder look like two.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        // Identity rather than spelling: macOS realpath keeps the typed case, so
+        // canonicalize cannot see that /x/Meetily and /x/meetily are one folder.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&ma, &mb);
+            if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                return ca == cb;
+            }
+        }
+    }
+
+    // At least one side does not exist yet, so compare the spelling alone.
+    lexical_key(a) == lexical_key(b)
+}
+
+fn lexical_key(p: &Path) -> Vec<String> {
+    let mut parts: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(parts.last(), Some(Component::Normal(_))) => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts
+        .iter()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            if cfg!(windows) {
+                s.to_lowercase()
+            } else {
+                s.into_owned()
+            }
+        })
+        .collect()
 }
 
 fn subdir(name: &str) -> PathBuf {
@@ -284,18 +346,40 @@ pub fn set_root(path: &Path) -> Result<()> {
     std::fs::create_dir_all(&legacy)
         .map_err(|e| anyhow!("Cannot create {}: {}", legacy.display(), e))?;
 
-    let pointer = Pointer {
-        data_root: if path == legacy {
-            None
-        } else {
-            Some(path.to_path_buf())
-        },
+    let data_root = if same_dir(path, &legacy) {
+        None
+    } else {
+        Some(path.to_path_buf())
     };
+    let configured = read_pointer(&legacy).and_then(|p| p.data_root);
+    let unchanged = match (&data_root, &configured) {
+        (Some(new), Some(old)) => same_dir(new, old),
+        (None, None) => true,
+        _ => false,
+    };
+    if unchanged {
+        return Ok(());
+    }
 
-    let target = pointer_path(&legacy);
-    let tmp = legacy.join(".storage.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&pointer)?)?;
-    std::fs::rename(&tmp, &target)?;
+    // The data stays where it is until restart, so the root in effect now is
+    // the one the next launch has to move from.
+    let previous = root();
+    let previous_root = (!same_dir(&previous, path)).then_some(previous);
+    let moving = previous_root.is_some();
+
+    write_pointer(
+        &legacy,
+        &Pointer {
+            data_root,
+            previous_root,
+        },
+    )?;
+
+    // A new move into this target must not be short-circuited by the record of
+    // an earlier move that happened to use the same two roots.
+    if moving {
+        let _ = std::fs::remove_file(path.join(migrate::STATE_FILE));
+    }
 
     log::info!("Data root set to {} (restart required)", path.display());
     Ok(())
@@ -315,6 +399,7 @@ mod tests {
             legacy.path().join(POINTER_FILE),
             serde_json::to_string(&Pointer {
                 data_root: Some(target.path().to_path_buf()),
+                previous_root: None,
             })
             .unwrap(),
         )
@@ -350,6 +435,7 @@ mod tests {
             legacy.path().join(POINTER_FILE),
             serde_json::to_string(&Pointer {
                 data_root: Some(unusable),
+                previous_root: None,
             })
             .unwrap(),
         )
@@ -375,7 +461,54 @@ mod tests {
     }
 
     #[test]
+    fn pointer_written_before_previous_root_still_parses() {
+        let old: Pointer = serde_json::from_str(r#"{"data_root":"/Volumes/Data/meetily"}"#).unwrap();
+        assert_eq!(old.data_root, Some(PathBuf::from("/Volumes/Data/meetily")));
+        assert!(old.previous_root.is_none());
+        assert_eq!(serde_json::to_string(&Pointer::default()).unwrap(), "{}");
+    }
+
+    #[test]
     fn set_root_rejects_relative_paths() {
         assert!(set_root(Path::new("relative/path")).is_err());
+    }
+
+    #[test]
+    fn same_dir_ignores_trailing_separators_and_dot_components() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("Meetily");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(same_dir(&dir, Path::new(&format!("{}/", dir.display()))));
+        assert!(same_dir(&dir, &dir.join(".")));
+        assert!(same_dir(&dir, &dir.join("..").join("Meetily")));
+    }
+
+    #[test]
+    fn same_dir_is_false_for_different_folders() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        assert!(!same_dir(&a, &b));
+        // Neither side of this comparison may need to exist for the answer to be known.
+        assert!(same_dir(&tmp.path().join("missing").join("..").join("a"), &a));
+    }
+
+    #[test]
+    fn same_dir_matches_the_same_folder_in_another_case() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("meetily");
+        std::fs::create_dir_all(&dir).unwrap();
+        let upper = PathBuf::from(dir.to_string_lossy().to_uppercase());
+
+        // Only meaningful where the volume ignores case (macOS and Windows defaults).
+        if !upper.exists() {
+            eprintln!("skipped: the volume is case-sensitive");
+            return;
+        }
+        assert!(same_dir(&dir, &upper));
     }
 }
