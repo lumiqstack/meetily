@@ -931,4 +931,68 @@ mod tests {
             other => panic!("unexpected outcome: {:?}", other),
         }
     }
+
+    // ---- reconnect budget -------------------------------------------------
+
+    /// A gateway that accepts the upgrade and then rejects `start` must not be
+    /// treated as a successful reconnect: the handshake alone proves nothing,
+    /// so the retry budget has to run out instead of looping forever.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_gateway_that_rejects_every_session_exhausts_the_retry_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+
+        let server_accepted = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let accepted = server_accepted.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    let _ = ws
+                        .send(Message::Text(r#"{"type":"error","message":"x"}"#.to_string()))
+                        .await;
+                    // Hold the socket until the client goes away.
+                    while let Some(Ok(_)) = ws.next().await {}
+                });
+            }
+        });
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let config = LiveSessionConfig {
+            endpoint: format!("ws://{}", addr),
+            bearer_token: "test".to_string(),
+            model: "test-model".to_string(),
+            language: None,
+        };
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_live_transcription(handle, receiver, config));
+
+        // The recording keeps going; only the live path is failing.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_secs(20), task).await;
+        server.abort();
+
+        let connections = accepted.load(Ordering::SeqCst);
+        assert!(
+            connections <= MAX_RECONNECT_ATTEMPTS as usize + 1,
+            "reconnected {} times; the budget is {} retries",
+            connections,
+            MAX_RECONNECT_ATTEMPTS
+        );
+    }
 }
