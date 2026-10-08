@@ -1666,19 +1666,17 @@ pub async fn start_import_from_url_command<R: Runtime>(
         if let Err(e) = result {
             error!("URL import {} failed: {}", id_task, e);
             // The import pipeline (once reached) emits its own import-error and
-            // journals cleanup. Only pre-pipeline failures (auth/download/engine
-            // acquisition) surface here — and cancellation is not an error the
-            // user needs to see twice.
-            let msg = e.to_string();
-            if !msg.contains("cancelled") {
-                let _ = app_task.emit(
-                    "import-error",
-                    ImportError {
-                        import_id: id_task.clone(),
-                        error: msg,
-                    },
-                );
-            }
+            // journals cleanup, and always returns Ok here, so this emit covers
+            // only pre-pipeline failures (auth/download/engine acquisition).
+            // A user cancel is emitted too: the frontend job stays in
+            // 'cancelling' until an import-error arrives to end it.
+            let _ = app_task.emit(
+                "import-error",
+                ImportError {
+                    import_id: id_task.clone(),
+                    error: e.to_string(),
+                },
+            );
         }
     });
 
