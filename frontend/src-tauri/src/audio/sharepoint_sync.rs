@@ -1954,4 +1954,43 @@ mod tests {
         assert_eq!(items[3].recording.name, "Old Sync.mp4");
         assert!(items[3].already_imported);
     }
+
+    #[tokio::test]
+    async fn direct_download_returns_on_cancel_while_stalled() {
+        use std::io::{Read, Write};
+        // Local server: answers the first request with headers + 10 bytes of a
+        // 1000-byte body, then stalls without closing the connection.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 1000\r\n\r\n0123456789",
+                );
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let url = url::Url::parse(&format!("http://127.0.0.1:{port}/sites/x/Shared%20Documents/rec.mp4")).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            canceller.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            download_direct_file(&url, "", tmp.path(), |_| {}, &cancel),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "download_direct_file did not return within 5s of start although cancel fired at 1s (stalled stream, no timeout)"
+        );
+    }
 }
