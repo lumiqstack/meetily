@@ -393,8 +393,9 @@ async fn pull_model_stream<R: Runtime>(
                     if total > 0 {
                         let progress = ((completed as f64 / total as f64) * 100.0) as u8;
 
-                        // Only emit if progress changed significantly (reduces event spam)
-                        if progress != last_progress && (progress - last_progress >= 1 || progress == 100) {
+                        // Progress is per layer and can drop when a new layer starts, so
+                        // any change is emitted; a signed/unsigned difference would underflow.
+                        if progress != last_progress {
                             log::info!("Ollama download progress for {}: {}%", model_name, progress);
 
                             let _ = app_handle.emit(
