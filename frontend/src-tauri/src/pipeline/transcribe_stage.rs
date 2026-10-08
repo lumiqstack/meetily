@@ -7,7 +7,7 @@
 
 use crate::audio::retranscription::start_retranscription;
 use crate::audio::transcription::gemini_batch::GeminiBatchError;
-use crate::pipeline::{FailureKind, StageError, PIPELINE_RETRANSCRIPTION};
+use crate::pipeline::{classify_message, FailureKind, StageError, PIPELINE_RETRANSCRIPTION};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Runtime};
 
@@ -101,31 +101,27 @@ pub async fn run_transcribe_stage<R: Runtime>(
     }
 }
 
-/// Retry class for a failed transcription attempt.
-///
-/// Gemini batch failures carry their own type, so they are classified
-/// structurally. Other engines only surface text.
+/// Phrases a transcription stage treats as retry-later: cancellation (how the
+/// pipeline yields the engine to a live recording) and engine contention
+/// ("someone else is using it right now").
+const TRANSCRIBE_RETRY_LATER: &[&str] = &[
+    "cancel",
+    "on-device transcription engine",
+    "already in progress",
+];
+
+/// Retry class for a failed transcription attempt. Gemini batch failures carry
+/// their own type and are classified structurally; other engines only surface
+/// text, which goes through the same classifier as summaries.
 pub(crate) fn classify_transcription_failure(error: &anyhow::Error) -> FailureKind {
     if let Some(batch) = error.downcast_ref::<GeminiBatchError>() {
-        return if batch.is_transient() || batch.is_cancellation() {
-            FailureKind::Transient
-        } else {
-            FailureKind::Hard
+        return match batch {
+            GeminiBatchError::Timeout => FailureKind::Timeout,
+            _ if batch.is_transient() || batch.is_cancellation() => FailureKind::Transient,
+            _ => FailureKind::Hard,
         };
     }
-
-    let message = error.to_string();
-    // Cancellation is how the pipeline yields the engine to a live recording,
-    // and engine contention means "someone else is using it right now" — both
-    // should simply be retried later.
-    if message.to_lowercase().contains("cancel")
-        || message.contains("on-device transcription engine")
-        || message.contains("already in progress")
-    {
-        FailureKind::Transient
-    } else {
-        FailureKind::Hard
-    }
+    classify_message(&error.to_string(), TRANSCRIBE_RETRY_LATER)
 }
 
 #[cfg(test)]

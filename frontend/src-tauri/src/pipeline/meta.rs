@@ -13,9 +13,11 @@ use std::collections::HashMap;
 /// Backoff ladder applied after each consecutive failure.
 const BACKOFF_MINUTES: [i64; 4] = [1, 5, 15, 60];
 
-/// Consecutive summary timeouts after which a meeting is suppressed until the
-/// user retries it by hand. A summariser that never finishes this meeting is
-/// not going to finish it on the next hourly tick either.
+/// Consecutive stage timeouts after which a meeting is suppressed until the
+/// user retries it by hand. A provider that never finishes this meeting is
+/// not going to finish it on the next hourly tick either. The count is per
+/// meeting, not per stage: `pipeline_meta` is keyed by meeting, and only an
+/// unbroken run of timeouts (any stage) counts.
 const MAX_CONSECUTIVE_TIMEOUTS: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -173,8 +175,15 @@ pub async fn begin_attempt(
     attempts
 }
 
-fn timeout_limit_reason() -> String {
-    format!("Summary timed out {MAX_CONSECUTIVE_TIMEOUTS} times. Try a smaller or faster model, then retry.")
+fn timeout_limit_reason(stage: &str) -> String {
+    match stage {
+        "transcribe" => format!(
+            "Transcription timed out {MAX_CONSECUTIVE_TIMEOUTS} times. Check the transcription provider, then retry."
+        ),
+        _ => format!(
+            "Summary timed out {MAX_CONSECUTIVE_TIMEOUTS} times. Try a smaller or faster model, then retry."
+        ),
+    }
 }
 
 /// Record a failed attempt and schedule the next one.
@@ -213,7 +222,7 @@ pub async fn record_failure(
         FailureKind::Transient => (0, error.to_string()),
         FailureKind::Hard => (i64::from(attempts >= max_attempts), error.to_string()),
         FailureKind::Timeout if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS => {
-            (1, timeout_limit_reason())
+            (1, timeout_limit_reason(stage))
         }
         FailureKind::Timeout => (0, error.to_string()),
     };

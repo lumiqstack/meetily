@@ -53,6 +53,42 @@ pub enum FailureKind {
     Timeout,
 }
 
+/// Phrases that mean the endpoint is unreachable, busy, or rate limiting. They
+/// say nothing about the meeting. Checked before the timeout phrases so that
+/// "504 Gateway Timeout" stays an outage.
+const OUTAGE_NEEDLES: &[&str] = &[
+    "connection",
+    "connect",
+    "network",
+    "unreachable",
+    "refused",
+    "dns",
+    "temporarily",
+    "503",
+    "502",
+    "504",
+    "429",
+    "rate limit",
+    "overloaded",
+];
+
+const TIMEOUT_NEEDLES: &[&str] = &["timed out", "timeout"];
+
+/// Classify a stage failure from its message. `stage_transient` holds phrases
+/// a stage treats as retry-later on top of the shared outage list (e.g.
+/// cancellation, engine contention). They are checked first.
+pub(crate) fn classify_message(error: &str, stage_transient: &[&str]) -> FailureKind {
+    let error = error.to_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
+    if mentions(stage_transient) || mentions(OUTAGE_NEEDLES) {
+        FailureKind::Transient
+    } else if mentions(TIMEOUT_NEEDLES) {
+        FailureKind::Timeout
+    } else {
+        FailureKind::Hard
+    }
+}
+
 /// A stage failure, classified for the retry policy.
 #[derive(Debug, Clone)]
 pub struct StageError {

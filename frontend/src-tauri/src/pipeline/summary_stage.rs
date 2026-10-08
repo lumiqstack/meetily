@@ -8,7 +8,7 @@ use crate::database::repositories::setting::SettingsRepository;
 use crate::database::repositories::summary::SummaryProcessesRepository;
 use crate::database::repositories::transcript_chunk::TranscriptChunksRepository;
 use crate::pipeline::settings::PipelineSettings;
-use crate::pipeline::{FailureKind, StageError};
+use crate::pipeline::{classify_message, FailureKind, StageError};
 use crate::summary::SummaryService;
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -49,36 +49,10 @@ pub fn build_summary_transcript_text(segments: &[Transcript]) -> String {
         .join("\n")
 }
 
-/// How a failed summary attempt is retried. Outages (the summariser is
-/// unreachable, busy, or rate limiting) say nothing about the meeting, so they
-/// never give up. A timeout is different: the provider was reachable but did
-/// not finish, which tends to repeat for the same meeting, so it is capped.
-/// Outage needles are checked first so that "504 Gateway Timeout" stays an
-/// outage.
+/// How a failed summary attempt is retried. Outages never give up, and
+/// timeouts give up after a run of consecutive ones (see `meta.rs`).
 fn classify_summary_failure(error: &str) -> FailureKind {
-    let error = error.to_lowercase();
-    let mentions = |needles: &[&str]| needles.iter().any(|needle| error.contains(needle));
-    if mentions(&[
-        "connection",
-        "connect",
-        "network",
-        "unreachable",
-        "refused",
-        "dns",
-        "temporarily",
-        "503",
-        "502",
-        "504",
-        "429",
-        "rate limit",
-        "overloaded",
-    ]) {
-        FailureKind::Transient
-    } else if mentions(&["timed out", "timeout"]) {
-        FailureKind::Timeout
-    } else {
-        FailureKind::Hard
-    }
+    classify_message(error, &[])
 }
 
 /// Read the user's explicit per-meeting summary language, if they set one.
