@@ -17,7 +17,7 @@
 //! The pointer file necessarily stays on the system drive: it is how we find the
 //! relocated root in the first place.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
@@ -87,7 +87,7 @@ fn resolve(legacy: &Path) -> PathBuf {
         return legacy.to_path_buf();
     };
 
-    if candidate == legacy {
+    if same_dir(&candidate, legacy) {
         return legacy.to_path_buf();
     }
 
@@ -181,12 +181,56 @@ pub fn root() -> PathBuf {
 /// True when the data root has been moved off `app_data_dir()`, i.e. there is
 /// something for [`migrate`] to do.
 pub fn is_relocated() -> bool {
-    root() != legacy_root()
+    !same_dir(&root(), &legacy_root())
 }
 
-/// Whether two paths name the same folder, whatever their spelling.
+/// Whether two paths name the same folder, whatever their spelling. Trailing
+/// separators, `.` and `..` components, and letter case on case-insensitive
+/// volumes must not make one folder look like two.
 fn same_dir(a: &Path, b: &Path) -> bool {
-    a == b
+    if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        // Identity rather than spelling: macOS realpath keeps the typed case, so
+        // canonicalize cannot see that /x/Meetily and /x/meetily are one folder.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&ma, &mb);
+            if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                return ca == cb;
+            }
+        }
+    }
+
+    // At least one side does not exist yet, so compare the spelling alone.
+    lexical_key(a) == lexical_key(b)
+}
+
+fn lexical_key(p: &Path) -> Vec<String> {
+    let mut parts: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(parts.last(), Some(Component::Normal(_))) => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts
+        .iter()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            if cfg!(windows) {
+                s.to_lowercase()
+            } else {
+                s.into_owned()
+            }
+        })
+        .collect()
 }
 
 fn subdir(name: &str) -> PathBuf {
@@ -302,20 +346,25 @@ pub fn set_root(path: &Path) -> Result<()> {
     std::fs::create_dir_all(&legacy)
         .map_err(|e| anyhow!("Cannot create {}: {}", legacy.display(), e))?;
 
-    let data_root = if path == legacy {
+    let data_root = if same_dir(path, &legacy) {
         None
     } else {
         Some(path.to_path_buf())
     };
     let configured = read_pointer(&legacy).and_then(|p| p.data_root);
-    if data_root == configured {
+    let unchanged = match (&data_root, &configured) {
+        (Some(new), Some(old)) => same_dir(new, old),
+        (None, None) => true,
+        _ => false,
+    };
+    if unchanged {
         return Ok(());
     }
 
     // The data stays where it is until restart, so the root in effect now is
     // the one the next launch has to move from.
     let previous = root();
-    let previous_root = (previous != path).then_some(previous);
+    let previous_root = (!same_dir(&previous, path)).then_some(previous);
     let moving = previous_root.is_some();
 
     write_pointer(

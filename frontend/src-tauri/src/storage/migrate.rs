@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Runtime};
 
-use super::{legacy_root, read_pointer, root, write_pointer};
+use super::{legacy_root, read_pointer, root, same_dir, write_pointer};
 
 pub(super) const STATE_FILE: &str = ".migration-state.json";
 
@@ -111,18 +111,20 @@ fn run_files_in(
         .and_then(|p| p.previous_root)
         .unwrap_or_else(|| legacy.to_path_buf());
 
-    if source == root {
+    if same_dir(&source, root) {
         let _ = clear_previous_root(legacy);
         return Ok(report);
     }
 
     let mut state = load_state(root);
     // Progress saved before moves were tagged can only be from legacy -> root.
-    if state.source.is_none() && source == legacy {
+    if state.source.is_none() && same_dir(&source, legacy) {
         state.source = Some(source.clone());
         state.target = Some(root.to_path_buf());
     }
-    if state.source.as_deref() != Some(source.as_path()) || state.target.as_deref() != Some(root) {
+    let same_move = state.source.as_deref().is_some_and(|s| same_dir(s, &source))
+        && state.target.as_deref().is_some_and(|t| same_dir(t, root));
+    if !same_move {
         state = State {
             source: Some(source.clone()),
             target: Some(root.to_path_buf()),
@@ -261,7 +263,7 @@ fn clear_previous_root(legacy: &Path) -> Result<()> {
 /// Where meeting folders go for a given root. The default root gets the folder a
 /// fresh install uses, not a `recordings` folder inside the app data directory.
 fn recordings_target(legacy: &Path, root: &Path) -> PathBuf {
-    if root == legacy {
+    if same_dir(root, legacy) {
         super::historical_recordings_dir()
     } else {
         root.join("recordings")
@@ -288,7 +290,7 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
     };
 
     let new_root = recordings_target(&legacy_root(), &root);
-    if old_root == new_root {
+    if same_dir(&old_root, &new_root) {
         state.db_paths_rewritten = true;
         let _ = save_state(&root, &state);
         return Ok(0);
@@ -469,7 +471,7 @@ fn copy_tree(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
 }
 
 fn archive_logs(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()> {
-    if !src.exists() || src == dst {
+    if !src.exists() || same_dir(src, dst) {
         return Ok(());
     }
     std::fs::create_dir_all(dst)?;
@@ -539,7 +541,7 @@ fn migrate_recordings(
 ) -> Result<bool> {
     let old_root = state.old_recordings_root.clone().unwrap_or_else(|| {
         stored_recordings_folder(legacy).unwrap_or_else(|| {
-            if source == legacy {
+            if same_dir(source, legacy) {
                 super::historical_recordings_dir()
             } else {
                 source.join("recordings")
@@ -548,7 +550,7 @@ fn migrate_recordings(
     });
 
     let new_root = recordings_target(legacy, root);
-    if old_root == new_root {
+    if same_dir(&old_root, &new_root) {
         return Ok(true);
     }
 
@@ -638,7 +640,7 @@ fn migrate_database(legacy: &Path, root: &Path, report: &mut MigrationReport) ->
 /// database rows still pointing at the old location. Partial progress has to be
 /// survivable, because with Files-On-Demand it is the normal case.
 fn move_tree(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<usize> {
-    if !src.exists() || src == dst {
+    if !src.exists() || same_dir(src, dst) {
         return Ok(0);
     }
 
