@@ -545,10 +545,6 @@ async fn run_import<R: Runtime>(
         title, source_path, language, model, provider
     );
 
-    // Determine which provider to use (default to whisper)
-    let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
-
     emit_progress(&app, &import_id, "copying", 5, "Creating meeting folder...");
 
     // Check for cancellation
@@ -569,6 +565,45 @@ async fn run_import<R: Runtime>(
     )
     .await;
 
+    // Everything past this point can fail with the folder half-built. A
+    // failure before the meeting row is committed must not leave it behind
+    // (a cancel counts as a failure here); `finish_import` is the commit point.
+    let result = import_into_folder(
+        app,
+        import_id,
+        &source,
+        title,
+        language,
+        model,
+        provider,
+        origin,
+        &meeting_folder,
+    )
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+    }
+    result
+}
+
+/// The fallible part of [`run_import`], run against an already-created
+/// `meeting_folder`. The caller removes the folder if this returns `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn import_into_folder<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: String,
+    source: &Path,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    origin: ImportOrigin,
+    meeting_folder: &Path,
+) -> Result<ImportResult> {
+    // Determine which provider to use (default to whisper)
+    let use_parakeet = provider.as_deref() == Some("parakeet");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
+
     // Copy audio file to meeting folder
     emit_progress(&app, &import_id, "copying", 10, "Copying audio file...");
 
@@ -581,7 +616,7 @@ async fn run_import<R: Runtime>(
     );
     let dest_path = meeting_folder.join(&dest_filename);
 
-    let src = source.clone();
+    let src = source.to_path_buf();
     let dst = dest_path.clone();
     tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
         .await
@@ -592,8 +627,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        // Cleanup: remove the meeting folder
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -643,7 +676,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -670,7 +702,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -751,7 +782,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -813,8 +843,7 @@ async fn run_import<R: Runtime>(
 
     for (i, segment) in processable_segments.iter().enumerate() {
         if is_import_cancelled(&import_id) {
-            let _ = std::fs::remove_dir_all(&meeting_folder);
-            return Err(anyhow!("Import cancelled"));
+                return Err(anyhow!("Import cancelled"));
         }
 
         let progress = 30 + ((i as f32 / processable_count.max(1) as f32) * 50.0) as u32;
@@ -894,7 +923,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -905,7 +933,7 @@ async fn run_import<R: Runtime>(
         &app,
         import_id,
         title,
-        &meeting_folder,
+        meeting_folder,
         &dest_filename,
         duration_seconds,
         segments,
@@ -924,7 +952,7 @@ async fn run_gemini_import<R: Runtime>(
     app: AppHandle<R>,
     import_id: String,
     title: String,
-    meeting_folder: PathBuf,
+    meeting_folder: &Path,
     audio_path: PathBuf,
     dest_filename: String,
     language: Option<String>,
@@ -936,19 +964,13 @@ async fn run_gemini_import<R: Runtime>(
 
     emit_progress(&app, &import_id, "preparing", 15, "Preparing audio for upload...");
 
-    let cleanup = |e: anyhow::Error| -> anyhow::Error {
-        // Match the cancellation paths, which remove the half-built folder.
-        let _ = std::fs::remove_dir_all(&meeting_folder);
-        e
-    };
-
     let duration_ms = match crate::audio::ffmpeg::probe_duration_ms(&audio_path) {
         Ok(ms) => ms,
         Err(e) => {
-            return Err(cleanup(anyhow!(
+            return Err(anyhow!(
                 "Could not read the audio file's duration: {}",
                 e
-            )))
+            ))
         }
     };
     let duration_seconds = duration_ms as f64 / 1000.0;
@@ -958,7 +980,7 @@ async fn run_gemini_import<R: Runtime>(
             .await
         {
             Ok(p) => p,
-            Err(e) => return Err(cleanup(anyhow!(e))),
+            Err(e) => return Err(anyhow!(e)),
         };
 
     // Bridge the cooperative cancel registry onto a token so an in-flight
@@ -1009,7 +1031,7 @@ async fn run_gemini_import<R: Runtime>(
     // classification in the pipeline stage.
     let batch_segments = match result {
         Ok(segments) => segments,
-        Err(e) => return Err(cleanup(anyhow::Error::new(e))),
+        Err(e) => return Err(anyhow::Error::new(e)),
     };
 
     let segments = create_transcript_segments_with_speakers(
@@ -1022,7 +1044,7 @@ async fn run_gemini_import<R: Runtime>(
         &app,
         import_id,
         title,
-        &meeting_folder,
+        meeting_folder,
         &dest_filename,
         duration_seconds,
         segments,
@@ -1059,7 +1081,9 @@ async fn finish_import<R: Runtime>(
     emit_progress(app, &import_id, "saving", 85, "Creating meeting...");
     let ImportOrigin { source_path, source_url, meeting_date } = origin;
 
-    // Save to database
+    // Commit point: `run_import` deletes the meeting folder if this returns
+    // Err, so every step after `create_meeting_with_transcripts` must stay
+    // non-fatal (log and continue) or it would delete a committed meeting's folder.
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
