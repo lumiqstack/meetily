@@ -228,6 +228,10 @@ whisper-rs = { version = "0.13.2", features = ["raw-api"] }
 futures-channel = "0.3.31"
 
 [dev-dependencies]
+# Test-only: lets unit tests build a mock AppHandle (tauri::test::mock_app)
+# for commands and stop/import paths that take one. Resolver 2 keeps this
+# feature out of release builds.
+tauri = { version = "2.6.2", features = ["test"] }
 # Contract tests for the Gemini batch gateway: asserts the exact multipart
 # fields and status->error mapping without spending real quota.
 wiremock = "0.6"
