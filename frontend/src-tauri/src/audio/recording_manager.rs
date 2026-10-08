@@ -568,6 +568,10 @@ impl RecordingManager {
     }
 
     /// Add a structured transcript segment to be saved later
+    pub fn transcript_sink(&self) -> super::recording_saver::TranscriptSink {
+        self.recording_saver.transcript_sink()
+    }
+
     pub fn add_transcript_segment(&self, segment: super::recording_saver::TranscriptSegment) {
         self.recording_saver.add_transcript_segment(segment);
     }

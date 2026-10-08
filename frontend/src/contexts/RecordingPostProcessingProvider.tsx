@@ -25,7 +25,7 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
 
   const {
     handleRecordingStop,
-  } = useRecordingStop(setIsRecording, setIsRecordingDisabled);
+  } = useRecordingStop(setIsRecording, setIsRecordingDisabled, { exposeToWindow: true });
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;

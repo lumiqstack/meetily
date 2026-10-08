@@ -225,6 +225,36 @@ async fn is_realtime_transcription_enabled<R: Runtime>(app: &AppHandle<R>) -> bo
     }
 }
 
+/// Register the `transcript-update` listener that persists each segment into
+/// the active recording manager's history.
+fn register_transcript_listener<R: Runtime>(
+    app: &AppHandle<R>,
+    transcript_sink: crate::audio::recording_saver::TranscriptSink,
+) -> tauri::EventId {
+    use tauri::Listener;
+    app.listen("transcript-update", move |event: tauri::Event| {
+        // Parse the transcript update from the event payload
+        if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
+            // Create structured transcript segment
+            let segment = crate::audio::recording_saver::TranscriptSegment {
+                id: format!("seg_{}", update.sequence_id),
+                text: update.text.clone(),
+                audio_start_time: update.audio_start_time,
+                audio_end_time: update.audio_end_time,
+                duration: update.duration,
+                display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
+                confidence: update.confidence,
+                sequence_id: update.sequence_id,
+                speaker: update.speaker.clone(),
+            };
+
+            // Captured at registration: stop_recording empties RECORDING_MANAGER
+            // before the transcription drain, and segments emitted then must be kept.
+            transcript_sink.add_segment(segment);
+        }
+    })
+}
+
 /// Unregister the `transcript-update` listener, if one is registered.
 ///
 /// Idempotent and safe on any path. Registration and teardown are not
@@ -524,6 +554,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let device_event_receiver = manager.take_device_event_receiver();
     let session = manager.get_state().clone();
 
+    let transcript_sink = manager.transcript_sink();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -560,31 +592,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         // This enables transcript history persistence for page reload sync
         // Store listener ID for cleanup during stop_recording to ensure microphone is released
         {
-            use tauri::Listener;
-            let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-                // Parse the transcript update from the event payload
-                if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                    // Create structured transcript segment
-                    let segment = crate::audio::recording_saver::TranscriptSegment {
-                        id: format!("seg_{}", update.sequence_id),
-                        text: update.text.clone(),
-                        audio_start_time: update.audio_start_time,
-                        audio_end_time: update.audio_end_time,
-                        duration: update.duration,
-                        display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
-                        confidence: update.confidence,
-                        sequence_id: update.sequence_id,
-                        speaker: update.speaker.clone(),
-                    };
-
-                    // Save to recording manager
-                    if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                        if let Some(manager) = manager_guard.as_ref() {
-                            manager.add_transcript_segment(segment);
-                        }
-                    }
-                }
-            });
+            let listener_id = register_transcript_listener(&app, transcript_sink);
             let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
             *global_listener = Some(listener_id);
             info!("✅ Transcript-update event listener registered for history persistence");
@@ -746,6 +754,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let device_event_receiver = manager.take_device_event_receiver();
     let session = manager.get_state().clone();
 
+    let transcript_sink = manager.transcript_sink();
+
     // Store the manager globally to keep it alive
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
@@ -782,31 +792,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         // This enables transcript history persistence for page reload sync
         // Store listener ID for cleanup during stop_recording to ensure microphone is released
         {
-            use tauri::Listener;
-            let listener_id = app.listen("transcript-update", move |event: tauri::Event| {
-                // Parse the transcript update from the event payload
-                if let Ok(update) = serde_json::from_str::<TranscriptUpdate>(event.payload()) {
-                    // Create structured transcript segment
-                    let segment = crate::audio::recording_saver::TranscriptSegment {
-                        id: format!("seg_{}", update.sequence_id),
-                        text: update.text.clone(),
-                        audio_start_time: update.audio_start_time,
-                        audio_end_time: update.audio_end_time,
-                        duration: update.duration,
-                        display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
-                        confidence: update.confidence,
-                        sequence_id: update.sequence_id,
-                        speaker: update.speaker.clone(),
-                    };
-
-                    // Save to recording manager
-                    if let Ok(manager_guard) = RECORDING_MANAGER.lock() {
-                        if let Some(manager) = manager_guard.as_ref() {
-                            manager.add_transcript_segment(segment);
-                        }
-                    }
-                }
-            });
+            let listener_id = register_transcript_listener(&app, transcript_sink);
             let mut global_listener = TRANSCRIPT_LISTENER_ID.lock().unwrap();
             *global_listener = Some(listener_id);
             info!("✅ Transcript-update event listener registered for history persistence");
@@ -1984,5 +1970,56 @@ mod start_transition_tests {
         let _guard = StartingGuard::acquire().unwrap();
         assert!(!wait_for_start_transition(std::time::Duration::from_millis(100)).await);
         reset();
+    }
+}
+
+#[cfg(test)]
+mod transcript_listener_tests {
+    use super::*;
+    use tauri::{Emitter, Listener};
+
+    fn update(sequence_id: u64) -> TranscriptUpdate {
+        TranscriptUpdate {
+            text: "hello from the drain".to_string(),
+            timestamp: "14:30:05".to_string(),
+            source: "mic".to_string(),
+            sequence_id,
+            chunk_start_time: 1.0,
+            is_partial: false,
+            confidence: 0.9,
+            audio_start_time: 1.0,
+            audio_end_time: 2.0,
+            duration: 1.0,
+            speaker: Some("mic".to_string()),
+        }
+    }
+
+    /// stop_recording takes the manager out of RECORDING_MANAGER before the
+    /// transcription drain, so segments emitted during the drain must still be
+    /// stored in that manager.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[test]
+    fn segment_emitted_after_manager_is_taken_is_stored_in_it() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+
+        let manager = RecordingManager::new();
+        let transcript_sink = manager.transcript_sink();
+        *RECORDING_MANAGER.lock().unwrap() = Some(manager);
+        let listener_id = register_transcript_listener(&handle, transcript_sink);
+
+        let taken = RECORDING_MANAGER
+            .lock()
+            .unwrap()
+            .take()
+            .expect("manager was registered");
+
+        handle.emit("transcript-update", update(1)).unwrap();
+        handle.unlisten(listener_id);
+
+        assert_eq!(taken.get_transcript_segments().len(), 1);
     }
 }

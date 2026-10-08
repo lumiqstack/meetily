@@ -128,6 +128,19 @@ impl AudioMixerRingBuffer {
         drain_window(&mut self.system_buffer, self.window_size_samples, sys_out);
         true
     }
+
+    /// Drain whatever remains in both buffers into one final window, shorter
+    /// than `window_size_samples`. Returns false when both are empty.
+    fn extract_partial_window_into(&mut self, mic_out: &mut Vec<f32>, sys_out: &mut Vec<f32>) -> bool {
+        let len = self.mic_buffer.len().max(self.system_buffer.len());
+        if len == 0 {
+            return false;
+        }
+
+        drain_window(&mut self.mic_buffer, len, mic_out);
+        drain_window(&mut self.system_buffer, len, sys_out);
+        true
+    }
 }
 
 /// Move up to `window` samples out of `src` into `dst`, zero-padding the tail.
@@ -726,6 +739,8 @@ pub struct AudioPipeline {
     /// but these two no longer are.
     mic_window: Vec<f32>,
     sys_window: Vec<f32>,
+    /// Timestamp of the most recent chunk, reused for the window flushed on stop.
+    last_chunk_timestamp: f64,
 }
 
 impl AudioPipeline {
@@ -821,6 +836,7 @@ impl AudioPipeline {
             segment_aggregator: super::source_attribution::SegmentAggregator::new(),
             mic_window: Vec::new(),
             sys_window: Vec::new(),
+            last_chunk_timestamp: 0.0,
         })
     }
 
@@ -893,6 +909,7 @@ impl AudioPipeline {
                     // STEP 1: Add raw audio to ring buffer for mixing
                     // Microphone audio is already normalized at capture level (AudioCapture)
                     // System audio remains raw
+                    self.last_chunk_timestamp = chunk.timestamp;
                     self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
@@ -908,119 +925,7 @@ impl AudioPipeline {
                             .extract_window_into(&mut mic_window, &mut sys_window);
 
                         if extracted {
-                            // Speaker attribution only labels transcript segments,
-                            // so it costs two RMS passes we can skip when there
-                            // will be no transcripts.
-                            let window_label = if self.vad_processor.is_some() {
-                                Some(self.window_labeler.label(&mic_window, &sys_window))
-                            } else {
-                                None
-                            };
-
-                            // Simple mixing without aggressive ducking.
-                            // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
-                            // (broadcast-standard loudness); system audio at natural levels.
-                            let mut mixed_with_gain = Vec::new();
-                            self.mixer
-                                .mix_window_into(&mic_window, &sys_window, &mut mixed_with_gain);
-
-                            // Weight the window's label by its (mixed) energy so
-                            // loud speech outvotes quiet crosstalk per segment.
-                            if let Some(window_label) = window_label {
-                                let window_energy: f32 =
-                                    mixed_with_gain.iter().map(|s| s * s).sum();
-                                self.segment_aggregator.add(window_label, window_energy);
-                            }
-
-                            // STEP 3: Send mixed audio for transcription (VAD + Whisper).
-                            // Skipped entirely when realtime transcription is off.
-                            // `map` ends the borrow of `self.vad_processor` before
-                            // the body touches `self.segment_aggregator`.
-                            let vad_result = self
-                                .vad_processor
-                                .as_mut()
-                                .map(|vad| vad.process_audio(&mixed_with_gain));
-
-                            match vad_result {
-                                Some(Ok(speech_segments)) => {
-                                    // One label per emission batch: the windows
-                                    // accumulated since the last VAD segment(s)
-                                    // back everything emitted now. (VAD segment
-                                    // boundaries can drift a window either way —
-                                    // acceptable for a binary Me/Others label.)
-                                    let batch_source = if speech_segments.is_empty() {
-                                        None
-                                    } else {
-                                        self.segment_aggregator.finalize()
-                                    };
-                                    for segment in speech_segments {
-                                        let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
-
-                                        if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
-                                            info!("📤 Sending VAD segment: {:.1}ms, {} samples",
-                                                  duration_ms, segment.samples.len());
-
-                                            let transcription_chunk = AudioChunk {
-                                                data: segment.samples,
-                                                sample_rate: 16000,
-                                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                                chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
-                                                dominant_source: batch_source.clone(),
-                                            };
-
-                                            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                                warn!("Failed to send VAD segment: {}", e);
-                                            } else {
-                                                self.chunk_id_counter += 1;
-                                            }
-                                        } else {
-                                            debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
-                                                   duration_ms, segment.samples.len());
-                                        }
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    warn!("⚠️ VAD error: {}", e);
-                                }
-                                // Realtime transcription disabled — no VAD.
-                                None => {}
-                            }
-
-                            // STEP 3b: Send the continuous mixed window to a
-                            // streaming transcription provider. Read by
-                            // reference — STEP 4 still needs to move the buffer
-                            // — and resampled by the live session, which owns
-                            // the wire format.
-                            if let Some(ref sender) = self.live_sender_for_mixed {
-                                let live_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
-                                    sample_rate: self.sample_rate,
-                                    timestamp: chunk.timestamp,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone,  // Mixed audio
-                                    // Mixed audio has no trustworthy per-window
-                                    // attribution, and the streaming provider
-                                    // does not use one.
-                                    dominant_source: None,
-                                };
-                                let _ = sender.send(live_chunk);
-                            }
-
-                            // STEP 4: Send mixed audio to the encoder.
-                            // Last use of the window, so move it instead of
-                            // cloning another 115 KB per window.
-                            if let Some(ref sender) = self.recording_sender_for_mixed {
-                                let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain,
-                                    sample_rate: self.sample_rate,
-                                    timestamp: chunk.timestamp,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone,  // Mixed audio
-                                    dominant_source: None,
-                                };
-                                let _ = sender.send(recording_chunk);
-                            }
+                            self.mix_and_send_window(&mic_window, &sys_window, chunk.timestamp);
                         }
 
                         // Hand the window buffers back for the next iteration.
@@ -1040,11 +945,142 @@ impl AudioPipeline {
             }
         }
 
-        // Flush any remaining VAD segments
+        // Channel closed: mix the partial window once, then flush VAD segments.
+        // Doing this on flush signals would split streams that arrive after one.
+        self.flush_partial_window();
         self.flush_remaining_audio()?;
 
         info!("VAD-driven audio pipeline ended");
         Ok(())
+    }
+
+    /// Label, mix, and dispatch one aligned window to speaker attribution,
+    /// the VAD, the live stream, and the recording sender.
+    fn mix_and_send_window(&mut self, mic_window: &[f32], sys_window: &[f32], timestamp: f64) {
+        // Speaker attribution only labels transcript segments,
+        // so it costs two RMS passes we can skip when there
+        // will be no transcripts.
+        let window_label = if self.vad_processor.is_some() {
+            Some(self.window_labeler.label(&mic_window, &sys_window))
+        } else {
+            None
+        };
+
+        // Simple mixing without aggressive ducking.
+        // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
+        // (broadcast-standard loudness); system audio at natural levels.
+        let mut mixed_with_gain = Vec::new();
+        self.mixer
+            .mix_window_into(&mic_window, &sys_window, &mut mixed_with_gain);
+
+        // Weight the window's label by its (mixed) energy so
+        // loud speech outvotes quiet crosstalk per segment.
+        if let Some(window_label) = window_label {
+            let window_energy: f32 =
+                mixed_with_gain.iter().map(|s| s * s).sum();
+            self.segment_aggregator.add(window_label, window_energy);
+        }
+
+        // STEP 3: Send mixed audio for transcription (VAD + Whisper).
+        // Skipped entirely when realtime transcription is off.
+        // `map` ends the borrow of `self.vad_processor` before
+        // the body touches `self.segment_aggregator`.
+        let vad_result = self
+            .vad_processor
+            .as_mut()
+            .map(|vad| vad.process_audio(&mixed_with_gain));
+
+        match vad_result {
+            Some(Ok(speech_segments)) => {
+                // One label per emission batch: the windows
+                // accumulated since the last VAD segment(s)
+                // back everything emitted now. (VAD segment
+                // boundaries can drift a window either way —
+                // acceptable for a binary Me/Others label.)
+                let batch_source = if speech_segments.is_empty() {
+                    None
+                } else {
+                    self.segment_aggregator.finalize()
+                };
+                for segment in speech_segments {
+                    let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
+
+                    if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
+                        info!("📤 Sending VAD segment: {:.1}ms, {} samples",
+                              duration_ms, segment.samples.len());
+
+                        let transcription_chunk = AudioChunk {
+                            data: segment.samples,
+                            sample_rate: 16000,
+                            timestamp: segment.start_timestamp_ms / 1000.0,
+                            chunk_id: self.chunk_id_counter,
+                            device_type: DeviceType::Microphone,  // Mixed audio
+                            dominant_source: batch_source.clone(),
+                        };
+
+                        if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+                            warn!("Failed to send VAD segment: {}", e);
+                        } else {
+                            self.chunk_id_counter += 1;
+                        }
+                    } else {
+                        debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
+                               duration_ms, segment.samples.len());
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                warn!("⚠️ VAD error: {}", e);
+            }
+            // Realtime transcription disabled — no VAD.
+            None => {}
+        }
+
+        // STEP 3b: Send the continuous mixed window to a
+        // streaming transcription provider. Read by
+        // reference — STEP 4 still needs to move the buffer
+        // — and resampled by the live session, which owns
+        // the wire format.
+        if let Some(ref sender) = self.live_sender_for_mixed {
+            let live_chunk = AudioChunk {
+                data: mixed_with_gain.clone(),
+                sample_rate: self.sample_rate,
+                timestamp,
+                chunk_id: self.chunk_id_counter,
+                device_type: DeviceType::Microphone,  // Mixed audio
+                // Mixed audio has no trustworthy per-window
+                // attribution, and the streaming provider
+                // does not use one.
+                dominant_source: None,
+            };
+            let _ = sender.send(live_chunk);
+        }
+
+        // STEP 4: Send mixed audio to the encoder.
+        // Last use of the window, so move it instead of
+        // cloning another 115 KB per window.
+        if let Some(ref sender) = self.recording_sender_for_mixed {
+            let recording_chunk = AudioChunk {
+                data: mixed_with_gain,
+                sample_rate: self.sample_rate,
+                timestamp,
+                chunk_id: self.chunk_id_counter,
+                device_type: DeviceType::Microphone,  // Mixed audio
+                dominant_source: None,
+            };
+            let _ = sender.send(recording_chunk);
+        }
+    }
+
+    /// Mix whatever is left in the ring buffer when the stream stops. A stream
+    /// that ends short of a full window would otherwise lose that tail.
+    fn flush_partial_window(&mut self) {
+        let mut mic_window = Vec::new();
+        let mut sys_window = Vec::new();
+        if self.ring_buffer.extract_partial_window_into(&mut mic_window, &mut sys_window) {
+            let timestamp = self.last_chunk_timestamp;
+            self.mix_and_send_window(&mic_window, &sys_window, timestamp);
+        }
     }
 
     fn flush_remaining_audio(&mut self) -> Result<()> {
@@ -1267,5 +1303,169 @@ mod tests {
         // uninterrupted speech. Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
+    }
+
+    /// A partial mixer window left in the ring buffer when the stream closes
+    /// must still reach the recording channel.
+    #[tokio::test]
+    async fn partial_window_is_flushed_on_stop() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.5f32; 14_400],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut total_samples = 0usize;
+        while let Ok(chunk) = recording_rx.try_recv() {
+            total_samples += chunk.data.len();
+        }
+        assert_eq!(total_samples, 14_400);
+    }
+
+    /// Mic and system audio that both stop short of a full window are mixed
+    /// together and flushed on stop. The final window is as long as the longer
+    /// stream, and the shorter stream is zero-padded to it.
+    #[tokio::test]
+    async fn partial_mic_and_system_windows_are_flushed_together_on_stop() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 14_400],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 9_600],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 1,
+                device_type: DeviceType::System,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut total_samples = 0usize;
+        while let Ok(chunk) = recording_rx.try_recv() {
+            total_samples += chunk.data.len();
+        }
+        assert_eq!(total_samples, 14_400);
+    }
+
+    /// A flush signal between two chunks of one instant must not split them:
+    /// mic and system audio that arrived before the stream closed are mixed
+    /// into the same window, even when a flush signal lands in between.
+    #[tokio::test]
+    async fn flush_signal_does_not_split_mic_and_system_windows() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 9_600],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        audio_tx
+            .send(AudioChunk {
+                data: vec![],
+                sample_rate: 16_000,
+                timestamp: 0.0,
+                chunk_id: u64::MAX,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 9_600],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 1,
+                device_type: DeviceType::System,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut lengths = Vec::new();
+        while let Ok(chunk) = recording_rx.try_recv() {
+            lengths.push(chunk.data.len());
+        }
+        assert_eq!(lengths, vec![9_600]);
     }
 }

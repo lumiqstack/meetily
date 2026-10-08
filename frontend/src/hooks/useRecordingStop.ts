@@ -40,7 +40,8 @@ interface UseRecordingStopReturn {
  */
 export function useRecordingStop(
   setIsRecording: (value: boolean) => void,
-  setIsRecordingDisabled: (value: boolean) => void
+  setIsRecordingDisabled: (value: boolean) => void,
+  { exposeToWindow = false }: { exposeToWindow?: boolean } = {}
 ): UseRecordingStopReturn {
   // USE global state instead
   const recordingState = useRecordingState();
@@ -511,7 +512,11 @@ export function useRecordingStop(
     handleRecordingStopRef.current = handleRecordingStop;
   });
 
+  // Only the instance that passes exposeToWindow owns the global. Several
+  // components call this hook, and a non-owner unmounting must not remove it.
   useEffect(() => {
+    if (!exposeToWindow) return;
+
     (window as any).handleRecordingStop = (callApi: boolean = true) => {
       handleRecordingStopRef.current(callApi);
     };
@@ -520,7 +525,7 @@ export function useRecordingStop(
     return () => {
       delete (window as any).handleRecordingStop;
     };
-  }, []);
+  }, [exposeToWindow]);
 
   // Derive summaryStatus from RecordingStatus for backward compatibility
   const summaryStatus: SummaryStatus = status === RecordingStatus.PROCESSING_TRANSCRIPTS ? 'processing' : 'idle';

@@ -254,7 +254,12 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
       if (stopHandler) {
         stopHandler(true);
       } else {
-        window.dispatchEvent(new CustomEvent('teams-detection-recording-stopped'));
+        // Nothing listens for the old fallback event, so the stop would end with the
+        // meeting unsaved and no sign of it. Report it instead.
+        console.error('[TeamsMeetingDetection] No recording stop handler is registered; meeting was not saved');
+        toast.error('Recording stopped, but the meeting was not saved', {
+          description: 'The save handler was not running, so the meeting was not saved.',
+        });
       }
     } catch (error) {
       console.error('[TeamsMeetingDetection] Failed to stop recording:', error);
