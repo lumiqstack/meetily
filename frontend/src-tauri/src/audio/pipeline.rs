@@ -1405,4 +1405,69 @@ mod tests {
         }
         assert_eq!(total_samples, 14_400);
     }
+
+    /// A flush signal between two chunks of one instant must not split them:
+    /// mic and system audio that arrived before the stream closed are mixed
+    /// into the same window, even when a flush signal lands in between.
+    #[tokio::test]
+    async fn flush_signal_does_not_split_mic_and_system_windows() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 9_600],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        audio_tx
+            .send(AudioChunk {
+                data: vec![],
+                sample_rate: 16_000,
+                timestamp: 0.0,
+                chunk_id: u64::MAX,
+                device_type: DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        audio_tx
+            .send(AudioChunk {
+                data: vec![0.25f32; 9_600],
+                sample_rate: 48_000,
+                timestamp: 0.0,
+                chunk_id: 1,
+                device_type: DeviceType::System,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut lengths = Vec::new();
+        while let Ok(chunk) = recording_rx.try_recv() {
+            lengths.push(chunk.data.len());
+        }
+        assert_eq!(lengths, vec![9_600]);
+    }
 }
