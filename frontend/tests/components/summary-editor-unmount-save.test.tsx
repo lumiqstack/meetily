@@ -79,11 +79,11 @@ async function mountSummary() {
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
 }
 
-async function editSummary() {
+async function editSummary(keyEvent: Record<string, unknown> = { key: 'a', ctrlKey: false, metaKey: false }) {
   await act(async () => {
     renderer!.root
       .find((node) => typeof node.props.onKeyDownCapture === 'function')
-      .props.onKeyDownCapture();
+      .props.onKeyDownCapture(keyEvent);
 
     emitEditorChange!([{ ...summaryBlocks[0], content: [{ type: 'text', text: 'edited', styles: {} }] }]);
   });
@@ -117,6 +117,16 @@ describe('summary editor saves unsaved edits when it unmounts', () => {
 
     expect(toastError).toHaveBeenCalledTimes(1);
     expect(toastError.mock.calls[0]?.[0]).toBe('Failed to save changes');
+  });
+
+  test('navigation keys are not edits, so an arrow key does not trigger an autosave', async () => {
+    await mountSummary();
+    await editSummary({ key: 'ArrowDown' });
+
+    await act(async () => { renderer!.unmount(); });
+    await settle();
+
+    expect(savedMarkdown()).toEqual([]);
   });
 
   test('an editor change the user did not make is not autosaved', async () => {
