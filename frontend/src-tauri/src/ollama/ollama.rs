@@ -613,4 +613,38 @@ mod tests {
         let error = second.expect_err("connection to a closed port must fail");
         assert!(!error.contains("already being downloaded"), "unexpected error: {error}");
     }
+
+    /// Two pulls of one model started together: only the first may run, the
+    /// second must be rejected as already downloading.
+    #[tokio::test]
+    async fn concurrent_pulls_of_same_model_only_one_is_accepted() {
+        let app = tauri::test::mock_app();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    read_request(&mut stream).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = stream.write_all(b"{\"status\":\"success\"}\n").await;
+                });
+            }
+        });
+
+        let model = "concurrent-pull-model".to_string();
+        let (first, second) = tokio::join!(
+            pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint.clone())),
+            pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint)),
+        );
+        let results = [first, second];
+        let rejected = results
+            .iter()
+            .filter(|r| r.as_ref().err().is_some_and(|e| e.contains("already being downloaded")))
+            .count();
+        assert_eq!(rejected, 1, "results: {results:?}");
+    }
 }
