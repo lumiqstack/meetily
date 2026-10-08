@@ -256,6 +256,14 @@ pub struct DownloadProgress {
     pub total: u64,
 }
 
+/// Longest silence tolerated between pull progress lines. Ollama can go quiet
+/// while it verifies a large layer's digest, so this is looser than the
+/// 30s per-chunk limit used for direct file downloads.
+const PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Limit on establishing the connection to the Ollama server.
+const PULL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[command]
 pub async fn pull_ollama_model<R: Runtime>(
     app_handle: AppHandle<R>,
@@ -278,8 +286,54 @@ pub async fn pull_ollama_model<R: Runtime>(
         log::info!("Started download tracking for model: {}", model_name);
     }
 
-    let client = Client::new();
-    let base_url = endpoint.as_deref().unwrap_or("http://localhost:11434");
+    let result = pull_model_stream(&app_handle, &model_name, endpoint.as_deref(), PULL_IDLE_TIMEOUT).await;
+
+    // Clear on every outcome so a failed pull can be retried without a restart
+    {
+        let mut downloading = DOWNLOADING_MODELS.write().await;
+        downloading.remove(&model_name);
+    }
+
+    if let Err(error_msg) = &result {
+        let _ = app_handle.emit(
+            "ollama-model-download-error",
+            serde_json::json!({
+                "modelName": model_name,
+                "error": error_msg
+            }),
+        );
+        return result;
+    }
+
+    log::info!("Removed {} from downloading set", model_name);
+
+    // Emit completion event
+    let _ = app_handle.emit(
+        "ollama-model-download-complete",
+        serde_json::json!({
+            "modelName": model_name
+        }),
+    );
+
+    log::info!("Ollama model {} downloaded successfully", model_name);
+
+    Ok(())
+}
+
+/// Streams `/api/pull` progress, failing if Ollama goes quiet for `idle_timeout`.
+/// A total request timeout would bound the whole body, which fails any pull
+/// longer than that limit, so only connection setup and per-chunk silence are bounded.
+async fn pull_model_stream<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    model_name: &str,
+    endpoint: Option<&str>,
+    idle_timeout: Duration,
+) -> Result<(), String> {
+    let client = Client::builder()
+        .connect_timeout(PULL_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let base_url = endpoint.unwrap_or("http://localhost:11434");
     let url = format!("{}/api/pull", base_url);
 
     let payload = serde_json::json!({
@@ -287,13 +341,9 @@ pub async fn pull_ollama_model<R: Runtime>(
         "stream": true
     });
 
-    let response = client
-        .post(&url)
-        .json(&payload)
-        .timeout(Duration::from_secs(600)) // 10 minutes timeout for pulling
-        .send()
-        .await
-        .map_err(|e| {
+    let response = match timeout(idle_timeout, client.post(&url).json(&payload).send()).await {
+        Err(_) => return Err(pull_stall_error(idle_timeout)),
+        Ok(response) => response.map_err(|e| {
             if e.is_timeout() {
                 format!("Download timed out. The model may be large, please try using the Ollama CLI: ollama pull {}", model_name)
             } else if e.is_connect() {
@@ -301,27 +351,12 @@ pub async fn pull_ollama_model<R: Runtime>(
             } else {
                 format!("Failed to download model: {}", e)
             }
-        })?;
+        })?,
+    };
 
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-
-        // Remove from downloading set on error
-        {
-            let mut downloading = DOWNLOADING_MODELS.write().await;
-            downloading.remove(&model_name);
-        }
-
-        // Emit error event
-        let _ = app_handle.emit(
-            "ollama-model-download-error",
-            serde_json::json!({
-                "modelName": model_name,
-                "error": format!("HTTP {}: {}", status, error_text)
-            }),
-        );
-
         return Err(format!("Failed to pull model (HTTP {}): {}", status, error_text));
     }
 
@@ -330,26 +365,12 @@ pub async fn pull_ollama_model<R: Runtime>(
     let mut buffer = String::new();
     let mut last_progress = 0u8;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            let error_msg = format!("Failed to read stream: {}", e);
-
-            // Remove from downloading set on stream error
-            let model_name_clone = model_name.clone();
-            tokio::spawn(async move {
-                let mut downloading = DOWNLOADING_MODELS.write().await;
-                downloading.remove(&model_name_clone);
-            });
-
-            let _ = app_handle.emit(
-                "ollama-model-download-error",
-                serde_json::json!({
-                    "modelName": model_name,
-                    "error": error_msg
-                }),
-            );
-            error_msg
-        })?;
+    loop {
+        let chunk = match timeout(idle_timeout, stream.next()).await {
+            Err(_) => return Err(pull_stall_error(idle_timeout)),
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk.map_err(|e| format!("Failed to read stream: {}", e))?,
+        };
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -391,55 +412,17 @@ pub async fn pull_ollama_model<R: Runtime>(
 
                 // Check for error status
                 if let Some(error) = json.get("error").and_then(|v| v.as_str()) {
-                    let error_msg = format!("Ollama error: {}", error);
-
-                    // Remove from downloading set on Ollama error
-                    {
-                        let mut downloading = DOWNLOADING_MODELS.write().await;
-                        downloading.remove(&model_name);
-                    }
-
-                    let _ = app_handle.emit(
-                        "ollama-model-download-error",
-                        serde_json::json!({
-                            "modelName": model_name,
-                            "error": error_msg
-                        }),
-                    );
-                    return Err(error_msg);
+                    return Err(format!("Ollama error: {}", error));
                 }
             }
         }
     }
 
-    // Remove from downloading set before emitting completion
-    {
-        let mut downloading = DOWNLOADING_MODELS.write().await;
-        downloading.remove(&model_name);
-        log::info!("Removed {} from downloading set", model_name);
-    }
-
-    // Emit completion event
-    let _ = app_handle.emit(
-        "ollama-model-download-complete",
-        serde_json::json!({
-            "modelName": model_name
-        }),
-    );
-
-    log::info!("Ollama model {} downloaded successfully", model_name);
-
     Ok(())
 }
 
-// Test seam for the stream idle limit; the body is still the pre-fix pull.
-async fn pull_model_stream<R: Runtime>(
-    app_handle: &AppHandle<R>,
-    model_name: &str,
-    endpoint: Option<&str>,
-    _idle_timeout: Duration,
-) -> Result<(), String> {
-    pull_ollama_model(app_handle.clone(), model_name.to_string(), endpoint.map(str::to_string)).await
+fn pull_stall_error(idle_timeout: Duration) -> String {
+    format!("Model download stalled: Ollama sent no data for {:?}", idle_timeout)
 }
 
 #[command]
