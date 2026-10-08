@@ -89,6 +89,16 @@ pub struct ChatResponse {
 #[derive(Deserialize, Debug)]
 pub struct Choice {
     pub message: MessageContent,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+
+const OUTPUT_LIMIT_MESSAGE: &str = "The summary was truncated because the model ran out of output space before it finished. Try again, or use a model with a larger output limit.";
+
+/// Stop reasons that mean the model ran out of output tokens: "length" for
+/// OpenAI-compatible APIs, "max_tokens" for Claude.
+fn is_output_limit_reason(reason: Option<&str>) -> bool {
+    matches!(reason, Some("length" | "max_tokens"))
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,6 +124,8 @@ pub struct ClaudeRequest {
 #[derive(Deserialize, Debug)]
 pub struct ClaudeChatResponse {
     pub content: Vec<ClaudeChatContent>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -124,15 +136,19 @@ pub struct ClaudeChatContent {
 }
 
 impl ClaudeChatResponse {
-    fn completion(&self) -> Option<LlmCompletion> {
+    fn completion(&self) -> Result<LlmCompletion, String> {
+        if is_output_limit_reason(self.stop_reason.as_deref()) {
+            return Err(OUTPUT_LIMIT_MESSAGE.to_string());
+        }
         let content = self
             .content
             .iter()
             .find(|block| block.block_type == "text")
-            .and_then(|block| block.text.as_deref())?
+            .and_then(|block| block.text.as_deref())
+            .ok_or("No text content in LLM response")?
             .trim()
             .to_string();
-        Some(LlmCompletion {
+        Ok(LlmCompletion {
             content,
             reasoning_stripped: self.content.iter().any(|block| {
                 matches!(block.block_type.as_str(), "thinking" | "redacted_thinking")
@@ -149,11 +165,11 @@ pub(crate) struct LlmCompletion {
 
 impl ChatResponse {
     fn completion(&self) -> Result<LlmCompletion, String> {
-        let message = &self
-            .choices
-            .first()
-            .ok_or("No content in LLM response")?
-            .message;
+        let choice = self.choices.first().ok_or("No content in LLM response")?;
+        if is_output_limit_reason(choice.finish_reason.as_deref()) {
+            return Err(OUTPUT_LIMIT_MESSAGE.to_string());
+        }
+        let message = &choice.message;
         Ok(LlmCompletion {
             content: message
                 .content
@@ -520,10 +536,7 @@ pub(crate) async fn generate_summary(
 
         info!("🐞 LLM Response received from Claude");
 
-        let completion = chat_response
-            .completion()
-            .ok_or("No text content in LLM response")?;
-        Ok(completion)
+        chat_response.completion()
     } else {
         let chat_response = await_or_cancel(
             response.json::<ChatResponse>(),
@@ -932,11 +945,86 @@ mod tests {
         .unwrap();
         assert_eq!(
             response.completion(),
-            Some(LlmCompletion {
+            Ok(LlmCompletion {
                 content: "Meeting summary.".to_string(),
                 reasoning_stripped: true,
             })
         );
+    }
+
+    #[test]
+    fn claude_max_tokens_stop_reason_is_not_a_complete_summary() {
+        let truncated: ClaudeChatResponse = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "# T\n## Action Items\n- Bob to"}],
+            "stop_reason": "max_tokens"
+        }))
+        .unwrap();
+        let error = truncated
+            .completion()
+            .expect_err("a max_tokens stop must be an error");
+        assert!(error.contains("truncated"));
+
+        let complete: ClaudeChatResponse = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "Meeting summary."}],
+            "stop_reason": "end_turn"
+        }))
+        .unwrap();
+        assert_eq!(
+            complete.completion(),
+            Ok(LlmCompletion {
+                content: "Meeting summary.".to_string(),
+                reasoning_stripped: false,
+            })
+        );
+    }
+
+    /// H5-F3: an OpenAI-compatible completion with `finish_reason: "length"`
+    /// was cut off mid-section. It must not be accepted as a finished summary.
+    #[tokio::test]
+    async fn finish_reason_length_is_not_a_complete_summary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            let body = br##"{"choices":[{"message":{"content":"# T\n## Action Items\n- Bob to"},"finish_reason":"length"}]}"##;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let client = Client::new();
+        let endpoint = format!("http://{address}");
+        let result = timeout(
+            Duration::from_secs(5),
+            generate_summary(
+                &client,
+                &LLMProvider::CustomOpenAI,
+                "model",
+                "",
+                "system",
+                "user",
+                None,
+                Some(&endpoint),
+                Some(8192),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("generation should finish");
+        server.await.unwrap();
+
+        let error = result.expect_err("a completion with finish_reason=length must be an error");
+        assert!(error.to_lowercase().contains("length") || error.to_lowercase().contains("truncat"));
     }
 }
 

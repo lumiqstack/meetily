@@ -51,6 +51,8 @@ export function useMeetingData({ meeting, summaryData, onMeetingUpdated }: UseMe
       meetingId: meeting.id,
       summary: formattedSummary,
     });
+    // Later saves with a clean editor re-send aiSummary, so it must hold what was just saved.
+    setAiSummary(formattedSummary);
   }, [meeting.id, meetingTitle]);
 
   const saveAllChanges = useCallback(async () => {

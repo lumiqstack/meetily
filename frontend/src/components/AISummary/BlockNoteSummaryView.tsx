@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from 'react';
+import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle, type KeyboardEvent } from 'react';
 import dynamic from 'next/dynamic';
 import { Summary, SummaryDataResponse, SummaryFormat, BlockNoteBlock } from '@/types';
 import { AISummary } from './index';
 import { Block } from '@blocknote/core';
 import { useCreateBlockNote } from '@blocknote/react';
 import { BlockNoteView } from '@blocknote/shadcn';
+import { toast } from 'sonner';
 import { blocksToMarkdownSafely } from '@/lib/blocknote-markdown';
 import "@blocknote/shadcn/style.css";
 
@@ -77,6 +78,21 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
 }, ref) => {
   const { format, data } = detectSummaryFormat(summaryData);
   const [isDirty, setIsDirty] = useState(false);
+  // The dirty flag can also be set by BlockNote normalizing loaded content, so the
+  // unmount autosave additionally requires real input from the user.
+  const userEditedRef = useRef(false);
+  const markUserEdit = useCallback(() => {
+    userEditedRef.current = true;
+  }, []);
+  // Arrows, Tab, Escape, bare modifiers and copy must not count, or they defeat the guard.
+  const markKeyEdit = useCallback((event: KeyboardEvent) => {
+    const { key, ctrlKey, metaKey } = event;
+    const modified = ctrlKey || metaKey;
+    const changesText = modified
+      ? ['v', 'x', 'z', 'y'].includes(key.toLowerCase())
+      : key.length === 1 || key === 'Backspace' || key === 'Delete' || key === 'Enter';
+    if (changesText) userEditedRef.current = true;
+  }, []);
   const [currentBlocks, setCurrentBlocks] = useState<Block[]>([]);
   const [isSaving, setIsSaving] = useState(false);
   const isContentLoaded = useRef(false);
@@ -164,6 +180,24 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
     }
   }, [onSave, isDirty, currentBlocks, editor]);
 
+  // Navigating to another meeting remounts the page and would drop unsaved edits, so the
+  // unmount cleanup saves them. The cleanup of an empty-deps effect sees the first render's
+  // values, so the latest ones are read through a ref.
+  const unmountSaveRef = useRef({ isDirty, handleSave });
+  useEffect(() => {
+    unmountSaveRef.current = { isDirty, handleSave };
+  }, [isDirty, handleSave]);
+
+  useEffect(() => {
+    return () => {
+      const { isDirty: dirtyOnExit, handleSave: saveOnExit } = unmountSaveRef.current;
+      if (!dirtyOnExit || !userEditedRef.current) return;
+      saveOnExit().catch((error) => {
+        toast.error('Failed to save changes', { description: String(error) });
+      });
+    };
+  }, []);
+
   // Expose methods to parent via ref
   useImperativeHandle(ref, () => ({
     saveSummary: handleSave,
@@ -236,7 +270,13 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
   if (format === 'blocknote') {
     console.log('🎨 Rendering BLOCKNOTE format (direct)');
     return (
-      <div className="flex flex-col w-full">
+      <div
+        className="flex flex-col w-full"
+        onKeyDownCapture={markKeyEdit}
+        onPasteCapture={markUserEdit}
+        onCutCapture={markUserEdit}
+        onDropCapture={markUserEdit}
+      >
         <div className="w-full">
           <Editor
             initialContent={data.summary_json}
@@ -255,7 +295,13 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
   if (format === 'markdown') {
     console.log('🎨 Rendering MARKDOWN format (parsed to BlockNote)');
     return (
-      <div className="flex flex-col w-full">
+      <div
+        className="flex flex-col w-full"
+        onKeyDownCapture={markKeyEdit}
+        onPasteCapture={markUserEdit}
+        onCutCapture={markUserEdit}
+        onDropCapture={markUserEdit}
+      >
         <div className="w-full">
           <BlockNoteView
             editor={editor}
