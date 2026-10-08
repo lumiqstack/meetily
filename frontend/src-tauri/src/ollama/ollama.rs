@@ -584,4 +584,32 @@ mod tests {
         let error = result.expect_err("a pull whose stream stalls past the idle limit must fail");
         assert!(error.contains("stalled"), "unexpected error: {error}");
     }
+
+    #[tokio::test]
+    async fn h5_f5_new_layer_progress_reset_does_not_panic() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling","completed":100,"total":100}"#),
+            (Duration::ZERO, r#"{"status":"pulling","completed":0,"total":50}"#),
+            (Duration::ZERO, r#"{"status":"success"}"#),
+        ])
+        .await;
+        let result = pull_ollama_model(app.handle().clone(), "h5-f5-layer-reset-model".to_string(), Some(endpoint)).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn h5_f5_failed_pull_clears_downloading_state_so_it_can_retry() {
+        let app = tauri::test::mock_app();
+        let closed_port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let endpoint = format!("http://{closed_port}");
+        let model = "h5-f5-retry-model".to_string();
+
+        let first = pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint.clone())).await;
+        assert!(first.is_err());
+
+        let second = pull_ollama_model(app.handle().clone(), model.clone(), Some(endpoint)).await;
+        let error = second.expect_err("connection to a closed port must fail");
+        assert!(!error.contains("already being downloaded"), "unexpected error: {error}");
+    }
 }
