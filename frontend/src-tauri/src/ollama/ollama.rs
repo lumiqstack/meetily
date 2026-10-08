@@ -552,6 +552,10 @@ mod tests {
         format!("http://{address}")
     }
 
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn h5_f4_pull_survives_slow_stream_with_gaps_under_idle_limit() {
         let app = tauri::test::mock_app();
@@ -567,6 +571,10 @@ mod tests {
         assert_eq!(result, Ok(()));
     }
 
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn h5_f4_pull_fails_when_stream_stalls_past_idle_limit() {
         let app = tauri::test::mock_app();
@@ -580,6 +588,10 @@ mod tests {
         assert!(error.contains("stalled"), "unexpected error: {error}");
     }
 
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn h5_f5_new_layer_progress_reset_does_not_panic() {
         let app = tauri::test::mock_app();
@@ -593,6 +605,10 @@ mod tests {
         assert_eq!(result, Ok(()));
     }
 
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn h5_f5_failed_pull_clears_downloading_state_so_it_can_retry() {
         let app = tauri::test::mock_app();
@@ -610,6 +626,10 @@ mod tests {
 
     /// Two pulls of one model started together: only the first may run, the
     /// second must be rejected as already downloading.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn concurrent_pulls_of_same_model_only_one_is_accepted() {
         let app = tauri::test::mock_app();
