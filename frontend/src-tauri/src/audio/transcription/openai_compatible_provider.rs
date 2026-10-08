@@ -154,7 +154,7 @@ impl TranscriptionProvider for OpenAICompatibleProvider {
             .text("model", self.model.clone())
             .text("response_format", "json");
 
-        if let Some(lang) = language.filter(|l| !l.is_empty() && l != "auto") {
+        if let Some(lang) = super::remote_language_code(language.as_deref()) {
             form = form.text("language", lang);
         }
         if let Some(prompt) = &self.prompt {

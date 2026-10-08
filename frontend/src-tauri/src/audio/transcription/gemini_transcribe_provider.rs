@@ -186,13 +186,8 @@ impl GeminiTranscribeProvider {
             .text("diarization", options.diarization.to_string())
             .text("word_timestamps", options.word_timestamps.to_string());
 
-        if let Some(language) = options
-            .language
-            .as_deref()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && *l != "auto")
-        {
-            form = form.text("language", language.to_string());
+        if let Some(language) = super::remote_language_code(options.language.as_deref()) {
+            form = form.text("language", language);
         }
 
         let request = self
@@ -314,7 +309,7 @@ impl TranscriptionProvider for GeminiTranscribeProvider {
             .part("file", file_part)
             .text("model", self.model.clone());
 
-        if let Some(lang) = language.filter(|l| !l.is_empty() && l != "auto") {
+        if let Some(lang) = super::remote_language_code(language.as_deref()) {
             form = form.text("language", lang);
         }
 
