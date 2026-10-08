@@ -115,6 +115,20 @@ describe('summary editor saves unsaved edits when it unmounts', () => {
     expect(toastError.mock.calls[0]?.[0]).toBe('Failed to save changes');
   });
 
+  test('an editor change the user did not make is not autosaved', async () => {
+    // BlockNote can report a change while it normalizes loaded content; saving that
+    // would rewrite an untouched summary through the lossy markdown conversion.
+    await mountSummary();
+    await act(async () => {
+      emitEditorChange!([{ ...summaryBlocks[0], content: [{ type: 'text', text: 'normalized', styles: {} }] }]);
+    });
+
+    await act(async () => { renderer!.unmount(); });
+    await settle();
+
+    expect(savedMarkdown()).toEqual([]);
+  });
+
   test('unmounting a clean summary editor does not save', async () => {
     await mountSummary();
 
