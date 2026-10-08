@@ -75,10 +75,18 @@ fn is_transient_provider_error(error: &str) -> bool {
     .any(|needle| error.contains(needle))
 }
 
-/// Read the user's explicit per-meeting summary language, if they set one.
-/// Auto-detection is handled inside `process_transcript_background`, so
-/// `None` here means "auto", matching the frontend's behaviour.
+/// The summary language for this run: the user's per-meeting choice, else the
+/// transcript's detected language. That is what the UI's Auto mode passes, so
+/// the automatic pipeline writes the same language as a manual run.
 async fn resolve_summary_language(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
+    match read_explicit_summary_language(pool, meeting_id).await {
+        Some(language) => Some(language),
+        None => SummaryService::read_detected_summary_language(pool, meeting_id).await,
+    }
+}
+
+/// Read the user's explicit per-meeting summary language, if they set one.
+async fn read_explicit_summary_language(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
     let meeting = MeetingsRepository::get_meeting_metadata(pool, meeting_id)
         .await
         .ok()
@@ -114,7 +122,10 @@ pub async fn run_summary_stage<R: Runtime>(
             StageError::hard("No summary model configured — set one in Settings first")
         })?;
 
-    let summary_language = resolve_summary_language(pool, meeting_id).await;
+    let summary_language = match resolve_summary_language(pool, meeting_id).await {
+        Some(language) => Some(language),
+        None => SummaryService::detect_summary_language_from_text(&text),
+    };
 
     let started_at = Utc::now();
     SummaryProcessesRepository::create_or_reset_process(pool, meeting_id, started_at)
