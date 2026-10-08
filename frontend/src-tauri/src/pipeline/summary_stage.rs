@@ -242,4 +242,45 @@ mod tests {
         assert!(!is_transient_provider_error("Failed to load template 'nope'"));
         assert!(!is_transient_provider_error("invalid api key"));
     }
+
+    async fn repro_test_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations must apply to a fresh database");
+        pool
+    }
+
+    /// H5-F2: a meeting whose transcript was detected as Spanish, with no
+    /// explicit override, must resolve to Spanish here. The UI's Auto mode
+    /// passes the detected code as the summary language; this pipeline path
+    /// passes None, which the processor normalises to English.
+    #[tokio::test]
+    async fn auto_mode_resolves_detected_spanish_not_none() {
+        let pool = repro_test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        crate::summary::metadata::write_detected_summary_language_to_metadata(
+            dir.path(),
+            Some("es"),
+        )
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+             VALUES ('m-es', 'Reunion', '2026-07-24T10:00:00Z', '2026-07-24T10:00:00Z', ?)",
+        )
+        .bind(dir.path().to_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resolve_summary_language(&pool, "m-es").await,
+            Some("es".to_string())
+        );
+    }
 }
