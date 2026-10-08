@@ -1997,6 +1997,10 @@ mod transcript_listener_tests {
     /// stop_recording takes the manager out of RECORDING_MANAGER before the
     /// transcription drain, so segments emitted during the drain must still be
     /// stored in that manager.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
     #[test]
     fn segment_emitted_after_manager_is_taken_is_stored_in_it() {
         let app = tauri::test::mock_app();
