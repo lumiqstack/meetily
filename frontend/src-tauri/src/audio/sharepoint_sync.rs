@@ -686,51 +686,58 @@ async fn download_direct_file_with_stall<F: Fn(u32)>(
     let mut file = tokio::fs::File::create(&dest)
         .await
         .with_context(|| format!("Could not create {}", dest.display()))?;
-    let mut downloaded: u64 = 0;
-    let mut last_pct: u32 = 0;
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => None,
-            chunk = tokio::time::timeout(stall, response.chunk()) => Some(chunk),
-        };
-        let chunk = match next {
-            None => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&dest).await;
-                return Err(anyhow!("Import cancelled"));
-            }
-            Some(Err(_)) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&dest).await;
-                return Err(anyhow!(
-                    "The download from SharePoint stalled: no data for {}s",
-                    stall.as_secs()
-                ));
-            }
-            Some(Ok(chunk)) => chunk.context("The download stream from SharePoint failed")?,
-        };
-        let Some(chunk) = chunk else { break };
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .context("Could not write the downloaded recording to disk")?;
-        downloaded += chunk.len() as u64;
-        if let Some(total) = total {
-            let pct = ((downloaded.saturating_mul(100)) / total.max(1)).min(100) as u32;
-            if pct != last_pct {
-                last_pct = pct;
-                on_progress(pct);
+    let copied: Result<u64> = async {
+        let mut downloaded: u64 = 0;
+        let mut last_pct: u32 = 0;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                chunk = tokio::time::timeout(stall, response.chunk()) => Some(chunk),
+            };
+            let chunk = match next {
+                None => return Err(anyhow!("Import cancelled")),
+                Some(Err(_)) => {
+                    return Err(anyhow!(
+                        "The download from SharePoint stalled: no data for {}s",
+                        stall.as_secs()
+                    ))
+                }
+                Some(Ok(chunk)) => chunk.context("The download stream from SharePoint failed")?,
+            };
+            let Some(chunk) = chunk else { break };
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .context("Could not write the downloaded recording to disk")?;
+            downloaded += chunk.len() as u64;
+            if let Some(total) = total {
+                let pct = ((downloaded.saturating_mul(100)) / total.max(1)).min(100) as u32;
+                if pct != last_pct {
+                    last_pct = pct;
+                    on_progress(pct);
+                }
             }
         }
+        tokio::io::AsyncWriteExt::flush(&mut file)
+            .await
+            .context("Could not finish writing the downloaded recording")?;
+        Ok(downloaded)
     }
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .context("Could not finish writing the downloaded recording")?;
-    info!(
-        "Direct SharePoint download complete: {} ({downloaded} bytes)",
-        dest.display()
-    );
-    Ok(dest)
+    .await;
+    match copied {
+        Ok(downloaded) => {
+            info!(
+                "Direct SharePoint download complete: {} ({downloaded} bytes)",
+                dest.display()
+            );
+            Ok(dest)
+        }
+        Err(e) => {
+            drop(file);
+            let _ = tokio::fs::remove_file(&dest).await;
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
