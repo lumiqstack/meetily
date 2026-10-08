@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import type { TranscriptionErrorPayload } from '@/services/transcriptService';
+import type { TranscriptChunkLossPayload } from '@/services/recordingService';
 
 export type ModalType =
   | 'modelSettings'
@@ -99,16 +100,17 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
     });
   }, []);
 
-  // Set up chunk drop warning listener
+  // Set up transcript chunk loss listener
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
 
     const setupChunkDropListener = async () => {
       try {
-        console.log('Setting up chunk-drop-warning listener...');
-        unlistenFn = await listen<string>('chunk-drop-warning', (event) => {
-          console.log('Audio chunk drop warning received');
-          showModal('chunkDropWarning', event.payload);
+        console.log('Setting up transcript-chunk-loss-detected listener...');
+        unlistenFn = await listen<TranscriptChunkLossPayload>('transcript-chunk-loss-detected', (event) => {
+          console.log('Transcript chunk loss detected');
+          const { message, chunks_lost, chunks_queued } = event.payload;
+          showModal('chunkDropWarning', `${message} (${chunks_lost} of ${chunks_queued} chunks lost).`);
         });
         console.log('Chunk drop warning listener setup complete');
       } catch (error) {
