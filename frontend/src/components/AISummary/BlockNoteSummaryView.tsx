@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle } from 'react';
+import { useState, useEffect, useCallback, useRef, forwardRef, useImperativeHandle, type KeyboardEvent } from 'react';
 import dynamic from 'next/dynamic';
 import { Summary, SummaryDataResponse, SummaryFormat, BlockNoteBlock } from '@/types';
 import { AISummary } from './index';
@@ -83,6 +83,15 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
   const userEditedRef = useRef(false);
   const markUserEdit = useCallback(() => {
     userEditedRef.current = true;
+  }, []);
+  // Arrows, Tab, Escape, bare modifiers and copy must not count, or they defeat the guard.
+  const markKeyEdit = useCallback((event: KeyboardEvent) => {
+    const { key, ctrlKey, metaKey } = event;
+    const modified = ctrlKey || metaKey;
+    const changesText = modified
+      ? ['v', 'x', 'z', 'y'].includes(key.toLowerCase())
+      : key.length === 1 || key === 'Backspace' || key === 'Delete' || key === 'Enter';
+    if (changesText) userEditedRef.current = true;
   }, []);
   const [currentBlocks, setCurrentBlocks] = useState<Block[]>([]);
   const [isSaving, setIsSaving] = useState(false);
@@ -263,7 +272,7 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
     return (
       <div
         className="flex flex-col w-full"
-        onKeyDownCapture={markUserEdit}
+        onKeyDownCapture={markKeyEdit}
         onPasteCapture={markUserEdit}
         onCutCapture={markUserEdit}
         onDropCapture={markUserEdit}
@@ -288,7 +297,7 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
     return (
       <div
         className="flex flex-col w-full"
-        onKeyDownCapture={markUserEdit}
+        onKeyDownCapture={markKeyEdit}
         onPasteCapture={markUserEdit}
         onCutCapture={markUserEdit}
         onDropCapture={markUserEdit}
