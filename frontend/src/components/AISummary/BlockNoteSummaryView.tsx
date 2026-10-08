@@ -7,6 +7,7 @@ import { AISummary } from './index';
 import { Block } from '@blocknote/core';
 import { useCreateBlockNote } from '@blocknote/react';
 import { BlockNoteView } from '@blocknote/shadcn';
+import { toast } from 'sonner';
 import { blocksToMarkdownSafely } from '@/lib/blocknote-markdown';
 import "@blocknote/shadcn/style.css";
 
@@ -163,6 +164,24 @@ export const BlockNoteSummaryView = forwardRef<BlockNoteSummaryViewRef, BlockNot
       setIsSaving(false);
     }
   }, [onSave, isDirty, currentBlocks, editor]);
+
+  // Navigating to another meeting remounts the page and would drop unsaved edits, so the
+  // unmount cleanup saves them. The cleanup of an empty-deps effect sees the first render's
+  // values, so the latest ones are read through a ref.
+  const unmountSaveRef = useRef({ isDirty, handleSave });
+  useEffect(() => {
+    unmountSaveRef.current = { isDirty, handleSave };
+  }, [isDirty, handleSave]);
+
+  useEffect(() => {
+    return () => {
+      const { isDirty: dirtyOnExit, handleSave: saveOnExit } = unmountSaveRef.current;
+      if (!dirtyOnExit) return;
+      saveOnExit().catch((error) => {
+        toast.error('Failed to save changes', { description: String(error) });
+      });
+    };
+  }, []);
 
   // Expose methods to parent via ref
   useImperativeHandle(ref, () => ({
