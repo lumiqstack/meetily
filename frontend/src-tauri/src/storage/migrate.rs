@@ -23,9 +23,9 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Runtime};
 
-use super::{legacy_root, root};
+use super::{legacy_root, read_pointer, root, write_pointer};
 
-const STATE_FILE: &str = ".migration-state.json";
+pub(super) const STATE_FILE: &str = ".migration-state.json";
 
 /// Above this size we verify by length alone. Hashing a 3 GB model file adds
 /// minutes to a startup that is already copying it once.
@@ -41,6 +41,12 @@ struct State {
     old_recordings_root: Option<PathBuf>,
     #[serde(default)]
     db_paths_rewritten: bool,
+    /// The move this state belongs to. Progress recorded for a different source
+    /// or target is from an earlier relocation and must not skip this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<PathBuf>,
 }
 
 impl State {
@@ -63,6 +69,7 @@ fn load_state(root: &Path) -> State {
 }
 
 fn save_state(root: &Path, state: &State) -> Result<()> {
+    std::fs::create_dir_all(root)?;
     let path = root.join(STATE_FILE);
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
@@ -86,6 +93,10 @@ pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
 
 /// [`run_files`] with the paths and event sink passed in, so the startup path can
 /// be exercised without a live `AppHandle` or the process-wide data root.
+///
+/// `legacy` is Tauri's app data directory, where the pointer file lives. The data
+/// is moved from the root recorded as `previous_root` when there is one, and from
+/// `legacy` otherwise.
 fn run_files_in(
     legacy: &Path,
     root: &Path,
@@ -93,15 +104,32 @@ fn run_files_in(
 ) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
 
-    if root == legacy {
+    let source = read_pointer(legacy)
+        .and_then(|p| p.previous_root)
+        .unwrap_or_else(|| legacy.to_path_buf());
+
+    if source == root {
+        let _ = clear_previous_root(legacy);
         return Ok(report);
     }
 
     let mut state = load_state(root);
+    // Progress saved before moves were tagged can only be from legacy -> root.
+    if state.source.is_none() && source == legacy {
+        state.source = Some(source.clone());
+        state.target = Some(root.to_path_buf());
+    }
+    if state.source.as_deref() != Some(source.as_path()) || state.target.as_deref() != Some(root) {
+        state = State {
+            source: Some(source.clone()),
+            target: Some(root.to_path_buf()),
+            ..State::default()
+        };
+    }
 
     log::info!(
         "Storage migration: {} -> {}",
-        legacy.display(),
+        source.display(),
         root.display()
     );
     emit(serde_json::json!({ "phase": "start" }));
@@ -113,7 +141,7 @@ fn run_files_in(
             continue;
         }
         emit(serde_json::json!({ "phase": "step", "step": name }));
-        match move_tree(&legacy.join(name), &root.join(name), &mut report) {
+        match move_tree(&source.join(name), &root.join(name), &mut report) {
             Ok(0) => {
                 state.mark(name);
                 let _ = save_state(root, &state);
@@ -142,7 +170,7 @@ fn run_files_in(
     // migration's own error output on the first run.
     if !state.done("logs") {
         let mut ok = true;
-        for old_logs in [legacy_logs_dir(), Some(legacy.join("logs"))]
+        for old_logs in [legacy_logs_dir(), Some(source.join("logs"))]
             .into_iter()
             .flatten()
         {
@@ -160,7 +188,7 @@ fn run_files_in(
 
     if !state.done("recordings") {
         emit(serde_json::json!({ "phase": "step", "step": "recordings" }));
-        match migrate_recordings(&legacy, &root, &mut state, &mut report) {
+        match migrate_recordings(legacy, &source, root, &mut state, &mut report) {
             Ok(true) => {
                 state.mark("recordings");
                 let _ = save_state(root, &state);
@@ -182,7 +210,7 @@ fn run_files_in(
     // unrecoverable, and by now everything it references has already moved.
     if !state.done("db") {
         emit(serde_json::json!({ "phase": "step", "step": "database" }));
-        match migrate_database(&legacy, &root, &mut report) {
+        match migrate_database(&source, root, &mut report) {
             Ok(()) => {
                 state.mark("db");
                 let _ = save_state(root, &state);
@@ -192,6 +220,13 @@ fn run_files_in(
                 report.skipped.push(format!("database: {}", e));
             }
         }
+    }
+
+    if ["bin", "sp-webview", "models", "logs", "recordings", "db"]
+        .iter()
+        .all(|step| state.done(step))
+    {
+        let _ = clear_previous_root(legacy);
     }
 
     log::info!(
@@ -207,6 +242,27 @@ fn run_files_in(
     emit(serde_json::json!({ "phase": "complete", "report": &report }));
 
     Ok(report)
+}
+
+/// Forget a finished move so later launches do not run it again.
+fn clear_previous_root(legacy: &Path) -> Result<()> {
+    let Some(mut pointer) = read_pointer(legacy) else {
+        return Ok(());
+    };
+    if pointer.previous_root.take().is_none() {
+        return Ok(());
+    }
+    write_pointer(legacy, &pointer)
+}
+
+/// Where meeting folders go for a given root. The default root gets the folder a
+/// fresh install uses, not a `recordings` folder inside the app data directory.
+fn recordings_target(legacy: &Path, root: &Path) -> PathBuf {
+    if root == legacy {
+        super::historical_recordings_dir()
+    } else {
+        root.join("recordings")
+    }
 }
 
 /// Phase 2: repoint the absolute paths the database stores for each meeting.
@@ -228,7 +284,7 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
         return Ok(0);
     };
 
-    let new_root = root.join("recordings");
+    let new_root = recordings_target(&legacy_root(), &root);
     if old_root == new_root {
         state.db_paths_rewritten = true;
         let _ = save_state(&root, &state);
@@ -473,15 +529,22 @@ fn legacy_logs_dir() -> Option<PathBuf> {
 /// only on success is what stranded the first three meetings.
 fn migrate_recordings(
     legacy: &Path,
+    source: &Path,
     root: &Path,
     state: &mut State,
     report: &mut MigrationReport,
 ) -> Result<bool> {
     let old_root = state.old_recordings_root.clone().unwrap_or_else(|| {
-        stored_recordings_folder(legacy).unwrap_or_else(super::historical_recordings_dir)
+        stored_recordings_folder(legacy).unwrap_or_else(|| {
+            if source == legacy {
+                super::historical_recordings_dir()
+            } else {
+                source.join("recordings")
+            }
+        })
     });
 
-    let new_root = root.join("recordings");
+    let new_root = recordings_target(legacy, root);
     if old_root == new_root {
         return Ok(true);
     }
@@ -705,6 +768,7 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Pointer;
     use tempfile::tempdir;
 
     fn write(path: &Path, contents: &[u8]) {
@@ -956,5 +1020,155 @@ mod tests {
             root2.join("meeting_minutes.sqlite").exists(),
             "database was left at the previous data root"
         );
+    }
+
+    #[test]
+    fn database_follows_root_changes_back_to_the_default() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(&root1.join("meeting_minutes.sqlite"), b"meetings");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root2.clone()),
+                previous_root: Some(root1.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root2, |_| {}).unwrap();
+
+        assert_eq!(
+            std::fs::read(root2.join("meeting_minutes.sqlite")).unwrap(),
+            b"meetings"
+        );
+        assert!(!root1.join("meeting_minutes.sqlite").exists());
+        assert!(
+            read_pointer(&legacy).unwrap().previous_root.is_none(),
+            "a finished move must clear previous_root"
+        );
+
+        // Back to the default: the pointer names no data root, but still says
+        // where the data has to come from.
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: None,
+                previous_root: Some(root2.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &legacy, |_| {}).unwrap();
+
+        assert_eq!(
+            std::fs::read(legacy.join("meeting_minutes.sqlite")).unwrap(),
+            b"meetings",
+            "database must end up at the default root"
+        );
+        assert!(!root2.join("meeting_minutes.sqlite").exists());
+    }
+
+    #[test]
+    fn stale_state_from_another_move_does_not_skip_the_database() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(&root1.join("meeting_minutes.sqlite"), b"meetings");
+        // Progress recorded for a legacy -> root2 move, which is not the move
+        // being run now.
+        write(
+            &root2.join(STATE_FILE),
+            serde_json::json!({
+                "completed": ["bin", "sp-webview", "models", "logs", "recordings", "db"],
+                "source": legacy,
+                "target": root2,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root2.clone()),
+                previous_root: Some(root1.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root2, |_| {}).unwrap();
+
+        assert_eq!(
+            std::fs::read(root2.join("meeting_minutes.sqlite")).unwrap(),
+            b"meetings"
+        );
+    }
+
+    /// State written before moves were tagged must survive the upgrade: its
+    /// pending recordings root is what rewrite_db_paths still needs.
+    #[test]
+    fn untagged_state_from_an_earlier_version_is_kept_for_a_legacy_move() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("root");
+        let old_recordings = tmp.path().join("old-recordings");
+        write(
+            &root.join(STATE_FILE),
+            serde_json::json!({
+                "completed": ["bin", "sp-webview", "models", "logs", "recordings", "db"],
+                "old_recordings_root": old_recordings,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root.clone()),
+                previous_root: None,
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root, |_| {}).unwrap();
+
+        assert_eq!(load_state(&root).old_recordings_root, Some(old_recordings));
+    }
+
+    #[test]
+    fn rerunning_a_finished_move_changes_nothing() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(&root1.join("meeting_minutes.sqlite"), b"meetings");
+        write(&root2.join("models/ggml-base.bin"), b"weights");
+        write(&root2.join("notes/extra.txt"), b"keep");
+        let pending = || Pointer {
+            data_root: Some(root2.clone()),
+            previous_root: Some(root1.clone()),
+        };
+
+        write_pointer(&legacy, &pending()).unwrap();
+        run_files_in(&legacy, &root2, |_| {}).unwrap();
+
+        // A crash before the pointer was cleared leaves the same request pending.
+        write_pointer(&legacy, &pending()).unwrap();
+        let report = run_files_in(&legacy, &root2, |_| {}).unwrap();
+
+        assert_eq!(report.files_moved, 0);
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            std::fs::read(root2.join("meeting_minutes.sqlite")).unwrap(),
+            b"meetings"
+        );
+        assert_eq!(
+            std::fs::read(root2.join("models/ggml-base.bin")).unwrap(),
+            b"weights"
+        );
+        assert_eq!(std::fs::read(root2.join("notes/extra.txt")).unwrap(), b"keep");
     }
 }

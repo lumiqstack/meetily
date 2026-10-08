@@ -42,6 +42,10 @@ static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 struct Pointer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_root: Option<PathBuf>,
+    /// The root the data was in before the latest change. Set until the move
+    /// out of it has finished, so a launch can resume that move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_root: Option<PathBuf>,
 }
 
 /// Reconstruct Tauri's `app_data_dir()` without an `AppHandle`.
@@ -116,6 +120,15 @@ fn read_pointer(legacy: &Path) -> Option<Pointer> {
             None
         }
     }
+}
+
+fn write_pointer(legacy: &Path, pointer: &Pointer) -> Result<()> {
+    std::fs::create_dir_all(legacy)?;
+    let target = pointer_path(legacy);
+    let tmp = legacy.join(".storage.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(pointer)?)?;
+    std::fs::rename(&tmp, &target)?;
+    Ok(())
 }
 
 /// Initialise from the environment, before the Tauri runtime exists.
@@ -284,18 +297,35 @@ pub fn set_root(path: &Path) -> Result<()> {
     std::fs::create_dir_all(&legacy)
         .map_err(|e| anyhow!("Cannot create {}: {}", legacy.display(), e))?;
 
-    let pointer = Pointer {
-        data_root: if path == legacy {
-            None
-        } else {
-            Some(path.to_path_buf())
-        },
+    let data_root = if path == legacy {
+        None
+    } else {
+        Some(path.to_path_buf())
     };
+    let configured = read_pointer(&legacy).and_then(|p| p.data_root);
+    if data_root == configured {
+        return Ok(());
+    }
 
-    let target = pointer_path(&legacy);
-    let tmp = legacy.join(".storage.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&pointer)?)?;
-    std::fs::rename(&tmp, &target)?;
+    // The data stays where it is until restart, so the root in effect now is
+    // the one the next launch has to move from.
+    let previous = root();
+    let previous_root = (previous != path).then_some(previous);
+    let moving = previous_root.is_some();
+
+    write_pointer(
+        &legacy,
+        &Pointer {
+            data_root,
+            previous_root,
+        },
+    )?;
+
+    // A new move into this target must not be short-circuited by the record of
+    // an earlier move that happened to use the same two roots.
+    if moving {
+        let _ = std::fs::remove_file(path.join(migrate::STATE_FILE));
+    }
 
     log::info!("Data root set to {} (restart required)", path.display());
     Ok(())
@@ -315,6 +345,7 @@ mod tests {
             legacy.path().join(POINTER_FILE),
             serde_json::to_string(&Pointer {
                 data_root: Some(target.path().to_path_buf()),
+                previous_root: None,
             })
             .unwrap(),
         )
@@ -350,6 +381,7 @@ mod tests {
             legacy.path().join(POINTER_FILE),
             serde_json::to_string(&Pointer {
                 data_root: Some(unusable),
+                previous_root: None,
             })
             .unwrap(),
         )
@@ -372,6 +404,14 @@ mod tests {
             let pointer = read_pointer(legacy.path()).unwrap();
             assert_eq!(pointer.data_root.as_deref(), Some(target.path()));
         }
+    }
+
+    #[test]
+    fn pointer_written_before_previous_root_still_parses() {
+        let old: Pointer = serde_json::from_str(r#"{"data_root":"/Volumes/Data/meetily"}"#).unwrap();
+        assert_eq!(old.data_root, Some(PathBuf::from("/Volumes/Data/meetily")));
+        assert!(old.previous_root.is_none());
+        assert_eq!(serde_json::to_string(&Pointer::default()).unwrap(), "{}");
     }
 
     #[test]
