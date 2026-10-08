@@ -108,7 +108,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
     try {
       const transcripts = await indexedDBService.getTranscripts(meetingId);
       // Sort by sequence ID
-      transcripts.sort((a, b) => (a.sequenceId || 0) - (b.sequenceId || 0));
+      transcripts.sort((a, b) => (a.sequence_id || 0) - (b.sequence_id || 0));
       return transcripts;
     } catch (error) {
       console.error('Failed to load meeting transcripts:', error);
@@ -259,7 +259,8 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         id: t.id?.toString() || `${Date.now()}-${index}`,
         text: t.text,
         timestamp: t.timestamp,
-        sequence_id: t.sequenceId || index,
+        sequence_id: t.sequence_id ?? index,
+        speaker: t.speaker ?? null,
         chunk_start_time: (t as any).chunk_start_time,
         is_partial: (t as any).is_partial || false,
         confidence: t.confidence,

@@ -186,13 +186,8 @@ impl GeminiTranscribeProvider {
             .text("diarization", options.diarization.to_string())
             .text("word_timestamps", options.word_timestamps.to_string());
 
-        if let Some(language) = options
-            .language
-            .as_deref()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && *l != "auto")
-        {
-            form = form.text("language", language.to_string());
+        if let Some(language) = super::remote_language_code(options.language.as_deref()) {
+            form = form.text("language", language);
         }
 
         let request = self
@@ -259,8 +254,12 @@ fn parse_batch_response(
 
     // Silently degrading an authoritative pass to one undifferentiated blob is
     // worse than failing it: the caller asked for segmentation and would get
-    // an hour-long row with no way to tell something went wrong.
-    if options.word_timestamps && words.as_ref().map_or(true, |w| w.is_empty()) {
+    // an hour-long row with no way to tell something went wrong. Silence is
+    // the exception: it legitimately comes back as empty text with no words.
+    if options.word_timestamps
+        && !text.is_empty()
+        && words.as_ref().map_or(true, |w| w.is_empty())
+    {
         return Err(GeminiBatchError::MissingAnnotations);
     }
 
@@ -314,7 +313,7 @@ impl TranscriptionProvider for GeminiTranscribeProvider {
             .part("file", file_part)
             .text("model", self.model.clone());
 
-        if let Some(lang) = language.filter(|l| !l.is_empty() && l != "auto") {
+        if let Some(lang) = super::remote_language_code(language.as_deref()) {
             form = form.text("language", lang);
         }
 
@@ -650,6 +649,32 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, GeminiBatchError::MissingAnnotations));
             assert!(!error.is_transient(), "must not be retried forever");
+        }
+
+        #[tokio::test]
+        async fn omits_language_for_auto_translate() {
+            let server = server_returning(200, OK_BODY).await;
+            let options = GeminiBatchOptions {
+                diarization: false,
+                word_timestamps: true,
+                language: Some("auto-translate".to_string()),
+            };
+            upload(&server, &options).await.unwrap();
+
+            let requests = server.received_requests().await.unwrap();
+            let body = String::from_utf8_lossy(&requests[0].body);
+            assert!(!body.contains("name=\"language\""), "{body}");
+            assert!(!body.contains("auto-translate"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn silent_chunk_with_empty_words_is_not_an_error() {
+            // A silent chunk legitimately has no words: the gateway answers
+            // with empty text and an empty (present) words array.
+            let server = server_returning(200, r#"{"text":"","words":[]}"#).await;
+            let result = upload(&server, &GeminiBatchOptions::authoritative(false, None)).await;
+            assert!(result.is_ok(), "silent chunk failed the pass: {:?}", result.err());
+            assert_eq!(result.unwrap().text, "");
         }
 
         #[tokio::test]

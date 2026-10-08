@@ -1,7 +1,8 @@
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
-use sqlx::{migrate::MigrateDatabase, Result, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::migrate::{MigrateDatabase, Migrator};
+use sqlx::{Result, Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -9,6 +10,13 @@ use std::time::Duration;
 const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_VERSION: i64 = 20260618000000;
 const ORPHANED_CLOUD_TRANSCRIPT_PROVIDER_KEYS_MIGRATION_DESCRIPTION: &str =
     "add cloud transcript provider keys";
+/// Name prefix for a legacy column parked while migrations run; see
+/// `park_legacy_columns_that_migrations_add`.
+const PARKED_COLUMN_PREFIX: &str = "__legacy_park_";
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 #[derive(Clone)]
 pub struct DatabaseManager {
@@ -56,7 +64,12 @@ impl DatabaseManager {
 
         let initialized = async {
             Self::reconcile_orphaned_cloud_transcript_provider_migration(&pool).await?;
-            sqlx::migrate!("./migrations").run(&pool).await?;
+            let migrator = sqlx::migrate!("./migrations");
+            if !Self::table_exists(&pool, "_sqlx_migrations").await? {
+                Self::park_legacy_columns_that_migrations_add(&pool, &migrator).await?;
+            }
+            migrator.run(&pool).await?;
+            Self::restore_parked_legacy_columns(&pool).await?;
             Self::ensure_cloud_transcript_provider_columns(&pool).await
         }
         .await;
@@ -74,7 +87,7 @@ impl DatabaseManager {
     // after they can just delete the existing .sqlite file and then copy the existing .db file to
     // the current app dir, So the system detects legacy db and copy it and starts with that data
     // (Newly created .sqlite with the copied content from .db)
-    pub async fn new_from_app_handle(_app_handle: &tauri::AppHandle) -> Result<Self> {
+    pub async fn new_from_app_handle<R: tauri::Runtime>(_app_handle: &tauri::AppHandle<R>) -> Result<Self> {
         // Resolve the configured data root (falls back to app_data_dir)
         let app_data_dir = crate::storage::db_dir();
 
@@ -141,24 +154,44 @@ impl DatabaseManager {
     }
 
     /// Import a legacy database from the specified path and initialize
-    pub async fn import_legacy_database(
-        app_handle: &tauri::AppHandle,
+    pub async fn import_legacy_database<R: tauri::Runtime>(
+        app_handle: &tauri::AppHandle<R>,
         legacy_db_path: &str,
     ) -> Result<Self> {
         let app_data_dir = crate::storage::db_dir();
 
         // Copy legacy database to the data root as meeting_minutes.db
         let target_legacy_path = app_data_dir.join("meeting_minutes.db");
-        log::info!(
-            "Copying legacy database from {} to {}",
-            legacy_db_path,
-            target_legacy_path.display()
-        );
 
-        fs::copy(legacy_db_path, &target_legacy_path).map_err(|e| sqlx::Error::Io(e))?;
+        // Onboarding passes the default location itself, which is already the
+        // target. `fs::copy` onto the same file truncates it to zero bytes on
+        // Unix, so the file is initialized in place instead.
+        if Self::is_same_file(Path::new(legacy_db_path), &target_legacy_path) {
+            log::info!(
+                "Legacy database is already at {}; initializing it in place",
+                target_legacy_path.display()
+            );
+        } else {
+            log::info!(
+                "Copying legacy database from {} to {}",
+                legacy_db_path,
+                target_legacy_path.display()
+            );
+            fs::copy(legacy_db_path, &target_legacy_path).map_err(|e| sqlx::Error::Io(e))?;
+        }
 
         // Now use the standard initialization which will detect and migrate the legacy db
         Self::new_from_app_handle(app_handle).await
+    }
+
+    /// True only when both paths exist and resolve to the same file. Compared
+    /// after canonicalization so that symlinks and differently spelled paths
+    /// are caught too.
+    fn is_same_file(a: &Path, b: &Path) -> bool {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
     }
 
     async fn reconcile_orphaned_cloud_transcript_provider_migration(
@@ -229,6 +262,133 @@ impl DatabaseManager {
         Self::ensure_transcript_settings_column(pool, "openRouterApiKey", "TEXT").await?;
 
         Ok(())
+    }
+
+    /// Databases written by the archived Python backend (backend/app/db.py
+    /// `_legacy_init_db`) have no `_sqlx_migrations` table, so sqlx runs every
+    /// migration on them. Some migrations `ADD COLUMN` a column the backend
+    /// already created (e.g. `meetings.folder_path`), and that statement fails
+    /// with "duplicate column name" on every launch.
+    ///
+    /// The colliding columns are renamed out of the way before migrating and
+    /// copied back afterwards. A rename keeps the values in the file, so a
+    /// migration that fails leaves them recoverable; the next successful open
+    /// restores them. The migration files themselves are never touched.
+    async fn park_legacy_columns_that_migrations_add(
+        pool: &SqlitePool,
+        migrator: &Migrator,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        for (table, column) in Self::migration_added_columns(migrator) {
+            if !Self::table_columns(&mut *tx, &table)
+                .await?
+                .contains(&column)
+            {
+                continue;
+            }
+            log::warn!(
+                "Legacy database already has {}.{}; parking it so migrations can add it",
+                table,
+                column
+            );
+            let parked = format!("{PARKED_COLUMN_PREFIX}{column}");
+            sqlx::query(&format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                quote_identifier(&table),
+                quote_identifier(&column),
+                quote_identifier(&parked)
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// Copy every parked column back into the column a migration re-added, then
+    /// drop the parked copy. Runs after each successful migration pass, so it
+    /// also finishes a restore that an earlier failed open left behind.
+    async fn restore_parked_legacy_columns(pool: &SqlitePool) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .fetch_all(&mut *tx)
+                .await?;
+        for table in tables {
+            let columns = Self::table_columns(&mut *tx, &table).await?;
+            for parked in columns
+                .iter()
+                .filter(|c| c.starts_with(PARKED_COLUMN_PREFIX))
+            {
+                let column = &parked[PARKED_COLUMN_PREFIX.len()..];
+                if !columns.iter().any(|c| c == column) {
+                    return Err(sqlx::Error::Configuration(
+                        format!("parked column {table}.{parked} has no migrated replacement")
+                            .into(),
+                    ));
+                }
+                log::info!("Restoring legacy values for {}.{}", table, column);
+                sqlx::query(&format!(
+                    "UPDATE {} SET {} = {}",
+                    quote_identifier(&table),
+                    quote_identifier(column),
+                    quote_identifier(parked)
+                ))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(&format!(
+                    "ALTER TABLE {} DROP COLUMN {}",
+                    quote_identifier(&table),
+                    quote_identifier(parked)
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await
+    }
+
+    /// `(table, column)` for every `ADD COLUMN` in the bundled migrations.
+    /// Parsed from the SQL so that future migrations are covered without a list
+    /// to maintain.
+    fn migration_added_columns(migrator: &Migrator) -> Vec<(String, String)> {
+        let mut added = Vec::new();
+        for migration in migrator.iter() {
+            let code: String = migration
+                .sql
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let spaced = code.replace(';', " ; ").replace(',', " ");
+            let tokens: Vec<&str> = spaced.split_whitespace().collect();
+            let mut table: Option<&str> = None;
+            for (i, token) in tokens.iter().enumerate() {
+                if *token == ";" {
+                    table = None;
+                } else if token.eq_ignore_ascii_case("TABLE")
+                    && i > 0
+                    && tokens[i - 1].eq_ignore_ascii_case("ALTER")
+                {
+                    table = tokens.get(i + 1).copied();
+                } else if token.eq_ignore_ascii_case("ADD")
+                    && tokens
+                        .get(i + 1)
+                        .is_some_and(|next| next.eq_ignore_ascii_case("COLUMN"))
+                {
+                    if let (Some(table), Some(column)) = (table, tokens.get(i + 2)) {
+                        added.push((table.to_string(), column.to_string()));
+                    }
+                }
+            }
+        }
+        added
+    }
+
+    async fn table_columns(conn: &mut SqliteConnection, table: &str) -> Result<Vec<String>> {
+        sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+            .bind(table)
+            .fetch_all(conn)
+            .await
     }
 
     async fn table_exists(pool: &SqlitePool, table_name: &str) -> Result<bool> {
@@ -434,5 +594,153 @@ mod open_failure_tests {
         assert_eq!(rows, 3);
         check.close().await;
         drop(writer);
+    }
+
+    /// H6-F2: a legacy backend DB (backend/app/db.py `_legacy_init_db`) already
+    /// has `meetings.folder_path`; migration 20251006000000 then runs
+    /// `ALTER TABLE meetings ADD COLUMN folder_path` and fails.
+    #[tokio::test]
+    async fn legacy_db_with_folder_path_opens_and_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        // Legacy backend DB is copied in by open_in_dir when meeting_minutes.sqlite is absent.
+        let legacy_db = dir.path().join("meeting_minutes.db");
+        let legacy = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&legacy_db)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, folder_path TEXT)",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m1', 'Standup', '2025-01-01', '2025-01-01', NULL)")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m2', 'Review', '2025-01-02', '2025-01-02', '/x/y')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        // Migration 20251006000000 also ADD COLUMNs three audio fields on transcripts.
+        sqlx::query(
+            "CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, \
+             transcript TEXT NOT NULL, timestamp TEXT NOT NULL, audio_start_time REAL, \
+             audio_end_time REAL, duration REAL)",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO transcripts VALUES ('t1', 'm2', 'hello', '2025-01-02', 1.5, 2.25, 0.75)")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        legacy.close().await;
+
+        let db = match DatabaseManager::open_in_dir(dir.path()).await {
+            Ok(db) => db,
+            Err(e) => panic!("open_in_dir on legacy DB failed: {e}"),
+        };
+        let folder_path: Option<String> =
+            sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = 'm2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(folder_path.as_deref(), Some("/x/y"));
+        let audio: (Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
+            "SELECT audio_start_time, audio_end_time, duration FROM transcripts WHERE id = 't1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(audio, (Some(1.5), Some(2.25), Some(0.75)));
+        db.cleanup().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod legacy_import_tests {
+    use super::*;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    /// H6-F1: onboarding passes the default legacy path (the data root's
+    /// `meeting_minutes.db`) back into `import_legacy_database`, which copies
+    /// it onto itself and truncates it.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn import_from_default_location_keeps_meetings() {
+        let root = tempfile::tempdir().unwrap();
+        // Another test may already own the process-wide data root; never write
+        // anywhere but the tempdir.
+        let _ = crate::storage::DATA_ROOT.set(root.path().to_path_buf());
+        assert_eq!(
+            crate::storage::root(),
+            root.path(),
+            "storage::DATA_ROOT is claimed by a different path; this test cannot sandbox its writes"
+        );
+        assert!(root.path().starts_with(std::env::temp_dir()));
+
+        let legacy_db = crate::storage::db_dir().join("meeting_minutes.db");
+        let legacy = SqlitePool::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&legacy_db)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&legacy)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m1', 'Standup', '2025-01-01', '2025-01-01')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO meetings VALUES ('m2', 'Review', '2025-01-02', '2025-01-02')")
+            .execute(&legacy)
+            .await
+            .unwrap();
+        legacy.close().await;
+
+        let app = tauri::test::mock_app();
+        let db = DatabaseManager::import_legacy_database(
+            app.handle(),
+            legacy_db.to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let meetings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(meetings, 2);
+        db.cleanup().await.unwrap();
+    }
+
+    #[test]
+    fn migration_column_parser_finds_every_add_column_form() {
+        let migrator = sqlx::migrate!("./migrations");
+        let added = DatabaseManager::migration_added_columns(&migrator);
+        let has = |table: &str, column: &str| {
+            added.iter().any(|(t, c)| t == table && c == column)
+        };
+        // Single-line ALTERs, a multi-line ALTER with the ADD on its own line,
+        // and a column whose default contains commas.
+        assert!(has("meetings", "folder_path"));
+        assert!(has("transcripts", "duration"));
+        assert!(has("summary_processes", "result_backup"));
+        assert!(has("transcript_settings", "openaiCompatibleBaseUrl"));
+        assert!(has("background_jobs", "wordTimestamps"));
+        assert!(has("transcript_settings", "whisperVocabularyHint"));
     }
 }

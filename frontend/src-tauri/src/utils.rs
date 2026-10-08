@@ -1,3 +1,15 @@
+/// Truncates `s` to at most `max_bytes`, backing off to a char boundary so a
+/// multi-byte character is never split (`String::truncate` would panic).
+pub fn truncate_to_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
 pub fn format_timestamp(seconds: f64) -> String {
     let total_seconds = seconds as u64;
     let hours = total_seconds / 3600;

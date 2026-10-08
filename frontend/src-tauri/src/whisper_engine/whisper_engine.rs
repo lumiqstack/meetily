@@ -476,7 +476,14 @@ impl WhisperEngine {
 
     // Check for obviously meaningless patterns
     fn is_meaningless_output(text: &str) -> bool {
-        let text_lower = text.to_lowercase();
+        // Only the whole output counts: real speech can contain these words
+        // ("slaughterhouse" contains "laughter", "the applause was loud").
+        let normalized = text
+            .trim_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         // Check for common meaningless patterns
         let meaningless_patterns = [
@@ -491,10 +498,8 @@ impl WhisperEngine {
             "ah ah ah",
         ];
 
-        for pattern in &meaningless_patterns {
-            if text_lower.contains(pattern) {
-                return true;
-            }
+        if meaningless_patterns.contains(&normalized.as_str()) {
+            return true;
         }
 
         // Check if text is mostly the same character or very short repetitive patterns
@@ -520,8 +525,8 @@ impl WhisperEngine {
                 repeat_count += 1;
             }
 
-            // Be more aggressive: if word is repeated 2+ times, only keep one instance
-            if repeat_count >= 2 {
+            // Collapse only 3+ repeats: Whisper loops, while doubles ("that that") are often grammatical
+            if repeat_count >= 3 {
                 cleaned_words.push(current_word);
                 i += repeat_count;
             } else {
@@ -1893,5 +1898,61 @@ mod tests {
         apply_vocabulary_hint_to_whisper_params(&mut params, prompt);
 
         assert_eq!(params.initial_prompt.as_deref(), Some(prompt));
+    }
+
+    #[test]
+    fn meaningless_filter_drops_real_speech_containing_laughter() {
+        // "slaughterhouse" contains the substring "laughter", which
+        // is_meaningless_output treats as a hallucination marker.
+        assert_eq!(
+            WhisperEngine::clean_repetitive_text(
+                "We toured the slaughterhouse on Monday and it went well"
+            ),
+            "We toured the slaughterhouse on Monday and it went well"
+        );
+    }
+
+    #[test]
+    fn word_repetition_filter_collapses_grammatical_that_that() {
+        // "that that" is grammatical English; collapsing it changes meaning.
+        assert_eq!(
+            WhisperEngine::clean_repetitive_text("I think that that is fine"),
+            "I think that that is fine"
+        );
+    }
+
+    #[test]
+    fn hallucination_marker_as_whole_output_is_dropped() {
+        assert_eq!(WhisperEngine::clean_repetitive_text("[Laughter]"), "");
+        assert_eq!(WhisperEngine::clean_repetitive_text("(applause)"), "");
+        assert_eq!(WhisperEngine::clean_repetitive_text("Thanks for watching!"), "");
+        assert_eq!(WhisperEngine::clean_repetitive_text("Thank you for watching."), "");
+        assert_eq!(WhisperEngine::clean_repetitive_text("um um um"), "");
+    }
+
+    #[test]
+    fn real_speech_containing_a_marker_phrase_is_kept() {
+        assert_eq!(
+            WhisperEngine::clean_repetitive_text("the applause was loud"),
+            "the applause was loud"
+        );
+        assert_eq!(
+            WhisperEngine::clean_repetitive_text("Thanks for watching the demo, Bob"),
+            "Thanks for watching the demo, Bob"
+        );
+    }
+
+    #[test]
+    fn whisper_repetition_loops_collapse_to_one_word() {
+        assert_eq!(WhisperEngine::clean_repetitive_text("the the the the the the"), "the");
+        assert_eq!(WhisperEngine::clean_repetitive_text("go go go"), "go");
+    }
+
+    #[test]
+    fn grammatical_double_words_are_kept() {
+        assert_eq!(
+            WhisperEngine::clean_repetitive_text("She had had enough"),
+            "She had had enough"
+        );
     }
 }

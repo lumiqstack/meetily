@@ -21,7 +21,8 @@ export interface StoredTranscript {
   text: string;               // Transcript text
   timestamp: string;          // ISO 8601 timestamp
   confidence: number;         // Whisper confidence score
-  sequenceId: number;         // Sequence number for ordering
+  sequence_id: number;        // Sequence number for ordering (TranscriptUpdate field name)
+  speaker?: string | null;    // "mic" / "system"; absent when ambiguous
   storedAt: number;           // Unix timestamp when saved
   audio_start_time?: number;  // Recording-relative start time in seconds
   audio_end_time?: number;    // Recording-relative end time in seconds
@@ -286,7 +287,7 @@ class IndexedDBService {
         request.onsuccess = () => {
           const transcripts = request.result as StoredTranscript[];
           // Sort by sequence ID
-          transcripts.sort((a, b) => a.sequenceId - b.sequenceId);
+          transcripts.sort((a, b) => a.sequence_id - b.sequence_id);
           resolve(transcripts);
         };
         request.onerror = () => reject(request.error);

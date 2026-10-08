@@ -2756,4 +2756,23 @@ mod tests {
             assert!(!result.truncated);
         }
     }
+
+    #[test]
+    fn meeting_date_from_title_with_percent_does_not_panic() {
+        // finish_import -> resolve_meeting_date -> meeting_date_from_name ->
+        // percent_decode_component on every import title. A '%' followed by a
+        // multi-byte char ('–') makes the byte-slice panic before the Teams
+        // stamp is read, so the expected date below is never reached.
+        use chrono::TimeZone;
+        let resolved = resolve_meeting_date(
+            "Growth 5%–10%-20260924_140734-Meeting%20Recording.mp4",
+            None,
+            None,
+        );
+        let expected = chrono::Local
+            .with_ymd_and_hms(2026, 9, 24, 14, 7, 34)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(resolved, expected);
+    }
 }
