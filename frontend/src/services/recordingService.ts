@@ -7,6 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { RecordingErrorPayload } from '@/lib/recording-error';
 
 export interface RecordingState {
   is_recording: boolean;
@@ -156,6 +157,18 @@ export class RecordingService {
    */
   async onRecordingStopped(callback: (payload: RecordingStoppedPayload) => void): Promise<UnlistenFn> {
     return listen<RecordingStoppedPayload>('recording-stopped', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for recording-error event (audio error; `recording_stopped` marks
+   * the one that made the backend stop capture)
+   * @param callback - Function to call for each audio error
+   * @returns Promise that resolves to unlisten function
+   */
+  async onRecordingError(callback: (payload: RecordingErrorPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingErrorPayload>('recording-error', (event) => {
       callback(event.payload);
     });
   }

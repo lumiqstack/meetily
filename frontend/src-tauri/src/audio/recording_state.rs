@@ -86,6 +86,34 @@ impl AudioError {
     }
 }
 
+/// Payload of the `recording-error` event. The frontend mirrors this shape in
+/// `src/lib/recording-error.ts`; change both together.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RecordingErrorPayload {
+    pub message: &'static str,
+    pub recoverable: bool,
+    /// True on the one event whose error made the backend stop recording.
+    /// The frontend runs the normal stop flow when it sees this.
+    pub recording_stopped: bool,
+}
+
+impl RecordingErrorPayload {
+    pub fn new(error: &AudioError, recording_stopped: bool) -> Self {
+        Self {
+            message: error.user_message(),
+            recoverable: error.is_recoverable(),
+            recording_stopped,
+        }
+    }
+}
+
+/// Recoverable errors further apart than this belong to separate episodes:
+/// the count restarts instead of accumulating over the whole session.
+pub const RECOVERABLE_ERROR_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Error callback: the error, and whether it stopped the recording.
+type ErrorCallback = Box<dyn Fn(&AudioError, bool) + Send + Sync>;
+
 /// Recording statistics
 #[derive(Debug, Default)]
 pub struct RecordingStats {
@@ -111,7 +139,10 @@ pub struct RecordingState {
     error_count: AtomicU32,
     recoverable_error_count: AtomicU32,
     last_error: Mutex<Option<AudioError>>,
-    error_callback: Mutex<Option<Box<dyn Fn(&AudioError) + Send + Sync>>>,
+    error_callback: Mutex<Option<ErrorCallback>>,
+    /// When the last recoverable error was reported, as nanoseconds since
+    /// `epoch`; `NOT_RECORDING` = none yet. Drives the quiet-period reset.
+    last_recoverable_error_nanos: AtomicU64,
 
     // Statistics
     stats: Mutex<RecordingStats>,
@@ -148,6 +179,7 @@ impl RecordingState {
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
+            last_recoverable_error_nanos: AtomicU64::new(NOT_RECORDING),
             stats: Mutex::new(RecordingStats::default()),
             chunks_processed: AtomicU64::new(0),
             recording_start: Mutex::new(None),
@@ -170,6 +202,7 @@ impl RecordingState {
         self.chunks_processed.store(0, Ordering::Relaxed);
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
+        self.last_recoverable_error_nanos.store(NOT_RECORDING, Ordering::SeqCst);
         *self.last_error.lock().unwrap() = None;
         Ok(())
     }
@@ -279,15 +312,49 @@ impl RecordingState {
     // Error handling
     pub fn set_error_callback<F>(&self, callback: F)
     where
-        F: Fn(&AudioError) + Send + Sync + 'static,
+        F: Fn(&AudioError, bool) + Send + Sync + 'static,
     {
         *self.error_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
+    /// End the current error episode: a stream was successfully rebuilt
+    /// (mic hot-swap), so earlier recoverable errors no longer count toward
+    /// the stop thresholds.
+    pub fn note_recovery(&self) {
+        let had = self.recoverable_error_count.swap(0, Ordering::SeqCst);
+        self.error_count.store(0, Ordering::SeqCst);
+        if had > 0 {
+            log::info!("Audio recovered; cleared {} recoverable error(s)", had);
+        }
+    }
+
     pub fn report_error(&self, error: AudioError) {
-        let count = self.error_count.fetch_add(1, Ordering::SeqCst) + 1;
+        self.report_error_at(error, self.epoch.elapsed().as_nanos() as u64);
+    }
+
+    /// `report_error` with an explicit clock (nanoseconds since `epoch`), so
+    /// the quiet-period reset is testable.
+    fn report_error_at(&self, error: AudioError, now_nanos: u64) {
+        let was_recording = self.is_recording();
 
         // Track recoverable vs non-recoverable errors separately
+        if error.is_recoverable() {
+            // A recoverable error long after the previous one starts a new
+            // episode. Both counters restart: the total below is in practice
+            // a recoverable count too (non-recoverable errors stop at once),
+            // so leaving it to accumulate would reintroduce the session-wide
+            // limit through the back door.
+            let last = self.last_recoverable_error_nanos.swap(now_nanos, Ordering::SeqCst);
+            if last != NOT_RECORDING
+                && now_nanos.saturating_sub(last) > RECOVERABLE_ERROR_QUIET_PERIOD.as_nanos() as u64
+            {
+                self.recoverable_error_count.store(0, Ordering::SeqCst);
+                self.error_count.store(0, Ordering::SeqCst);
+            }
+        }
+
+        let count = self.error_count.fetch_add(1, Ordering::SeqCst) + 1;
+
         if error.is_recoverable() {
             let recoverable_count = self.recoverable_error_count.fetch_add(1, Ordering::SeqCst) + 1;
             log::warn!("Recoverable audio error ({}): {:?}", recoverable_count, error);
@@ -303,17 +370,19 @@ impl RecordingState {
             self.stop_recording();
         }
 
-        *self.last_error.lock().unwrap() = Some(error.clone());
-
-        // Call error callback if set
-        if let Some(callback) = self.error_callback.lock().unwrap().as_ref() {
-            callback(&error);
-        }
-
         // Fallback: stop recording after too many total errors
         if count >= 15 {
             log::error!("Too many total audio errors ({}), stopping recording", count);
             self.stop_recording();
+        }
+
+        *self.last_error.lock().unwrap() = Some(error.clone());
+
+        // Tell the callback whether *this* error ended the recording, so the
+        // frontend runs its stop flow exactly once.
+        let stopped = was_recording && !self.is_recording();
+        if let Some(callback) = self.error_callback.lock().unwrap().as_ref() {
+            callback(&error, stopped);
         }
     }
 
@@ -407,6 +476,7 @@ impl RecordingState {
         *self.total_pause_duration.lock().unwrap() = std::time::Duration::ZERO;
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
+        self.last_recoverable_error_nanos.store(NOT_RECORDING, Ordering::SeqCst);
     }
 }
 
@@ -422,6 +492,7 @@ impl Default for RecordingState {
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
+            last_recoverable_error_nanos: AtomicU64::new(NOT_RECORDING),
             stats: Mutex::new(RecordingStats::default()),
             chunks_processed: AtomicU64::new(0),
             recording_start: Mutex::new(None),
