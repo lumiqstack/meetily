@@ -107,7 +107,26 @@ fn run_files_in(
 ) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
 
-    let source = read_pointer(legacy)
+    let pointer = read_pointer(legacy);
+
+    // resolve() falls back to `legacy` when the configured root is unusable (an
+    // unplugged drive). Migrating then would pull the previous root's data onto
+    // the system drive and clear previous_root, so the move the user asked for
+    // would never happen. Leave everything, pointer included, for a launch that
+    // can reach the configured root.
+    if let Some(pointer) = &pointer {
+        let configured = pointer.data_root.as_deref().unwrap_or(legacy);
+        if !same_dir(configured, root) {
+            log::warn!(
+                "Storage migration skipped: running from {} instead of the configured root {}",
+                root.display(),
+                configured.display()
+            );
+            return Ok(report);
+        }
+    }
+
+    let source = pointer
         .and_then(|p| p.previous_root)
         .unwrap_or_else(|| legacy.to_path_buf());
 
@@ -1366,6 +1385,53 @@ mod tests {
             b"weights"
         );
         assert_eq!(std::fs::read(root2.join("notes/extra.txt")).unwrap(), b"keep");
+    }
+
+    /// An unplugged target drive makes resolve() fall back to the legacy dir. That
+    /// launch must not pull the previous root's data onto the system drive, nor
+    /// forget the pending move, or the next launch with the drive back moves nothing.
+    #[test]
+    fn fallback_root_neither_migrates_nor_clears_the_pending_move() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let previous = tmp.path().join("previous");
+        let configured = tmp.path().join("unplugged");
+        write(&previous.join("meeting_minutes.sqlite"), b"meetings");
+        write(&previous.join("models/ggml-base.bin"), b"weights");
+        let pending = Pointer {
+            data_root: Some(configured.clone()),
+            previous_root: Some(previous.clone()),
+        };
+        write_pointer(&legacy, &pending).unwrap();
+
+        // resolve() fell back: the root in use is the legacy dir, not data_root.
+        let report = run_files_in(&legacy, &legacy, None, |_| {}).unwrap();
+
+        assert_eq!(report.files_moved, 0);
+        assert_eq!(
+            std::fs::read(previous.join("meeting_minutes.sqlite")).unwrap(),
+            b"meetings"
+        );
+        assert!(previous.join("models/ggml-base.bin").exists());
+        assert!(!legacy.join("meeting_minutes.sqlite").exists());
+        assert!(!legacy.join("models").exists());
+        assert!(!legacy.join(STATE_FILE).exists());
+        let pointer = read_pointer(&legacy).unwrap();
+        assert_eq!(pointer.data_root, pending.data_root);
+        assert_eq!(pointer.previous_root, pending.previous_root);
+
+        // The drive is back: the pending move now goes where the user asked.
+        run_files_in(&legacy, &configured, None, |_| {}).unwrap();
+
+        assert_eq!(
+            std::fs::read(configured.join("meeting_minutes.sqlite")).unwrap(),
+            b"meetings"
+        );
+        assert_eq!(
+            std::fs::read(configured.join("models/ggml-base.bin")).unwrap(),
+            b"weights"
+        );
+        assert!(read_pointer(&legacy).unwrap().previous_root.is_none());
     }
 
     /// A pointer naming the current root with a trailing separator is the same
