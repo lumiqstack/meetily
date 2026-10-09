@@ -93,7 +93,7 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
-const OUTPUT_LIMIT_MESSAGE: &str = "The summary was truncated because the model ran out of output space before it finished. Try again, or use a model with a larger output limit.";
+pub(crate) const OUTPUT_LIMIT_MESSAGE: &str = "The summary was truncated because the model ran out of output space before it finished. Try again, or use a model with a larger output limit.";
 
 /// Stop reasons that mean the model ran out of output tokens: "length" for
 /// OpenAI-compatible APIs, "max_tokens" for Claude.

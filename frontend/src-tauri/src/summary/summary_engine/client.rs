@@ -43,7 +43,13 @@ enum Request {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
-    Response { text: String, error: Option<String> },
+    Response {
+        text: String,
+        error: Option<String>,
+        /// "max_tokens" when the output was cut off; older helpers omit it.
+        #[serde(default)]
+        stop_reason: Option<String>,
+    },
     Error { message: String },
 }
 
@@ -232,10 +238,18 @@ pub async fn generate_with_builtin(
     let response: Response = serde_json::from_str(&response_json)
         .with_context(|| format!("Failed to parse response: {}", response_json))?;
 
+    interpret_response(response)
+}
+
+/// Turns a sidecar reply into the generated text, rejecting truncated output.
+fn interpret_response(response: Response) -> Result<String> {
     match response {
-        Response::Response { text, error } => {
+        Response::Response { text, error, stop_reason } => {
             if let Some(err_msg) = error {
                 Err(anyhow!("Generation failed: {}", err_msg))
+            } else if stop_reason.as_deref() == Some("max_tokens") {
+                log::warn!("Generation stopped at max_tokens after {} chars", text.len());
+                Err(anyhow!(crate::summary::llm_client::OUTPUT_LIMIT_MESSAGE))
             } else {
                 log::info!("Generation completed: {} chars", text.len());
                 Ok(text)
@@ -336,7 +350,7 @@ mod tests {
         let response: Response = serde_json::from_str(json).unwrap();
 
         match response {
-            Response::Response { text, error } => {
+            Response::Response { text, error, .. } => {
                 assert_eq!(text, "generated text");
                 assert!(error.is_none());
             }
@@ -355,5 +369,30 @@ mod tests {
             }
             _ => panic!("Wrong response type"),
         }
+    }
+
+    #[test]
+    fn response_stopped_at_max_tokens_is_rejected_as_truncated() {
+        let json = r###"{"type":"response","text":"## Summary\n- first point","error":null,"stop_reason":"max_tokens"}"###;
+        let response: Response = serde_json::from_str(json).unwrap();
+        let error = interpret_response(response).expect_err("a truncated summary must not succeed");
+        assert_eq!(
+            error.to_string(),
+            "The summary was truncated because the model ran out of output space before it finished. Try again, or use a model with a larger output limit."
+        );
+    }
+
+    #[test]
+    fn response_finished_naturally_is_accepted() {
+        let json = r###"{"type":"response","text":"## Summary\n- done","error":null,"stop_reason":"end_of_generation"}"###;
+        let response: Response = serde_json::from_str(json).unwrap();
+        assert_eq!(interpret_response(response).unwrap(), "## Summary\n- done");
+    }
+
+    #[test]
+    fn response_from_helper_without_stop_reason_is_accepted() {
+        let json = r###"{"type":"response","text":"## Summary\n- done","error":null}"###;
+        let response: Response = serde_json::from_str(json).unwrap();
+        assert_eq!(interpret_response(response).unwrap(), "## Summary\n- done");
     }
 }

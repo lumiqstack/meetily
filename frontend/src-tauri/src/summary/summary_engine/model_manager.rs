@@ -14,7 +14,11 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use super::models::{get_available_models, get_model_by_name};
+use super::models::{get_available_models, get_model_by_name, ModelDef};
+
+/// Longest silence from the server (awaiting headers or between body chunks)
+/// before a download is treated as stalled.
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ============================================================================
 // Model Status Types
@@ -353,6 +357,22 @@ impl ModelManager {
         model_name: &str,
         progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
     ) -> Result<()> {
+        let model_def = get_model_by_name(model_name)
+            .ok_or_else(|| anyhow!("Unknown model: {}", model_name))?;
+        self.download_model_def(&model_def, progress_callback, DOWNLOAD_IDLE_TIMEOUT)
+            .await
+    }
+
+    /// Downloads `model_def`, failing if the server goes quiet for `idle_timeout`.
+    /// A total request timeout would bound the whole body, which fails any download
+    /// longer than that limit, so only connection setup and per-chunk silence are bounded.
+    async fn download_model_def(
+        &self,
+        model_def: &ModelDef,
+        progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+        idle_timeout: Duration,
+    ) -> Result<()> {
+        let model_name = model_def.name.as_str();
         log::info!("Starting download for model: {}", model_name);
 
         // Check if already downloading
@@ -363,10 +383,6 @@ impl ModelManager {
                 return Err(anyhow!("Download already in progress"));
             }
         }
-
-        // Get model definition
-        let model_def = get_model_by_name(model_name)
-            .ok_or_else(|| anyhow!("Unknown model: {}", model_name))?;
 
         // Add to active downloads
         {
@@ -473,7 +489,6 @@ impl ModelManager {
         let client = Client::builder()
             .tcp_nodelay(true) // Disable Nagle's algorithm for faster streaming
             .pool_max_idle_per_host(1) // Keep connection alive
-            .timeout(Duration::from_secs(3600)) // 1 hour timeout for large files
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
@@ -489,10 +504,19 @@ impl ModelManager {
             request = request.header("Range", format!("bytes={}-", existing_size));
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to start download: {}", e))?;
+        let response = match timeout(idle_timeout, request.send()).await {
+            Err(_) => {
+                let mut active = self.active_downloads.write().await;
+                active.remove(model_name);
+                let message = format!("Download stalled - No response for {:?}", idle_timeout);
+                let mut models = self.available_models.write().await;
+                if let Some(model_info) = models.get_mut(model_name) {
+                    model_info.status = ModelStatus::Error(message.clone());
+                }
+                return Err(anyhow!(message));
+            }
+            Ok(response) => response.map_err(|e| anyhow!("Failed to start download: {}", e))?,
+        };
 
         // Check response status - 200 OK (full download) or 206 Partial Content (resume)
         let (total_size, resuming) = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -584,13 +608,14 @@ impl ModelManager {
                 }
             }
 
-            // Add per-chunk timeout (30 seconds) to detect stalled connections
-            let next_result = timeout(Duration::from_secs(30), stream.next()).await;
+            // Per-chunk timeout to detect stalled connections
+            let next_result = timeout(idle_timeout, stream.next()).await;
 
             let chunk = match next_result {
-                // Timeout - no data received for 30 seconds
+                // Timeout - no data received within the idle limit
                 Err(_) => {
-                    log::warn!("Download timeout for {}: no data received for 30 seconds", model_name);
+                    let message = format!("Download stalled - No data received for {:?}", idle_timeout);
+                    log::warn!("{} ({})", message, model_name);
                     let _ = writer.flush().await;
 
                     // Cleanup: Remove from active downloads
@@ -601,11 +626,11 @@ impl ModelManager {
                     {
                         let mut models = self.available_models.write().await;
                         if let Some(model_info) = models.get_mut(model_name) {
-                            model_info.status = ModelStatus::Error("Download timeout - No data received for 30 seconds".to_string());
+                            model_info.status = ModelStatus::Error(message.clone());
                         }
                     }
 
-                    return Err(anyhow!("Download timeout - No data received for 30 seconds"));
+                    return Err(anyhow!(message));
                 },
                 // Stream ended
                 Ok(None) => break,
@@ -847,5 +872,84 @@ impl ModelManager {
     /// Get models directory path
     pub fn get_models_directory(&self) -> PathBuf {
         self.models_dir.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const IDLE_LIMIT: Duration = Duration::from_millis(500);
+
+    /// Serves one GGUF body with its full Content-Length up front, writing each
+    /// piece after its delay, so the body spans the sum of the delays.
+    async fn serve_drip(pieces: Vec<(Duration, &'static [u8])>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let length: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+            let _ = socket.write_all(headers.as_bytes()).await;
+            for (delay, piece) in pieces {
+                tokio::time::sleep(delay).await;
+                let _ = socket.write_all(piece).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{address}/model.gguf")
+    }
+
+    fn test_model(download_url: String) -> ModelDef {
+        let mut model = get_available_models().into_iter().next().unwrap();
+        model.gguf_file = "drip-test.gguf".to_string();
+        model.download_url = download_url;
+        model
+    }
+
+    #[tokio::test]
+    async fn download_survives_slow_stream_longer_than_idle_limit() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let url = serve_drip(vec![
+            (Duration::ZERO, b"GG"),
+            (Duration::from_millis(200), b"UF"),
+            (Duration::from_millis(200), b"-body"),
+            (Duration::from_millis(200), b"-end"),
+        ])
+        .await;
+        manager
+            .download_model_def(&test_model(url), None, IDLE_LIMIT)
+            .await
+            .expect("a steady stream whose gaps stay under the idle limit must succeed");
+        assert_eq!(
+            fs::read(models_dir.path().join("drip-test.gguf")).await.unwrap(),
+            b"GGUF-body-end"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_fails_when_stream_stalls_past_idle_limit() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let url = serve_drip(vec![
+            (Duration::ZERO, b"GGUF"),
+            (Duration::from_millis(1500), b"-end"),
+        ])
+        .await;
+        let error = manager
+            .download_model_def(&test_model(url), None, IDLE_LIMIT)
+            .await
+            .expect_err("a stream that stalls past the idle limit must fail");
+        assert!(error.to_string().contains("stalled"), "unexpected error: {error}");
     }
 }
