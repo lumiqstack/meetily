@@ -4,7 +4,7 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::database::repositories::meeting_sources::MeetingSource;
@@ -787,7 +787,7 @@ async fn export_note<R: Runtime>(
     if let Some(pool) = pool.as_ref() {
         record_exported_filename(pool, meeting_id, &filename).await;
     }
-    let _ = app.emit("obsidian-exported", meeting_id);
+    crate::api::emit_meetings_changed(app, meeting_id);
 
     info!(
         "Exported meeting {} to Obsidian: {:?}",

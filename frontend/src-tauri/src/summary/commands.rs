@@ -238,6 +238,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         recording.as_ref().map(|metadata| metadata.recorded_at.clone()),
     )
     .await?;
+    crate::api::emit_meetings_changed(&app, &imported.meeting_id);
     let exported = crate::obsidian::export_copilot_recap_note(
         &app,
         &imported.meeting_id,
@@ -737,6 +738,8 @@ pub async fn api_process_transcript<R: Runtime>(
     SummaryProcessesRepository::create_or_reset_process(&pool, &m_id, started_at)
         .await
         .map_err(|e| format!("Failed to initialize process: {}", e))?;
+    // The reset row is pending, so the meeting no longer counts as summarized.
+    crate::api::emit_meetings_changed(&app, &m_id);
 
     let chunk_size = _chunk_size.unwrap_or(40000);
     let overlap = _overlap.unwrap_or(1000);
@@ -759,6 +762,7 @@ pub async fn api_process_transcript<R: Runtime>(
             &message,
         )
         .await;
+        crate::api::emit_meetings_changed(&app, &m_id);
         return Err(message);
     }
 
@@ -767,6 +771,7 @@ pub async fn api_process_transcript<R: Runtime>(
     let meeting_id_clone = m_id.clone();
     let supervisor_pool = pool.clone();
     let supervisor_meeting_id = m_id.clone();
+    let supervisor_app = app.clone();
     tauri::async_runtime::spawn(async move {
         // The supervisor turns a panicking attempt into a terminal 'failed'
         // row for this attempt only, and always releases its cancel token.
@@ -785,11 +790,13 @@ pub async fn api_process_transcript<R: Runtime>(
         );
         SummaryService::supervise_summary_attempt(
             supervisor_pool,
-            supervisor_meeting_id,
+            supervisor_meeting_id.clone(),
             started_at,
             attempt,
         )
         .await;
+        // Completed, failed, cancelled or crashed: the process row is terminal.
+        crate::api::emit_meetings_changed(&supervisor_app, &supervisor_meeting_id);
     });
 
     log_info!("🚀 Background task spawned for meeting_id: {}", &m_id);

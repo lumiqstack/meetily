@@ -16,6 +16,14 @@ export interface RecordingState {
   active_duration: number | null;
 }
 
+/** Payload of `transcript-chunk-loss-detected` (src-tauri/src/audio/transcription/worker.rs). */
+export interface TranscriptChunkLossPayload {
+  chunks_queued: number;
+  chunks_completed: number;
+  chunks_lost: number;
+  message: string;
+}
+
 export interface RecordingStoppedPayload {
   message: string;
   folder_path?: string;
@@ -179,12 +187,12 @@ export class RecordingService {
   }
 
   /**
-   * Listen for chunk-drop-warning event (audio buffer overflow)
-   * @param callback - Function to call when chunks are dropped
+   * Listen for transcript-chunk-loss-detected event (queued chunks never transcribed)
+   * @param callback - Function to call when chunk loss is detected
    * @returns Promise that resolves to unlisten function
    */
-  async onChunkDropWarning(callback: (warning: string) => void): Promise<UnlistenFn> {
-    return listen<string>('chunk-drop-warning', (event) => {
+  async onTranscriptChunkLossDetected(callback: (payload: TranscriptChunkLossPayload) => void): Promise<UnlistenFn> {
+    return listen<TranscriptChunkLossPayload>('transcript-chunk-loss-detected', (event) => {
       callback(event.payload);
     });
   }

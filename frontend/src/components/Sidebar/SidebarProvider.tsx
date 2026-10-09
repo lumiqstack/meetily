@@ -4,25 +4,23 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
+import type { MeetingStages } from './meetingStages';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 
 
 
-interface SidebarItem {
+export interface SidebarItem extends Partial<MeetingStages> {
   id: string;
   title: string;
   type: 'folder' | 'file';
   children?: SidebarItem[];
-  /** The meeting has a note in the Obsidian vault. */
-  obsidianExported?: boolean;
 }
 
-export interface CurrentMeeting {
+export interface CurrentMeeting extends Partial<MeetingStages> {
   id: string;
   title: string;
-  obsidianExported?: boolean;
 }
 
 // Search result type for transcript search
@@ -104,11 +102,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, obsidian_exported?: boolean }>;
-        const transformedMeetings = meetings.map((meeting) => ({
-          id: meeting.id,
-          title: meeting.title,
-          obsidianExported: !!meeting.obsidian_exported,
+        const meetings = await invoke('api_get_meetings') as Array<{
+          id: string, title: string, transcribed: boolean, summarized: boolean, obsidian_exported: boolean
+        }>;
+        const transformedMeetings = meetings.map(({ obsidian_exported, ...meeting }) => ({
+          ...meeting,
+          obsidianExported: obsidian_exported,
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -124,24 +123,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchMeetings();
   }, [serverAddress, fetchMeetings]);
 
-  // Manual and automatic Obsidian exports both emit this; flag the meeting
-  // without refetching the whole list.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    listen<string>('obsidian-exported', (event) => {
-      setMeetings(prev => prev.map(m => m.id === event.payload ? { ...m, obsidianExported: true } : m));
-    })
-      .then(fn => {
-        if (disposed) fn();
-        else unlisten = fn;
-      })
-      .catch(error => console.warn('Could not listen for Obsidian exports:', error));
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
+  // Rust emits this wherever the list or a meeting's transcribed / summarized
+  // / Obsidian-exported flags change (pipeline, summaries, imports, exports,
+  // retranscription, rename, delete).
+  useTauriEvent('meetings-changed', () => { void fetchMeetings(); });
 
   useEffect(() => {
     const fetchSettings = async () => {
@@ -157,7 +142,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       title: 'Meeting Notes',
       type: 'folder' as const,
       children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const, obsidianExported: meeting.obsidianExported }))
+        ...meetings.map(meeting => ({ ...meeting, type: 'file' as const }))
       ]
     },
   ];
@@ -214,24 +199,30 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     // The actual recording start/stop is handled in the Home component
   }, [isRecording, pathname, router]);
 
-  // Function to search through meeting transcripts
+  // Function to search through meeting transcripts. Responses can arrive out of
+  // order, so only the most recent request may update the results.
+  const searchRequestIdRef = React.useRef(0);
   const searchTranscripts = React.useCallback(async (query: string) => {
+    const requestId = ++searchRequestIdRef.current;
     if (!query.trim()) {
       setSearchResults([]);
+      setIsSearching(false);
       return;
     }
 
     try {
       setIsSearching(true);
-
-
       const results = await invoke('api_search_transcripts', { query }) as TranscriptSearchResult[];
+      if (requestId !== searchRequestIdRef.current) return;
       setSearchResults(results);
     } catch (error) {
+      if (requestId !== searchRequestIdRef.current) return;
       console.error('Error searching transcripts:', error);
       setSearchResults([]);
     } finally {
-      setIsSearching(false);
+      if (requestId === searchRequestIdRef.current) {
+        setIsSearching(false);
+      }
     }
   }, []);
 

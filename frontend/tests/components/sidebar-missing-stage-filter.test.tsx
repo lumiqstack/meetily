@@ -21,23 +21,26 @@ mock.module('@tauri-apps/api/event', () => ({
   ...originalEvent,
   listen: async (name: string, handler: (event: { payload: unknown }) => void) => {
     handlers.set(name, handler);
-    return () => handlers.delete(name);
+    return () => { if (handlers.get(name) === handler) handlers.delete(name); };
   },
 }));
-let exported = new Set(['meeting-a']);
+
+let backendMeetings = [
+  { id: 'recorded', title: 'Recorded', transcribed: false, summarized: false, obsidian_exported: false },
+  { id: 'transcribed', title: 'Transcribed', transcribed: true, summarized: false, obsidian_exported: false },
+  { id: 'done', title: 'Done', transcribed: true, summarized: true, obsidian_exported: true },
+];
 mock.module('@tauri-apps/api/core', () => ({
   ...originalCore,
   invoke: async (command: string) => {
     if (command === 'api_get_meetings') {
-      return [
-        { id: 'meeting-a', title: 'Exported', obsidian_exported: exported.has('meeting-a') },
-        { id: 'meeting-b', title: 'Not yet', obsidian_exported: exported.has('meeting-b') },
-      ];
+      return backendMeetings;
     }
     throw new Error(`Unexpected command: ${command}`);
   },
 }));
 const { SidebarProvider, useSidebar } = await import('../../src/components/Sidebar/SidebarProvider');
+const { missingStage } = await import('../../src/components/Sidebar/meetingStages');
 
 let context!: ReturnType<typeof useSidebar>;
 function Probe() {
@@ -45,20 +48,29 @@ function Probe() {
   return null;
 }
 const flush = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
-const flags = () =>
-  Object.fromEntries(context.sidebarItems[0].children!.map((item) => [item.id, item.obsidianExported]));
+const shown = (stage: Parameters<typeof missingStage>[1]) =>
+  missingStage(context.sidebarItems, stage)[0].children!.map(item => item.id);
 
-describe('sidebar Obsidian indicator', () => {
-  test('carries the exported flag from the backend and refetches it when meetings change', async () => {
+describe('sidebar missing-stage filter', () => {
+  test('shows meetings missing each stage and refreshes on meetings-changed', async () => {
     let renderer: ReturnType<typeof create> | undefined;
     await act(async () => { renderer = create(<SidebarProvider><Probe /></SidebarProvider>); });
     await flush();
-    expect(flags()).toEqual({ 'meeting-a': true, 'meeting-b': false });
 
-    exported.add('meeting-b');
-    await act(async () => { handlers.get('meetings-changed')!({ payload: { meeting_id: 'meeting-b' } }); });
+    expect(shown(null)).toEqual(['recorded', 'transcribed', 'done']);
+    expect(shown('transcribed')).toEqual(['recorded']);
+    expect(shown('summarized')).toEqual(['recorded', 'transcribed']);
+    expect(shown('obsidianExported')).toEqual(['recorded', 'transcribed']);
+
+    backendMeetings = backendMeetings.map(m => m.id === 'transcribed' ? { ...m, summarized: true } : m);
+    await act(async () => { handlers.get('meetings-changed')!({ payload: { meeting_id: 'transcribed' } }); });
     await flush();
-    expect(flags()).toEqual({ 'meeting-a': true, 'meeting-b': true });
+    expect(shown('summarized')).toEqual(['recorded']);
+
+    backendMeetings = backendMeetings.map(m => m.id === 'recorded' ? { ...m, transcribed: true } : m);
+    await act(async () => { handlers.get('meetings-changed')!({ payload: { meeting_id: 'recorded' } }); });
+    await flush();
+    expect(shown('transcribed')).toEqual([]);
 
     await act(async () => { renderer!.unmount(); });
     expect(handlers.has('meetings-changed')).toBe(false);

@@ -1,7 +1,7 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -27,12 +27,16 @@ pub struct ApiResponse<T> {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// A sidebar row: the meeting plus which pipeline stages it has finished.
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    /// Has a transcript that live transcription finished writing.
+    pub transcribed: bool,
+    /// Has a completed AI summary.
+    pub summarized: bool,
     /// The meeting has a note in the Obsidian vault.
-    #[serde(default)]
     pub obsidian_exported: bool,
 }
 
@@ -344,6 +348,14 @@ async fn make_api_request<R: Runtime, T: for<'de> Deserialize<'de>>(
     })
 }
 
+/// Tells the UI to refetch `api_get_meetings`: the meeting list or one
+/// meeting's transcribed / summarized / Obsidian-exported flags changed.
+pub fn emit_meetings_changed<R: Runtime>(app: &AppHandle<R>, meeting_id: &str) {
+    if let Err(e) = app.emit("meetings-changed", serde_json::json!({ "meeting_id": meeting_id })) {
+        log_warn!("Failed to emit meetings-changed for {}: {}", meeting_id, e);
+    }
+}
+
 // API Commands for Tauri
 
 #[tauri::command]
@@ -357,31 +369,10 @@ pub async fn api_get_meetings<R: Runtime>(
         auth_token.is_some()
     );
     let pool = state.db_manager.pool();
-    let meetings: Result<Vec<MeetingModel>, sqlx::Error> =
-        MeetingsRepository::get_meetings(pool).await;
-
-    match meetings {
-        Ok(meeting_models) => {
-            log_info!("Successfully got {} meetings", meeting_models.len());
-
-            // Best-effort: a failed lookup only hides the sidebar indicator.
-            let exported: std::collections::HashSet<String> =
-                sqlx::query_scalar::<_, String>("SELECT meeting_id FROM obsidian_exports")
-                    .fetch_all(pool)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-
-            let result: Vec<Meeting> = meeting_models
-                .into_iter()
-                .map(|m| Meeting {
-                    obsidian_exported: exported.contains(&m.id),
-                    id: m.id,
-                    title: m.title,
-                })
-                .collect();
-            Ok(result)
+    match MeetingsRepository::get_meetings(pool).await {
+        Ok(meetings) => {
+            log_info!("Successfully got {} meetings", meetings.len());
+            Ok(meetings)
         }
         Err(e) => {
             log_error!("Error getting meetings: {}", e);
@@ -910,7 +901,7 @@ pub async fn api_delete_api_key<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_delete_meeting<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
     auth_token: Option<String>,
@@ -926,6 +917,7 @@ pub async fn api_delete_meeting<R: Runtime>(
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
         Ok(true) => {
             log_info!("Successfully deleted meeting {}", meeting_id);
+            emit_meetings_changed(&app, &meeting_id);
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Meeting deleted successfully"
@@ -1121,6 +1113,7 @@ pub async fn api_save_meeting_title<R: Runtime>(
     match MeetingsRepository::update_meeting_title(pool, &meeting_id, &title).await {
         Ok(true) => {
             log_info!("Successfully saved meeting title");
+            emit_meetings_changed(&app, &meeting_id);
             let obsidian_note = rename_obsidian_note(&app, pool, &meeting_id, &title).await;
             Ok(serde_json::json!({
                 "message": "Meeting title saved successfully",
@@ -1140,7 +1133,7 @@ pub async fn api_save_meeting_title<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_save_transcript<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_title: String,
     transcripts: Vec<serde_json::Value>,
@@ -1193,6 +1186,7 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            emit_meetings_changed(&app, &meeting_id);
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Transcript saved successfully",

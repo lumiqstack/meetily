@@ -31,14 +31,9 @@ import Info from '../Info';
 import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group';
-
-interface SidebarItem {
-  id: string;
-  title: string;
-  type: 'folder' | 'file';
-  children?: SidebarItem[];
-  obsidianExported?: boolean;
-}
+import { MISSING_STAGE_FILTERS, missingStage, type MeetingStage } from './meetingStages';
+import type { SidebarItem } from './SidebarProvider';
+import { cn } from '@/lib/utils';
 
 const Sidebar: React.FC = () => {
   const router = useRouter();
@@ -64,6 +59,7 @@ const Sidebar: React.FC = () => {
   const { betaFeatures } = useConfig();
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [missingFilter, setMissingFilter] = useState<MeetingStage | null>(null);
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'ollama',
@@ -323,6 +319,18 @@ const Sidebar: React.FC = () => {
         .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
     }
   }, [sidebarItems, searchQuery, searchResults]);
+
+  const missingCounts = useMemo(
+    () => Object.fromEntries(
+      MISSING_STAGE_FILTERS.map(({ stage }) => [stage, meetings.filter(m => !m[stage]).length])
+    ) as Record<MeetingStage, number>,
+    [meetings]
+  );
+
+  const visibleSidebarItems = useMemo(
+    () => missingStage(filteredSidebarItems, missingFilter),
+    [filteredSidebarItems, missingFilter]
+  );
 
 
   const handleDelete = async (itemId: string) => {
@@ -740,6 +748,27 @@ const Sidebar: React.FC = () => {
                     }
                   </InputGroup>
                 </div>
+                <div className="flex flex-wrap gap-1 mt-2" role="group" aria-label="Show meetings missing">
+                  {MISSING_STAGE_FILTERS.map(({ stage, label }) => {
+                    const active = missingFilter === stage;
+                    return (
+                      <button
+                        key={stage}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => setMissingFilter(active ? null : stage)}
+                        className={cn(
+                          'px-2 py-0.5 text-xs rounded-full border transition-colors',
+                          active
+                            ? 'bg-blue-600 border-blue-600 text-white'
+                            : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-100'
+                        )}
+                      >
+                        {label} · {missingCounts[stage]}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>
@@ -766,7 +795,7 @@ const Sidebar: React.FC = () => {
             {/* Meeting Notes folder header - fixed */}
             {!isCollapsed && (
               <div className="flex-shrink-0">
-                {filteredSidebarItems.filter(item => item.type === 'folder').map(item => (
+                {visibleSidebarItems.filter(item => item.type === 'folder').map(item => (
                   <div key={item.id}>
                     <div
                       className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg"
@@ -785,11 +814,14 @@ const Sidebar: React.FC = () => {
             {/* Scrollable meeting items */}
             {!isCollapsed && (
               <div className="flex-1 overflow-y-auto custom-scrollbar min-h-0">
-                {filteredSidebarItems
+                {visibleSidebarItems
                   .filter(item => item.type === 'folder' && expandedFolders.has(item.id) && item.children)
                   .map(item => (
                     <div key={`${item.id}-children`} className="mx-3">
                       {item.children!.map(child => renderItem(child, 1))}
+                      {missingFilter && item.children!.length === 0 && (
+                        <p className="px-3 py-2 text-sm text-gray-500">No meetings match this filter.</p>
+                      )}
                     </div>
                   ))}
               </div>

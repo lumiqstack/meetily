@@ -44,10 +44,49 @@ enum Request {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
-    Response { text: String, error: Option<String> },
+    Response {
+        text: String,
+        error: Option<String>,
+        /// Why generation stopped; absent when it failed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<StopReason>,
+    },
     Pong,
     Goodbye,
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StopReason {
+    /// The model emitted an end-of-generation token.
+    EndOfGeneration,
+    /// A model-specific stop string appeared in the output.
+    StopToken,
+    /// The output hit max_tokens, so the text is cut off.
+    MaxTokens,
+}
+
+#[derive(Debug)]
+struct Generation {
+    text: String,
+    stop_reason: StopReason,
+}
+
+/// Builds the reply to a generate request.
+fn generation_response(result: Result<Generation>) -> Response {
+    match result {
+        Ok(Generation { text, stop_reason }) => Response::Response {
+            text,
+            error: None,
+            stop_reason: Some(stop_reason),
+        },
+        Err(e) => Response::Response {
+            text: String::new(),
+            error: Some(format!("Generation failed: {}", e)),
+            stop_reason: None,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -351,7 +390,7 @@ impl ModelState {
         max_tokens: i32,
         sampling: SamplingConfig,
         stop_tokens: Vec<String>,
-    ) -> Result<String> {
+    ) -> Result<Generation> {
         let start_time = Instant::now();
         let model = self.model.as_ref().context("Model not loaded")?;
 
@@ -401,6 +440,7 @@ impl ModelState {
         let mut n_cur = n_prompt_tokens;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
+        let stop_reason;
 
         eprintln!("🔄 Starting generation (max_tokens: {})", max_tokens);
 
@@ -451,6 +491,7 @@ impl ModelState {
             // Check if we've generated enough tokens
             if (n_cur - n_prompt_tokens) >= max_tokens {
                 eprintln!("✓ Reached max_tokens limit");
+                stop_reason = StopReason::MaxTokens;
                 break;
             }
 
@@ -462,6 +503,7 @@ impl ModelState {
                     "✓ End-of-generation token reached (generated {} chars)",
                     output.len()
                 );
+                stop_reason = StopReason::EndOfGeneration;
                 break;
             }
 
@@ -498,6 +540,7 @@ impl ModelState {
                 }
             }
             if should_stop {
+                stop_reason = StopReason::StopToken;
                 break;
             }
 
@@ -530,7 +573,10 @@ impl ModelState {
         eprintln!("   • Speed: {:.2} tokens/sec", tokens_per_sec);
 
         self.update_activity();
-        Ok(output)
+        Ok(Generation {
+            text: output,
+            stop_reason,
+        })
     }
 }
 
@@ -622,28 +668,15 @@ fn main() -> Result<()> {
                                 send_response(&Response::Response {
                                     text: String::new(),
                                     error: Some(format!("Failed to load model: {}", e)),
+                                    stop_reason: None,
                                 })?;
                                 continue;
                             }
                         }
 
                         // Generate response with sampling parameters
-                        match state.generate(
-                            prompt,
-                            max_tokens,
-                            sampling,
-                            stop_tokens,
-                        ) {
-                            Ok(text) => {
-                                send_response(&Response::Response { text, error: None })?;
-                            }
-                            Err(e) => {
-                                send_response(&Response::Response {
-                                    text: String::new(),
-                                    error: Some(format!("Generation failed: {}", e)),
-                                })?;
-                            }
-                        }
+                        let result = state.generate(prompt, max_tokens, sampling, stop_tokens);
+                        send_response(&generation_response(result))?;
                     }
                     Ok(Request::Ping) => {
                         state.update_activity();
@@ -746,5 +779,38 @@ mod tests {
         assert_eq!(sampling.repeat_penalty, 1.05);
         assert_eq!(sampling.penalty_last_n, 256);
         assert!(sampling.uses_penalties());
+    }
+
+    #[test]
+    fn response_reports_max_tokens_stop_reason() {
+        let response = generation_response(Ok(Generation {
+            text: "## Summary\n- first point".to_string(),
+            stop_reason: StopReason::MaxTokens,
+        }));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r###"{"type":"response","text":"## Summary\n- first point","error":null,"stop_reason":"max_tokens"}"###
+        );
+    }
+
+    #[test]
+    fn response_reports_end_of_generation_stop_reason() {
+        let response = generation_response(Ok(Generation {
+            text: "done".to_string(),
+            stop_reason: StopReason::EndOfGeneration,
+        }));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"type":"response","text":"done","error":null,"stop_reason":"end_of_generation"}"#
+        );
+    }
+
+    #[test]
+    fn failed_generation_has_no_stop_reason() {
+        let response = generation_response(Err(anyhow::anyhow!("failed to eval")));
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"type":"response","text":"","error":"Generation failed: failed to eval"}"#
+        );
     }
 }

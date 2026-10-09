@@ -36,7 +36,9 @@ export function useRecordingStateSync(
   setIsMeetingActiveRef.current = setIsMeetingActive;
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !(window as any).__TAURI__) {
+    // Tauri 2 only defines window.__TAURI__ with withGlobalTauri, which this app
+    // doesn't set; __TAURI_INTERNALS__ is always present in the webview.
+    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
       return;
     }
 

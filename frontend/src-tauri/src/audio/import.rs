@@ -494,6 +494,7 @@ async fn start_import_with_guard<R: Runtime>(
                     "duration_seconds": res.duration_seconds
                 }),
             );
+            crate::api::emit_meetings_changed(&app, &res.meeting_id);
             // A freshly imported meeting is pending a summary; let the
             // automatic pipeline pick it up without waiting for its tick.
             crate::pipeline::wake();
@@ -545,10 +546,6 @@ async fn run_import<R: Runtime>(
         title, source_path, language, model, provider
     );
 
-    // Determine which provider to use (default to whisper)
-    let use_parakeet = provider.as_deref() == Some("parakeet");
-    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
-
     emit_progress(&app, &import_id, "copying", 5, "Creating meeting folder...");
 
     // Check for cancellation
@@ -569,6 +566,45 @@ async fn run_import<R: Runtime>(
     )
     .await;
 
+    // Everything past this point can fail with the folder half-built. A
+    // failure before the meeting row is committed must not leave it behind
+    // (a cancel counts as a failure here); `finish_import` is the commit point.
+    let result = import_into_folder(
+        app,
+        import_id,
+        &source,
+        title,
+        language,
+        model,
+        provider,
+        origin,
+        &meeting_folder,
+    )
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&meeting_folder);
+    }
+    result
+}
+
+/// The fallible part of [`run_import`], run against an already-created
+/// `meeting_folder`. The caller removes the folder if this returns `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn import_into_folder<R: Runtime>(
+    app: AppHandle<R>,
+    import_id: String,
+    source: &Path,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    origin: ImportOrigin,
+    meeting_folder: &Path,
+) -> Result<ImportResult> {
+    // Determine which provider to use (default to whisper)
+    let use_parakeet = provider.as_deref() == Some("parakeet");
+    let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
+
     // Copy audio file to meeting folder
     emit_progress(&app, &import_id, "copying", 10, "Copying audio file...");
 
@@ -581,7 +617,7 @@ async fn run_import<R: Runtime>(
     );
     let dest_path = meeting_folder.join(&dest_filename);
 
-    let src = source.clone();
+    let src = source.to_path_buf();
     let dst = dest_path.clone();
     tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
         .await
@@ -592,8 +628,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        // Cleanup: remove the meeting folder
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -643,7 +677,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -670,7 +703,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -751,7 +783,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -813,8 +844,7 @@ async fn run_import<R: Runtime>(
 
     for (i, segment) in processable_segments.iter().enumerate() {
         if is_import_cancelled(&import_id) {
-            let _ = std::fs::remove_dir_all(&meeting_folder);
-            return Err(anyhow!("Import cancelled"));
+                return Err(anyhow!("Import cancelled"));
         }
 
         let progress = 30 + ((i as f32 / processable_count.max(1) as f32) * 50.0) as u32;
@@ -894,7 +924,6 @@ async fn run_import<R: Runtime>(
 
     // Check for cancellation
     if is_import_cancelled(&import_id) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
         return Err(anyhow!("Import cancelled"));
     }
 
@@ -905,7 +934,7 @@ async fn run_import<R: Runtime>(
         &app,
         import_id,
         title,
-        &meeting_folder,
+        meeting_folder,
         &dest_filename,
         duration_seconds,
         segments,
@@ -924,7 +953,7 @@ async fn run_gemini_import<R: Runtime>(
     app: AppHandle<R>,
     import_id: String,
     title: String,
-    meeting_folder: PathBuf,
+    meeting_folder: &Path,
     audio_path: PathBuf,
     dest_filename: String,
     language: Option<String>,
@@ -936,19 +965,13 @@ async fn run_gemini_import<R: Runtime>(
 
     emit_progress(&app, &import_id, "preparing", 15, "Preparing audio for upload...");
 
-    let cleanup = |e: anyhow::Error| -> anyhow::Error {
-        // Match the cancellation paths, which remove the half-built folder.
-        let _ = std::fs::remove_dir_all(&meeting_folder);
-        e
-    };
-
     let duration_ms = match crate::audio::ffmpeg::probe_duration_ms(&audio_path) {
         Ok(ms) => ms,
         Err(e) => {
-            return Err(cleanup(anyhow!(
+            return Err(anyhow!(
                 "Could not read the audio file's duration: {}",
                 e
-            )))
+            ))
         }
     };
     let duration_seconds = duration_ms as f64 / 1000.0;
@@ -958,7 +981,7 @@ async fn run_gemini_import<R: Runtime>(
             .await
         {
             Ok(p) => p,
-            Err(e) => return Err(cleanup(anyhow!(e))),
+            Err(e) => return Err(anyhow!(e)),
         };
 
     // Bridge the cooperative cancel registry onto a token so an in-flight
@@ -1009,7 +1032,7 @@ async fn run_gemini_import<R: Runtime>(
     // classification in the pipeline stage.
     let batch_segments = match result {
         Ok(segments) => segments,
-        Err(e) => return Err(cleanup(anyhow::Error::new(e))),
+        Err(e) => return Err(anyhow::Error::new(e)),
     };
 
     let segments = create_transcript_segments_with_speakers(
@@ -1022,7 +1045,7 @@ async fn run_gemini_import<R: Runtime>(
         &app,
         import_id,
         title,
-        &meeting_folder,
+        meeting_folder,
         &dest_filename,
         duration_seconds,
         segments,
@@ -1059,7 +1082,9 @@ async fn finish_import<R: Runtime>(
     emit_progress(app, &import_id, "saving", 85, "Creating meeting...");
     let ImportOrigin { source_path, source_url, meeting_date } = origin;
 
-    // Save to database
+    // Commit point: `run_import` deletes the meeting folder if this returns
+    // Err, so every step after `create_meeting_with_transcripts` must stay
+    // non-fatal (log and continue) or it would delete a committed meeting's folder.
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
@@ -1664,19 +1689,22 @@ pub async fn start_import_from_url_command<R: Runtime>(
         super::job_persistence::try_clear_job(&app_task, &id_task).await;
 
         if let Err(e) = result {
-            error!("URL import {} failed: {}", id_task, e);
-            // The import pipeline (once reached) emits its own import-error and
-            // journals cleanup, and always returns Ok here, so this emit covers
-            // only pre-pipeline failures (auth/download/engine acquisition).
-            // A user cancel is emitted too: the frontend job stays in
-            // 'cancelling' until an import-error arrives to end it.
-            let _ = app_task.emit(
-                "import-error",
-                ImportError {
-                    import_id: id_task.clone(),
-                    error: e.to_string(),
-                },
-            );
+            error!("URL import {} failed: {:#}", id_task, match &e {
+                UrlImportError::BeforePipeline(e) | UrlImportError::InPipeline(e) => e,
+            });
+            // The pipeline (once reached) emits its own import-error, so this
+            // emit covers only pre-pipeline failures (auth/download/engine
+            // acquisition). A user cancel is emitted too: the frontend job
+            // stays in 'cancelling' until an import-error arrives to end it.
+            if needs_import_error_event(&e) {
+                let _ = app_task.emit(
+                    "import-error",
+                    ImportError {
+                        import_id: id_task.clone(),
+                        error: e.into_inner().to_string(),
+                    },
+                );
+            }
         }
     });
 
@@ -1727,13 +1755,45 @@ pub async fn import_from_url_internal<R: Runtime>(
     // survive to be reported as interrupted on the next launch.
     super::job_persistence::try_clear_job(&app, &import_id).await;
 
-    result
+    result.map_err(UrlImportError::into_inner)
+}
+
+/// Why a URL import failed, and who has already told the user.
+#[derive(Debug)]
+enum UrlImportError {
+    /// Failed before the shared import pipeline took over (sign-in, download,
+    /// cancel, engine acquisition). Nothing has been reported yet.
+    BeforePipeline(anyhow::Error),
+    /// The pipeline ran and failed. It already emitted `import-error`.
+    InPipeline(anyhow::Error),
+}
+
+impl From<anyhow::Error> for UrlImportError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::BeforePipeline(e)
+    }
+}
+
+impl UrlImportError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::BeforePipeline(e) | Self::InPipeline(e) => e,
+        }
+    }
+}
+
+/// Whether the caller must emit `import-error`: the frontend's error handler
+/// is not idempotent, so a failure the pipeline already reported must not be
+/// emitted a second time.
+fn needs_import_error_event(error: &UrlImportError) -> bool {
+    matches!(error, UrlImportError::BeforePipeline(_))
 }
 
 /// Orchestrate a URL import: authenticate → download → hand off to the shared
-/// import pipeline. Returns `Ok(())` once the download has been handed to the
-/// pipeline (which then owns success/error reporting); returns `Err` only for
-/// failures that occur before the pipeline takes over.
+/// import pipeline. Returns `Ok(())` once the pipeline has imported the
+/// recording. A failure before the hand-off is `BeforePipeline` (nobody has
+/// told the user); a pipeline failure is `InPipeline` (it already emitted
+/// `import-error`).
 #[allow(clippy::too_many_arguments)]
 async fn run_url_import<R: Runtime>(
     app: AppHandle<R>,
@@ -1747,7 +1807,7 @@ async fn run_url_import<R: Runtime>(
     meeting_date: Option<String>,
     cancel: tokio_util::sync::CancellationToken,
     auth_mode: super::sharepoint::AuthMode,
-) -> Result<()> {
+) -> Result<(), UrlImportError> {
     use super::{sharepoint, url_import, ytdlp};
 
     // The downloaded file may not keep the recording's name, so date the
@@ -1827,7 +1887,7 @@ async fn run_url_import<R: Runtime>(
         )
         .await?;
         if cancel.is_cancelled() {
-            return Err(anyhow!("Import cancelled"));
+            return Err(anyhow!("Import cancelled").into());
         }
         let cookies = auth
             .host_cookies
@@ -1872,7 +1932,7 @@ async fn run_url_import<R: Runtime>(
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&work_dir);
-                return Err(e);
+                return Err(e.into());
             }
         }
     }
@@ -1896,14 +1956,14 @@ async fn run_url_import<R: Runtime>(
                 Ok(a) => a,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&work_dir);
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         };
 
         if cancel.is_cancelled() {
             auth.cleanup();
-            return Err(anyhow!("Import cancelled"));
+            return Err(anyhow!("Import cancelled").into());
         }
 
         // Phase 2: locate yt-dlp (downloaded on first use).
@@ -1912,7 +1972,7 @@ async fn run_url_import<R: Runtime>(
             Ok(p) => p,
             Err(e) => {
                 auth.cleanup();
-                return Err(e);
+                return Err(e.into());
             }
         };
         let ffmpeg_path = super::ffmpeg::find_ffmpeg_path();
@@ -1924,7 +1984,7 @@ async fn run_url_import<R: Runtime>(
                 run_transcript_import(&app, &import_id, &ytdlp_url, &title, meeting_date.as_deref(), &ytdlp_path, ffmpeg_path.as_deref(), &auth, &cancel)
                     .await;
             auth.cleanup();
-            return result;
+            return result.map_err(Into::into);
         }
 
         // Phase 3: download into a dedicated working directory. Progress is
@@ -1959,19 +2019,41 @@ async fn run_url_import<R: Runtime>(
             Ok(p) => p,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&work_dir);
-                return Err(e);
+                return Err(e.into());
             }
         }
     };
 
-    // Phase 4: claim the shared engine guard now (after the long download) and
-    // hand off to the normal pipeline, which journals + emits its own events.
+    hand_off_to_pipeline(
+        &app, import_id, url, title, language, model, provider, mode, meeting_date, media_path,
+        work_dir,
+    )
+    .await
+}
+
+/// Phase 4 of a URL import: claim the shared engine guard (after the long
+/// download) and hand the file to the normal pipeline, which journals and
+/// emits its own events.
+#[allow(clippy::too_many_arguments)]
+async fn hand_off_to_pipeline<R: Runtime>(
+    app: &AppHandle<R>,
+    import_id: String,
+    url: String,
+    title: String,
+    language: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    mode: Option<String>,
+    meeting_date: Option<String>,
+    media_path: PathBuf,
+    work_dir: PathBuf,
+) -> Result<(), UrlImportError> {
     let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
     let guard = match IMPORT_JOBS.acquire(import_id.clone(), use_remote) {
         Ok(g) => g,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&work_dir);
-            return Err(anyhow!(e));
+            return Err(anyhow!(e).into());
         }
     };
 
@@ -1979,7 +2061,7 @@ async fn run_url_import<R: Runtime>(
     URL_DOWNLOADS.remove(&import_id);
 
     let media_path_str = media_path.to_string_lossy().to_string();
-    let _ = start_import_with_guard(
+    let result = start_import_with_guard(
         app.clone(),
         import_id.clone(),
         media_path_str,
@@ -1995,7 +2077,7 @@ async fn run_url_import<R: Runtime>(
     .await;
 
     let _ = std::fs::remove_dir_all(&work_dir);
-    Ok(())
+    result.map(|_| ()).map_err(UrlImportError::InPipeline)
 }
 
 /// Build a meeting directly from a Teams transcript (VTT) — no audio download,
@@ -2337,6 +2419,96 @@ mod tests {
             "local import must not be blocked by the remote cap: {:?}",
             local.err()
         );
+    }
+
+    /// H4-F2: the automatic SharePoint sync marks a recording imported when
+    /// the hand-off returns Ok. A pipeline failure must come back as Err so
+    /// the item is retried. Drives the real pipeline with a media file that
+    /// does not exist, which fails before any folder is created.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn url_hand_off_reports_a_pipeline_failure() {
+        let _serial = global_coordinator_test_lock();
+        let work_dir = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_app();
+        let result = hand_off_to_pipeline(
+            app.handle(),
+            "import-hand-off-failure".to_string(),
+            "https://contoso-my.sharepoint.com/x.mp4".to_string(),
+            "Hand off failure".to_string(),
+            None,
+            None,
+            None,
+            Some("audio".to_string()),
+            None,
+            work_dir.path().join("missing.mp4"),
+            work_dir.path().join("work"),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UrlImportError::InPipeline(_))),
+            "expected InPipeline failure, got {result:?}"
+        );
+    }
+
+    /// The manual wrapper emits `import-error` only for failures the pipeline
+    /// has not already reported (the frontend handler is not idempotent).
+    #[test]
+    fn import_error_event_is_emitted_only_for_pre_pipeline_failures() {
+        assert!(needs_import_error_event(&UrlImportError::BeforePipeline(anyhow!("download failed"))));
+        assert!(needs_import_error_event(&UrlImportError::BeforePipeline(anyhow!("Import cancelled"))));
+        assert!(!needs_import_error_event(&UrlImportError::InPipeline(anyhow!("decode failed"))));
+    }
+
+    /// H4-F4: a local import whose decode fails after the audio copy must not
+    /// leave the meeting folder (with the full audio copy) behind.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn failed_local_import_leaves_no_meeting_folder() {
+        let _serial = global_coordinator_test_lock();
+        // The data root is process-wide and may be claimed first by this test
+        // or another one, so the directory must outlive the test.
+        let data = tempfile::tempdir().unwrap().keep();
+        let _ = crate::storage::DATA_ROOT.set(data);
+        assert!(
+            crate::storage::default_recordings_dir().starts_with(std::env::temp_dir()),
+            "recordings dir is not sandboxed; this test cannot run safely"
+        );
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let source = src_dir.path().join("not-audio.wav");
+        std::fs::write(&source, vec![0x5Au8; 4096]).unwrap();
+
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let title = format!("Cleanup {unique}");
+        let app = tauri::test::mock_app();
+        let result = run_import(
+            app.handle().clone(),
+            "import-failed-local-cleanup".to_string(),
+            source.to_string_lossy().to_string(),
+            title,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "random bytes must not decode");
+
+        let leftovers: Vec<_> = std::fs::read_dir(crate::storage::default_recordings_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(&unique))
+            .map(|e| e.path())
+            .collect();
+        assert!(leftovers.is_empty(), "meeting folder left behind: {leftovers:?}");
     }
 
     #[test]

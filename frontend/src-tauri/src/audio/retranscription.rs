@@ -180,6 +180,7 @@ async fn start_retranscription_with_guard<R: Runtime>(
                     "language": res.language
                 }),
             );
+            crate::api::emit_meetings_changed(&app, &res.meeting_id);
         }
         Err(e) => {
             let _ = app.emit(

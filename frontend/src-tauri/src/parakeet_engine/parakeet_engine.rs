@@ -171,6 +171,9 @@ pub enum CancelDownloadOutcome {
 }
 
 const CANCEL_DOWNLOAD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest silence from the server (awaiting headers or between body chunks)
+/// before a download is treated as stalled.
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 struct DownloadStateTestHook {
@@ -690,6 +693,7 @@ impl ParakeetEngine {
         file_url: &str,
         range_start: Option<u64>,
         active_download: &ActiveDownload,
+        idle_timeout: Duration,
     ) -> Result<reqwest::Response> {
         let mut request = client.get(file_url);
         if let Some(range_start) = range_start {
@@ -699,7 +703,8 @@ impl ParakeetEngine {
         tokio::select! {
             biased;
             _ = active_download.cancellation.cancelled() => Err(DownloadCancelled.into()),
-            response = request.send() => response
+            response = timeout(idle_timeout, request.send()) => response
+                .map_err(|_| anyhow!("Download stalled for {}: no response for {:?}", file_url, idle_timeout))?
                 .map_err(|error| anyhow!("Failed to start download for {}: {}", file_url, error)),
         }
     }
@@ -812,6 +817,29 @@ impl ParakeetEngine {
         artifacts: &[ArtifactSpec],
         progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
     ) -> Result<()> {
+        self.download_model_with_idle_timeout(
+            model_name,
+            model_dir,
+            base_url,
+            artifacts,
+            progress_callback,
+            DOWNLOAD_IDLE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Downloads `artifacts`, failing if the server goes quiet for `idle_timeout`.
+    /// A total request timeout would bound the whole body, which fails any download
+    /// longer than that limit, so only connection setup and per-chunk silence are bounded.
+    async fn download_model_with_idle_timeout(
+        &self,
+        model_name: &str,
+        model_dir: &Path,
+        base_url: &str,
+        artifacts: &[ArtifactSpec],
+        progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+        idle_timeout: Duration,
+    ) -> Result<()> {
         let active_download = self.reserve_active_download(model_name).await?;
         self.set_downloading_status(model_name, 0).await;
 
@@ -823,6 +851,7 @@ impl ParakeetEngine {
                 artifacts,
                 &active_download,
                 progress_callback,
+                idle_timeout,
             )
             .await;
         let (result, progress_callback) = match result {
@@ -849,6 +878,7 @@ impl ParakeetEngine {
         artifacts: &[ArtifactSpec],
         active_download: &ActiveDownload,
         progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+        idle_timeout: Duration,
     ) -> Result<(DownloadProgress, Option<Box<dyn Fn(DownloadProgress) + Send>>)> {
         if active_download.cancellation.is_cancelled() {
             return Err(DownloadCancelled.into());
@@ -860,7 +890,6 @@ impl ParakeetEngine {
         let client = reqwest::Client::builder()
             .tcp_nodelay(true)
             .pool_max_idle_per_host(1)
-            .timeout(Duration::from_secs(3600))
             .connect_timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| anyhow!("Failed to create HTTP client: {}", error))?;
@@ -908,7 +937,7 @@ impl ParakeetEngine {
             let range_start = (local_bytes > 0 && local_bytes < artifact.exact_bytes)
                 .then_some(local_bytes);
             let response = self
-                .send_download_request(&client, &file_url, range_start, active_download)
+                .send_download_request(&client, &file_url, range_start, active_download, idle_timeout)
                 .await?;
 
             let (response, mut artifact_bytes, append) = match range_start {
@@ -935,7 +964,7 @@ impl ParakeetEngine {
                     reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
                         Self::validate_unsatisfied_response(&response, artifact.exact_bytes)?;
                         let retry = self
-                            .send_download_request(&client, &file_url, None, active_download)
+                            .send_download_request(&client, &file_url, None, active_download, idle_timeout)
                             .await?;
                         Self::validate_full_response(&retry, artifact.exact_bytes)?;
                         (retry, 0, false)
@@ -998,7 +1027,7 @@ impl ParakeetEngine {
                         })?;
                         return Err(DownloadCancelled.into());
                     }
-                    chunk = timeout(Duration::from_secs(30), stream.next()) => chunk,
+                    chunk = timeout(idle_timeout, stream.next()) => chunk,
                 };
                 let chunk = match next_chunk {
                     Err(_) => {
@@ -1006,8 +1035,9 @@ impl ParakeetEngine {
                             anyhow!("Failed to preserve {} after timeout: {}", artifact.filename, error)
                         })?;
                         return Err(anyhow!(
-                            "Download timeout for {}: no data received for 30 seconds",
-                            artifact.filename
+                            "Download stalled for {}: no data received for {:?}",
+                            artifact.filename,
+                            idle_timeout
                         ));
                     }
                     Ok(None) => break,
@@ -2007,5 +2037,80 @@ mod tests {
         assert!(matches!(discovered_model.status, ModelStatus::Available));
         assert!(matches!(test_model_status(&engine).await, ModelStatus::Available));
         assert!(!engine.active_downloads.lock().await.downloads.contains_key(TEST_MODEL_NAME));
+    }
+
+    const IDLE_LIMIT: Duration = Duration::from_millis(500);
+    const DRIP_ARTIFACTS: &[ArtifactSpec] = &[ArtifactSpec {
+        filename: "drip.bin",
+        exact_bytes: 4,
+    }];
+
+    /// Serves `drip.bin` with its full Content-Length up front, then writes each
+    /// body piece after its delay, so the body spans the sum of the delays.
+    async fn serve_drip(pieces: Vec<(Duration, &'static [u8])>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback test server");
+        let address = listener.local_addr().expect("get loopback address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test request");
+            read_request(&mut socket).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .await;
+            for (delay, piece) in pieces {
+                tokio::time::sleep(delay).await;
+                let _ = socket.write_all(piece).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn download_survives_slow_stream_longer_than_idle_limit() {
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        let base_url = serve_drip(vec![
+            (Duration::ZERO, b"A"),
+            (Duration::from_millis(200), b"B"),
+            (Duration::from_millis(200), b"C"),
+            (Duration::from_millis(200), b"D"),
+        ])
+        .await;
+        engine
+            .download_model_with_idle_timeout(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                DRIP_ARTIFACTS,
+                None,
+                IDLE_LIMIT,
+            )
+            .await
+            .expect("a steady stream whose gaps stay under the idle limit must succeed");
+        assert_eq!(fs::read(model_dir.join("drip.bin")).await.unwrap(), b"ABCD");
+    }
+
+    #[tokio::test]
+    async fn download_fails_when_stream_stalls_past_idle_limit() {
+        let (_temp_dir, engine, model_dir) = test_engine().await;
+        let base_url = serve_drip(vec![
+            (Duration::ZERO, b"A"),
+            (Duration::from_millis(1500), b"BCD"),
+        ])
+        .await;
+        let error = engine
+            .download_model_with_idle_timeout(
+                TEST_MODEL_NAME,
+                &model_dir,
+                &base_url,
+                DRIP_ARTIFACTS,
+                None,
+                IDLE_LIMIT,
+            )
+            .await
+            .expect_err("a stream that stalls past the idle limit must fail");
+        assert!(error.to_string().contains("stalled"), "unexpected error: {error}");
+        assert_eq!(fs::read(model_dir.join("drip.bin")).await.unwrap(), b"A");
     }
 }
