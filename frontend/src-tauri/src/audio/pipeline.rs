@@ -26,6 +26,14 @@ use super::vad::{ContinuousVadProcessor};
 /// during continuous speech is tracked separately in #756.
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
 
+/// How many whole windows one stream may run ahead of the other before the
+/// mixer stops waiting and zero-pads the missing stream. Below this, a short
+/// stream is treated as late (jitter, a delayed WASAPI/Core Audio callback)
+/// and waited for; beyond it, as stalled (unplugged device, idle WASAPI
+/// loopback that delivers no packets). Must stay below the 8-window
+/// `max_buffer_size`, or the leading stream would drop samples first.
+const MAX_MIXER_LAG_WINDOWS: usize = 2;
+
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
 struct AudioMixerRingBuffer {
@@ -38,6 +46,10 @@ struct AudioMixerRingBuffer {
     /// stream hiccup into a ~200 lines/second write storm that makes the
     /// underlying stall worse.
     add_calls: u64,
+    /// The stream that fell more than `MAX_MIXER_LAG_WINDOWS` behind. While
+    /// set, windows are cut as soon as the other stream has one, padding this
+    /// stream; cleared as soon as it delivers samples again.
+    stalled: Option<DeviceType>,
 }
 
 impl AudioMixerRingBuffer {
@@ -62,6 +74,7 @@ impl AudioMixerRingBuffer {
             window_size_samples,
             max_buffer_size,
             add_calls: 0,
+            stalled: None,
         }
     }
 
@@ -75,9 +88,31 @@ impl AudioMixerRingBuffer {
                    self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
         }
 
+        // A stalled stream that delivers again is back in lockstep: from here
+        // on, windows wait for it.
+        if !samples.is_empty() && self.stalled.as_ref() == Some(&device_type) {
+            info!("🔊 Mixer: {:?} stream resumed, waiting for aligned windows again", device_type);
+            self.stalled = None;
+        }
+
         match device_type {
             DeviceType::Microphone => self.mic_buffer.extend(samples),
             DeviceType::System => self.system_buffer.extend(samples),
+        }
+
+        // One stream running more than the lag bound ahead means the other is
+        // not merely late. Mark it stalled so the backlog drains (padded)
+        // instead of the leading stream overflowing.
+        if self.stalled.is_none() {
+            let lead_limit = (MAX_MIXER_LAG_WINDOWS + 1) * self.window_size_samples;
+            let (mic, sys, w) = (self.mic_buffer.len(), self.system_buffer.len(), self.window_size_samples);
+            if mic >= lead_limit && sys < w {
+                warn!("🔊 Mixer: system stream {} windows behind, padding it until it resumes", MAX_MIXER_LAG_WINDOWS);
+                self.stalled = Some(DeviceType::System);
+            } else if sys >= lead_limit && mic < w {
+                warn!("🔊 Mixer: microphone stream {} windows behind, padding it until it resumes", MAX_MIXER_LAG_WINDOWS);
+                self.stalled = Some(DeviceType::Microphone);
+            }
         }
 
         // CRITICAL FIX: Add warnings before dropping samples
@@ -104,9 +139,17 @@ impl AudioMixerRingBuffer {
         }
     }
 
+    /// A window is ready when both streams have one, or when the stream that
+    /// is not stalled has one. A stream that is merely late is waited for —
+    /// cutting the window early would zero-pad audio that is about to arrive
+    /// and shift everything after it out of alignment.
     fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples ||
-        self.system_buffer.len() >= self.window_size_samples
+        let w = self.window_size_samples;
+        match self.stalled {
+            None => self.mic_buffer.len() >= w && self.system_buffer.len() >= w,
+            Some(DeviceType::System) => self.mic_buffer.len() >= w,
+            Some(DeviceType::Microphone) => self.system_buffer.len() >= w,
+        }
     }
 
     /// Fill `mic_out` and `sys_out` with the next aligned window.
@@ -116,9 +159,9 @@ impl AudioMixerRingBuffer {
     /// the mixer's own output buffer — meant three allocations and three full
     /// copies for every 600 ms of audio.
     ///
-    /// Both outputs are always exactly `window_size_samples` long, zero-padded
-    /// when a stream is short. Zero-padding (silence) is preferred over
-    /// last-sample-hold to prevent repetition artifacts, and is inaudible.
+    /// Both outputs are always exactly `window_size_samples` long. Only a
+    /// stalled stream is ever short, and it is zero-padded: silence is
+    /// preferred over last-sample-hold to prevent repetition artifacts.
     fn extract_window_into(&mut self, mic_out: &mut Vec<f32>, sys_out: &mut Vec<f32>) -> bool {
         if !self.can_mix() {
             return false;
@@ -129,8 +172,10 @@ impl AudioMixerRingBuffer {
         true
     }
 
-    /// Drain whatever remains in both buffers into one final window, shorter
-    /// than `window_size_samples`. Returns false when both are empty.
+    /// Drain whatever remains in both buffers into one final window, as long as
+    /// the longer stream (up to the lag bound, so possibly longer than
+    /// `window_size_samples`); the shorter one is zero-padded. Returns false
+    /// when both are empty.
     fn extract_partial_window_into(&mut self, mic_out: &mut Vec<f32>, sys_out: &mut Vec<f32>) -> bool {
         let len = self.mic_buffer.len().max(self.system_buffer.len());
         if len == 0 {
@@ -912,7 +957,8 @@ impl AudioPipeline {
                     self.last_chunk_timestamp = chunk.timestamp;
                     self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
 
-                    // STEP 2: Mix audio in fixed windows when both streams have sufficient data
+                    // STEP 2: Mix audio in fixed windows when both streams have
+                    // a window (or one is stalled — see MAX_MIXER_LAG_WINDOWS)
                     while self.ring_buffer.can_mix() {
                         // `mic_window`/`sys_window` are reused buffers owned by
                         // self; move them out for the duration of the body so
@@ -1467,5 +1513,155 @@ mod tests {
             lengths.push(chunk.data.len());
         }
         assert_eq!(lengths, vec![9_600]);
+    }
+
+    const CHUNK: usize = 480;
+
+    fn drain_ready_windows(
+        rb: &mut AudioMixerRingBuffer,
+        mic_out: &mut Vec<f32>,
+        sys_out: &mut Vec<f32>,
+        mic_all: &mut Vec<f32>,
+        sys_all: &mut Vec<f32>,
+    ) -> usize {
+        let mut windows = 0;
+        while rb.can_mix() {
+            assert!(rb.extract_window_into(mic_out, sys_out));
+            mic_all.extend_from_slice(mic_out);
+            sys_all.extend_from_slice(sys_out);
+            windows += 1;
+        }
+        windows
+    }
+
+    /// H1-F2: a system chunk that is only one chunk late across a window
+    /// boundary must be waited for, not zero-padded into the window.
+    #[test]
+    fn late_system_chunk_is_waited_for_not_zero_padded() {
+        let mut rb = AudioMixerRingBuffer::new(48_000);
+        let window = rb.window_size_samples;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let (mut mic_all, mut sys_all) = (Vec::new(), Vec::new());
+
+        // Window 1: 60 lockstep pairs (system pushed first), one clean window.
+        for _ in 0..60 {
+            rb.add_samples(DeviceType::System, vec![0.5; CHUNK]);
+            rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+            drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+        }
+
+        // Window 2: 59 lockstep pairs; the 60th system chunk is late.
+        for _ in 0..59 {
+            rb.add_samples(DeviceType::System, vec![0.5; CHUNK]);
+            rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+            drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+        }
+        // Mic chunk 60 completes the mic window while system holds 59 chunks.
+        rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+        drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+        // The merely-late system chunk arrives.
+        rb.add_samples(DeviceType::System, vec![0.5; CHUNK]);
+        drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+
+        assert_eq!(sys_all.len(), 2 * window);
+        assert_eq!(sys_all.iter().filter(|s| **s == 0.0).count(), 0);
+        assert_eq!(mic_all.iter().filter(|s| **s == 0.0).count(), 0);
+    }
+
+    /// A stream that stops delivering (unplugged device, idle WASAPI loopback)
+    /// must not stall the mix: once the other stream is more than
+    /// MAX_MIXER_LAG_WINDOWS ahead, mixing proceeds with the missing stream
+    /// zero-padded, then keeps up window by window until the stream returns,
+    /// after which windows wait for both streams again.
+    #[test]
+    fn stalled_stream_is_padded_after_lag_bound_and_realigns_on_return() {
+        let mut rb = AudioMixerRingBuffer::new(48_000);
+        let window = rb.window_size_samples;
+        let chunks_per_window = window / CHUNK;
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let (mut mic_all, mut sys_all) = (Vec::new(), Vec::new());
+
+        // Mic only. Nothing is mixed while the mic is within the lag bound.
+        let bound_chunks = (MAX_MIXER_LAG_WINDOWS + 1) * chunks_per_window;
+        for i in 0..bound_chunks {
+            rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+            let n = drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+            if i + 1 < bound_chunks {
+                assert_eq!(n, 0, "mixed early at mic chunk {}", i);
+            }
+        }
+        // Reaching the bound releases the whole backlog, system padded.
+        assert_eq!(mic_all.len(), (MAX_MIXER_LAG_WINDOWS + 1) * window);
+        assert!(sys_all.iter().all(|s| *s == 0.0));
+
+        // While system is stalled, each new mic window is mixed immediately.
+        for _ in 0..chunks_per_window {
+            rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+            drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+        }
+        assert_eq!(mic_all.len(), (MAX_MIXER_LAG_WINDOWS + 2) * window);
+
+        // System returns: windows wait for both streams again. Mic completes a
+        // window one chunk before system; no zero may enter the system side.
+        let sys_before = sys_all.len();
+        for _ in 0..chunks_per_window - 1 {
+            rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+            rb.add_samples(DeviceType::System, vec![0.25; CHUNK]);
+            drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+        }
+        rb.add_samples(DeviceType::Microphone, vec![0.5; CHUNK]);
+        assert!(!rb.can_mix(), "mic must wait for the returning system stream");
+        rb.add_samples(DeviceType::System, vec![0.25; CHUNK]);
+        drain_ready_windows(&mut rb, &mut mic_out, &mut sys_out, &mut mic_all, &mut sys_all);
+        assert_eq!(sys_all.len(), sys_before + window);
+        assert!(sys_all[sys_before..].iter().all(|s| *s == 0.25));
+    }
+
+    /// Stop flush with a mic-only backlog longer than one window but still
+    /// inside the lag bound: every sample reaches the recording, exactly once.
+    #[tokio::test]
+    async fn backlog_within_lag_bound_is_flushed_once_on_stop() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let mut pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            false,
+        )
+        .expect("pipeline construction");
+        let (recording_tx, mut recording_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        pipeline.recording_sender_for_mixed = Some(recording_tx);
+
+        // 2.5 windows of mic audio in 10 ms chunks; system never arrives.
+        let total = 28_800 * 5 / 2;
+        for i in 0..(total / CHUNK) {
+            audio_tx
+                .send(AudioChunk {
+                    data: vec![0.5f32; CHUNK],
+                    sample_rate: 48_000,
+                    timestamp: 0.0,
+                    chunk_id: i as u64,
+                    device_type: DeviceType::Microphone,
+                    dominant_source: None,
+                })
+                .unwrap();
+        }
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut total_samples = 0usize;
+        while let Ok(chunk) = recording_rx.try_recv() {
+            total_samples += chunk.data.len();
+        }
+        assert_eq!(total_samples, total);
     }
 }

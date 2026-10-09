@@ -546,7 +546,7 @@ impl RecordingManager {
     /// Set error callback for handling errors
     pub fn set_error_callback<F>(&self, callback: F)
     where
-        F: Fn(&super::recording_state::AudioError) + Send + Sync + 'static,
+        F: Fn(&super::recording_state::AudioError, bool) + Send + Sync + 'static,
     {
         self.state.set_error_callback(callback);
     }
@@ -657,6 +657,9 @@ impl RecordingManager {
             monitor.notify_mic_swapped(device.name.clone(), system_name);
         }
         self.state.set_microphone_device(device);
+        // The disconnect that triggered this swap is resolved; its errors must
+        // not count toward stopping a later, unrelated episode.
+        self.state.note_recovery();
     }
 
     /// Get reference to recording state for external access
