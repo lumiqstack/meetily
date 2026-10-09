@@ -34,6 +34,22 @@ const VAD_REDEMPTION_TIME_MS: u32 = 500;
 /// `max_buffer_size`, or the leading stream would drop samples first.
 const MAX_MIXER_LAG_WINDOWS: usize = 2;
 
+/// A capture's first chunk (no previous callback to measure a gap from) is
+/// placed against the other stream's timeline by timestamp. Callback timing
+/// makes that estimate wobble by a few ms, so offsets below this are left
+/// alone rather than padded or trimmed.
+const FIRST_CHUNK_TOLERANCE_MS: f64 = 20.0;
+
+/// Where one stream stands on the shared mix timeline, in samples.
+#[derive(Default)]
+struct StreamTimeline {
+    /// Samples placed so far: real audio plus silence the mixer padded in.
+    placed: u64,
+    /// Timeline position right after the last captured chunk, and that
+    /// chunk's capture time (`AudioChunk::timestamp`).
+    last_capture: Option<(u64, f64)>,
+}
+
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
 struct AudioMixerRingBuffer {
@@ -50,6 +66,9 @@ struct AudioMixerRingBuffer {
     /// set, windows are cut as soon as the other stream has one, padding this
     /// stream; cleared as soon as it delivers samples again.
     stalled: Option<DeviceType>,
+    sample_rate: u32,
+    mic_timeline: StreamTimeline,
+    system_timeline: StreamTimeline,
 }
 
 impl AudioMixerRingBuffer {
@@ -75,7 +94,77 @@ impl AudioMixerRingBuffer {
             max_buffer_size,
             add_calls: 0,
             stalled: None,
+            sample_rate,
+            mic_timeline: StreamTimeline::default(),
+            system_timeline: StreamTimeline::default(),
         }
+    }
+
+    /// Add a raw capture chunk at its place on the timeline.
+    ///
+    /// Buffers pair mic and system audio by position, so a stream that skipped
+    /// time (WASAPI loopback sends nothing while no app plays sound) must have
+    /// that time filled with silence, or everything after it pairs with the
+    /// wrong moment of the other stream. `gap` (`AudioChunk::capture_gap`) is
+    /// the time the device skipped since its previous callback; when it is
+    /// unknown (a capture's first callback: recording start, mic hot-swap)
+    /// the chunk is placed against the other stream by `capture_end`.
+    ///
+    /// Silence the stall path already padded in counts toward the gap. If it
+    /// overshot (the stream was very late rather than silent), the start of
+    /// the chunk falls in time already mixed as silence and is dropped.
+    fn add_captured(&mut self, device_type: DeviceType, mut samples: Vec<f32>, capture_end: f64, gap: Option<f64>) {
+        let rate = self.sample_rate as f64;
+        let len = samples.len() as i64;
+        let (own, other, buffer) = match device_type {
+            DeviceType::Microphone => (&self.mic_timeline, &self.system_timeline, &self.mic_buffer),
+            DeviceType::System => (&self.system_timeline, &self.mic_timeline, &self.system_buffer),
+        };
+
+        let target_start = match gap {
+            Some(gap) => own.last_capture.map(|(end, _)| end as i64 + (gap * rate).round() as i64),
+            None => other
+                .last_capture
+                .map(|(end, at)| end as i64 + ((capture_end - at) * rate).round() as i64 - len),
+        };
+        let mut offset = target_start.map_or(0, |start| start - own.placed as i64);
+        if gap.is_none() && (offset.abs() as f64) < FIRST_CHUNK_TOLERANCE_MS * rate / 1000.0 {
+            offset = 0;
+        }
+
+        let mut pad = 0usize;
+        if offset > 0 {
+            let room = self.max_buffer_size.saturating_sub(buffer.len());
+            pad = (offset as usize).min(room);
+            if pad < offset as usize {
+                warn!("🔊 Mixer: {:?} gap of {} samples exceeds buffer room, padding {}", device_type, offset, pad);
+            }
+            info!("🔊 Mixer: {:?} skipped {} ms, padding with silence", device_type, pad as u64 * 1000 / self.sample_rate as u64);
+        } else if offset < 0 {
+            let skip = (-offset as usize).min(samples.len());
+            info!("🔊 Mixer: {:?} resumed inside {} ms already mixed as silence, dropping it", device_type, skip as u64 * 1000 / self.sample_rate as u64);
+            samples.drain(..skip);
+        }
+
+        if pad > 0 {
+            if self.stalled.as_ref() == Some(&device_type) {
+                self.stalled = None;
+            }
+            let buffer = match device_type {
+                DeviceType::Microphone => &mut self.mic_buffer,
+                DeviceType::System => &mut self.system_buffer,
+            };
+            buffer.extend(std::iter::repeat(0.0).take(pad));
+        }
+        // add_samples counts the samples on the timeline; the padding is
+        // counted here.
+        self.add_samples(device_type.clone(), samples);
+        let own = match device_type {
+            DeviceType::Microphone => &mut self.mic_timeline,
+            DeviceType::System => &mut self.system_timeline,
+        };
+        own.placed += pad as u64;
+        own.last_capture = Some((own.placed, capture_end));
     }
 
     fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
@@ -96,8 +185,14 @@ impl AudioMixerRingBuffer {
         }
 
         match device_type {
-            DeviceType::Microphone => self.mic_buffer.extend(samples),
-            DeviceType::System => self.system_buffer.extend(samples),
+            DeviceType::Microphone => {
+                self.mic_timeline.placed += samples.len() as u64;
+                self.mic_buffer.extend(samples);
+            }
+            DeviceType::System => {
+                self.system_timeline.placed += samples.len() as u64;
+                self.system_buffer.extend(samples);
+            }
         }
 
         // One stream running more than the lag bound ahead means the other is
@@ -167,8 +262,10 @@ impl AudioMixerRingBuffer {
             return false;
         }
 
-        drain_window(&mut self.mic_buffer, self.window_size_samples, mic_out);
-        drain_window(&mut self.system_buffer, self.window_size_samples, sys_out);
+        // A stalled stream is padded; that silence holds its place on the
+        // timeline until the stream's next chunk says how long it was gone.
+        self.mic_timeline.placed += drain_window(&mut self.mic_buffer, self.window_size_samples, mic_out) as u64;
+        self.system_timeline.placed += drain_window(&mut self.system_buffer, self.window_size_samples, sys_out) as u64;
         true
     }
 
@@ -182,20 +279,22 @@ impl AudioMixerRingBuffer {
             return false;
         }
 
-        drain_window(&mut self.mic_buffer, len, mic_out);
-        drain_window(&mut self.system_buffer, len, sys_out);
+        self.mic_timeline.placed += drain_window(&mut self.mic_buffer, len, mic_out) as u64;
+        self.system_timeline.placed += drain_window(&mut self.system_buffer, len, sys_out) as u64;
         true
     }
 }
 
-/// Move up to `window` samples out of `src` into `dst`, zero-padding the tail.
-fn drain_window(src: &mut VecDeque<f32>, window: usize, dst: &mut Vec<f32>) {
+/// Move up to `window` samples out of `src` into `dst`, zero-padding the
+/// tail. Returns how many padding samples were added.
+fn drain_window(src: &mut VecDeque<f32>, window: usize, dst: &mut Vec<f32>) -> usize {
     dst.clear();
     dst.reserve(window);
 
     let take = src.len().min(window);
     dst.extend(src.drain(0..take));
     dst.resize(window, 0.0);
+    window - take
 }
 
 /// Simple audio mixer without aggressive ducking
@@ -245,6 +344,81 @@ struct MicChain {
 }
 
 /// Simplified audio capture without broadcast channels
+/// Device-clock timing of one capture callback, from cpal.
+#[derive(Clone, Copy)]
+pub struct CaptureTiming {
+    /// When the callback's first frame was captured.
+    pub capture: cpal::StreamInstant,
+    /// When the callback ran.
+    pub callback: cpal::StreamInstant,
+}
+
+impl CaptureTiming {
+    pub fn from_cpal(info: &cpal::InputCallbackInfo) -> Self {
+        let ts = info.timestamp();
+        Self { capture: ts.capture, callback: ts.callback }
+    }
+}
+
+/// Gaps shorter than this are clock rounding, not skipped audio.
+const MIN_CAPTURE_GAP_SECS: f64 = 0.002;
+
+/// Measures, across one stream's callbacks, how much time the device skipped
+/// (see `AudioChunk::capture_gap`). Gaps from callbacks that sent no chunk
+/// (the resampler was still filling) carry over to the next chunk sent.
+#[derive(Default)]
+struct CaptureContinuity {
+    /// cpal instants have no public absolute value, so times are kept as
+    /// seconds since the stream's first timed callback.
+    anchor: Option<cpal::StreamInstant>,
+    /// Capture time just past the previous callback's last frame.
+    prev_end: Option<f64>,
+    /// Gap not yet attached to a chunk; `None` until the first chunk is sent,
+    /// since the first callback has nothing to measure against.
+    pending_gap: Option<f64>,
+    started: bool,
+}
+
+impl CaptureContinuity {
+    /// Record one callback of `frames` frames. Returns how long ago (seconds)
+    /// its last frame was captured: 0 without device timing.
+    fn observe(&mut self, timing: Option<CaptureTiming>, frames: usize, sample_rate: u32) -> f64 {
+        let secs = timing.map(|t| {
+            let anchor = *self.anchor.get_or_insert(t.capture);
+            let since = |i: &cpal::StreamInstant| i.duration_since(&anchor).map_or(0.0, |d| d.as_secs_f64());
+            (since(&t.capture), since(&t.callback))
+        });
+        self.observe_secs(secs, frames as f64 / sample_rate as f64)
+    }
+
+    /// `observe` on plain seconds: `(capture, callback)` of the first frame.
+    fn observe_secs(&mut self, timing: Option<(f64, f64)>, duration: f64) -> f64 {
+        let Some((capture, callback)) = timing else {
+            // No device clock: assume the stream is continuous.
+            self.prev_end = None;
+            return 0.0;
+        };
+        if let (Some(prev_end), Some(pending)) = (self.prev_end, self.pending_gap.as_mut()) {
+            let gap = capture - prev_end;
+            if gap >= MIN_CAPTURE_GAP_SECS {
+                *pending += gap;
+            }
+        }
+        self.prev_end = Some(capture + duration);
+        (callback - capture - duration).max(0.0)
+    }
+
+    /// The gap to attach to the chunk being sent; resets the running total.
+    fn take_gap(&mut self) -> Option<f64> {
+        if !self.started {
+            self.started = true;
+            self.pending_gap = Some(0.0);
+            return None;
+        }
+        self.pending_gap.replace(0.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct AudioCapture {
     device: Arc<AudioDevice>,
@@ -261,7 +435,8 @@ pub struct AudioCapture {
     resampler_chunk_size: usize,  // Fixed chunk size for resampler (512 samples)
     /// Microphone-only enhancement chain; `None` for system audio.
     mic_chain: Option<Arc<std::sync::Mutex<MicChain>>>,
-    // Note: Using global recording timestamp for synchronization
+    /// Touched only from this stream's callback thread, so never contended.
+    continuity: Arc<std::sync::Mutex<CaptureContinuity>>,
 }
 
 impl AudioCapture {
@@ -441,16 +616,29 @@ impl AudioCapture {
             resampler_input_buffer: Arc::new(std::sync::Mutex::new(Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2))),
             resampler_chunk_size: RESAMPLER_CHUNK_SIZE,
             mic_chain,
-            // Using global recording time for sync
+            continuity: Arc::new(std::sync::Mutex::new(CaptureContinuity::default())),
         }
     }
 
-    /// Process audio data directly from callback
+    /// Process audio data from a source without device timestamps.
     pub fn process_audio_data(&self, data: &[f32]) {
+        self.process_audio_data_at(data, None);
+    }
+
+    /// Process audio data directly from callback. `timing` lets the mixer
+    /// fill time the device skipped (see `AudioChunk::capture_gap`).
+    pub fn process_audio_data_at(&self, data: &[f32], timing: Option<CaptureTiming>) {
         // Check if still recording
         if !self.state.is_recording() {
             return;
         }
+
+        let frames = data.len() / self.channels.max(1) as usize;
+        let last_frame_age = self
+            .continuity
+            .lock()
+            .map(|mut c| c.observe(timing, frames, self.sample_rate))
+            .unwrap_or(0.0);
 
         // Convert to mono if needed. This buffer is eventually moved into the
         // AudioChunk, so it has to be owned — but the filter and normalizer
@@ -669,12 +857,14 @@ impl AudioCapture {
         //     }
         // }
 
-        // Use global recording timestamp for proper synchronization
-        let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        // Capture time of this callback's last frame on the recording clock.
+        let timestamp = (self.state.get_recording_duration().unwrap_or(0.0) - last_frame_age).max(0.0);
+        let capture_gap = self.continuity.lock().ok().and_then(|mut c| c.take_gap());
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
         let audio_chunk = AudioChunk {
+            capture_gap,
             data: mono_data,  // Raw audio (resampled if needed), no gain yet
             sample_rate: if self.needs_resampling { 48000 } else { self.sample_rate },
             timestamp,
@@ -955,7 +1145,12 @@ impl AudioPipeline {
                     // Microphone audio is already normalized at capture level (AudioCapture)
                     // System audio remains raw
                     self.last_chunk_timestamp = chunk.timestamp;
-                    self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
+                    self.ring_buffer.add_captured(
+                        chunk.device_type.clone(),
+                        chunk.data,
+                        chunk.timestamp,
+                        chunk.capture_gap,
+                    );
 
                     // STEP 2: Mix audio in fixed windows when both streams have
                     // a window (or one is stalled — see MAX_MIXER_LAG_WINDOWS)
@@ -1056,6 +1251,7 @@ impl AudioPipeline {
                               duration_ms, segment.samples.len());
 
                         let transcription_chunk = AudioChunk {
+                            capture_gap: None,
                             data: segment.samples,
                             sample_rate: 16000,
                             timestamp: segment.start_timestamp_ms / 1000.0,
@@ -1089,6 +1285,7 @@ impl AudioPipeline {
         // the wire format.
         if let Some(ref sender) = self.live_sender_for_mixed {
             let live_chunk = AudioChunk {
+                capture_gap: None,
                 data: mixed_with_gain.clone(),
                 sample_rate: self.sample_rate,
                 timestamp,
@@ -1107,6 +1304,7 @@ impl AudioPipeline {
         // cloning another 115 KB per window.
         if let Some(ref sender) = self.recording_sender_for_mixed {
             let recording_chunk = AudioChunk {
+                capture_gap: None,
                 data: mixed_with_gain,
                 sample_rate: self.sample_rate,
                 timestamp,
@@ -1155,6 +1353,7 @@ impl AudioPipeline {
                               duration_ms, segment.samples.len());
 
                         let transcription_chunk = AudioChunk {
+                            capture_gap: None,
                             data: segment.samples,
                             sample_rate: 16000,
                             timestamp: segment.start_timestamp_ms / 1000.0,
@@ -1293,6 +1492,7 @@ impl AudioPipelineManager {
         if let Some(sender) = &self.audio_sender {
             // Create a special flush chunk to trigger immediate processing
             let flush_chunk = AudioChunk {
+                capture_gap: None,
                 data: vec![], // Empty data signals flush
                 sample_rate: 16000,
                 timestamp: 0.0,
@@ -1314,6 +1514,7 @@ impl AudioPipelineManager {
                 // This aggressive approach eliminates shutdown delay issues
                 for i in 0..3 {
                     let additional_flush = AudioChunk {
+                        capture_gap: None,
                         data: vec![],
                         sample_rate: 16000,
                         timestamp: 0.0,
@@ -1376,6 +1577,7 @@ mod tests {
 
         audio_tx
             .send(AudioChunk {
+                capture_gap: None,
                 data: vec![0.5f32; 14_400],
                 sample_rate: 48_000,
                 timestamp: 0.0,
@@ -1421,6 +1623,7 @@ mod tests {
 
         audio_tx
             .send(AudioChunk {
+                capture_gap: None,
                 data: vec![0.25f32; 14_400],
                 sample_rate: 48_000,
                 timestamp: 0.0,
@@ -1431,6 +1634,7 @@ mod tests {
             .unwrap();
         audio_tx
             .send(AudioChunk {
+                capture_gap: None,
                 data: vec![0.25f32; 9_600],
                 sample_rate: 48_000,
                 timestamp: 0.0,
@@ -1476,6 +1680,7 @@ mod tests {
 
         audio_tx
             .send(AudioChunk {
+                capture_gap: None,
                 data: vec![0.25f32; 9_600],
                 sample_rate: 48_000,
                 timestamp: 0.0,
@@ -1486,6 +1691,7 @@ mod tests {
             .unwrap();
         audio_tx
             .send(AudioChunk {
+                capture_gap: None,
                 data: vec![],
                 sample_rate: 16_000,
                 timestamp: 0.0,
@@ -1496,6 +1702,7 @@ mod tests {
             .unwrap();
         audio_tx
             .send(AudioChunk {
+                capture_gap: None,
                 data: vec![0.25f32; 9_600],
                 sample_rate: 48_000,
                 timestamp: 0.0,
@@ -1566,6 +1773,186 @@ mod tests {
         assert_eq!(sys_all.len(), 2 * window);
         assert_eq!(sys_all.iter().filter(|s| **s == 0.0).count(), 0);
         assert_eq!(mic_all.iter().filter(|s| **s == 0.0).count(), 0);
+    }
+
+    // ---- WASAPI timing replay ----------------------------------------------
+    //
+    // These replay the delivery pattern of cpal's WASAPI backend on Windows:
+    // the mic sends a 10 ms packet every 10 ms, but loopback (system audio)
+    // jitters, arrives in bursts, and sends *nothing* while no app is
+    // rendering. Every sample carries its capture time (sample index + 1, so
+    // 0.0 still means "padding"), which makes alignment checkable: a mixed
+    // window is aligned when, at every position where both streams carry
+    // real audio, they carry the same capture time.
+
+    /// One simulated delivery: at `arrival` (sample clock), `device` hands
+    /// over the samples captured over `[start, start + CHUNK)`.
+    struct Delivery {
+        arrival: usize,
+        device: DeviceType,
+        start: usize,
+    }
+
+    fn mic_deliveries(seconds: usize) -> Vec<Delivery> {
+        (0..seconds * 100)
+            .map(|i| Delivery { arrival: (i + 1) * CHUNK, device: DeviceType::Microphone, start: i * CHUNK })
+            .collect()
+    }
+
+    /// Loopback packets for the capture times in `active` (in samples),
+    /// each delivered `delay(i)` samples after it was captured. WASAPI
+    /// delivers in order, so a packet never arrives before the one ahead
+    /// of it; a delayed packet holds back the ones behind it into a burst.
+    fn loopback_deliveries(
+        active: std::ops::Range<usize>,
+        delay: impl Fn(usize) -> usize,
+    ) -> Vec<Delivery> {
+        let mut last_arrival = 0;
+        (active.start / CHUNK..active.end / CHUNK)
+            .map(|i| {
+                last_arrival = ((i + 1) * CHUNK + delay(i)).max(last_arrival);
+                Delivery { arrival: last_arrival, device: DeviceType::System, start: i * CHUNK }
+            })
+            .collect()
+    }
+
+    /// Replays deliveries in arrival order through the ring buffer, with the
+    /// timing real capture attaches (capture-end timestamp; `capture_gap`
+    /// `None` on a stream's first chunk, then the time skipped since the
+    /// previous packet). Returns, per mixed window, the largest capture-time
+    /// gap between mic and system at positions where both carry audio
+    /// (0 = aligned).
+    fn replay_misalignment(mut deliveries: Vec<Delivery>) -> Vec<usize> {
+        // Stable sort: on equal arrival the mic (pushed first) goes first.
+        deliveries.sort_by_key(|d| d.arrival);
+        let mut rb = AudioMixerRingBuffer::new(48_000);
+        let (mut mic_out, mut sys_out) = (Vec::new(), Vec::new());
+        let mut prev_end: [Option<usize>; 2] = [None, None];
+        let mut per_window = Vec::new();
+        for d in deliveries {
+            let slot = matches!(d.device, DeviceType::System) as usize;
+            let gap = prev_end[slot].map(|end| (d.start - end) as f64 / 48_000.0);
+            prev_end[slot] = Some(d.start + CHUNK);
+            let samples = (d.start..d.start + CHUNK).map(|t| (t + 1) as f32).collect();
+            rb.add_captured(d.device, samples, (d.start + CHUNK) as f64 / 48_000.0, gap);
+            while rb.extract_window_into(&mut mic_out, &mut sys_out) {
+                let worst = mic_out
+                    .iter()
+                    .zip(&sys_out)
+                    .filter(|(m, s)| **m != 0.0 && **s != 0.0)
+                    .map(|(m, s)| (*m as i64 - *s as i64).unsigned_abs() as usize)
+                    .max()
+                    .unwrap_or(0);
+                per_window.push(worst);
+            }
+        }
+        per_window
+    }
+
+    /// Loopback jitter up to 30 ms with occasional 4-packet bursts: every
+    /// window must still pair mic and system audio captured at the same time.
+    #[test]
+    fn wasapi_replay_jitter_and_bursts_stay_aligned() {
+        let mut d = mic_deliveries(20);
+        d.extend(loopback_deliveries(0..20 * 48_000, |i| {
+            if i % 40 < 4 { (4 - i % 40) * CHUNK } else { (i * 7 % 3) * CHUNK }
+        }));
+        let gaps = replay_misalignment(d);
+        assert!(gaps.len() >= 30, "only {} windows mixed", gaps.len());
+        assert!(gaps.iter().all(|g| *g == 0), "misaligned windows: {:?}", gaps);
+    }
+
+    /// Nothing plays for the first 10 s (loopback silent), then audio starts.
+    /// After it starts, system audio must line up with the mic again.
+    #[test]
+    fn wasapi_replay_idle_loopback_then_playback_realigns() {
+        let mut d = mic_deliveries(20);
+        d.extend(loopback_deliveries(10 * 48_000 + 7 * CHUNK..20 * 48_000, |_| CHUNK));
+        let gaps = replay_misalignment(d);
+        let worst_ms = gaps.iter().max().copied().unwrap_or(0) / 48;
+        assert_eq!(worst_ms, 0, "system audio offset by up to {} ms after playback started", worst_ms);
+    }
+
+    /// Playback pauses for 500 ms (below the stall bound) and resumes. The
+    /// pause must not shift system audio against the mic for the rest of
+    /// the recording.
+    #[test]
+    fn wasapi_replay_short_loopback_pause_does_not_shift_alignment() {
+        let mut d = mic_deliveries(20);
+        d.extend(loopback_deliveries(0..8 * 48_000, |_| CHUNK));
+        d.extend(loopback_deliveries(8 * 48_000 + 50 * CHUNK..20 * 48_000, |_| CHUNK));
+        let gaps = replay_misalignment(d);
+        let worst_ms = gaps.iter().max().copied().unwrap_or(0) / 48;
+        assert_eq!(worst_ms, 0, "system audio offset by up to {} ms after a 500 ms pause", worst_ms);
+    }
+
+    /// Playback stops for 3 s (past the stall bound) mid-recording and
+    /// resumes: stall padding plus the reported gap must land system audio
+    /// back on the mic's timeline.
+    #[test]
+    fn wasapi_replay_long_loopback_pause_realigns() {
+        let mut d = mic_deliveries(20);
+        d.extend(loopback_deliveries(0..6 * 48_000, |_| CHUNK));
+        d.extend(loopback_deliveries(9 * 48_000 + 13 * CHUNK..20 * 48_000, |_| CHUNK));
+        let gaps = replay_misalignment(d);
+        let worst_ms = gaps.iter().max().copied().unwrap_or(0) / 48;
+        assert_eq!(worst_ms, 0, "system audio offset by up to {} ms after a 3 s pause", worst_ms);
+    }
+
+    /// The mic stream starts 300 ms after system audio (slow device open):
+    /// its first chunk is placed by timestamp, not at the buffer front.
+    #[test]
+    fn wasapi_replay_late_mic_start_is_aligned() {
+        let mut d: Vec<Delivery> = mic_deliveries(20).into_iter().filter(|m| m.start >= 30 * CHUNK).collect();
+        d.extend(loopback_deliveries(0..20 * 48_000, |_| CHUNK));
+        let gaps = replay_misalignment(d);
+        assert!(gaps.iter().all(|g| *g == 0), "misaligned windows: {:?}", gaps);
+    }
+
+    #[test]
+    fn capture_continuity_reports_skipped_time() {
+        let mut c = CaptureContinuity::default();
+        let dur = 0.01;
+        // First callback: nothing to measure against.
+        c.observe_secs(Some((0.0, 0.015)), dur);
+        assert_eq!(c.take_gap(), None);
+        // Contiguous packet, delivered late: no gap.
+        c.observe_secs(Some((0.01, 0.05)), dur);
+        assert_eq!(c.take_gap(), Some(0.0));
+        // Loopback idle for 2 s, then a packet.
+        c.observe_secs(Some((2.02, 2.03)), dur);
+        let gap = c.take_gap().unwrap();
+        assert!((gap - 2.0).abs() < 1e-9, "gap {}", gap);
+    }
+
+    #[test]
+    fn capture_continuity_carries_gap_past_callbacks_that_sent_nothing() {
+        let mut c = CaptureContinuity::default();
+        c.observe_secs(Some((0.0, 0.01)), 0.01);
+        assert_eq!(c.take_gap(), None);
+        // A gap lands on a callback whose samples stay in the resampler...
+        c.observe_secs(Some((0.51, 0.52)), 0.01);
+        // ...and the next callback sends the chunk.
+        c.observe_secs(Some((0.52, 0.53)), 0.01);
+        let gap = c.take_gap().unwrap();
+        assert!((gap - 0.5).abs() < 1e-9, "gap {}", gap);
+    }
+
+    #[test]
+    fn capture_continuity_without_device_timing_assumes_continuous() {
+        let mut c = CaptureContinuity::default();
+        assert_eq!(c.observe_secs(None, 0.01), 0.0);
+        assert_eq!(c.take_gap(), None);
+        c.observe_secs(None, 0.01);
+        assert_eq!(c.take_gap(), Some(0.0));
+    }
+
+    #[test]
+    fn capture_continuity_reports_last_frame_age() {
+        let mut c = CaptureContinuity::default();
+        // First frame captured 25 ms before the callback; 10 ms of frames.
+        let age = c.observe_secs(Some((1.0, 1.025)), 0.01);
+        assert!((age - 0.015).abs() < 1e-9, "age {}", age);
     }
 
     /// A stream that stops delivering (unplugged device, idle WASAPI loopback)
@@ -1645,6 +2032,7 @@ mod tests {
         for i in 0..(total / CHUNK) {
             audio_tx
                 .send(AudioChunk {
+                    capture_gap: None,
                     data: vec![0.5f32; CHUNK],
                     sample_rate: 48_000,
                     timestamp: 0.0,
