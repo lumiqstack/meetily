@@ -27,6 +27,14 @@ use super::{legacy_root, read_pointer, root, same_dir, write_pointer};
 
 pub(super) const STATE_FILE: &str = ".migration-state.json";
 
+/// Every step of a move, in the order [`run_files_in`] runs them. The move is
+/// finished once all of them are recorded as done.
+const STEPS: [&str; 7] = ["bin", "sp-webview", "models", "config", "logs", "recordings", "db"];
+
+/// Settings files that lived in `dirs::config_dir()/meetily` before they moved
+/// under the data root.
+const CONFIG_FILES: [&str; 2] = ["notifications.json", "meeting_detection.json"];
+
 /// Above this size we verify by length alone. Hashing a 3 GB model file adds
 /// minutes to a startup that is already copying it once.
 const HASH_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
@@ -86,9 +94,16 @@ pub struct MigrationReport {
 
 /// Phase 1: move files. Returns immediately when no relocation is configured.
 pub fn run_files<R: Runtime>(app: &AppHandle<R>) -> Result<MigrationReport> {
-    run_files_in(&legacy_root(), &root(), legacy_logs_dir(), |payload| {
+    let report = run_files_in(&legacy_root(), &root(), legacy_logs_dir(), |payload| {
         let _ = app.emit("storage-migration", payload);
-    })
+    });
+    // After the move, so the files land in the root's config folder wherever
+    // that now is. Runs whether or not a root was ever chosen.
+    migrate_old_config(
+        dirs::config_dir().map(|d| d.join("meetily")).as_deref(),
+        &root().join("config"),
+    );
+    report
 }
 
 /// [`run_files`] with the paths and event sink passed in, so the startup path can
@@ -160,7 +175,7 @@ fn run_files_in(
 
     // Plain subdirectory moves, in increasing order of "how bad is it if this is
     // the step that gets interrupted".
-    for name in ["bin", "sp-webview", "models"] {
+    for name in ["bin", "sp-webview", "models", "config"] {
         if state.done(name) {
             continue;
         }
@@ -246,10 +261,7 @@ fn run_files_in(
         }
     }
 
-    if ["bin", "sp-webview", "models", "logs", "recordings", "db"]
-        .iter()
-        .all(|step| state.done(step))
-    {
+    if STEPS.iter().all(|step| state.done(step)) {
         let _ = clear_previous_root(legacy);
     }
 
@@ -267,6 +279,93 @@ fn run_files_in(
 
     Ok(report)
 }
+
+/// Bring settings from `dirs::config_dir()/meetily` into `<root>/config`.
+///
+/// Only fills in files that are missing at the new location: one that exists
+/// there was written by this version and is newer than the old copy. `old` is a
+/// parameter so tests never reach the real user's config folder.
+fn migrate_old_config(old: Option<&Path>, new: &Path) {
+    let Some(old) = old else { return };
+    if same_dir(old, new) {
+        return;
+    }
+    let mut report = MigrationReport::default();
+    for name in CONFIG_FILES {
+        let (from, to) = (old.join(name), new.join(name));
+        if !from.is_file() || to.exists() {
+            continue;
+        }
+        match move_file(&from, &to, &mut report) {
+            Ok(()) => log::info!("Moved {} to {}", from.display(), to.display()),
+            Err(e) => log::warn!("Could not move {}: {:#}", from.display(), e),
+        }
+    }
+    // Only succeeds once nothing is left in it.
+    let _ = std::fs::remove_dir(old);
+}
+
+/// Describe an earlier move that has not finished, or `None` when the data is
+/// settled in `current`, the root this process is using.
+///
+/// Starting another move on top of an unfinished one would lose track of it:
+/// the pointer holds a single `previous_root`, and the state file in `current`
+/// holds the only record of which meetings still point at the old recordings
+/// folder. So a new root is refused until this returns `None`.
+pub(super) fn unfinished_move(legacy: &Path, current: &Path) -> Option<String> {
+    // previous_root equal to the live root is a request nothing has acted on
+    // yet (the move runs at the next launch); replacing it loses nothing.
+    if let Some(previous) = read_pointer(legacy)
+        .and_then(|p| p.previous_root)
+        .filter(|p| !same_dir(p, current))
+    {
+        return Some(format!(
+            "Meetily has not finished moving your data from {} to {}. Restart Meetily \
+             to let the move finish, then choose the new location. If it still does not \
+             finish, make sure every file in {} is available on this computer (for \
+             OneDrive, \"Always keep on this device\").",
+            previous.display(),
+            current.display(),
+            previous.display()
+        ));
+    }
+
+    if !current.join(STATE_FILE).exists() {
+        return None;
+    }
+    let state = load_state(current);
+    // A move recorded before the pointer kept previous_root.
+    let files_pending = !STEPS.iter().all(|step| state.done(step));
+    let paths_pending = state.old_recordings_root.is_some() && !state.db_paths_rewritten;
+    if !files_pending && !paths_pending {
+        return None;
+    }
+    let from = state
+        .source
+        .as_deref()
+        .or(state.old_recordings_root.as_deref())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "its previous location".into());
+    Some(if files_pending {
+        format!(
+            "Meetily has not finished moving your data from {} to {}. Restart Meetily \
+             to let the move finish, then choose the new location.",
+            from,
+            current.display()
+        )
+    } else {
+        format!(
+            "Meetily has moved your data to {} but some meetings still point at {}. \
+             Restart Meetily to let it update them, then choose the new location. If it \
+             still does not finish, make sure every meeting folder in {} is available \
+             on this computer.",
+            current.display(),
+            from,
+            from
+        )
+    })
+}
+
 
 /// Forget a finished move so later launches do not run it again.
 fn clear_previous_root(legacy: &Path) -> Result<()> {
@@ -298,8 +397,11 @@ fn recordings_target(legacy: &Path, root: &Path) -> PathBuf {
 /// at the destination. Idempotent, and safe to run on every launch until the
 /// move finishes.
 pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
-    let root = root();
-    let mut state = load_state(&root);
+    rewrite_db_paths_in(pool, &legacy_root(), &root()).await
+}
+
+async fn rewrite_db_paths_in(pool: &SqlitePool, legacy: &Path, root: &Path) -> Result<u64> {
+    let mut state = load_state(root);
 
     if state.db_paths_rewritten {
         return Ok(0);
@@ -308,10 +410,10 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
         return Ok(0);
     };
 
-    let new_root = recordings_target(&legacy_root(), &root);
+    let new_root = recordings_target(legacy, root);
     if same_dir(&old_root, &new_root) {
         state.db_paths_rewritten = true;
-        let _ = save_state(&root, &state);
+        let _ = save_state(root, &state);
         return Ok(0);
     }
 
@@ -338,8 +440,13 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
             };
             let candidate = new_root.join(rest.trim_start_matches(['\\', '/']));
             if !candidate.exists() {
-                pending += 1;
-                continue; // Not moved yet — leave it pointing at the old copy.
+                // Not moved yet — leave it pointing at the old copy. A folder that
+                // exists at neither end will never arrive, so it is not waited on:
+                // that would keep the rewrite, and every later root change, pending.
+                if Path::new(&folder).exists() {
+                    pending += 1;
+                }
+                continue;
             }
 
             let update = format!("UPDATE {table} SET folder_path = ?1 WHERE rowid = ?2");
@@ -364,7 +471,7 @@ pub async fn rewrite_db_paths(pool: &SqlitePool) -> Result<u64> {
     } else if pending > 0 {
         log::info!("{} meeting folder path(s) still awaiting their files", pending);
     }
-    save_state(&root, &state)?;
+    save_state(root, &state)?;
 
     Ok(total)
 }
@@ -1385,6 +1492,210 @@ mod tests {
             b"weights"
         );
         assert_eq!(std::fs::read(root2.join("notes/extra.txt")).unwrap(), b"keep");
+    }
+
+    fn pointer(legacy: &Path) -> Pointer {
+        read_pointer(legacy).unwrap_or_default()
+    }
+
+    async fn meetings_pool(folders: &[&Path]) -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE meetings (id TEXT, folder_path TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for folder in folders {
+            sqlx::query("INSERT INTO meetings (id, folder_path) VALUES ('m', ?1)")
+                .bind(folder.to_string_lossy().to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool
+    }
+
+    /// Re-targeting mid-move: with D -> E unfinished, picking F would drop D from
+    /// the pointer and strand whatever is still there. The change must be refused,
+    /// and allowed once the earlier move (files and meeting paths) has finished.
+    #[tokio::test]
+    async fn changing_the_root_waits_for_an_unfinished_move() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let d = tmp.path().join("d");
+        let e = tmp.path().join("e");
+        let f = tmp.path().join("f");
+        write(&d.join("models/ggml-base.bin"), b"weights");
+        write(&d.join("recordings/Meeting_1/audio.mp4"), b"audio");
+        write(&d.join("meeting_minutes.sqlite"), b"meetings");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(e.clone()),
+                previous_root: Some(d.clone()),
+            },
+        )
+        .unwrap();
+        // A directory where the model file has to go stands in for a OneDrive
+        // placeholder that cannot be moved yet.
+        std::fs::create_dir_all(e.join("models/ggml-base.bin")).unwrap();
+
+        run_files_in(&legacy, &e, None, |_| {}).unwrap();
+        assert_eq!(pointer(&legacy).previous_root, Some(d.clone()));
+
+        let err = crate::storage::set_root_in(&legacy, &e, &f)
+            .expect_err("a root change while files are still at D must be refused");
+        assert!(err.to_string().contains(&d.display().to_string()), "{err}");
+        assert_eq!(pointer(&legacy).data_root, Some(e.clone()));
+        assert_eq!(pointer(&legacy).previous_root, Some(d.clone()));
+        assert!(e.join(STATE_FILE).exists(), "progress of the D -> E move was discarded");
+
+        // The placeholder downloads; the next launch finishes the files...
+        std::fs::remove_dir(e.join("models/ggml-base.bin")).unwrap();
+        run_files_in(&legacy, &e, None, |_| {}).unwrap();
+        assert_eq!(std::fs::read(e.join("models/ggml-base.bin")).unwrap(), b"weights");
+        assert!(pointer(&legacy).previous_root.is_none());
+
+        // ...but until the database has been repointed, meetings still name D.
+        assert!(crate::storage::set_root_in(&legacy, &e, &f).is_err());
+
+        let pool = meetings_pool(&[&d.join("recordings/Meeting_1")]).await;
+        rewrite_db_paths_in(&pool, &legacy, &e).await.unwrap();
+
+        crate::storage::set_root_in(&legacy, &e, &f).unwrap();
+        assert_eq!(pointer(&legacy).data_root, Some(f.clone()));
+        assert_eq!(pointer(&legacy).previous_root, Some(e.clone()));
+    }
+
+    /// A move that has not started yet (no restart since the last pick) is just a
+    /// request; correcting it must still be allowed.
+    #[test]
+    fn changing_the_root_again_before_restarting_is_allowed() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let d = tmp.path().join("d");
+        let e = tmp.path().join("e");
+        let f = tmp.path().join("f");
+        std::fs::create_dir_all(&d).unwrap();
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(e.clone()),
+                previous_root: Some(d.clone()),
+            },
+        )
+        .unwrap();
+
+        crate::storage::set_root_in(&legacy, &d, &f).unwrap();
+
+        assert_eq!(pointer(&legacy).data_root, Some(f));
+        assert_eq!(pointer(&legacy).previous_root, Some(d));
+    }
+
+    /// A meeting whose folder exists at neither end can never be repointed. It
+    /// must not keep the rewrite (and with it every later root change) pending.
+    #[tokio::test]
+    async fn rewrite_does_not_wait_for_meetings_whose_folder_is_gone() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("root");
+        let old = tmp.path().join("old-recordings");
+        save_state(
+            &root,
+            &State {
+                completed: ["bin", "sp-webview", "models", "config", "logs", "recordings", "db"]
+                    .map(String::from)
+                    .to_vec(),
+                old_recordings_root: Some(old.clone()),
+                ..State::default()
+            },
+        )
+        .unwrap();
+
+        let pool = meetings_pool(&[&old.join("Deleted_meeting")]).await;
+        rewrite_db_paths_in(&pool, &legacy, &root).await.unwrap();
+        assert!(load_state(&root).db_paths_rewritten);
+    }
+
+    /// The opposite case: a folder still sitting at the old root is real pending
+    /// work and keeps the rewrite armed.
+    #[tokio::test]
+    async fn rewrite_keeps_waiting_for_meetings_still_at_the_old_root() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root = tmp.path().join("root");
+        let old = tmp.path().join("old-recordings");
+        write(&old.join("Meeting_1/audio.mp4"), b"audio");
+        save_state(
+            &root,
+            &State {
+                completed: ["bin", "sp-webview", "models", "config", "logs", "recordings", "db"]
+                    .map(String::from)
+                    .to_vec(),
+                old_recordings_root: Some(old.clone()),
+                ..State::default()
+            },
+        )
+        .unwrap();
+
+        let pool = meetings_pool(&[&old.join("Meeting_1")]).await;
+        rewrite_db_paths_in(&pool, &legacy, &root).await.unwrap();
+        assert!(!load_state(&root).db_paths_rewritten);
+    }
+
+    /// H6-F6: settings moved from dirs::config_dir()/meetily to <root>/config.
+    #[test]
+    fn old_config_files_move_once_when_the_new_ones_are_missing() {
+        let tmp = tempdir().unwrap();
+        let old = tmp.path().join("old-config/meetily");
+        let new = tmp.path().join("root/config");
+        write(&old.join("notifications.json"), br#"{"consent":true}"#);
+        write(&old.join("meeting_detection.json"), br#"{"teams":true}"#);
+        write(&new.join("meeting_detection.json"), br#"{"teams":false,"newer":1}"#);
+
+        migrate_old_config(Some(&old), &new);
+
+        assert_eq!(
+            std::fs::read(new.join("notifications.json")).unwrap(),
+            br#"{"consent":true}"#
+        );
+        assert!(!old.join("notifications.json").exists());
+        assert_eq!(
+            std::fs::read(new.join("meeting_detection.json")).unwrap(),
+            br#"{"teams":false,"newer":1}"#,
+            "an existing setting at the new location must win"
+        );
+
+        // Running again (every launch does) changes nothing.
+        migrate_old_config(Some(&old), &new);
+        assert_eq!(
+            std::fs::read(new.join("notifications.json")).unwrap(),
+            br#"{"consent":true}"#
+        );
+    }
+
+    #[test]
+    fn changing_the_root_moves_the_config_folder() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let d = tmp.path().join("d");
+        let e = tmp.path().join("e");
+        write(&d.join("config/notifications.json"), b"consent");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(e.clone()),
+                previous_root: Some(d.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &e, None, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(e.join("config/notifications.json")).unwrap(), b"consent");
     }
 
     /// An unplugged target drive makes resolve() fall back to the legacy dir. That

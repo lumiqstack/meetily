@@ -328,6 +328,12 @@ pub fn db_dir() -> PathBuf {
 /// model directories, an open SQLite pool, and a live WebView2 profile at
 /// runtime is not worth the complexity.
 pub fn set_root(path: &Path) -> Result<()> {
+    set_root_in(&legacy_root(), &root(), path)
+}
+
+/// [`set_root`] with the pointer directory and the root in effect passed in, so
+/// it can be tested without the process-wide roots.
+fn set_root_in(legacy: &Path, current: &Path, path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(anyhow!("Data root must be an absolute path"));
     }
@@ -342,16 +348,15 @@ pub fn set_root(path: &Path) -> Result<()> {
         .map_err(|e| anyhow!("{} is not writable: {}", path.display(), e))?;
     let _ = std::fs::remove_file(&probe);
 
-    let legacy = legacy_root();
-    std::fs::create_dir_all(&legacy)
+    std::fs::create_dir_all(legacy)
         .map_err(|e| anyhow!("Cannot create {}: {}", legacy.display(), e))?;
 
-    let data_root = if same_dir(path, &legacy) {
+    let data_root = if same_dir(path, legacy) {
         None
     } else {
         Some(path.to_path_buf())
     };
-    let configured = read_pointer(&legacy).and_then(|p| p.data_root);
+    let configured = read_pointer(legacy).and_then(|p| p.data_root);
     let unchanged = match (&data_root, &configured) {
         (Some(new), Some(old)) => same_dir(new, old),
         (None, None) => true,
@@ -361,14 +366,19 @@ pub fn set_root(path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // One move at a time: replacing previous_root, or the state file below,
+    // while an earlier move is unfinished would strand whatever it had left.
+    if let Some(reason) = migrate::unfinished_move(legacy, current) {
+        return Err(anyhow!(reason));
+    }
+
     // The data stays where it is until restart, so the root in effect now is
     // the one the next launch has to move from.
-    let previous = root();
-    let previous_root = (!same_dir(&previous, path)).then_some(previous);
+    let previous_root = (!same_dir(current, path)).then(|| current.to_path_buf());
     let moving = previous_root.is_some();
 
     write_pointer(
-        &legacy,
+        legacy,
         &Pointer {
             data_root,
             previous_root,
