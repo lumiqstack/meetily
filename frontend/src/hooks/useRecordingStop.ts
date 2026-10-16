@@ -71,6 +71,13 @@ export function useRecordingStop(
 
   const router = useRouter();
 
+  // Start is re-enabled before the post-save navigation timer fires, so the
+  // timer must see the live status to tell whether a new recording began.
+  const statusRef = useRef(status);
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
   // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
   const stopInProgressRef = useRef(false);
 
@@ -405,6 +412,7 @@ export function useRecordingStop(
 
           // Auto-navigate after a short delay with source parameter
           setTimeout(() => {
+            if (statusRef.current !== RecordingStatus.COMPLETED) return;
             // Incomplete transcripts must not trigger auto-summary.
             router.push(postRecordingDestination(meetingId, transcriptionIncomplete));
             clearTranscripts()
