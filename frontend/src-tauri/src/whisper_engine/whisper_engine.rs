@@ -330,14 +330,14 @@ impl WhisperEngine {
     }
     
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
-        let models = self.available_models.read().await;
-        let model_info = models.get(model_name)
+        let model_info = self.available_models.read().await.get(model_name).cloned()
             .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
 
         match model_info.status {
             ModelStatus::Available => {
-                // FIX 5: Check if this model is already loaded
-                if let Some(current_model) = self.current_model.read().await.as_ref() {
+                // Clone the name out so the read guard is dropped before unload_model takes the write lock.
+                let current_model = self.current_model.read().await.clone();
+                if let Some(current_model) = current_model {
                     if current_model == model_name {
                         log::info!("Model {} is already loaded, skipping reload", model_name);
                         return Ok(());
