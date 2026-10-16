@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { handleRecordingError, type RecordingErrorDeps } from '../../src/lib/recording-error';
+import {
+  handleRecordingError,
+  isAlreadyRecordingError,
+  type RecordingErrorDeps,
+} from '../../src/lib/recording-error';
 
 function fakeDeps(overrides: Partial<RecordingErrorDeps> = {}) {
   const calls: string[] = [];
@@ -47,5 +51,20 @@ describe('handleRecordingError', () => {
     expect(outcome).toBe('stop-failed');
     expect(calls).toEqual([]);
     expect(toasts).toEqual(['Recording stopped because of an audio error', 'Failed to stop recording']);
+  });
+});
+
+// Strings returned by StartingGuard::acquire in src-tauri/src/audio/recording_commands.rs.
+describe('isAlreadyRecordingError', () => {
+  test('a start that lost the race to another start is benign', () => {
+    expect(isAlreadyRecordingError('Recording is already starting')).toBe(true);
+  });
+
+  test('a start rejected by a live recording is benign', () => {
+    expect(isAlreadyRecordingError('Recording already in progress')).toBe(true);
+  });
+
+  test('a start rejected while the previous recording stops is a real failure', () => {
+    expect(isAlreadyRecordingError('The previous recording is still stopping; try again in a moment')).toBe(false);
   });
 });
