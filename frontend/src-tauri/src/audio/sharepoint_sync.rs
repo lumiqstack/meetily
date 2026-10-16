@@ -1496,6 +1496,18 @@ mod tests {
     }
 
     #[test]
+    fn rfc3339_since_with_offset_and_nanos_becomes_a_plain_utc_odata_datetime() {
+        // `Utc::now().to_rfc3339()` shape: nanoseconds and a `+00:00` offset.
+        // A raw `+` decodes to a space in the query string, and OData v3
+        // datetime literals take neither an offset nor 9 fractional digits.
+        let out = odata_datetime("2026-09-16T08:12:33.123456789+00:00");
+        assert_eq!(out, "2026-09-16T08:12:33Z");
+        assert_eq!(odata_datetime("2026-09-16T10:12:33+02:00"), "2026-09-16T08:12:33Z");
+        assert_eq!(odata_datetime("2026-07-27T00:00:00Z"), "2026-07-27T00:00:00Z");
+        assert_eq!(odata_datetime("2026-07-27"), "2026-07-27T00:00:00Z");
+    }
+
+    #[test]
     fn odata_quotes_are_doubled_in_paths() {
         let url = build_recordings_query_url(
             "t-my.sharepoint.com",
