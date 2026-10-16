@@ -9,6 +9,7 @@ import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import { describeIncompleteRecovery, postRecordingDestination, waitForLiveTranscription } from '@/lib/live-transcription-wait';
 import Analytics from '@/lib/analytics';
+import { errorMessage } from '@/lib/utils';
 import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
@@ -482,7 +483,7 @@ export function useRecordingStop(
       setIsRecordingDisabled(false);
     } catch (error) {
       console.error('Error in handleRecordingStop:', error);
-      setStatus(RecordingStatus.ERROR, error instanceof Error ? error.message : 'Unknown error');
+      setStatus(RecordingStatus.ERROR, errorMessage(error));
       // isRecording already set to false at function start
       setIsRecordingDisabled(false);
     } finally {

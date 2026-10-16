@@ -14,6 +14,7 @@ import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
 import { useConfig } from '@/contexts/ConfigContext';
 import { toast } from 'sonner';
 import { BATCH_CAPABLE_PROVIDERS } from '@/lib/transcription-providers';
+import { errorMessage } from '@/lib/utils';
 
 interface AudioRecoveryStatus {
   status: string; // "success" | "partial" | "failed" | "none"
@@ -242,7 +243,7 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
             status: 'failed',
             chunk_count: 0,
             estimated_duration_seconds: 0,
-            message: error instanceof Error ? error.message : 'Unknown error'
+            message: errorMessage(error)
           };
         }
       } else {

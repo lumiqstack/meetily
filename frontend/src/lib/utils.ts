@@ -5,6 +5,13 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/** Message for a caught error. Tauri v2 rejects `invoke` with the Rust error string, not an Error. */
+export function errorMessage(error: unknown, fallback = 'Unknown error'): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string' && error) return error;
+  return fallback;
+}
+
 /**
  * Detects if an error message indicates that Ollama is not installed or not running
  * @param errorMessage - The error message to check
