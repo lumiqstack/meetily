@@ -11,12 +11,14 @@ const originals = {
   event: { ...await import('@tauri-apps/api/event') },
   core: { ...await import('@tauri-apps/api/core') },
   analytics: { ...await import('../../src/lib/analytics') },
+  tooltip: { ...await import('../../src/components/ui/tooltip') },
 };
 afterAll(() => {
   if (originals.recordingState) mock.module('../../src/contexts/RecordingStateContext', () => originals.recordingState);
   mock.module('@tauri-apps/api/event', () => originals.event);
   mock.module('@tauri-apps/api/core', () => originals.core);
   mock.module('../../src/lib/analytics', () => originals.analytics);
+  mock.module('../../src/components/ui/tooltip', () => originals.tooltip);
   if (!hadWindow) delete (globalThis as any).window;
   if (!hadSessionStorage) delete (globalThis as any).sessionStorage;
 });
@@ -49,6 +51,11 @@ mock.module('@tauri-apps/api/event', () => ({
 }));
 mock.module('@tauri-apps/api/core', () => ({ ...originals.core, invoke: async () => false }));
 mock.module('../../src/lib/analytics', () => ({ default: { trackTranscriptionError() {}, trackButtonClick() {} } }));
+// Radix tooltips need a DOM; this test only cares about the listeners.
+const Passthrough = ({ children }: { children?: React.ReactNode }) => <>{children}</>;
+mock.module('../../src/components/ui/tooltip', () => ({
+  Tooltip: Passthrough, TooltipContent: Passthrough, TooltipProvider: Passthrough, TooltipTrigger: Passthrough,
+}));
 
 let RecordingControls: React.FC<any>;
 beforeAll(async () => {
