@@ -16,6 +16,7 @@ import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useImportDialog } from '@/contexts/ImportDialogContext';
 import { useConfig } from '@/contexts/ConfigContext';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 
 import {
   Dialog,
@@ -160,24 +161,10 @@ const Sidebar: React.FC = () => {
   }, [serverAddress]);
 
   // Listen for model config updates from other components
-  useEffect(() => {
-    const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
-        console.log('Sidebar received model-config-updated event:', event.payload);
-        setModelConfig(event.payload);
-      });
-
-      return unlisten;
-    };
-
-    let cleanup: (() => void) | undefined;
-    setupListener().then(fn => cleanup = fn);
-
-    return () => {
-      cleanup?.();
-    };
-  }, []);
+  useTauriEvent<ModelConfig>('model-config-updated', (config) => {
+    console.log('Sidebar received model-config-updated event:', config);
+    setModelConfig(config);
+  });
 
 
 
