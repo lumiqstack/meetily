@@ -883,13 +883,15 @@ mod tests {
 
     const IDLE_LIMIT: Duration = Duration::from_millis(500);
 
-    /// Serves one GGUF body with its full Content-Length up front, writing each
-    /// piece after its delay, so the body spans the sum of the delays.
-    async fn serve_drip(pieces: Vec<(Duration, &'static [u8])>) -> String {
+    /// Answers one request with `head` followed by each piece after its delay,
+    /// and yields the raw request it received.
+    async fn serve(
+        head: String,
+        pieces: Vec<(Duration, &'static [u8])>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let length: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut buffer = [0u8; 1024];
@@ -898,15 +900,23 @@ mod tests {
                 assert_ne!(read, 0, "request ended before its headers");
                 request.extend_from_slice(&buffer[..read]);
             }
-            let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
-            let _ = socket.write_all(headers.as_bytes()).await;
+            let _ = socket.write_all(head.as_bytes()).await;
             for (delay, piece) in pieces {
                 tokio::time::sleep(delay).await;
                 let _ = socket.write_all(piece).await;
                 let _ = socket.flush().await;
             }
+            String::from_utf8_lossy(&request).to_string()
         });
-        format!("http://{address}/model.gguf")
+        (format!("http://{address}/model.gguf"), handle)
+    }
+
+    /// Serves one GGUF body with its full Content-Length up front, writing each
+    /// piece after its delay, so the body spans the sum of the delays.
+    async fn serve_drip(pieces: Vec<(Duration, &'static [u8])>) -> String {
+        let length: usize = pieces.iter().map(|(_, piece)| piece.len()).sum();
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+        serve(head, pieces).await.0
     }
 
     fn test_model(download_url: String) -> ModelDef {
@@ -951,5 +961,63 @@ mod tests {
             .await
             .expect_err("a stream that stalls past the idle limit must fail");
         assert!(error.to_string().contains("stalled"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn partial_part_file_is_not_reported_available() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let model = get_available_models().into_iter().next().unwrap();
+        let part_path = models_dir.path().join(format!("{}.part", model.gguf_file));
+        let mut part = std::fs::File::create(&part_path).unwrap();
+        std::io::Write::write_all(&mut part, b"GGUF").unwrap();
+        part.set_len(model.size_mb * 1024 * 1024 * 95 / 100).unwrap();
+
+        manager.scan_models().await.unwrap();
+
+        let status = manager.get_model_info(&model.name).await.unwrap().status;
+        assert_ne!(status, ModelStatus::Available);
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_stays_incomplete_and_resumes_on_retry() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let final_path = models_dir.path().join("resume-test.gguf");
+
+        let (url, _) = serve(
+            "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n".to_string(),
+            vec![
+                (Duration::ZERO, b"GGUF-partial"),
+                (Duration::from_millis(1500), b"-the-end"),
+            ],
+        )
+        .await;
+        let mut model = test_model(url);
+        model.gguf_file = "resume-test.gguf".to_string();
+        // Small enough that the 12 bytes on disk fall inside the size tolerance.
+        model.size_mb = 1;
+        manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect_err("a stalled download must fail");
+        assert!(
+            !final_path.exists(),
+            "an interrupted download must not leave a file under the final model name"
+        );
+
+        let (url, request) = serve(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
+            vec![(Duration::ZERO, b"-the-end")],
+        )
+        .await;
+        model.download_url = url;
+        manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect("retry must resume the partial download");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("range: bytes=12-"), "retry did not resume: {request}");
+        assert_eq!(fs::read(&final_path).await.unwrap(), b"GGUF-partial-the-end");
     }
 }
