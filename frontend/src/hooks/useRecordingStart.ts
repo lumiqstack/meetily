@@ -8,6 +8,7 @@ import { recordingService } from '@/services/recordingService';
 import { configService } from '@/services/configService';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
+import { isAlreadyRecordingError } from '@/lib/recording-error';
 import {
   getProviderCommands,
   hasDownloadingModel,
@@ -224,7 +225,7 @@ export function useRecordingStart(
       // the running recording's state. The winning start is live, so reflect
       // RECORDING here — leaving STARTING latched would keep the Stop button
       // disabled forever, since it's gated on isStartingRecording.
-      if (errorMsg.includes('already in progress')) {
+      if (isAlreadyRecordingError(errorMsg)) {
         console.warn('Start rejected because recording is already active - leaving live recording state untouched');
         setStatus(RecordingStatus.RECORDING);
         Analytics.trackButtonClick('start_recording_error', 'home_page');
@@ -294,7 +295,7 @@ export function useRecordingStart(
           } catch (error) {
             console.error('Failed to auto-start recording:', error);
             const errorMsg = error instanceof Error ? error.message : String(error);
-            if (errorMsg.includes('already in progress')) {
+            if (isAlreadyRecordingError(errorMsg)) {
               // Benign race — another start won and is live; skip ERROR/alert.
               setStatus(RecordingStatus.RECORDING);
             } else {
@@ -373,7 +374,7 @@ export function useRecordingStart(
       } catch (error) {
         console.error('Failed to start recording from sidebar:', error);
         const errorMsg = error instanceof Error ? error.message : String(error);
-        if (errorMsg.includes('already in progress')) {
+        if (isAlreadyRecordingError(errorMsg)) {
           // Benign race — another start won and is live; skip ERROR/alert.
           setStatus(RecordingStatus.RECORDING);
         } else {
