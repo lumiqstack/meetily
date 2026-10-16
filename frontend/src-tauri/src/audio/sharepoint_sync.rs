@@ -101,14 +101,22 @@ pub(crate) fn build_recordings_query_url(
     )
 }
 
-/// OData `datetime'…'` literals require a full ISO timestamp. Persisted sync
-/// state can carry a bare date (`2026-07-27`), which SharePoint rejects with
-/// InvalidClientQueryException — widen it to midnight UTC.
+/// OData v3 `datetime'…'` literals take a full timestamp with no offset and
+/// no more than .NET's 7 fractional digits; SharePoint rejects anything else
+/// with InvalidClientQueryException. Persisted sync state can carry a bare
+/// date (`2026-07-27`) and the scheduled scan passes `to_rfc3339()` output
+/// (`…:33.123456789+00:00`, whose raw `+` also decodes to a space in the
+/// query string), so normalise both to whole seconds in UTC.
 fn odata_datetime(since_iso: &str) -> String {
     if !since_iso.contains('T') {
-        format!("{since_iso}T00:00:00Z")
-    } else {
-        since_iso.to_string()
+        return format!("{since_iso}T00:00:00Z");
+    }
+    match chrono::DateTime::parse_from_rfc3339(since_iso) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+        Err(_) => since_iso.to_string(),
     }
 }
 
