@@ -15,7 +15,11 @@ const invoke = mock((command: string, args: Record<string, unknown>) => new Prom
 }));
 mock.module('@tauri-apps/api/core', () => ({ ...originalCore, invoke }));
 const { usePaginatedTranscripts } = await import('../../src/hooks/usePaginatedTranscripts');
-afterAll(() => mock.module('@tauri-apps/api/core', () => originalCore));
+// Block body on purpose: returning mock.module's result from a hook (bun 1.4.2) makes
+// later files' mock.module('@tauri-apps/api/core') calls silently ignored.
+afterAll(() => {
+  mock.module('@tauri-apps/api/core', () => originalCore);
+});
 
 let state: ReturnType<typeof usePaginatedTranscripts>;
 let renderer: ReactTestRenderer | undefined;
