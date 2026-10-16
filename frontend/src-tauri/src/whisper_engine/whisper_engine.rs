@@ -1955,4 +1955,32 @@ mod tests {
             "She had had enough"
         );
     }
+
+    #[tokio::test]
+    async fn switching_models_unloads_the_current_one_without_deadlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WhisperEngine::new_with_models_dir(Some(dir.path().to_path_buf())).unwrap();
+
+        *engine.current_model.write().await = Some("a".to_string());
+        engine.available_models.write().await.insert(
+            "b".to_string(),
+            ModelInfo {
+                name: "b".to_string(),
+                path: dir.path().join("ggml-b.bin"),
+                size_mb: 1,
+                accuracy: "Basic".to_string(),
+                speed: "Fast".to_string(),
+                status: ModelStatus::Available,
+                description: "test model".to_string(),
+            },
+        );
+
+        let result = timeout(Duration::from_secs(2), engine.load_model("b"))
+            .await
+            .expect("load_model must not deadlock while switching models");
+
+        assert!(result.is_err(), "model file is missing, so loading must fail");
+        assert_eq!(engine.get_current_model().await, None);
+        assert!(!engine.is_model_loaded().await);
+    }
 }
