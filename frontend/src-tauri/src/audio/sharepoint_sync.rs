@@ -149,6 +149,7 @@ pub(crate) fn build_search_query_url(root_host: &str, since_iso: &str) -> String
 fn encode_server_relative_path(path: &str) -> String {
     path.chars()
         .map(|c| match c {
+            '%' => "%25".to_string(),
             ' ' => "%20".to_string(),
             '\'' => "%27".to_string(),
             '#' => "%23".to_string(),
@@ -197,7 +198,7 @@ pub(crate) fn parse_onedrive_files(
             });
             Some(SharePointRecording {
                 stream_url: stream_url_for(my_host, &rel),
-                file_url: format!("https://{my_host}{rel}"),
+                file_url: format!("https://{my_host}{}", encode_server_relative_path(&rel)),
                 name,
                 created,
                 size_bytes,
