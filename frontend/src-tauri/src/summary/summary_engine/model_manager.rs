@@ -1042,4 +1042,66 @@ mod tests {
         assert!(request.contains("range: bytes=12-"), "retry did not resume: {request}");
         assert_eq!(fs::read(&final_path).await.unwrap(), b"GGUF-partial-the-end");
     }
+
+    #[tokio::test]
+    async fn failed_download_start_does_not_block_retry() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+        let model = test_model("http://127.0.0.1:1/model.gguf".to_string());
+
+        let first = manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect_err("an unreachable server must fail the download");
+        assert!(
+            !first.to_string().contains("already in progress"),
+            "unexpected error: {first}"
+        );
+
+        let second = manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect_err("an unreachable server must fail the download");
+        assert!(
+            !second.to_string().contains("already in progress"),
+            "retry was blocked by the failed attempt: {second}"
+        );
+        assert!(matches!(
+            manager.get_model_info(&model.name).await.unwrap().status,
+            ModelStatus::Error(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_download_is_marked_failed_and_can_be_retried() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+        let (url, _) = serve(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            vec![],
+        )
+        .await;
+        let mut model = test_model(url);
+
+        manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect_err("a 404 must fail the download");
+        assert!(matches!(
+            manager.get_model_info(&model.name).await.unwrap().status,
+            ModelStatus::Error(_)
+        ));
+
+        model.download_url = "http://127.0.0.1:1/model.gguf".to_string();
+        let retry = manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect_err("an unreachable server must fail the download");
+        assert!(
+            !retry.to_string().contains("already in progress"),
+            "retry was blocked by the failed attempt: {retry}"
+        );
+    }
 }
