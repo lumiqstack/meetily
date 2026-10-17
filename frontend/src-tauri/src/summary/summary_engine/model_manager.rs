@@ -405,6 +405,9 @@ impl ModelManager {
         }
 
         let file_path = self.models_dir.join(&model_def.gguf_file);
+        // Bytes land here and only move to `file_path` once the whole body has arrived,
+        // so a file under the final name is always a finished download.
+        let part_path = self.models_dir.join(format!("{}.part", model_def.gguf_file));
 
         // Check if model already exists and is valid (skip re-download)
         if file_path.exists() {
@@ -454,21 +457,18 @@ impl ModelManager {
                         log::warn!("Failed to delete oversized model file: {}", e);
                     }
                 } else {
-                    // File is SMALLER than expected - likely partial download
-                    // DON'T DELETE - let resume logic handle it
                     log::info!(
-                        "Model '{}' exists but is incomplete ({} MB, expected min {} MB), will resume download",
+                        "Model '{}' exists but is too small ({} MB, expected min {} MB), will replace it",
                         model_name,
                         file_size_mb,
                         expected_min
                     );
-                    // Continue to download/resume logic below
                 }
             }
         }
 
         log::info!("Downloading from: {}", model_def.download_url);
-        log::info!("Saving to: {}", file_path.display());
+        log::info!("Saving to: {}", part_path.display());
 
         // Create models directory if needed
         if !self.models_dir.exists() {
@@ -476,8 +476,8 @@ impl ModelManager {
         }
 
         // Check for existing partial download to resume
-        let existing_size: u64 = if file_path.exists() {
-            fs::metadata(&file_path)
+        let existing_size: u64 = if part_path.exists() {
+            fs::metadata(&part_path)
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0)
@@ -543,11 +543,11 @@ impl ModelManager {
             OpenOptions::new()
                 .write(true)
                 .append(true)
-                .open(&file_path)
+                .open(&part_path)
                 .await
                 .map_err(|e| anyhow!("Failed to open file for append: {}", e))?
         } else {
-            fs::File::create(&file_path)
+            fs::File::create(&part_path)
                 .await
                 .map_err(|e| anyhow!("Failed to create file: {}", e))?
         };
@@ -739,6 +739,21 @@ impl ModelManager {
         writer.flush().await?;
         drop(writer);
 
+        if total_size > 0 && downloaded != total_size {
+            let message = format!(
+                "Download incomplete - received {} of {} bytes",
+                downloaded, total_size
+            );
+            log::warn!("{} ({})", message, model_name);
+            let mut active = self.active_downloads.write().await;
+            active.remove(model_name);
+            let mut models = self.available_models.write().await;
+            if let Some(model_info) = models.get_mut(model_name) {
+                model_info.status = ModelStatus::Error(message.clone());
+            }
+            return Err(anyhow!(message));
+        }
+
         log::info!("Download completed for model: {}", model_name);
 
         {
@@ -755,11 +770,11 @@ impl ModelManager {
         // Small delay to ensure UI receives 100% event
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        if let Err(e) = self.validate_gguf_file(&file_path).await {
+        if let Err(e) = self.validate_gguf_file(&part_path).await {
             log::error!("Downloaded file failed validation: {}", e);
 
             // Clean up invalid file
-            let _ = fs::remove_file(&file_path).await;
+            let _ = fs::remove_file(&part_path).await;
 
             // Update status
             {
@@ -775,6 +790,10 @@ impl ModelManager {
 
             return Err(anyhow!("File validation failed: {}", e));
         }
+
+        fs::rename(&part_path, &file_path)
+            .await
+            .map_err(|e| anyhow!("Failed to move downloaded model into place: {}", e))?;
 
         // Update status to available
         {
@@ -852,10 +871,13 @@ impl ModelManager {
             .ok_or_else(|| anyhow!("Unknown model: {}", model_name))?;
 
         let file_path = self.models_dir.join(&model_def.gguf_file);
+        let part_path = self.models_dir.join(format!("{}.part", model_def.gguf_file));
 
-        if file_path.exists() {
-            fs::remove_file(&file_path).await?;
-            log::info!("Deleted model file: {}", file_path.display());
+        for path in [&file_path, &part_path] {
+            if path.exists() {
+                fs::remove_file(path).await?;
+                log::info!("Deleted model file: {}", path.display());
+            }
         }
 
         // Update status
