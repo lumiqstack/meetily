@@ -19,7 +19,8 @@ export interface TranscriptionErrorPayload {
   error: string;
   userMessage: string;
   actionable: boolean;
-  phase: 'startup' | 'active';
+  /** 'active' ends the recording in the UI. Gemini Live omits it: losing the live session keeps the recording running. */
+  phase?: 'startup' | 'active';
 }
 
 export interface ModelDownloadCompletePayload {

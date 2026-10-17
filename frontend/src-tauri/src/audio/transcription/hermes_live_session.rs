@@ -739,11 +739,13 @@ fn emit_error<R: Runtime>(app: &AppHandle<R>, message: &str) {
     let _ = app.emit("transcription-error", error_payload(message));
 }
 
+/// No `phase`: "active" makes the UI end the recording, but a lost live
+/// session leaves the recording running and re-transcribable afterwards.
 fn error_payload(message: &str) -> serde_json::Value {
     serde_json::json!({
         "error": message,
         "userMessage": message,
-        "actionable": true,
+        "actionable": false,
     })
 }
 
