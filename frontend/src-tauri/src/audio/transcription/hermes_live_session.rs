@@ -736,19 +736,33 @@ fn emit_warning<R: Runtime>(app: &AppHandle<R>, message: &str) {
 }
 
 fn emit_error<R: Runtime>(app: &AppHandle<R>, message: &str) {
-    let _ = app.emit(
-        "transcription-error",
-        serde_json::json!({
-            "error": message,
-            "userMessage": message,
-            "actionable": true,
-        }),
-    );
+    let _ = app.emit("transcription-error", error_payload(message));
+}
+
+fn error_payload(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": message,
+        "userMessage": message,
+        "actionable": true,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- transcription-error payload ---------------------------------------
+
+    #[test]
+    fn error_payload_is_a_toast_that_keeps_the_recording() {
+        // `actionable` opens the local model picker (useModalState.ts) and
+        // `phase: "active"` ends the recording in the UI (RecordingControls.tsx);
+        // a lost live session needs neither: the recording keeps saving.
+        let payload = error_payload("Live transcription disconnected: timeout");
+        assert_eq!(payload["actionable"], false);
+        assert_ne!(payload["phase"], "active");
+        assert_eq!(payload["userMessage"], "Live transcription disconnected: timeout");
+    }
 
     // ---- timeline ledger --------------------------------------------------
 
