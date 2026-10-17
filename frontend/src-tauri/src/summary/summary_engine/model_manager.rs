@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, Result};
 use reqwest::Client;
@@ -111,6 +111,36 @@ pub struct ModelInfo {
 // Model Manager
 // ============================================================================
 
+/// A model's entry in `active_downloads`, removed on drop so that every way out of a
+/// download, `?` included, frees the model for a retry.
+struct ActiveDownload {
+    downloads: Arc<Mutex<HashSet<String>>>,
+    model_name: String,
+}
+
+impl ActiveDownload {
+    /// Returns `None` when a download of `model_name` is already running.
+    fn claim(downloads: &Arc<Mutex<HashSet<String>>>, model_name: &str) -> Option<Self> {
+        let inserted = downloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(model_name.to_string());
+        inserted.then(|| Self {
+            downloads: Arc::clone(downloads),
+            model_name: model_name.to_string(),
+        })
+    }
+}
+
+impl Drop for ActiveDownload {
+    fn drop(&mut self) {
+        self.downloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.model_name);
+    }
+}
+
 pub struct ModelManager {
     /// Directory where models are stored
     models_dir: PathBuf,
@@ -119,7 +149,7 @@ pub struct ModelManager {
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
 
     /// Active downloads (model names)
-    active_downloads: Arc<RwLock<HashSet<String>>>,
+    active_downloads: Arc<Mutex<HashSet<String>>>,
 
     /// Cancellation flag for current download
     cancel_download_flag: Arc<RwLock<Option<String>>>,
@@ -163,7 +193,7 @@ impl ModelManager {
         Ok(Self {
             models_dir,
             available_models: Arc::new(RwLock::new(HashMap::new())),
-            active_downloads: Arc::new(RwLock::new(HashSet::new())),
+            active_downloads: Arc::new(Mutex::new(HashSet::new())),
             cancel_download_flag: Arc::new(RwLock::new(None)),
         })
     }
@@ -202,10 +232,11 @@ impl ModelManager {
                 model_path.display()
             );
 
-            let is_actively_downloading = {
-                let active = self.active_downloads.read().await;
-                active.contains(&model_def.name)
-            };
+            let is_actively_downloading = self
+                .active_downloads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&model_def.name);
 
             // If actively downloading, preserve existing status from memory
             if is_actively_downloading {
@@ -375,20 +406,36 @@ impl ModelManager {
         let model_name = model_def.name.as_str();
         log::info!("Starting download for model: {}", model_name);
 
-        // Check if already downloading
-        {
-            let active = self.active_downloads.read().await;
-            if active.contains(model_name) {
-                log::warn!("Download already in progress for model: {}", model_name);
-                return Err(anyhow!("Download already in progress"));
+        let Some(_active) = ActiveDownload::claim(&self.active_downloads, model_name) else {
+            log::warn!("Download already in progress for model: {}", model_name);
+            return Err(anyhow!("Download already in progress"));
+        };
+
+        let result = self
+            .download_claimed_model(model_def, progress_callback, idle_timeout)
+            .await;
+
+        if let Err(e) = &result {
+            let mut models = self.available_models.write().await;
+            if let Some(model_info) = models.get_mut(model_name) {
+                // Failures that already set a status (cancel, friendlier error text) keep it.
+                if matches!(model_info.status, ModelStatus::Downloading { .. }) {
+                    model_info.status = ModelStatus::Error(e.to_string());
+                }
             }
         }
 
-        // Add to active downloads
-        {
-            let mut active = self.active_downloads.write().await;
-            active.insert(model_name.to_string());
-        }
+        result
+    }
+
+    /// Body of `download_model_def`, run while the caller holds the model's `ActiveDownload`.
+    async fn download_claimed_model(
+        &self,
+        model_def: &ModelDef,
+        progress_callback: Option<Box<dyn Fn(DownloadProgress) + Send>>,
+        idle_timeout: Duration,
+    ) -> Result<()> {
+        let model_name = model_def.name.as_str();
 
         // Clear cancellation flag
         {
@@ -429,12 +476,6 @@ impl ModelManager {
                         if let Some(model_info) = models.get_mut(model_name) {
                             model_info.status = ModelStatus::Available;
                         }
-                    }
-
-                    // Remove from active downloads
-                    {
-                        let mut active = self.active_downloads.write().await;
-                        active.remove(model_name);
                     }
 
                     // Report 100% progress
@@ -506,14 +547,7 @@ impl ModelManager {
 
         let response = match timeout(idle_timeout, request.send()).await {
             Err(_) => {
-                let mut active = self.active_downloads.write().await;
-                active.remove(model_name);
-                let message = format!("Download stalled - No response for {:?}", idle_timeout);
-                let mut models = self.available_models.write().await;
-                if let Some(model_info) = models.get_mut(model_name) {
-                    model_info.status = ModelStatus::Error(message.clone());
-                }
-                return Err(anyhow!(message));
+                return Err(anyhow!("Download stalled - No response for {:?}", idle_timeout));
             }
             Ok(response) => response.map_err(|e| anyhow!("Failed to start download: {}", e))?,
         };
@@ -531,8 +565,6 @@ impl ModelManager {
             }
             (response.content_length().unwrap_or(0), false)
         } else {
-            let mut active = self.active_downloads.write().await;
-            active.remove(model_name);
             return Err(anyhow!("Download failed with status: {}", response.status()));
         };
 
@@ -591,10 +623,6 @@ impl ModelManager {
                     let _ = writer.flush().await;
                     drop(writer);
 
-                    // Remove from active downloads
-                    let mut active = self.active_downloads.write().await;
-                    active.remove(model_name);
-
                     // Update status
                     {
                         let mut models = self.available_models.write().await;
@@ -617,19 +645,6 @@ impl ModelManager {
                     let message = format!("Download stalled - No data received for {:?}", idle_timeout);
                     log::warn!("{} ({})", message, model_name);
                     let _ = writer.flush().await;
-
-                    // Cleanup: Remove from active downloads
-                    let mut active = self.active_downloads.write().await;
-                    active.remove(model_name);
-
-                    // Set model status to Error (NOT NotDownloaded) so UI can show retry button
-                    {
-                        let mut models = self.available_models.write().await;
-                        if let Some(model_info) = models.get_mut(model_name) {
-                            model_info.status = ModelStatus::Error(message.clone());
-                        }
-                    }
-
                     return Err(anyhow!(message));
                 },
                 // Stream ended
@@ -642,10 +657,6 @@ impl ModelManager {
                         Err(e) => {
                             log::error!("Download error for {}: {:?}", model_name, e);
                             let _ = writer.flush().await;
-
-                            // Cleanup: Remove from active downloads
-                            let mut active = self.active_downloads.write().await;
-                            active.remove(model_name);
 
                             // Categorize error for user-friendly message
                             let error_msg = if e.is_timeout() {
@@ -745,12 +756,6 @@ impl ModelManager {
                 downloaded, total_size
             );
             log::warn!("{} ({})", message, model_name);
-            let mut active = self.active_downloads.write().await;
-            active.remove(model_name);
-            let mut models = self.available_models.write().await;
-            if let Some(model_info) = models.get_mut(model_name) {
-                model_info.status = ModelStatus::Error(message.clone());
-            }
             return Err(anyhow!(message));
         }
 
@@ -776,18 +781,6 @@ impl ModelManager {
             // Clean up invalid file
             let _ = fs::remove_file(&part_path).await;
 
-            // Update status
-            {
-                let mut models = self.available_models.write().await;
-                if let Some(model_info) = models.get_mut(model_name) {
-                    model_info.status = ModelStatus::Error(format!("Validation failed: {}", e));
-                }
-            }
-
-            // Remove from active downloads
-            let mut active = self.active_downloads.write().await;
-            active.remove(model_name);
-
             return Err(anyhow!("File validation failed: {}", e));
         }
 
@@ -802,12 +795,6 @@ impl ModelManager {
                 model_info.status = ModelStatus::Available;
                 model_info.path = file_path.clone();
             }
-        }
-
-        // Remove from active downloads
-        {
-            let mut active = self.active_downloads.write().await;
-            active.remove(model_name);
         }
 
         Ok(())
