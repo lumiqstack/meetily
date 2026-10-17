@@ -185,6 +185,18 @@ pub async fn wake_audio_connection_for_swap(speaker_device_name: &str) -> Result
     }).await.map_err(|e| anyhow::anyhow!("Join error: {}", e))?
 }
 
+/// Values the stop command reports after `stop_streams_and_force_flush`,
+/// which wipes the live state they come from.
+struct StoppedSnapshot {
+    total_duration: Option<f64>,
+    active_duration: Option<f64>,
+    pause_duration: f64,
+    had_fatal_error: bool,
+    stats: super::recording_state::RecordingStats,
+    microphone_name: Option<String>,
+    system_name: Option<String>,
+}
+
 /// Simplified recording manager that coordinates all audio components
 pub struct RecordingManager {
     state: Arc<RecordingState>,
@@ -193,6 +205,7 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    stopped: Option<StoppedSnapshot>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -213,6 +226,7 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            stopped: None,
         }
     }
 
@@ -386,6 +400,19 @@ impl RecordingManager {
             monitor.stop_monitoring().await;
         }
 
+        // Taken before stop_recording, which ends any open pause and clears
+        // the devices, and before cleanup, which clears everything else.
+        self.stopped = Some(StoppedSnapshot {
+            total_duration: self.state.get_recording_duration(),
+            active_duration: self.state.get_active_recording_duration(),
+            pause_duration: self.state.get_total_pause_duration()
+                + self.state.get_current_pause_duration().unwrap_or(0.0),
+            had_fatal_error: self.state.has_fatal_error(),
+            stats: self.state.get_stats(),
+            microphone_name: self.state.get_microphone_device().map(|d| d.name.clone()),
+            system_name: self.state.get_system_device().map(|d| d.name.clone()),
+        });
+
         // Stop recording state first - this clears device references
         self.state.stop_recording();
 
@@ -412,9 +439,8 @@ impl RecordingManager {
     pub async fn save_recording_only<R: tauri::Runtime>(&mut self, app: &tauri::AppHandle<R>) -> Result<()> {
         debug!("Saving recording with transcript chunks");
 
-        // Get actual recording duration from state
-        let recording_duration = self.state.get_active_recording_duration();
-        info!("Recording duration from state: {:?}s", recording_duration);
+        let recording_duration = self.get_active_recording_duration();
+        info!("Recording duration: {:?}s", recording_duration);
 
         // Save the recording with actual duration. Failures are returned so
         // the stop command can tell the user; it still completes shutdown.
@@ -510,22 +536,45 @@ impl RecordingManager {
 
     /// Get recording statistics
     pub fn get_stats(&self) -> super::recording_state::RecordingStats {
-        self.state.get_stats()
+        match &self.stopped {
+            Some(s) => s.stats.clone(),
+            None => self.state.get_stats(),
+        }
     }
 
     /// Get recording duration
     pub fn get_recording_duration(&self) -> Option<f64> {
-        self.state.get_recording_duration()
+        match &self.stopped {
+            Some(s) => s.total_duration,
+            None => self.state.get_recording_duration(),
+        }
     }
 
     /// Get active recording duration (excluding pauses)
     pub fn get_active_recording_duration(&self) -> Option<f64> {
-        self.state.get_active_recording_duration()
+        match &self.stopped {
+            Some(s) => s.active_duration,
+            None => self.state.get_active_recording_duration(),
+        }
     }
 
     /// Get total pause duration
     pub fn get_total_pause_duration(&self) -> f64 {
-        self.state.get_total_pause_duration()
+        match &self.stopped {
+            Some(s) => s.pause_duration,
+            None => self.state.get_total_pause_duration(),
+        }
+    }
+
+    /// Microphone and system device names
+    pub fn get_device_names(&self) -> (Option<String>, Option<String>) {
+        match &self.stopped {
+            Some(s) => (s.microphone_name.clone(), s.system_name.clone()),
+            None => (
+                self.state.get_microphone_device().map(|d| d.name.clone()),
+                self.state.get_system_device().map(|d| d.name.clone()),
+            ),
+        }
     }
 
     /// Get current pause duration if paused
@@ -553,7 +602,10 @@ impl RecordingManager {
 
     /// Check if there's a fatal error
     pub fn has_fatal_error(&self) -> bool {
-        self.state.has_fatal_error()
+        match &self.stopped {
+            Some(s) => s.had_fatal_error,
+            None => self.state.has_fatal_error(),
+        }
     }
 
     /// Set the meeting name for this recording session
@@ -704,6 +756,10 @@ mod stop_tests {
     async fn duration_survives_stop_streams_and_force_flush() {
         let mut manager = RecordingManager::new();
         manager.state.start_recording().unwrap();
+        manager.state.set_microphone_device(Arc::new(AudioDevice::new(
+            "Test Mic".to_string(),
+            super::super::devices::DeviceType::Input,
+        )));
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(manager.get_active_recording_duration().is_some());
 
@@ -713,5 +769,6 @@ mod stop_tests {
         assert!(matches!(active, Some(d) if d >= 0.03), "active duration after stop: {:?}", active);
         let total = manager.get_recording_duration();
         assert!(matches!(total, Some(d) if d >= 0.03), "total duration after stop: {:?}", total);
+        assert_eq!(manager.get_device_names(), (Some("Test Mic".to_string()), None));
     }
 }
