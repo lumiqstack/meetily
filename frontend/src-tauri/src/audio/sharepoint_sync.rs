@@ -1537,6 +1537,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn percent_sign_in_a_file_name_is_escaped() {
+        let path = "/personal/u/Documents/Recordings/Q3 100% Review.mp4";
+        assert_eq!(
+            stream_url_for("t-my.sharepoint.com", path),
+            "https://t-my.sharepoint.com/_layouts/15/stream.aspx?id=/personal/u/Documents/Recordings/Q3%20100%25%20Review.mp4"
+        );
+        let json = serde_json::json!({"value":[{
+            "Name":"Q3 100% Review.mp4",
+            "ServerRelativeUrl": path,
+            "TimeCreated":"2026-07-10T15:00:00Z",
+            "Length": 1
+        }]});
+        let recs = parse_onedrive_files(&json, "t-my.sharepoint.com");
+        assert_eq!(
+            recs[0].file_url,
+            "https://t-my.sharepoint.com/personal/u/Documents/Recordings/Q3%20100%25%20Review.mp4"
+        );
+        assert_eq!(
+            percent_decode_component(direct_sharepoint_media_url(&recs[0].file_url).unwrap().path()),
+            path
+        );
+    }
+
     fn fixture_files(dir: &str) -> Vec<(String, serde_json::Value)> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/sharepoint")
