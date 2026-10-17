@@ -51,18 +51,15 @@ impl<R: Runtime> MeetingDetectionManager<R> {
     }
 
     pub async fn start(&self) {
-        {
-            let cancellation = self.cancellation.read().await;
+        let token = {
+            let mut cancellation = self.cancellation.write().await;
             if cancellation.is_some() {
                 return;
             }
-        }
-
-        let token = CancellationToken::new();
-        {
-            let mut cancellation = self.cancellation.write().await;
+            let token = CancellationToken::new();
             *cancellation = Some(token.clone());
-        }
+            token
+        };
 
         {
             let mut status = self.status.write().await;
@@ -73,7 +70,6 @@ impl<R: Runtime> MeetingDetectionManager<R> {
         let app_handle = self.app_handle.clone();
         let settings = Arc::clone(&self.settings);
         let status = Arc::clone(&self.status);
-        let cancellation = Arc::clone(&self.cancellation);
 
         tauri::async_runtime::spawn(async move {
             info!("Starting Teams meeting detection task");
@@ -84,10 +80,10 @@ impl<R: Runtime> MeetingDetectionManager<R> {
 
             loop {
                 tokio::select! {
+                    // stop() owns the slot and `running`; a restart may already have
+                    // replaced both by the time this task sees its cancel.
                     _ = token.cancelled() => {
                         info!("Teams meeting detection task stopped");
-                        let mut status = status.write().await;
-                        status.running = false;
                         break;
                     }
                     _ = interval.tick() => {
@@ -125,7 +121,6 @@ impl<R: Runtime> MeetingDetectionManager<R> {
                         {
                             let mut status = status.write().await;
                             status.settings = current_settings.clone();
-                            status.running = true;
                             status.teams_running = sample.teams_running;
                             status.teams_audio_active = sample.teams_audio_active;
                             status.confidence = sample.confidence();
@@ -164,17 +159,11 @@ impl<R: Runtime> MeetingDetectionManager<R> {
                     }
                 }
             }
-
-            let mut cancellation = cancellation.write().await;
-            *cancellation = None;
         });
     }
 
     pub async fn stop(&self) {
-        let token = {
-            let cancellation = self.cancellation.read().await;
-            cancellation.clone()
-        };
+        let token = self.cancellation.write().await.take();
 
         if let Some(token) = token {
             token.cancel();
