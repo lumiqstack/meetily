@@ -661,6 +661,15 @@ async fn persist_retranscription<R: Runtime>(
     segments: Vec<crate::api::TranscriptSegment>,
     language: Option<String>,
 ) -> Result<RetranscriptionResult> {
+    // Both callers drop empty-text segments, so an empty list means speech was
+    // found but nothing was transcribed (e.g. wrong-language model). Replacing
+    // the existing transcript with nothing would be silent data loss.
+    if segments.is_empty() {
+        return Err(anyhow!(
+            "Retranscription produced no text; the existing transcript was kept. Try a different model or language."
+        ));
+    }
+
     emit_progress(app, meeting_id, "saving", 80, "Saving transcripts...");
 
     // Save to database
