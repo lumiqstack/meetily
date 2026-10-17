@@ -57,9 +57,8 @@ impl<R: Runtime> NotificationManager<R> {
 
         // Try to request system permission if not already granted
         if !self.consent_manager.has_system_permission().await {
-            match self.system_handler.request_permission().await {
+            match self.request_permission().await {
                 Ok(granted) => {
-                    self.consent_manager.set_system_permission(granted).await?;
                     if granted {
                         log_info!("System notification permission granted");
                     } else {
