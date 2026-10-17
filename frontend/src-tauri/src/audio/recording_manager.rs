@@ -692,3 +692,26 @@ mod wake_tests {
         assert!(wake_audio_connection_sync("__no_such_device__").is_err());
     }
 }
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// The stop command reads duration (for metadata.json and analytics)
+    /// only after `stop_streams_and_force_flush` has returned, so the values
+    /// must survive that call.
+    #[tokio::test]
+    async fn duration_survives_stop_streams_and_force_flush() {
+        let mut manager = RecordingManager::new();
+        manager.state.start_recording().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(manager.get_active_recording_duration().is_some());
+
+        manager.stop_streams_and_force_flush().await.unwrap();
+
+        let active = manager.get_active_recording_duration();
+        assert!(matches!(active, Some(d) if d >= 0.03), "active duration after stop: {:?}", active);
+        let total = manager.get_recording_duration();
+        assert!(matches!(total, Some(d) if d >= 0.03), "total duration after stop: {:?}", total);
+    }
+}
