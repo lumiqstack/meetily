@@ -1,4 +1,12 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+
+const originalCore = { ...(await import("@tauri-apps/api/core")) };
+const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+afterAll(() => {
+  mock.module("@tauri-apps/api/core", () => originalCore);
+  if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+  else delete globalThis.window;
+});
 
 const invokeMock = mock(async () => null);
 
