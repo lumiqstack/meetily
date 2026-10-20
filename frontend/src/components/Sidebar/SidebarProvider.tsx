@@ -8,6 +8,7 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
 import type { MeetingStages } from './meetingStages';
 import { useTauriEvent } from '@/hooks/useTauriEvent';
+import { errorMessage } from '@/lib/utils';
 
 
 
@@ -114,7 +115,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       } catch (error) {
         console.error('Error fetching meetings:', error);
         setMeetings([]);
-        Analytics.trackBackendConnection(false, error instanceof Error ? error.message : 'Unknown error');
+        Analytics.trackBackendConnection(false, errorMessage(error));
       }
     }
   }, [serverAddress]);
@@ -282,7 +283,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         } catch (error) {
           if (summaryPollsRef.current.get(meetingId) !== entry) return;
           consecutiveReadFailures += 1;
-          const detail = error instanceof Error ? error.message : 'Unknown error';
+          const detail = errorMessage(error);
           if (consecutiveReadFailures < MAX_CONSECUTIVE_SUMMARY_READ_FAILURES) {
             console.warn(
               `Summary status read failed (${consecutiveReadFailures}/${MAX_CONSECUTIVE_SUMMARY_READ_FAILURES}); retrying:`,
@@ -304,7 +305,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           await onUpdate(result);
         } catch (error) {
           if (summaryPollsRef.current.get(meetingId) !== entry) return;
-          await reportPollingError(entry, error instanceof Error ? error.message : 'Unknown error');
+          await reportPollingError(entry, errorMessage(error));
           return;
         }
         if (summaryPollsRef.current.get(meetingId) !== entry) return;

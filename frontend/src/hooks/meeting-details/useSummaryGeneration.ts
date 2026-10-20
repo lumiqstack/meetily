@@ -20,6 +20,7 @@ import {
   readCachedDetectedSummaryLanguage,
 } from '@/lib/summary-language-preferences';
 import { parseSummaryContent, readSummaryMetadata } from '@/lib/summary-content';
+import { errorMessage } from '@/lib/utils';
 
 async function resolveSummaryLanguage(
   meetingId: string,
@@ -390,7 +391,7 @@ export function useSummaryGeneration({
       startSummaryPolling(meeting.id, processId, result =>
         pollingResultRef.current(result, generationId, isRegeneration));
     } catch (error) {
-      await failGeneration(generationId, isRegeneration, error instanceof Error ? error.message : 'Summary generation failed.');
+      await failGeneration(generationId, isRegeneration, errorMessage(error, 'Summary generation failed.'));
     }
   }, [
     failGeneration,

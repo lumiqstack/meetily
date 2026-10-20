@@ -24,6 +24,15 @@ export interface RecordingErrorDeps {
   finishStop: () => void | Promise<void>;
 }
 
+/**
+ * True when start_recording was refused because another start already won
+ * (StartingGuard::acquire in audio/recording_commands.rs). The winning start
+ * owns the recording state, so the loser must not show a failure.
+ */
+export function isAlreadyRecordingError(message: string): boolean {
+  return message.includes('already in progress') || message.includes('already starting');
+}
+
 export type RecordingErrorOutcome = 'ignored' | 'stopped' | 'stop-failed';
 
 export async function handleRecordingError(

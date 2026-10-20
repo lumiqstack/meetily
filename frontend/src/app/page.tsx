@@ -20,6 +20,7 @@ import { TranscriptRecovery } from '@/components/TranscriptRecovery';
 import { indexedDBService } from '@/services/indexedDBService';
 import { toast } from 'sonner';
 import { useRouter } from 'next/navigation';
+import { errorMessage } from '@/lib/utils';
 
 export default function Home() {
   // Local page state (not moved to contexts)
@@ -168,7 +169,7 @@ export default function Home() {
       }
     } catch (error) {
       toast.error('Failed to recover meeting', {
-        description: error instanceof Error ? error.message : 'Unknown error occurred',
+        description: errorMessage(error, 'Unknown error occurred'),
       });
       throw error;
     }

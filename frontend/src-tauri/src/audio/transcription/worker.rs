@@ -102,7 +102,8 @@ pub fn start_transcription_task<R: Runtime>(
                     let _ = app.emit("transcription-error", serde_json::json!({
                         "error": e,
                         "userMessage": format!("Live transcription is not configured: {}", e),
-                        "actionable": true
+                        "actionable": false,
+                        "phase": "startup"
                     }));
                     return;
                 }
