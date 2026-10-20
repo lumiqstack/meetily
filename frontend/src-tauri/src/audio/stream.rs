@@ -6,7 +6,7 @@ use log::{error, info, warn};
 use tokio::sync::mpsc;
 
 use super::devices::{AudioDevice, get_device_and_config};
-use super::pipeline::AudioCapture;
+use super::pipeline::{AudioCapture, CaptureTiming};
 use super::recording_state::{RecordingState, DeviceType};
 use super::capture::{AudioCaptureBackend, get_current_backend};
 
@@ -246,8 +246,8 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        capture.process_audio_data(data);
+                    move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                        capture.process_audio_data_at(data, Some(CaptureTiming::from_cpal(info)));
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -259,11 +259,11 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    move |data: &[i16], info: &cpal::InputCallbackInfo| {
                         let f32_data: Vec<f32> = data.iter()
                             .map(|&sample| sample as f32 / i16::MAX as f32)
                             .collect();
-                        capture.process_audio_data(&f32_data);
+                        capture.process_audio_data_at(&f32_data, Some(CaptureTiming::from_cpal(info)));
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -275,11 +275,11 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    move |data: &[i32], info: &cpal::InputCallbackInfo| {
                         let f32_data: Vec<f32> = data.iter()
                             .map(|&sample| sample as f32 / i32::MAX as f32)
                             .collect();
-                        capture.process_audio_data(&f32_data);
+                        capture.process_audio_data_at(&f32_data, Some(CaptureTiming::from_cpal(info)));
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -291,11 +291,11 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[i8], _: &cpal::InputCallbackInfo| {
+                    move |data: &[i8], info: &cpal::InputCallbackInfo| {
                         let f32_data: Vec<f32> = data.iter()
                             .map(|&sample| sample as f32 / i8::MAX as f32)
                             .collect();
-                        capture.process_audio_data(&f32_data);
+                        capture.process_audio_data_at(&f32_data, Some(CaptureTiming::from_cpal(info)));
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);

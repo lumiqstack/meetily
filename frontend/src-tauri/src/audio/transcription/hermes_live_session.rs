@@ -866,6 +866,7 @@ mod tests {
     #[test]
     fn chunks_already_at_16k_are_not_resampled() {
         let chunk = AudioChunk {
+            capture_gap: None,
             data: vec![0.0; 1600],
             sample_rate: LIVE_SAMPLE_RATE,
             timestamp: 2.0,
@@ -882,6 +883,7 @@ mod tests {
     #[test]
     fn chunks_are_resampled_down_to_16k() {
         let chunk = AudioChunk {
+            capture_gap: None,
             data: vec![0.0; 4800], // 100ms at 48kHz
             sample_rate: 48000,
             timestamp: 0.0,

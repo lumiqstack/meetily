@@ -336,6 +336,7 @@ mod tests {
 
     fn chunk(samples: usize, id: u64) -> AudioChunk {
         AudioChunk {
+            capture_gap: None,
             data: vec![0.25f32; samples],
             sample_rate: 48000,
             timestamp: id as f64 * 0.5,

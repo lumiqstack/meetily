@@ -20,8 +20,17 @@ pub struct AudioChunk {
     /// (drives Me/Others speaker labels). None for raw capture, recording,
     /// and flush chunks — and when neither source clearly dominated.
     pub dominant_source: Option<DeviceType>,
+    /// Raw capture chunks only: seconds of audio the device did not deliver
+    /// between the previous callback and this one (WASAPI loopback sends no
+    /// packets while nothing plays). `None` on a capture's first callback,
+    /// where there is no previous one, and on every non-capture chunk. The
+    /// mixer pads the gap with silence so both streams stay time-aligned.
+    pub capture_gap: Option<f64>,
     pub data: Vec<f32>,
     pub sample_rate: u32,
+    /// Raw capture chunks: capture time of the chunk's last sample, in
+    /// seconds since recording start. Other chunks: their position in the
+    /// recording.
     pub timestamp: f64,
     pub chunk_id: u64,
     pub device_type: DeviceType,

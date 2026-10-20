@@ -679,6 +679,7 @@ mod drain_tests {
 
     fn chunk(id: u64) -> AudioChunk {
         AudioChunk {
+            capture_gap: None,
             data: vec![0.0; 480],
             sample_rate: 48000,
             timestamp: id as f64 * 0.01,
