@@ -596,6 +596,28 @@ mod open_failure_tests {
         drop(writer);
     }
 
+    /// `fs::copy` creates the destination before it reads anything, so a copy
+    /// that fails partway (disk full, I/O error) used to leave a partial
+    /// `.sqlite` that the next launch opened and reported as damaged.
+    /// Reading `/proc/self/mem` at offset 0 fails with EIO after that point.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_legacy_copy_leaves_no_partial_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_db = dir.path().join("meeting_minutes.db");
+        std::os::unix::fs::symlink("/proc/self/mem", &legacy_db).unwrap();
+
+        assert!(DatabaseManager::open_in_dir(dir.path()).await.is_err());
+
+        let mut left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["meeting_minutes.db"]);
+        assert_eq!(fs::read_link(&legacy_db).unwrap(), Path::new("/proc/self/mem"));
+    }
+
     /// H6-F2: a legacy backend DB (backend/app/db.py `_legacy_init_db`) already
     /// has `meetings.folder_path`; migration 20251006000000 then runs
     /// `ALTER TABLE meetings ADD COLUMN folder_path` and fails.
