@@ -101,6 +101,11 @@ impl DatabaseManager {
     /// committed meetings that were never checkpointed into the main file, so
     /// deleting or moving it is never a safe automatic "recovery".
     pub(crate) async fn open_in_dir(app_data_dir: &Path) -> Result<Self> {
+        if let Some(message) = crate::storage::migrate::unfinished_database_move(app_data_dir) {
+            log::error!("{}", message);
+            return Err(sqlx::Error::Configuration(message.into()));
+        }
+
         let tauri_db_path = app_data_dir
             .join("meeting_minutes.sqlite")
             .to_string_lossy()

@@ -31,6 +31,13 @@ pub(super) const STATE_FILE: &str = ".migration-state.json";
 /// finished once all of them are recorded as done.
 const STEPS: [&str; 7] = ["bin", "sp-webview", "models", "config", "logs", "recordings", "db"];
 
+/// One SQLite database: the main file first, then the files beside it.
+const DB_SET: [&str; 3] = [
+    "meeting_minutes.sqlite",
+    "meeting_minutes.sqlite-wal",
+    "meeting_minutes.sqlite-shm",
+];
+
 /// Settings files that lived in `dirs::config_dir()/meetily` before they moved
 /// under the data root.
 const CONFIG_FILES: [&str; 2] = ["notifications.json", "meeting_detection.json"];
@@ -366,6 +373,36 @@ pub(super) fn unfinished_move(legacy: &Path, current: &Path) -> Option<String> {
     })
 }
 
+/// Why the database in `root` must not be opened yet, or `None` when it may be.
+///
+/// Until the move records its `db` step, whatever sits at `root` is missing,
+/// partial or a leftover, and the real database is still at the source. Opening
+/// it would show an empty or damaged library, and creating one there would be
+/// overwritten by the next attempt.
+pub(crate) fn unfinished_database_move(root: &Path) -> Option<String> {
+    if !root.join(STATE_FILE).exists() {
+        return None;
+    }
+    let state = load_state(root);
+    if state.done("db") {
+        return None;
+    }
+    let from = state
+        .source
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "its previous location".into());
+    Some(format!(
+        "Meetily has not finished moving its database from {} to {}, so it will not open \
+         the database at the new location yet. Your meetings are still in {}. Restart \
+         Meetily to retry the move; if it keeps failing, make sure {} is writable and has \
+         enough free space.",
+        from,
+        root.display(),
+        from,
+        root.display()
+    ))
+}
 
 /// Forget a finished move so later launches do not run it again.
 fn clear_previous_root(legacy: &Path) -> Result<()> {
@@ -774,17 +811,70 @@ fn rewrite_stored_recordings_folder(legacy: &Path, new_root: &Path) -> Result<()
     Ok(())
 }
 
-fn migrate_database(legacy: &Path, root: &Path, report: &mut MigrationReport) -> Result<()> {
-    for name in [
-        "meeting_minutes.sqlite",
-        "meeting_minutes.sqlite-wal",
-        "meeting_minutes.sqlite-shm",
-        "meeting_minutes.db",
-    ] {
-        let src = legacy.join(name);
-        if src.exists() {
-            move_file(&src, &root.join(name), report)?;
+fn migrate_database(source: &Path, root: &Path, report: &mut MigrationReport) -> Result<()> {
+    // move_database_set removes the main file first, so its absence means an
+    // earlier run already put the whole set in place.
+    if source.join(DB_SET[0]).exists() {
+        move_database_set(source, root, report)?;
+    }
+    move_file(
+        &source.join("meeting_minutes.db"),
+        &root.join("meeting_minutes.db"),
+        report,
+    )
+}
+
+/// Move the SQLite set all-or-nothing: copy every file to a temporary name,
+/// rename them all into place, and only then remove the originals. A main file
+/// without its WAL is missing recent meetings, and a WAL beside a different
+/// main file gets replayed into it, so on any failure nothing is left at `root`
+/// and the set stays whole at `source`.
+fn move_database_set(source: &Path, root: &Path, report: &mut MigrationReport) -> Result<()> {
+    let staged = |name: &str| root.join(format!("{name}.migrating"));
+    let present: Vec<&str> = DB_SET.into_iter().filter(|n| source.join(n).exists()).collect();
+    let mut placed = Vec::new();
+
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(root)?;
+        for name in &present {
+            let (src, tmp) = (source.join(name), staged(name));
+            std::fs::copy(&src, &tmp)
+                .with_context(|| format!("copying {} -> {}", src.display(), tmp.display()))?;
+            if !verify(&src, &tmp)? {
+                return Err(anyhow!("verification failed for {} -> {}", src.display(), tmp.display()));
+            }
         }
+        for name in DB_SET {
+            let dst = root.join(name);
+            if present.contains(&name) {
+                std::fs::rename(staged(name), &dst)
+                    .with_context(|| format!("placing {}", dst.display()))?;
+                placed.push(dst);
+            } else if dst.exists() {
+                // Left by an earlier move; SQLite would replay it into this database.
+                std::fs::remove_file(&dst)
+                    .with_context(|| format!("removing stale {}", dst.display()))?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        for name in DB_SET {
+            let _ = std::fs::remove_file(staged(name));
+        }
+        for dst in &placed {
+            let _ = std::fs::remove_file(dst);
+        }
+        return Err(e);
+    }
+
+    for name in &present {
+        let src = source.join(name);
+        let len = std::fs::metadata(root.join(name))?.len();
+        std::fs::remove_file(&src).with_context(|| format!("removing {}", src.display()))?;
+        report.files_moved += 1;
+        report.bytes_moved += len;
     }
     Ok(())
 }
@@ -886,8 +976,10 @@ fn move_file(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
         return Ok(());
     }
 
-    std::fs::copy(src, dst)
-        .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
+    if let Err(e) = std::fs::copy(src, dst) {
+        let _ = std::fs::remove_file(dst);
+        return Err(e).with_context(|| format!("copying {} -> {}", src.display(), dst.display()));
+    }
 
     if !verify(src, dst)? {
         let _ = std::fs::remove_file(dst);
