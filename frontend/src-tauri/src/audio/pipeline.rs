@@ -2071,6 +2071,47 @@ mod tests {
         AudioCapture::new(device, state.clone(), sample_rate, 1, DeviceType::System, None)
     }
 
+    /// Feed `input_len` samples through `capture` in 1024-sample callbacks and
+    /// return how many samples reached the pipeline and at what rate.
+    fn captured_output(
+        capture: &AudioCapture,
+        rx: &mut mpsc::UnboundedReceiver<AudioChunk>,
+        input_len: usize,
+    ) -> (usize, u32) {
+        for _ in 0..input_len / 1024 {
+            capture.process_audio_data(&vec![0.1f32; 1024]);
+        }
+        let (mut total, mut rate) = (0usize, 0u32);
+        while let Ok(chunk) = rx.try_recv() {
+            total += chunk.data.len();
+            rate = chunk.sample_rate;
+        }
+        (total, rate)
+    }
+
+    /// Core Audio's nominal rate changes mid-recording (Bluetooth headset
+    /// switching to HFP). The capture must resample from the new rate, or
+    /// system audio plays at the wrong pitch and drifts against the mic.
+    #[test]
+    fn input_rate_change_retunes_resampler() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AudioChunk>();
+        state.set_audio_sender(tx);
+
+        let mut capture = system_capture(&state, 48_000);
+        capture.set_input_sample_rate(16_000);
+        // About one second at 16 kHz must come out as about one second at 48 kHz.
+        let (total, rate) = captured_output(&capture, &mut rx, 16_384);
+        assert_eq!(rate, 48_000);
+        assert!((45_000..=50_000).contains(&total), "16 kHz second resampled to {} samples", total);
+
+        capture.set_input_sample_rate(48_000);
+        let (total, rate) = captured_output(&capture, &mut rx, 48_128);
+        assert_eq!(rate, 48_000);
+        assert_eq!(total, 48_128, "48 kHz input must pass through unresampled");
+    }
+
     /// A capture stream that ends while still recording must be reported,
     /// not left to pad system audio with silence for the rest of the meeting.
     #[test]
