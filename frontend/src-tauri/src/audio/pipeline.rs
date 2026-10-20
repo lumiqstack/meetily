@@ -1474,10 +1474,6 @@ impl AudioPipelineManager {
         }
     }
 
-    /// Drop the sender and wait for the pipeline to drain and flush.
-    pub async fn force_flush_and_stop(&mut self) -> Result<()> {
-        self.stop().await
-    }
 }
 
 impl Default for AudioPipelineManager {
