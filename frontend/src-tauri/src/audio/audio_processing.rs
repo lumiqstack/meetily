@@ -848,4 +848,59 @@ mod tests {
         let name = folder.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.len() <= 200, "folder name is {} bytes", name.len());
     }
+
+    const SR: u32 = 48_000;
+
+    /// Deterministic white noise scaled so its integrated EBU R128 loudness is `lufs`.
+    fn noise_at_lufs(lufs: f64, seconds: usize) -> Vec<f32> {
+        let mut state: u32 = 0x1234_5678;
+        let mut samples: Vec<f32> = (0..SR as usize * seconds)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect();
+        let mut meter = ebur128::EbuR128::new(1, SR, ebur128::Mode::I).unwrap();
+        meter.add_frames_f32(&samples).unwrap();
+        let measured = meter.loudness_global().unwrap();
+        let scale = 10_f32.powf((lufs - measured) as f32 / 20.0);
+        for s in samples.iter_mut() {
+            *s *= scale;
+        }
+        samples
+    }
+
+    fn gain_db_after(input: &[f32]) -> f32 {
+        let mut normalizer = LoudnessNormalizer::new(1, SR).unwrap();
+        // Feed in callback-sized pieces, as the capture path does.
+        let mut buf = input.to_vec();
+        for chunk in buf.chunks_mut(480) {
+            normalizer.normalize_in_place(chunk);
+        }
+        20.0 * normalizer.gain_linear.log10()
+    }
+
+    #[test]
+    fn mic_noise_floor_is_not_amplified() {
+        let gain_db = gain_db_after(&noise_at_lufs(-58.0, 5));
+        assert!(gain_db <= 0.01, "room noise at -58 LUFS got {:.1} dB of gain", gain_db);
+    }
+
+    #[test]
+    fn quiet_speech_gain_is_capped() {
+        let gain_db = gain_db_after(&noise_at_lufs(-40.0, 5));
+        assert!(gain_db > 11.5 && gain_db <= 12.01, "-40 LUFS got {:.1} dB, want the +12 dB cap", gain_db);
+    }
+
+    #[test]
+    fn moderate_speech_is_raised_to_target_within_cap() {
+        let gain_db = gain_db_after(&noise_at_lufs(-30.0, 5));
+        assert!((gain_db - 7.0).abs() < 0.5, "-30 LUFS got {:.1} dB, want ~+7 dB", gain_db);
+    }
+
+    #[test]
+    fn loud_content_still_converges_to_target() {
+        let gain_db = gain_db_after(&noise_at_lufs(-20.0, 5));
+        assert!((gain_db + 3.0).abs() < 0.5, "-20 LUFS got {:.1} dB, want ~-3 dB", gain_db);
+    }
 }
