@@ -244,6 +244,8 @@ impl LoudnessNormalizer {
         }
 
         const TARGET_LUFS: f64 = -23.0;
+        const MAX_GAIN_DB: f64 = 12.0;
+        const NOISE_FLOOR_LUFS: f64 = -50.0;
         const ANALYZE_CHUNK_SIZE: usize = 512;
         // `loudness_global()` integrates the whole gated histogram. The gain it
         // produces is a slow-moving normalization target, so recomputing it on
@@ -266,8 +268,16 @@ impl LoudnessNormalizer {
 
                         // Update gain based on cumulative loudness
                         if let Ok(current_lufs) = self.ebur128.loudness_global() {
-                            if current_lufs.is_finite() && current_lufs < 0.0 {
-                                let gain_db = TARGET_LUFS - current_lufs;
+                            // Below the noise floor there is nothing to
+                            // normalise: the absolute gate only drops audio
+                            // under -70 LUFS, so a muted mic's room noise
+                            // would otherwise get +30 dB or more.
+                            if current_lufs.is_finite()
+                                && current_lufs < 0.0
+                                && current_lufs >= NOISE_FLOOR_LUFS
+                            {
+                                let gain_db = (TARGET_LUFS - current_lufs)
+                                    .clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
                                 self.gain_linear = 10_f32.powf(gain_db as f32 / 20.0);
                             }
                         }
