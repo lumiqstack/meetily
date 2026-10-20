@@ -659,6 +659,61 @@ mod tests {
         );
     }
 
+    /// Header of a 16-bit mono PCM WAV whose data chunk declares `data_len` bytes.
+    fn wav_header(sample_rate: u32, data_len: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&(36 + data_len).to_le_bytes());
+        h.extend_from_slice(b"WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        h.extend_from_slice(&1u16.to_le_bytes()); // mono
+        h.extend_from_slice(&sample_rate.to_le_bytes());
+        h.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        h.extend_from_slice(&2u16.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&data_len.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn truncated_file_is_an_error_not_a_short_decode() {
+        // The header promises 10 s but only 3 s of samples were written, as with
+        // a recording cut off mid-write. A short Ok here let retranscription
+        // replace the full transcript with one covering only the first 3 s.
+        let rate = 8000u32;
+        let mut bytes = wav_header(rate, rate * 2 * 10);
+        bytes.extend(std::iter::repeat([0x00u8, 0x10]).take((rate * 3) as usize).flatten());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.wav");
+        std::fs::write(&path, &bytes).unwrap();
+
+        match decode_audio_file(&path) {
+            Err(_) => {}
+            Ok(decoded) => panic!(
+                "truncated file decoded as Ok with {:.2}s of a declared 10s",
+                decoded.duration_seconds
+            ),
+        }
+    }
+
+    #[test]
+    fn chained_ogg_decodes_every_link() {
+        // Two 3 s Ogg FLAC streams concatenated. Symphonia signals the second
+        // link with ResetRequired, which used to be treated as end of file.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chained_ogg_flac_8k_2x3s.ogg");
+        let decoded = decode_audio_file(&path).expect("failed to decode chained Ogg");
+
+        assert!(
+            (decoded.duration_seconds - 6.0).abs() < 0.1,
+            "expected both 3s links (~6s), got {:.2}s",
+            decoded.duration_seconds
+        );
+    }
+
     #[test]
     fn test_to_whisper_format_mono_16k() {
         // Already in correct format
