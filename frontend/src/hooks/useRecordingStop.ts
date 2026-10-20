@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -86,66 +87,44 @@ export function useRecordingStop(
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
 
   // Set up recording-stopped listener for meeting navigation
-  useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
+  useTauriEvent<{
+    message: string;
+    folder_path?: string;
+    meeting_name?: string;
+    audio_save_enabled?: boolean;
+    realtime_transcription_enabled?: boolean;
+    audio_save_error?: string | null;
+  }>('recording-stopped', (payload) => {
+    // Create promise that resolves when sessionStorage is set (prevents race condition)
+    recordingStoppedDataRef.current = (async () => {
+      const { folder_path, meeting_name } = payload;
 
-    const setupRecordingStoppedListener = async () => {
-      try {
-        console.log('Setting up recording-stopped listener for navigation...');
-        unlistenFn = await listen<{
-          message: string;
-          folder_path?: string;
-          meeting_name?: string;
-          audio_save_enabled?: boolean;
-          realtime_transcription_enabled?: boolean;
-          audio_save_error?: string | null;
-        }>('recording-stopped', async (event) => {
-          // Create promise that resolves when sessionStorage is set (prevents race condition)
-          recordingStoppedDataRef.current = (async () => {
-            const { folder_path, meeting_name } = event.payload;
-
-            // Store folder_path and meeting_name for later use in handleRecordingStop
-            if (folder_path) {
-              sessionStorage.setItem('last_recording_folder_path', folder_path);
-            }
-            if (meeting_name) {
-              sessionStorage.setItem('last_recording_meeting_name', meeting_name);
-            }
-            sessionStorage.setItem(
-              'last_recording_realtime_transcription_enabled',
-              String(!!event.payload.realtime_transcription_enabled)
-            );
-            sessionStorage.setItem(
-              'last_recording_audio_save_enabled',
-              String(!!event.payload.audio_save_enabled)
-            );
-            if (event.payload.audio_save_error) {
-              sessionStorage.setItem('last_recording_audio_save_error', event.payload.audio_save_error);
-              toast.warning('Recording audio was not fully saved', {
-                description: event.payload.audio_save_error,
-                duration: 15000,
-              });
-            } else {
-              sessionStorage.removeItem('last_recording_audio_save_error');
-            }
-          })();
-
+      // Store folder_path and meeting_name for later use in handleRecordingStop
+      if (folder_path) {
+        sessionStorage.setItem('last_recording_folder_path', folder_path);
+      }
+      if (meeting_name) {
+        sessionStorage.setItem('last_recording_meeting_name', meeting_name);
+      }
+      sessionStorage.setItem(
+        'last_recording_realtime_transcription_enabled',
+        String(!!payload.realtime_transcription_enabled)
+      );
+      sessionStorage.setItem(
+        'last_recording_audio_save_enabled',
+        String(!!payload.audio_save_enabled)
+      );
+      if (payload.audio_save_error) {
+        sessionStorage.setItem('last_recording_audio_save_error', payload.audio_save_error);
+        toast.warning('Recording audio was not fully saved', {
+          description: payload.audio_save_error,
+          duration: 15000,
         });
-        console.log('Recording stopped listener setup complete');
-      } catch (error) {
-        console.error('Failed to setup recording stopped listener:', error);
+      } else {
+        sessionStorage.removeItem('last_recording_audio_save_error');
       }
-    };
-
-    setupRecordingStoppedListener();
-
-    return () => {
-      console.log('Cleaning up recording stopped listener...');
-      if (unlistenFn) {
-        unlistenFn();
-      }
-    };
-  }, [router]);
+    })();
+  });
 
   // Main recording stop handler
   const handleRecordingStop = useCallback(async (isCallApi: boolean) => {
