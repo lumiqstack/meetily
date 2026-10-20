@@ -454,6 +454,47 @@ mod tests {
         assert_eq!(resolve(legacy.path()), legacy.path());
     }
 
+    /// An unmounted drive behind the configured root must not look like a fresh
+    /// install: onboarding would start a new database at the fallback, and its
+    /// meetings vanish once the drive is back.
+    #[test]
+    fn uncreatable_root_is_reported_and_is_not_a_first_launch() {
+        let legacy = tempdir().unwrap();
+        let blocker = legacy.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let unusable = blocker.join("root");
+        write_pointer(
+            legacy.path(),
+            &Pointer {
+                data_root: Some(unusable.clone()),
+                previous_root: None,
+            },
+        )
+        .unwrap();
+
+        let resolved = resolve(legacy.path());
+
+        assert_eq!(resolved.root, legacy.path());
+        assert_eq!(resolved.unavailable.as_deref(), Some(unusable.as_path()));
+        assert!(!crate::database::manager::DatabaseManager::is_first_launch_in(
+            &resolved.root,
+            resolved.unavailable.as_deref()
+        ));
+    }
+
+    #[test]
+    fn missing_database_without_a_configured_root_is_a_first_launch() {
+        let legacy = tempdir().unwrap();
+
+        let resolved = resolve(legacy.path());
+
+        assert!(resolved.unavailable.is_none());
+        assert!(crate::database::manager::DatabaseManager::is_first_launch_in(
+            &resolved.root,
+            resolved.unavailable.as_deref()
+        ));
+    }
+
     #[test]
     fn set_root_writes_a_readable_pointer() {
         let legacy = tempdir().unwrap();
