@@ -2,7 +2,8 @@
 // Follows the same pattern as whisper_engine/whisper_engine.rs for consistency
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::{BufReader, Read, Seek};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, Result};
@@ -19,6 +20,203 @@ use super::models::{get_available_models, get_model_by_name, ModelDef};
 /// Longest silence from the server (awaiting headers or between body chunks)
 /// before a download is treated as stalled.
 const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ============================================================================
+// GGUF header
+// ============================================================================
+
+/// Limits that keep a garbage header from driving huge loops or allocations.
+const GGUF_MAX_ENTRIES: u64 = 1 << 20;
+const GGUF_MAX_ARRAY_LEN: u64 = 1 << 24;
+const GGUF_MAX_KEY_LEN: u64 = 1 << 16;
+const GGUF_MAX_DIMS: u32 = 4;
+
+const GGUF_TYPE_UINT32: u32 = 4;
+const GGUF_TYPE_STRING: u32 = 8;
+const GGUF_TYPE_ARRAY: u32 = 9;
+
+fn read_u32(reader: &mut impl Read) -> std::io::Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(reader: &mut impl Read) -> std::io::Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn skip_bytes<R: Read + Seek>(reader: &mut BufReader<R>, count: u64) -> Result<()> {
+    let count =
+        i64::try_from(count).map_err(|_| anyhow!("GGUF field length {} out of range", count))?;
+    reader.seek_relative(count)?;
+    Ok(())
+}
+
+/// Byte size of a fixed-size GGUF metadata value type.
+fn gguf_scalar_size(value_type: u32) -> Option<u64> {
+    match value_type {
+        0 | 1 | 7 => Some(1),    // uint8, int8, bool
+        2 | 3 => Some(2),        // uint16, int16
+        4 | 5 | 6 => Some(4),    // uint32, int32, float32
+        10 | 11 | 12 => Some(8), // uint64, int64, float64
+        _ => None,
+    }
+}
+
+/// Skips one metadata value. Returns `false` for a value type this parser does not know.
+fn skip_gguf_value<R: Read + Seek>(reader: &mut BufReader<R>, value_type: u32) -> Result<bool> {
+    if let Some(size) = gguf_scalar_size(value_type) {
+        skip_bytes(reader, size)?;
+        return Ok(true);
+    }
+    match value_type {
+        GGUF_TYPE_STRING => {
+            let len = read_u64(reader)?;
+            skip_bytes(reader, len)?;
+        }
+        GGUF_TYPE_ARRAY => {
+            let element_type = read_u32(reader)?;
+            let count = read_u64(reader)?;
+            if count > GGUF_MAX_ARRAY_LEN {
+                return Err(anyhow!("implausible GGUF array length {}", count));
+            }
+            if let Some(size) = gguf_scalar_size(element_type) {
+                skip_bytes(reader, count * size)?;
+            } else if element_type == GGUF_TYPE_STRING {
+                for _ in 0..count {
+                    let len = read_u64(reader)?;
+                    skip_bytes(reader, len)?;
+                }
+            } else {
+                return Ok(false);
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// (bytes per block, elements per block) of a ggml tensor type.
+fn ggml_type_size(ggml_type: u32) -> Option<(u64, u64)> {
+    Some(match ggml_type {
+        0 => (4, 1),      // F32
+        1 => (2, 1),      // F16
+        2 => (18, 32),    // Q4_0
+        3 => (20, 32),    // Q4_1
+        6 => (22, 32),    // Q5_0
+        7 => (24, 32),    // Q5_1
+        8 => (34, 32),    // Q8_0
+        9 => (36, 32),    // Q8_1
+        10 => (84, 256),  // Q2_K
+        11 => (110, 256), // Q3_K
+        12 => (144, 256), // Q4_K
+        13 => (176, 256), // Q5_K
+        14 => (210, 256), // Q6_K
+        15 => (292, 256), // Q8_K
+        16 => (66, 256),  // IQ2_XXS
+        17 => (74, 256),  // IQ2_XS
+        18 => (98, 256),  // IQ3_XXS
+        19 => (50, 256),  // IQ1_S
+        20 => (18, 32),   // IQ4_NL
+        21 => (110, 256), // IQ3_S
+        22 => (82, 256),  // IQ2_S
+        23 => (136, 256), // IQ4_XS
+        24 => (1, 1),     // I8
+        25 => (2, 1),     // I16
+        26 => (4, 1),     // I32
+        27 => (8, 1),     // I64
+        28 => (8, 1),     // F64
+        29 => (56, 256),  // IQ1_M
+        30 => (2, 1),     // BF16
+        34 => (54, 256),  // TQ1_0
+        35 => (66, 256),  // TQ2_0
+        _ => return None,
+    })
+}
+
+/// Size a GGUF file must have to hold all the tensor data its header declares, read
+/// from the header alone. `Ok(None)` means the header uses a version or type this
+/// parser does not know, so the file cannot be checked this way; `Err` means the
+/// header is malformed or cut short.
+///
+/// The end of the last tensor is not rounded up to the alignment: llama.cpp only
+/// requires each tensor to lie within the file, and not every writer pads the tail.
+fn gguf_expected_size(path: &Path) -> Result<Option<u64>> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"GGUF" {
+        return Err(anyhow!("not a GGUF file"));
+    }
+    if !(2..=3).contains(&read_u32(&mut reader)?) {
+        return Ok(None);
+    }
+    let n_tensors = read_u64(&mut reader)?;
+    let n_kv = read_u64(&mut reader)?;
+    if n_tensors > GGUF_MAX_ENTRIES || n_kv > GGUF_MAX_ENTRIES {
+        return Err(anyhow!(
+            "implausible GGUF header: {} tensors, {} metadata entries",
+            n_tensors,
+            n_kv
+        ));
+    }
+
+    let mut alignment: u64 = 32;
+    for _ in 0..n_kv {
+        let key_len = read_u64(&mut reader)?;
+        if key_len > GGUF_MAX_KEY_LEN {
+            return Err(anyhow!("implausible GGUF key length {}", key_len));
+        }
+        let mut key = vec![0u8; key_len as usize];
+        reader.read_exact(&mut key)?;
+        let value_type = read_u32(&mut reader)?;
+        if key == b"general.alignment" && value_type == GGUF_TYPE_UINT32 {
+            alignment = u64::from(read_u32(&mut reader)?);
+        } else if !skip_gguf_value(&mut reader, value_type)? {
+            return Ok(None);
+        }
+    }
+    if !alignment.is_power_of_two() {
+        return Err(anyhow!("invalid GGUF alignment {}", alignment));
+    }
+
+    let overflow = || anyhow!("GGUF tensor size overflows");
+    let mut data_len: u64 = 0;
+    for _ in 0..n_tensors {
+        let name_len = read_u64(&mut reader)?;
+        skip_bytes(&mut reader, name_len)?;
+        let n_dims = read_u32(&mut reader)?;
+        if n_dims > GGUF_MAX_DIMS {
+            return Err(anyhow!("invalid GGUF tensor rank {}", n_dims));
+        }
+        let mut n_elements: u64 = 1;
+        for _ in 0..n_dims {
+            n_elements = n_elements
+                .checked_mul(read_u64(&mut reader)?)
+                .ok_or_else(overflow)?;
+        }
+        let ggml_type = read_u32(&mut reader)?;
+        let offset = read_u64(&mut reader)?;
+        let Some((type_size, block_size)) = ggml_type_size(ggml_type) else {
+            return Ok(None);
+        };
+        let tensor_end = n_elements
+            .div_ceil(block_size)
+            .checked_mul(type_size)
+            .and_then(|size| offset.checked_add(size))
+            .ok_or_else(overflow)?;
+        data_len = data_len.max(tensor_end);
+    }
+
+    let header_len = reader.stream_position()?;
+    let data_offset = header_len.div_ceil(alignment) * alignment;
+    data_offset
+        .checked_add(data_len)
+        .map(Some)
+        .ok_or_else(overflow)
+}
 
 // ============================================================================
 // Model Status Types
@@ -274,9 +472,22 @@ impl ModelManager {
                             expected_max
                         );
 
-                        if file_size_mb >= expected_min && file_size_mb <= expected_max {
+                        let validation =
+                            if file_size_mb >= expected_min && file_size_mb <= expected_max {
+                                Some(self.validate_gguf_file(&model_path).await)
+                            } else {
+                                None
+                            };
+
+                        if let Some(Ok(())) = validation {
                             log::info!("Model '{}': AVAILABLE", model_def.name);
                             ModelStatus::Available
+                        } else if let Some(Err(e)) = validation {
+                            log::warn!("Model '{}': CORRUPTED ({})", model_def.name, e);
+                            ModelStatus::Corrupted {
+                                file_size: file_size_mb,
+                                expected_min_size: expected_min,
+                            }
                         } else {
                             log::warn!(
                                 "Model '{}': CORRUPTED (size mismatch: {} MB, expected {} MB)",
@@ -462,8 +673,9 @@ impl ModelManager {
                 let file_size_mb = metadata.len() / (1024 * 1024);
                 let expected_min = (model_def.size_mb as f64 * 0.9) as u64;
                 let expected_max = (model_def.size_mb as f64 * 1.1) as u64;
+                let in_size_range = file_size_mb >= expected_min && file_size_mb <= expected_max;
 
-                if file_size_mb >= expected_min && file_size_mb <= expected_max {
+                if in_size_range && self.validate_gguf_file(&file_path).await.is_ok() {
                     log::info!(
                         "Model '{}' already exists and is valid ({} MB), skipping download",
                         model_name,
@@ -499,7 +711,7 @@ impl ModelManager {
                     }
                 } else {
                     log::info!(
-                        "Model '{}' exists but is too small ({} MB, expected min {} MB), will replace it",
+                        "Model '{}' exists but is incomplete ({} MB, expected min {} MB), will replace it",
                         model_name,
                         file_size_mb,
                         expected_min
@@ -848,7 +1060,19 @@ impl ModelManager {
 
         // GGUF magic number is "GGUF" (0x47475546)
         if &magic == b"GGUF" {
-            Ok(())
+            let file_len = file.metadata().await?.len();
+            let header_path = path.clone();
+            let expected = tokio::task::spawn_blocking(move || gguf_expected_size(&header_path))
+                .await?
+                .map_err(|e| anyhow!("Unreadable GGUF header: {}", e))?;
+            match expected {
+                Some(expected) if file_len < expected => Err(anyhow!(
+                    "Incomplete model file: {} of {} bytes",
+                    file_len,
+                    expected
+                )),
+                _ => Ok(()),
+            }
         } else if &magic == b"ggjt" || &magic == b"ggla" || &magic == b"ggml" {
             // Older formats (GGML, GGJT)
             Ok(())
@@ -1046,6 +1270,7 @@ mod tests {
         let full_len = header.len() as u64 + 1024 * 4;
 
         write_gguf(&path, &header, full_len);
+        assert_eq!(gguf_expected_size(&path).unwrap(), Some(full_len));
         manager
             .validate_gguf_file(&path)
             .await
@@ -1087,6 +1312,7 @@ mod tests {
         let header = gguf_header(9999, f32_elements_filling(model.size_mb));
         write_gguf(&path, &header, model.size_mb * 1024 * 1024 - 100);
 
+        assert_eq!(gguf_expected_size(&path).unwrap(), None);
         manager.validate_gguf_file(&path).await.unwrap();
         assert!(manager.is_model_ready(&model.name, true).await);
     }
