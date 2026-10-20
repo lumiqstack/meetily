@@ -997,6 +997,123 @@ mod tests {
         model
     }
 
+    const GGML_TYPE_F32: u32 = 0;
+
+    /// A GGUF v3 header with a string and an alignment entry and one tensor of
+    /// `ggml_type` with `elements` elements, padded to the 32-byte alignment.
+    fn gguf_header(ggml_type: u32, elements: u64) -> Vec<u8> {
+        fn string(out: &mut Vec<u8>, value: &str) {
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = b"GGUF".to_vec();
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&2u64.to_le_bytes());
+        string(&mut out, "general.name");
+        out.extend_from_slice(&8u32.to_le_bytes());
+        string(&mut out, "synthetic");
+        string(&mut out, "general.alignment");
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&32u32.to_le_bytes());
+        string(&mut out, "weights");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&elements.to_le_bytes());
+        out.extend_from_slice(&ggml_type.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.resize(out.len().div_ceil(32) * 32, 0);
+        out
+    }
+
+    /// Writes `header` followed by (sparse) zeroed tensor data, `len` bytes in all.
+    fn write_gguf(path: &std::path::Path, header: &[u8], len: u64) {
+        std::fs::write(path, header).unwrap();
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(len).unwrap();
+    }
+
+    /// Element count of one F32 tensor that brings a GGUF file to exactly `size_mb` MiB.
+    fn f32_elements_filling(size_mb: u64) -> u64 {
+        let header_len = gguf_header(GGML_TYPE_F32, 0).len() as u64;
+        (size_mb * 1024 * 1024 - header_len) / 4
+    }
+
+    #[tokio::test]
+    async fn gguf_validation_rejects_file_shorter_than_its_tensor_data() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let path = models_dir.path().join("tiny.gguf");
+        let header = gguf_header(GGML_TYPE_F32, 1024);
+        let full_len = header.len() as u64 + 1024 * 4;
+
+        write_gguf(&path, &header, full_len);
+        manager
+            .validate_gguf_file(&path)
+            .await
+            .expect("a GGUF file holding all its tensor data must validate");
+
+        write_gguf(&path, &header, full_len - 100);
+        manager
+            .validate_gguf_file(&path)
+            .await
+            .expect_err("a GGUF file missing tensor data must not validate");
+    }
+
+    #[tokio::test]
+    async fn truncated_final_model_within_size_tolerance_is_not_available() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let model = get_available_models().into_iter().next().unwrap();
+        let path = models_dir.path().join(&model.gguf_file);
+        let header = gguf_header(GGML_TYPE_F32, f32_elements_filling(model.size_mb));
+        let full_len = model.size_mb * 1024 * 1024;
+
+        write_gguf(&path, &header, full_len);
+        assert!(manager.is_model_ready(&model.name, true).await);
+
+        write_gguf(&path, &header, full_len - 100);
+        assert!(!manager.is_model_ready(&model.name, true).await);
+        assert!(matches!(
+            manager.get_model_info(&model.name).await.unwrap().status,
+            ModelStatus::Corrupted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn gguf_with_unknown_tensor_type_falls_back_to_size_check() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        let model = get_available_models().into_iter().next().unwrap();
+        let path = models_dir.path().join(&model.gguf_file);
+        let header = gguf_header(9999, f32_elements_filling(model.size_mb));
+        write_gguf(&path, &header, model.size_mb * 1024 * 1024 - 100);
+
+        manager.validate_gguf_file(&path).await.unwrap();
+        assert!(manager.is_model_ready(&model.name, true).await);
+    }
+
+    #[tokio::test]
+    async fn download_replaces_truncated_final_model_within_size_tolerance() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+        let (url, _) = serve(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
+            vec![(Duration::ZERO, b"GGUF-new")],
+        )
+        .await;
+        let model = test_model(url);
+        let path = models_dir.path().join(&model.gguf_file);
+        let header = gguf_header(GGML_TYPE_F32, f32_elements_filling(model.size_mb));
+        write_gguf(&path, &header, model.size_mb * 1024 * 1024 - 100);
+
+        manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect("the download must replace the truncated model");
+
+        assert_eq!(fs::read(&path).await.unwrap(), b"GGUF-new");
+    }
+
     #[tokio::test]
     async fn download_survives_slow_stream_longer_than_idle_limit() {
         let models_dir = tempfile::tempdir().unwrap();
