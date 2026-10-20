@@ -1232,6 +1232,44 @@ mod tests {
         );
     }
 
+    /// Both old log folders hold a meetily.log; the second must not be taken
+    /// for an already-archived copy of the first and deleted.
+    #[test]
+    fn archiving_two_log_folders_keeps_both_logs() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        let platform_logs = tmp.path().join("platform-logs");
+        write(&platform_logs.join("meetily.log"), b"platform log");
+        write(&root1.join("logs/meetily.log"), b"previous root log");
+        write(&root2.join("logs/meetily.log"), b"the log this process is writing");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root2.clone()),
+                previous_root: Some(root1.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root2, Some(platform_logs), |_| {}).unwrap();
+
+        let mut logs: Vec<Vec<u8>> = std::fs::read_dir(root2.join("logs"))
+            .unwrap()
+            .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec![
+                b"platform log".to_vec(),
+                b"previous root log".to_vec(),
+                b"the log this process is writing".to_vec(),
+            ]
+        );
+    }
+
     #[test]
     fn strip_prefix_ci_matches_regardless_of_drive_letter_case() {
         assert_eq!(
