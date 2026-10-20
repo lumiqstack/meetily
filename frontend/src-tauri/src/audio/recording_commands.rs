@@ -1071,18 +1071,17 @@ pub async fn stop_recording<R: Runtime>(
     // Step 3.5: Track meeting ended analytics with privacy-safe metadata
     // Extract all data from manager BEFORE any async operations to avoid Send issues
     let analytics_data = if let Some(ref manager) = manager_for_cleanup {
-        let state = manager.get_state();
-        let stats = state.get_stats();
+        let (mic_device_name, sys_device_name) = manager.get_device_names();
 
         Some((
             manager.get_recording_duration(),
             manager.get_active_recording_duration().unwrap_or(0.0),
             manager.get_total_pause_duration(),
             manager.get_transcript_segments().len() as u64,
-            state.has_fatal_error(),
-            state.get_microphone_device().map(|d| d.name.clone()),
-            state.get_system_device().map(|d| d.name.clone()),
-            stats.chunks_processed,
+            manager.has_fatal_error(),
+            mic_device_name,
+            sys_device_name,
+            manager.get_stats().chunks_processed,
         ))
     } else {
         None
