@@ -10,6 +10,7 @@ const originals = {
   recordingState: null as unknown as Record<string, unknown>,
   event: { ...await import('@tauri-apps/api/event') },
   core: { ...await import('@tauri-apps/api/core') },
+  path: { ...await import('@tauri-apps/api/path') },
   analytics: { ...await import('../../src/lib/analytics') },
   tooltip: { ...await import('../../src/components/ui/tooltip') },
 };
@@ -17,6 +18,7 @@ afterAll(() => {
   if (originals.recordingState) mock.module('../../src/contexts/RecordingStateContext', () => originals.recordingState);
   mock.module('@tauri-apps/api/event', () => originals.event);
   mock.module('@tauri-apps/api/core', () => originals.core);
+  mock.module('@tauri-apps/api/path', () => originals.path);
   mock.module('../../src/lib/analytics', () => originals.analytics);
   mock.module('../../src/components/ui/tooltip', () => originals.tooltip);
   if (!hadWindow) delete (globalThis as any).window;
@@ -49,8 +51,13 @@ mock.module('@tauri-apps/api/event', () => ({
       pending.push(registration);
     }),
 }));
-mock.module('@tauri-apps/api/core', () => ({ ...originals.core, invoke: async () => false }));
-mock.module('../../src/lib/analytics', () => ({ default: { trackTranscriptionError() {}, trackButtonClick() {} } }));
+const invokeCalls: string[] = [];
+mock.module('@tauri-apps/api/core', () => ({
+  ...originals.core,
+  invoke: async (command: string) => { invokeCalls.push(command); return false; },
+}));
+mock.module('@tauri-apps/api/path', () => ({ ...originals.path, appDataDir: async () => '/data' }));
+mock.module('../../src/lib/analytics', () => ({ default: { trackTranscriptionError() {}, trackTranscriptionSuccess() {}, trackButtonClick() {} } }));
 // Radix tooltips need a DOM; this test only cares about the listeners.
 const Passthrough = ({ children }: { children?: React.ReactNode }) => <>{children}</>;
 mock.module('../../src/components/ui/tooltip', () => ({
@@ -105,5 +112,55 @@ describe('RecordingControls event listeners', () => {
     await resolveAllPending();
     expect(registrations.length).toBeGreaterThan(0);
     expect(registrations.filter(r => !r.unlistened).map(r => r.name)).toEqual([]);
+  });
+});
+
+describe('RecordingControls transcription-error', () => {
+  const props = {
+    isRecording: true,
+    onRecordingStart: async () => {},
+    onTranscriptReceived: () => {},
+    isRecordingDisabled: false,
+    isParentProcessing: false,
+  };
+
+  async function renderAndEmit(payload: Record<string, unknown>) {
+    const onRecordingStop = mock((_callApi?: boolean) => {});
+    let renderer: ReactTestRenderer | undefined;
+    await act(async () => {
+      renderer = create(<RecordingControls {...props} onRecordingStop={onRecordingStop} />);
+    });
+    await resolveAllPending();
+    invokeCalls.length = 0;
+    await act(async () => {
+      for (const r of registrations.filter(r => r.name === 'transcription-error' && !r.unlistened)) {
+        r.handler({ payload });
+      }
+    });
+    await act(async () => renderer!.unmount());
+    await resolveAllPending();
+    return onRecordingStop;
+  }
+
+  test('a per-chunk error leaves the recording running', async () => {
+    // Shape of worker.rs chunk_error_payload: a toast, no phase.
+    const onRecordingStop = await renderAndEmit({
+      error: 'Transcription engine failed: HTTP 503',
+      userMessage: 'Transcription failed: Transcription engine failed: HTTP 503',
+      actionable: false,
+    });
+    expect(onRecordingStop).toHaveBeenCalledTimes(0);
+    expect(invokeCalls).toEqual([]);
+  });
+
+  test('a fatal error stops the backend recording before post-processing', async () => {
+    const onRecordingStop = await renderAndEmit({
+      error: 'engine init failed',
+      userMessage: 'Recording failed: Unable to initialize speech recognition.',
+      actionable: true,
+      phase: 'active',
+    });
+    expect(invokeCalls).toEqual(['stop_recording']);
+    expect(onRecordingStop.mock.calls).toEqual([[true]]);
   });
 });

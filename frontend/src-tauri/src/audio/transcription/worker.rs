@@ -519,12 +519,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     let transcription_error = TranscriptionError::EngineFailed(e.to_string());
                     let _ = app.emit(
                         "transcription-error",
-                        &serde_json::json!({
-                            "error": transcription_error.to_string(),
-                            "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
+                        chunk_error_payload(&transcription_error),
                     );
 
                     Err(transcription_error)
@@ -556,12 +551,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     let transcription_error = TranscriptionError::EngineFailed(e.to_string());
                     let _ = app.emit(
                         "transcription-error",
-                        &serde_json::json!({
-                            "error": transcription_error.to_string(),
-                            "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
+                        chunk_error_payload(&transcription_error),
                     );
 
                     Err(transcription_error)
@@ -603,21 +593,22 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         e
                     );
 
-                    let _ = app.emit(
-                        "transcription-error",
-                        &serde_json::json!({
-                            "error": e.to_string(),
-                            "userMessage": format!("Transcription failed: {}", e),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
-                    );
+                    let _ = app.emit("transcription-error", chunk_error_payload(&e));
 
                     Err(e)
                 }
             }
         }
     }
+}
+
+fn chunk_error_payload(error: &impl std::fmt::Display) -> serde_json::Value {
+    serde_json::json!({
+        "error": error.to_string(),
+        "userMessage": format!("Transcription failed: {}", error),
+        "actionable": false,
+        "phase": "active"
+    })
 }
 
 /// Format current timestamp (wall-clock time)
@@ -659,3 +650,18 @@ fn format_recording_time(seconds: f64) -> String {
             assert!(!should_emit_transcript("   "));
         }
     }
+
+#[cfg(test)]
+mod chunk_error_tests {
+    use super::*;
+
+    #[test]
+    fn chunk_error_payload_is_a_toast_that_keeps_the_recording() {
+        // `phase: "active"` ends the recording in the UI (RecordingControls.tsx);
+        // one failed chunk (a provider 5xx, one bad chunk) must not.
+        let payload = chunk_error_payload(&TranscriptionError::EngineFailed("HTTP 503".into()));
+        assert_eq!(payload["actionable"], false);
+        assert_ne!(payload["phase"], "active");
+        assert_eq!(payload["userMessage"], "Transcription failed: Transcription engine failed: HTTP 503");
+    }
+}
