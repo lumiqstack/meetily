@@ -330,14 +330,14 @@ impl WhisperEngine {
     }
     
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
-        let models = self.available_models.read().await;
-        let model_info = models.get(model_name)
+        let model_info = self.available_models.read().await.get(model_name).cloned()
             .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
 
         match model_info.status {
             ModelStatus::Available => {
-                // FIX 5: Check if this model is already loaded
-                if let Some(current_model) = self.current_model.read().await.as_ref() {
+                // Clone the name out so the read guard is dropped before unload_model takes the write lock.
+                let current_model = self.current_model.read().await.clone();
+                if let Some(current_model) = current_model {
                     if current_model == model_name {
                         log::info!("Model {} is already loaded, skipping reload", model_name);
                         return Ok(());
@@ -1954,5 +1954,33 @@ mod tests {
             WhisperEngine::clean_repetitive_text("She had had enough"),
             "She had had enough"
         );
+    }
+
+    #[tokio::test]
+    async fn switching_models_unloads_the_current_one_without_deadlocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WhisperEngine::new_with_models_dir(Some(dir.path().to_path_buf())).unwrap();
+
+        *engine.current_model.write().await = Some("a".to_string());
+        engine.available_models.write().await.insert(
+            "b".to_string(),
+            ModelInfo {
+                name: "b".to_string(),
+                path: dir.path().join("ggml-b.bin"),
+                size_mb: 1,
+                accuracy: "Basic".to_string(),
+                speed: "Fast".to_string(),
+                status: ModelStatus::Available,
+                description: "test model".to_string(),
+            },
+        );
+
+        let result = timeout(Duration::from_secs(2), engine.load_model("b"))
+            .await
+            .expect("load_model must not deadlock while switching models");
+
+        assert!(result.is_err(), "model file is missing, so loading must fail");
+        assert_eq!(engine.get_current_model().await, None);
+        assert!(!engine.is_model_loaded().await);
     }
 }
