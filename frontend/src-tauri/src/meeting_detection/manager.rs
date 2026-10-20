@@ -15,19 +15,19 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Emitter, Wry};
+use tauri::{AppHandle, Emitter, Runtime, Wry};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-pub struct MeetingDetectionManager {
-    app_handle: AppHandle<Wry>,
+pub struct MeetingDetectionManager<R: Runtime = Wry> {
+    app_handle: AppHandle<R>,
     settings: Arc<RwLock<MeetingDetectionSettings>>,
     status: Arc<RwLock<MeetingDetectionStatus>>,
     cancellation: Arc<RwLock<Option<CancellationToken>>>,
 }
 
-impl MeetingDetectionManager {
-    pub async fn new(app_handle: AppHandle<Wry>) -> Result<Self> {
+impl<R: Runtime> MeetingDetectionManager<R> {
+    pub async fn new(app_handle: AppHandle<R>) -> Result<Self> {
         let settings = load_settings().await.unwrap_or_default();
         let status = MeetingDetectionStatus::stopped(settings.clone());
 
@@ -51,18 +51,15 @@ impl MeetingDetectionManager {
     }
 
     pub async fn start(&self) {
-        {
-            let cancellation = self.cancellation.read().await;
+        let token = {
+            let mut cancellation = self.cancellation.write().await;
             if cancellation.is_some() {
                 return;
             }
-        }
-
-        let token = CancellationToken::new();
-        {
-            let mut cancellation = self.cancellation.write().await;
+            let token = CancellationToken::new();
             *cancellation = Some(token.clone());
-        }
+            token
+        };
 
         {
             let mut status = self.status.write().await;
@@ -73,7 +70,6 @@ impl MeetingDetectionManager {
         let app_handle = self.app_handle.clone();
         let settings = Arc::clone(&self.settings);
         let status = Arc::clone(&self.status);
-        let cancellation = Arc::clone(&self.cancellation);
 
         tauri::async_runtime::spawn(async move {
             info!("Starting Teams meeting detection task");
@@ -84,10 +80,10 @@ impl MeetingDetectionManager {
 
             loop {
                 tokio::select! {
+                    // stop() owns the slot and `running`; a restart may already have
+                    // replaced both by the time this task sees its cancel.
                     _ = token.cancelled() => {
                         info!("Teams meeting detection task stopped");
-                        let mut status = status.write().await;
-                        status.running = false;
                         break;
                     }
                     _ = interval.tick() => {
@@ -125,7 +121,6 @@ impl MeetingDetectionManager {
                         {
                             let mut status = status.write().await;
                             status.settings = current_settings.clone();
-                            status.running = true;
                             status.teams_running = sample.teams_running;
                             status.teams_audio_active = sample.teams_audio_active;
                             status.confidence = sample.confidence();
@@ -164,17 +159,11 @@ impl MeetingDetectionManager {
                     }
                 }
             }
-
-            let mut cancellation = cancellation.write().await;
-            *cancellation = None;
         });
     }
 
     pub async fn stop(&self) {
-        let token = {
-            let cancellation = self.cancellation.read().await;
-            cancellation.clone()
-        };
+        let token = self.cancellation.write().await.take();
 
         if let Some(token) = token {
             token.cancel();
@@ -241,4 +230,39 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn start_immediately_after_stop_restarts_detection() {
+        let app = tauri::test::mock_app();
+        // Detection disabled in settings so the poll loop's ticks are no-ops and
+        // the test never depends on Teams or audio state.
+        let settings = MeetingDetectionSettings::default();
+        let manager = MeetingDetectionManager {
+            app_handle: app.handle().clone(),
+            settings: Arc::new(RwLock::new(settings.clone())),
+            status: Arc::new(RwLock::new(MeetingDetectionStatus::stopped(settings))),
+            cancellation: Arc::new(RwLock::new(None)),
+        };
+
+        manager.start().await;
+        manager.stop().await;
+        manager.start().await;
+
+        // Let the first task observe its cancellation and finish.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(manager.get_status().await.running);
+        assert!(manager.cancellation.read().await.is_some());
+
+        manager.stop().await;
+    }
 }
