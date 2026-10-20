@@ -671,6 +671,38 @@ mod tests {
         assert_eq!(chunk_text("abcd", 1, 1), vec!["abc", "bcd"]);
     }
 
+    fn chinese_text(chars: usize) -> String {
+        "我们今天讨论项目进度和下周的发布计划，大家请准时参加会议。"
+            .chars()
+            .cycle()
+            .take(chars)
+            .collect()
+    }
+
+    #[test]
+    fn rough_token_count_keeps_latin_estimate() {
+        let text = "a".repeat(1000);
+        assert_eq!(rough_token_count(&text), 350);
+    }
+
+    #[test]
+    fn rough_token_count_counts_cjk_characters_as_tokens() {
+        assert!(rough_token_count(&chinese_text(1000)) >= 900);
+        assert!(rough_token_count(&"ひらがなカタカナ한국어".repeat(100)) >= 1000);
+    }
+
+    #[test]
+    fn chunk_text_keeps_cjk_chunks_within_token_budget() {
+        let text = chinese_text(3000);
+        let chunks = chunk_text(&text, 200, 50);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            let tokens = rough_token_count(chunk);
+            assert!(tokens <= 200, "chunk estimated at {tokens} tokens exceeds 200");
+        }
+    }
+
     #[test]
     fn chunk_summary_prompt_forces_english_base_output() {
         let prompt = build_chunk_summary_user_prompt("会議の内容");
