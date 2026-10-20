@@ -1817,4 +1817,69 @@ mod tests {
         assert_eq!(std::fs::read(root.join("sentinel.txt")).unwrap(), b"keep");
         assert!(!root.join(STATE_FILE).exists());
     }
+
+    /// The database, its WAL and its shm are one unit: a move that fails partway
+    /// must leave nothing at the new root and the whole set at the old one.
+    #[test]
+    fn a_database_move_that_fails_partway_leaves_the_set_where_it_was() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(&root1.join("meeting_minutes.sqlite"), b"main file");
+        write(&root1.join("meeting_minutes.sqlite-wal"), b"recent meetings");
+        write(&root1.join("meeting_minutes.sqlite-shm"), b"shm");
+        // Something the WAL can never be written over.
+        std::fs::create_dir_all(root2.join("meeting_minutes.sqlite-wal")).unwrap();
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root2.clone()),
+                previous_root: Some(root1.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root2, None, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(root1.join("meeting_minutes.sqlite")).unwrap(), b"main file");
+        assert_eq!(
+            std::fs::read(root1.join("meeting_minutes.sqlite-wal")).unwrap(),
+            b"recent meetings"
+        );
+        assert_eq!(std::fs::read(root1.join("meeting_minutes.sqlite-shm")).unwrap(), b"shm");
+        let leftovers: Vec<_> = std::fs::read_dir(&root2)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("meeting_minutes"))
+            .collect();
+        assert!(leftovers.is_empty(), "partial database files at the new root: {leftovers:?}");
+        assert!(!load_state(&root2).done("db"));
+    }
+
+    /// Opening (or creating) a database at the new root while the old one has
+    /// not arrived would show an empty or damaged library, and the next move
+    /// attempt would then overwrite whatever was written to it.
+    #[tokio::test]
+    async fn the_database_is_not_opened_while_its_move_is_unfinished() {
+        let tmp = tempdir().unwrap();
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(
+            &root2.join(STATE_FILE),
+            serde_json::json!({
+                "completed": ["bin", "sp-webview", "models", "config", "logs", "recordings"],
+                "source": root1,
+                "target": root2,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+
+        let opened = crate::database::manager::DatabaseManager::open_in_dir(&root2).await;
+
+        assert!(opened.is_err(), "database opened while its move is unfinished");
+        assert!(!root2.join("meeting_minutes.sqlite").exists());
+    }
 }
