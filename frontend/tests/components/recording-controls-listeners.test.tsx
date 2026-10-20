@@ -5,7 +5,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 // RecordingControls' listeners must survive onRecordingStop changing identity
 // (it does at recording start) without leaking: every listener registered must be
 // unlistened, even one whose listen() was still pending when the effect cleaned
-// up. A leaked `transcript-error` listener calls a stale onRecordingStop again.
+// up. A leaked `transcription-error` listener calls a stale onRecordingStop again.
 const originals = {
   recordingState: null as unknown as Record<string, unknown>,
   event: { ...await import('@tauri-apps/api/event') },
@@ -101,12 +101,12 @@ describe('RecordingControls event listeners', () => {
     await resolveAllPending();
 
     await act(async () => {
-      for (const r of registrations.filter(r => r.name === 'transcript-error' && !r.unlistened)) {
-        r.handler({ payload: 'boom' });
+      for (const r of registrations.filter(r => r.name === 'transcription-error' && !r.unlistened)) {
+        r.handler({ payload: { error: 'boom', phase: 'active' } });
       }
     });
     expect(firstStop).toHaveBeenCalledTimes(0);
-    expect(secondStop.mock.calls).toEqual([[false]]);
+    expect(secondStop.mock.calls).toEqual([[true]]);
 
     await act(async () => renderer!.unmount());
     await resolveAllPending();

@@ -269,25 +269,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     };
   }, []);
 
-  // Transcript error listener - handles both regular and actionable errors
-  useTauriEvent<string>('transcript-error', (errorMessage) => {
-    console.log('transcript-error event received');
-
-    Analytics.trackTranscriptionError(errorMessage);
-
-    setTranscriptionErrors(prev => {
-      const newCount = prev + 1;
-      console.log('Transcription error count incremented:', newCount);
-      return newCount;
-    });
-    setIsProcessing(false);
-    console.log('Calling onRecordingStop(false) due to transcript error');
-    onRecordingStop(false);
-    if (onTranscriptionError) {
-      onTranscriptionError(errorMessage);
-    }
-  });
-
   // Transcription error listener - handles structured error objects with actionable flag
   useTauriEvent<TranscriptionErrorPayload>('transcription-error', (payload) => {
     console.log('transcription-error event received');
