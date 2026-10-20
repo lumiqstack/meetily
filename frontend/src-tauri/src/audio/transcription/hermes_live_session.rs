@@ -1034,4 +1034,118 @@ mod tests {
             MAX_RECONNECT_ATTEMPTS
         );
     }
+
+    /// Pressing Stop during a reconnect backoff closes the input while the
+    /// end of the meeting is still sitting in `pending`. That tail must reach
+    /// the gateway and its finals must come back, not be dropped on exit.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn audio_buffered_during_backoff_is_flushed_when_input_closes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let audio_bytes = Arc::new(AtomicUsize::new(0));
+        let got_stop = Arc::new(AtomicBool::new(false));
+
+        let (server_connections, server_audio, server_stop) =
+            (connections.clone(), audio_bytes.clone(), got_stop.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let n = server_connections.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First attempt: a transient upgrade failure, so the
+                    // session goes into backoff.
+                    let _ = tokio_tungstenite::accept_hdr_async(stream, |_: &_, _| {
+                        Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                            .status(503)
+                            .body(None)
+                            .unwrap())
+                    })
+                    .await;
+                    continue;
+                }
+                let (audio, stop) = (server_audio.clone(), server_stop.clone());
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        match message {
+                            Message::Binary(frame) => {
+                                audio.fetch_add(frame.len(), Ordering::SeqCst);
+                            }
+                            Message::Text(text) if text.contains(r#""stop""#) => {
+                                stop.store(true, Ordering::SeqCst);
+                                let _ = ws
+                                    .send(Message::Text(
+                                        r#"{"type":"transcript.final","text":"Last words."}"#
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                let _ = ws
+                                    .send(Message::Text(r#"{"type":"session.finished"}"#.to_string()))
+                                    .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let finals = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = finals.clone();
+        handle.listen("transcript-update", move |event| {
+            seen.lock().unwrap().push(event.payload().to_string());
+        });
+
+        let config = LiveSessionConfig {
+            endpoint: format!("ws://{}", addr),
+            bearer_token: "test".to_string(),
+            model: "test-model".to_string(),
+            language: None,
+        };
+
+        // The user's last 100ms of speech, then Stop — all before the first
+        // connect fails, so both land in the backoff buffer.
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender
+            .send(AudioChunk {
+                capture_gap: None,
+                data: vec![0.0; 1600],
+                sample_rate: LIVE_SAMPLE_RATE,
+                timestamp: 0.0,
+                chunk_id: 1,
+                device_type: crate::audio::recording_state::DeviceType::Microphone,
+                dominant_source: None,
+            })
+            .unwrap();
+        drop(sender);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_live_transcription(handle, receiver, config),
+        )
+        .await;
+        server.abort();
+        assert!(result.is_ok(), "live task did not finish");
+
+        assert_eq!(
+            audio_bytes.load(Ordering::SeqCst),
+            1600 * 2,
+            "the buffered tail never reached the gateway ({} connections)",
+            connections.load(Ordering::SeqCst)
+        );
+        assert!(got_stop.load(Ordering::SeqCst), "the tail session was not finished");
+        let finals = finals.lock().unwrap();
+        assert_eq!(finals.len(), 1, "finals: {:?}", finals);
+        assert!(finals[0].contains("Last words."), "{}", finals[0]);
+    }
 }
