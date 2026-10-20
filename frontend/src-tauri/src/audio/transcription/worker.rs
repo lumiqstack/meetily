@@ -602,12 +602,13 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
     }
 }
 
+/// No `phase`: "active" makes the UI stop the recording, but one failed chunk
+/// (a provider 5xx, one bad chunk) leaves the rest of the recording usable.
 fn chunk_error_payload(error: &impl std::fmt::Display) -> serde_json::Value {
     serde_json::json!({
         "error": error.to_string(),
         "userMessage": format!("Transcription failed: {}", error),
         "actionable": false,
-        "phase": "active"
     })
 }
 

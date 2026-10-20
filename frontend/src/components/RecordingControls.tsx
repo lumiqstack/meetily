@@ -304,8 +304,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     setIsProcessing(false);
 
     if (payload.phase === 'active') {
-      console.log('Calling onRecordingStop(false) due to active transcription error');
-      onRecordingStop(false);
+      handleStopRecording();
     }
 
     // For actionable errors (like model loading failures), the main page will handle showing the model selector
