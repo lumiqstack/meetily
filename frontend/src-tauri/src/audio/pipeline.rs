@@ -2052,4 +2052,27 @@ mod tests {
         }
         assert_eq!(total_samples, total);
     }
+
+    fn system_capture(state: &Arc<RecordingState>, sample_rate: u32) -> AudioCapture {
+        let device = Arc::new(AudioDevice::new(
+            "system".to_string(),
+            crate::audio::devices::DeviceType::Output,
+        ));
+        AudioCapture::new(device, state.clone(), sample_rate, 1, DeviceType::System, None)
+    }
+
+    /// A capture stream that ends while still recording must be reported,
+    /// not left to pad system audio with silence for the rest of the meeting.
+    #[test]
+    fn stream_end_while_recording_reports_stream_failed() {
+        let state = RecordingState::new();
+        let capture = system_capture(&state, 48_000);
+
+        capture.handle_stream_end();
+        assert!(state.get_last_error().is_none(), "an end after stop is not an error");
+
+        state.start_recording().unwrap();
+        capture.handle_stream_end();
+        assert!(matches!(state.get_last_error(), Some(AudioError::StreamFailed)));
+    }
 }
