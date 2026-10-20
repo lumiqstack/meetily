@@ -661,6 +661,15 @@ async fn persist_retranscription<R: Runtime>(
     segments: Vec<crate::api::TranscriptSegment>,
     language: Option<String>,
 ) -> Result<RetranscriptionResult> {
+    // Both callers drop empty-text segments, so an empty list means speech was
+    // found but nothing was transcribed (e.g. wrong-language model). Replacing
+    // the existing transcript with nothing would be silent data loss.
+    if segments.is_empty() {
+        return Err(anyhow!(
+            "Retranscription produced no text; the existing transcript was kept. Try a different model or language."
+        ));
+    }
+
     emit_progress(app, meeting_id, "saving", 80, "Saving transcripts...");
 
     // Save to database
@@ -1440,5 +1449,68 @@ mod tests {
         assert_eq!(metadata["summary_language"], "fr");
         assert_eq!(metadata["custom_field"], "preserve me");
         assert!(metadata.get("detected_summary_language").is_none());
+    }
+
+    /// A pass that produced no text (wrong-language model, every chunk filtered,
+    /// a remote endpoint returning `{"text":""}`) must not replace the existing
+    /// transcript with nothing.
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn empty_retranscription_keeps_existing_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("meetings.sqlite");
+        let db = crate::database::manager::DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            dir.path().join("absent.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let pool = db.pool().clone();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at, transcription_incomplete) \
+             VALUES ('m1', 'Standup', '2025-01-01', '2025-01-01', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp) \
+             VALUES ('t1', 'm1', 'live text', '2025-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = tauri::test::mock_app();
+        app.manage(AppState { db_manager: db });
+
+        let result = persist_retranscription(
+            app.handle(),
+            "m1",
+            dir.path(),
+            &dir.path().join("audio.mp4"),
+            12.0,
+            Vec::new(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "an empty pass must fail the job");
+
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE meeting_id = 'm1'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, vec!["live text".to_string()]);
+        let incomplete: i64 =
+            sqlx::query_scalar("SELECT transcription_incomplete FROM meetings WHERE id = 'm1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(incomplete, 1, "metadata must not be marked complete");
+        assert!(!dir.path().join("transcripts.json").exists());
     }
 }
