@@ -288,6 +288,7 @@ async fn run_live_transcription<R: Runtime>(
                 // so the pipeline's unbounded channel does not grow without
                 // limit during an outage.
                 if !sleep_while_buffering(&mut receiver, &mut pending, &mut ledger, delay).await {
+                    flush_tail(&app, &mut receiver, &config, &mut ledger, &mut pending).await;
                     break;
                 }
                 continue;
@@ -349,6 +350,7 @@ async fn run_live_transcription<R: Runtime>(
 
                 let delay = backoff_delay(attempt);
                 if !sleep_while_buffering(&mut receiver, &mut pending, &mut ledger, delay).await {
+                    flush_tail(&app, &mut receiver, &config, &mut ledger, &mut pending).await;
                     break;
                 }
             }
@@ -451,6 +453,58 @@ async fn sleep_while_buffering(
                 None => return false,
             },
         }
+    }
+}
+
+/// The recording stopped during a reconnect backoff, so `pending` holds the
+/// end of the meeting. Make one last attempt to deliver it and drain its
+/// finals; `receiver` is already closed, so `run_session` flushes `pending`
+/// and then finishes the session.
+async fn flush_tail<R: Runtime>(
+    app: &AppHandle<R>,
+    receiver: &mut UnboundedReceiver<AudioChunk>,
+    config: &LiveSessionConfig,
+    ledger: &mut TimelineLedger,
+    pending: &mut PendingFrames,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let bytes_per_second = LIVE_SAMPLE_RATE as usize * 2;
+    let seconds = pending.bytes.div_ceil(bytes_per_second);
+
+    let delivered = match connect(config).await {
+        Ok(socket) => {
+            let mut transcribed = false;
+            let outcome = run_session(
+                app,
+                socket,
+                receiver,
+                config,
+                ledger,
+                pending,
+                &mut transcribed,
+            )
+            .await;
+            if let SessionOutcome::Disconnected(reason) = &outcome {
+                warn!("Gemini Live: final flush failed: {}", reason);
+            }
+            outcome == SessionOutcome::InputClosed
+        }
+        Err(e) => {
+            warn!("Gemini Live: final reconnect failed: {}", e.message);
+            false
+        }
+    };
+
+    if !delivered {
+        emit_warning(
+            app,
+            &format!(
+                "Live transcription could not reconnect before the recording stopped, so the last {} seconds were not transcribed live. The full recording was saved and can be re-transcribed.",
+                seconds
+            ),
+        );
     }
 }
 
