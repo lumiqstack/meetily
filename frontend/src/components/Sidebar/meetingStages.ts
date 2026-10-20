@@ -12,7 +12,7 @@ export type MeetingStage = keyof MeetingStages;
 
 /** Sidebar filter chips, in display order: each shows meetings missing that stage. */
 export const MISSING_STAGE_FILTERS: ReadonlyArray<{ stage: MeetingStage; label: string }> = [
-  { stage: 'transcribed', label: 'No transcript' },
+  { stage: 'transcribed', label: 'Transcript needed' },
   { stage: 'summarized', label: 'No summary' },
   { stage: 'obsidianExported', label: 'Not in Obsidian' },
 ];
