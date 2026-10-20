@@ -1082,7 +1082,7 @@ impl AudioPipeline {
         // CRITICAL FIX: Continue processing until channel is closed, not based on recording state
         // This ensures ALL chunks are processed during shutdown, fixing premature meeting completion
         // Previous bug: Loop checked `while self.state.is_recording()` which caused early exit when
-        // stop_recording() was called, losing flush signals and remaining chunks in the pipeline
+        // stop_recording() was called, losing remaining chunks in the pipeline
         loop {
             // Block until the next chunk. There is no periodic work to do here —
             // VAD drives all segmentation — so the previous 50ms timeout only
@@ -1090,16 +1090,6 @@ impl AudioPipeline {
             // 20x/s through silence.
             match self.receiver.recv().await {
                 Some(chunk) => {
-                    // Flush signals (chunk IDs >= u64::MAX - 10) carry no audio.
-                    // The flush itself happens once, when the channel closes:
-                    // flushing the VAD here would force-end the utterance
-                    // before the partial window behind it is mixed, losing
-                    // or duplicating the user's last words.
-                    if chunk.chunk_id >= u64::MAX - 10 {
-                        info!("📥 Received FLUSH signal #{}", u64::MAX - chunk.chunk_id);
-                        continue;
-                    }
-
                     // PERFORMANCE OPTIMIZATION: Eliminate per-chunk logging overhead
                     // Logging in hot paths causes severe performance degradation
                     self.processed_chunks += 1;
@@ -1187,9 +1177,8 @@ impl AudioPipeline {
             }
         }
 
-        // Channel closed: mix the partial window once, then flush VAD segments.
-        // Mixing the partial window on a flush signal would split streams
-        // that arrive after one, so the VAD flush waits for it here.
+        // Channel closed: mix the partial window before flushing the VAD, so
+        // speech in it ends the final utterance instead of being lost.
         self.flush_partial_window();
         self.flush_remaining_audio()?;
 
@@ -1485,54 +1474,8 @@ impl AudioPipelineManager {
         }
     }
 
-    /// Force immediate flush of accumulated audio and stop pipeline
-    /// PERFORMANCE CRITICAL: Eliminates 30+ second shutdown delays
+    /// Drop the sender and wait for the pipeline to drain and flush.
     pub async fn force_flush_and_stop(&mut self) -> Result<()> {
-        info!("🚀 Force flushing pipeline - processing ALL accumulated audio immediately");
-
-        // If we have a sender, send a special flush signal first
-        if let Some(sender) = &self.audio_sender {
-            // Create a special flush chunk to trigger immediate processing
-            let flush_chunk = AudioChunk {
-                capture_gap: None,
-                data: vec![], // Empty data signals flush
-                sample_rate: 16000,
-                timestamp: 0.0,
-                chunk_id: u64::MAX, // Special ID to indicate flush
-                device_type: super::recording_state::DeviceType::Microphone,
-                dominant_source: None,
-            };
-
-            if let Err(e) = sender.send(flush_chunk) {
-                warn!("Failed to send flush signal: {}", e);
-            } else {
-                info!("📤 Sent flush signal to pipeline");
-
-                // PERFORMANCE OPTIMIZATION: Reduced wait time from 50ms to 20ms
-                // Pipeline should process flush signal very quickly
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
-                // Send multiple flush signals to ensure the pipeline catches it
-                // This aggressive approach eliminates shutdown delay issues
-                for i in 0..3 {
-                    let additional_flush = AudioChunk {
-                        capture_gap: None,
-                        data: vec![],
-                        sample_rate: 16000,
-                        timestamp: 0.0,
-                        chunk_id: u64::MAX - (i as u64),
-                        device_type: super::recording_state::DeviceType::Microphone,
-                        dominant_source: None,
-                    };
-                    let _ = sender.send(additional_flush);
-                }
-
-                info!("📤 Sent additional flush signals for reliability");
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-        }
-
-        // Now stop normally
         self.stop().await
     }
 }
@@ -1656,11 +1599,10 @@ mod tests {
         assert_eq!(total_samples, 14_400);
     }
 
-    /// A flush signal between two chunks of one instant must not split them:
-    /// mic and system audio that arrived before the stream closed are mixed
-    /// into the same window, even when a flush signal lands in between.
+    /// A system chunk that arrives after the mic chunk of the same instant,
+    /// just before the stream closes, is mixed into the same final window.
     #[tokio::test]
-    async fn flush_signal_does_not_split_mic_and_system_windows() {
+    async fn late_system_chunk_is_not_split_from_mic_on_stop() {
         let state = RecordingState::new();
         let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
         let (transcription_tx, _transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
@@ -1694,17 +1636,6 @@ mod tests {
         audio_tx
             .send(AudioChunk {
                 capture_gap: None,
-                data: vec![],
-                sample_rate: 16_000,
-                timestamp: 0.0,
-                chunk_id: u64::MAX,
-                device_type: DeviceType::Microphone,
-                dominant_source: None,
-            })
-            .unwrap();
-        audio_tx
-            .send(AudioChunk {
-                capture_gap: None,
                 data: vec![0.25f32; 9_600],
                 sample_rate: 48_000,
                 timestamp: 0.0,
@@ -1724,12 +1655,12 @@ mod tests {
         assert_eq!(lengths, vec![9_600]);
     }
 
-    /// Stop sends in-band flush signals while the ring buffer still holds a
-    /// partial window of the utterance in progress. That tail must reach the
+    /// Stop closes the stream while the ring buffer still holds a partial
+    /// window of the utterance in progress. That tail must reach the
     /// transcript exactly once: not dropped by a VAD flushed before it was
     /// mixed, and not re-sent alongside the part flushed earlier.
     #[tokio::test]
-    async fn flush_signal_mid_speech_keeps_partial_window_speech_once() {
+    async fn stop_mid_speech_keeps_partial_window_speech_once() {
         let state = RecordingState::new();
         let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
         let (transcription_tx, mut transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
@@ -1773,20 +1704,6 @@ mod tests {
                     .unwrap();
             }
         }
-        // Same signals, same order as force_flush_and_stop().
-        for i in 0..4u64 {
-            audio_tx
-                .send(AudioChunk {
-                    capture_gap: None,
-                    data: vec![],
-                    sample_rate: 16_000,
-                    timestamp: 0.0,
-                    chunk_id: u64::MAX - i,
-                    device_type: DeviceType::Microphone,
-                    dominant_source: None,
-                })
-                .unwrap();
-        }
         drop(audio_tx);
 
         pipeline.run().await.expect("pipeline run");
@@ -1798,7 +1715,7 @@ mod tests {
         }
         let covering = |t: f64| segments.iter().filter(|(s, e)| *s <= t && t < *e).count();
         assert_eq!(covering(4.4), 1, "speech in the partial window, segments: {segments:?}");
-        assert_eq!(covering(3.0), 1, "speech before the flush signal, segments: {segments:?}");
+        assert_eq!(covering(3.0), 1, "speech before the partial window, segments: {segments:?}");
     }
 
     const CHUNK: usize = 480;
