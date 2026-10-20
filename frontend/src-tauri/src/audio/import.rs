@@ -2058,7 +2058,17 @@ async fn hand_off_to_pipeline<R: Runtime>(
     };
 
     // The import guard now owns this job; cancellation flows through IMPORT_JOBS.
-    URL_DOWNLOADS.remove(&import_id);
+    // A cancel that arrived before `acquire` was cleared from IMPORT_JOBS by
+    // it, but it cancelled the download token first, so the token is what
+    // records it. Checked after `acquire` so no cancel can fall between the two.
+    let cancelled_before_hand_off = URL_DOWNLOADS
+        .remove(&import_id)
+        .is_some_and(|(_, token)| token.is_cancelled());
+    if cancelled_before_hand_off {
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(anyhow!("Import cancelled").into());
+    }
 
     let media_path_str = media_path.to_string_lossy().to_string();
     let result = start_import_with_guard(
