@@ -378,7 +378,10 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
 
 /// Splits a transcript into chunks sized for a model whose usable context is `token_threshold`
 fn chunk_for_context(text: &str, token_threshold: usize) -> Vec<String> {
-    chunk_text(text, token_threshold - 300, 100)
+    // Small-context models (e.g. num_ctx 512) have a threshold below the 300-token
+    // prompt reserve; keep a floor so chunks stay small instead of underflowing.
+    const MIN_CHUNK_TOKENS: usize = 200;
+    chunk_text(text, token_threshold.saturating_sub(300).max(MIN_CHUNK_TOKENS), 100)
 }
 
 /// Extracts meeting name from the first heading in markdown
