@@ -1090,12 +1090,13 @@ impl AudioPipeline {
             // 20x/s through silence.
             match self.receiver.recv().await {
                 Some(chunk) => {
-                    // PERFORMANCE: Check for flush signal (special chunk with ID >= u64::MAX - 10)
-                    // Multiple flush signals may be sent to ensure processing
+                    // Flush signals (chunk IDs >= u64::MAX - 10) carry no audio.
+                    // The flush itself happens once, when the channel closes:
+                    // flushing the VAD here would force-end the utterance
+                    // before the partial window behind it is mixed, losing
+                    // or duplicating the user's last words.
                     if chunk.chunk_id >= u64::MAX - 10 {
-                        info!("📥 Received FLUSH signal #{} - flushing VAD processor", u64::MAX - chunk.chunk_id);
-                        self.flush_remaining_audio()?;
-                        // Continue processing to handle any remaining chunks
+                        info!("📥 Received FLUSH signal #{}", u64::MAX - chunk.chunk_id);
                         continue;
                     }
 
@@ -1187,7 +1188,8 @@ impl AudioPipeline {
         }
 
         // Channel closed: mix the partial window once, then flush VAD segments.
-        // Doing this on flush signals would split streams that arrive after one.
+        // Mixing the partial window on a flush signal would split streams
+        // that arrive after one, so the VAD flush waits for it here.
         self.flush_partial_window();
         self.flush_remaining_audio()?;
 

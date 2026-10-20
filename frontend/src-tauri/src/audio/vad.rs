@@ -249,6 +249,9 @@ impl ContinuousVadProcessor {
             self.current_speech.clear();
             self.last_large_buffer_warn = 0;
             self.in_speech = false;
+            // Silero still has this utterance open; without a reset it would
+            // swallow the next SpeechStart and later re-emit from the old start.
+            self.session.reset();
         }
 
         // Extract all remaining segments
