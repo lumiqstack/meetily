@@ -1,11 +1,11 @@
 'use client';
 
 import React, { useEffect } from 'react';
-import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { appDataDir } from '@tauri-apps/api/path';
 import { toast } from 'sonner';
 import { useRecordingStop } from '@/hooks/useRecordingStop';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { handleRecordingError } from '@/lib/recording-error';
 import { recordingService } from '@/services/recordingService';
 
@@ -36,35 +36,11 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
     handleRecordingStop,
   } = useRecordingStop(setIsRecording, setIsRecordingDisabled, { exposeToWindow: true });
 
-  useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
-
-    const setupListener = async () => {
-      try {
-        // Listen for recording-stop-complete event from Rust
-        unlistenFn = await listen<boolean>('recording-stop-complete', (event) => {
-          console.log('[RecordingPostProcessing] Received recording-stop-complete event:', event.payload);
-
-          // Call the post-processing handler
-          // event.payload is the callApi boolean (true for normal stops)
-          handleRecordingStop(event.payload);
-        });
-
-        console.log('[RecordingPostProcessing] Event listener set up successfully');
-      } catch (error) {
-        console.error('[RecordingPostProcessing] Failed to set up event listener:', error);
-      }
-    };
-
-    setupListener();
-
-    return () => {
-      if (unlistenFn) {
-        console.log('[RecordingPostProcessing] Cleaning up event listener');
-        unlistenFn();
-      }
-    };
-  }, [handleRecordingStop]);
+  useTauriEvent<boolean>('recording-stop-complete', (callApi) => {
+    console.log('[RecordingPostProcessing] Received recording-stop-complete event:', callApi);
+    // callApi is true for normal stops
+    handleRecordingStop(callApi);
+  });
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;

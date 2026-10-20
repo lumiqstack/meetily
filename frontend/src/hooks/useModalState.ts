@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { useState, useCallback } from 'react';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { toast } from 'sonner';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import type { TranscriptionErrorPayload } from '@/services/transcriptService';
@@ -100,97 +100,38 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
     });
   }, []);
 
-  // Set up transcript chunk loss listener
-  useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
+  useTauriEvent<TranscriptChunkLossPayload>('transcript-chunk-loss-detected', (payload) => {
+    console.log('Transcript chunk loss detected');
+    const { message, chunks_lost, chunks_queued } = payload;
+    showModal('chunkDropWarning', `${message} (${chunks_lost} of ${chunks_queued} chunks lost).`);
+  });
 
-    const setupChunkDropListener = async () => {
-      try {
-        console.log('Setting up transcript-chunk-loss-detected listener...');
-        unlistenFn = await listen<TranscriptChunkLossPayload>('transcript-chunk-loss-detected', (event) => {
-          console.log('Transcript chunk loss detected');
-          const { message, chunks_lost, chunks_queued } = event.payload;
-          showModal('chunkDropWarning', `${message} (${chunks_lost} of ${chunks_queued} chunks lost).`);
-        });
-        console.log('Chunk drop warning listener setup complete');
-      } catch (error) {
-        console.error('Failed to setup chunk drop warning listener:', error);
-      }
-    };
+  // Model loading failures
+  useTauriEvent<TranscriptionErrorPayload>('transcription-error', (payload) => {
+    console.log('Transcription error received');
+    const { userMessage, actionable } = payload;
 
-    setupChunkDropListener();
-
-    return () => {
-      console.log('Cleaning up chunk drop warning listener...');
-      if (unlistenFn) {
-        unlistenFn();
-      }
-    };
-  }, [showModal]);
-
-  // Set up transcription error listener for model loading failures
-  useEffect(() => {
-    let unlistenFn: (() => void) | undefined;
-
-    const setupTranscriptionErrorListener = async () => {
-      try {
-        console.log('Setting up transcription-error listener...');
-        unlistenFn = await listen<TranscriptionErrorPayload>('transcription-error', (event) => {
-          console.log('Transcription error received');
-          const { userMessage, actionable } = event.payload;
-
-          if (actionable) {
-            // This is a model-related error that requires user action
-            showModal('modelSelector', userMessage);
-          } else {
-            // Show toast instead of modal for non-actionable errors (consistent with sidebar)
-            toast.error('', {
-              description: userMessage,
-              duration: 5000,
-            });
-          }
-        });
-        console.log('Transcription error listener setup complete');
-      } catch (error) {
-        console.error('Failed to setup transcription error listener:', error);
-      }
-    };
-
-    setupTranscriptionErrorListener();
-
-    return () => {
-      console.log('Cleaning up transcription error listener...');
-      if (unlistenFn) {
-        unlistenFn();
-      }
-    };
-  }, [showModal]);
-
-  // Listen for model download completion to auto-close modal
-  useEffect(() => {
-    const setupDownloadListeners = async () => {
-      const unlisteners: (() => void)[] = [];
-
-      // Listen for Whisper model download complete
-      const unlistenWhisper = await listen<{ modelName: string }>('model-download-complete', (event) => {
-        const { modelName } = event.payload;
-        console.log('[useModalState] Whisper model download complete:', modelName);
-
-        // Auto-close modal if the downloaded model matches the selected one
-        if (transcriptModelConfig?.provider === 'localWhisper' && transcriptModelConfig?.model === modelName) {
-          toast.success('Model ready! Closing window...', { duration: 1500 });
-          setTimeout(() => hideModal('modelSelector'), 1500);
-        }
+    if (actionable) {
+      // This is a model-related error that requires user action
+      showModal('modelSelector', userMessage);
+    } else {
+      // Show toast instead of modal for non-actionable errors (consistent with sidebar)
+      toast.error('', {
+        description: userMessage,
+        duration: 5000,
       });
-      unlisteners.push(unlistenWhisper);
+    }
+  });
 
-      return () => {
-        unlisteners.forEach(unsub => unsub());
-      };
-    };
+  // Auto-close the model selector once the selected Whisper model finishes downloading
+  useTauriEvent<{ modelName: string }>('model-download-complete', ({ modelName }) => {
+    console.log('[useModalState] Whisper model download complete:', modelName);
 
-    setupDownloadListeners();
-  }, [transcriptModelConfig, hideModal]);
+    if (transcriptModelConfig?.provider === 'localWhisper' && transcriptModelConfig?.model === modelName) {
+      toast.success('Model ready! Closing window...', { duration: 1500 });
+      setTimeout(() => hideModal('modelSelector'), 1500);
+    }
+  });
 
   return {
     modals,

@@ -6,6 +6,7 @@ import { SelectedDevices } from '@/components/DeviceSelection';
 import { configService, ModelConfig } from '@/services/configService';
 import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { BetaFeatures, BetaFeatureKey, loadBetaFeatures, saveBetaFeatures } from '@/types/betaFeatures';
 import { COPILOT_CLI_MODELS, resolveSavedCopilotCliModel } from '@/lib/copilot-cli-models';
 
@@ -383,28 +384,15 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Listen for model config updates from other components
-  useEffect(() => {
-    const setupListener = async () => {
-      const { listen } = await import('@tauri-apps/api/event');
-      const unlisten = await listen<ModelConfig>('model-config-updated', (event) => {
-        console.log('[ConfigContext] Received model-config-updated event:', event.payload);
-        setModelConfig(event.payload);
+  useTauriEvent<ModelConfig>('model-config-updated', (config) => {
+    console.log('[ConfigContext] Received model-config-updated event:', config);
+    setModelConfig(config);
 
-        // Update provider-specific key when config changes
-        if (event.payload.apiKey && event.payload.provider !== 'custom-openai') {
-          updateProviderApiKey(event.payload.provider, event.payload.apiKey);
-        }
-      });
-      return unlisten;
-    };
-
-    let cleanup: (() => void) | undefined;
-    setupListener().then(fn => cleanup = fn);
-
-    return () => {
-      cleanup?.();
-    };
-  }, []);
+    // Update provider-specific key when config changes
+    if (config.apiKey && config.provider !== 'custom-openai') {
+      updateProviderApiKey(config.provider, config.apiKey);
+    }
+  });
 
   // Load device preferences on mount
   useEffect(() => {
