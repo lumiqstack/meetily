@@ -101,14 +101,22 @@ pub(crate) fn build_recordings_query_url(
     )
 }
 
-/// OData `datetime'…'` literals require a full ISO timestamp. Persisted sync
-/// state can carry a bare date (`2026-07-27`), which SharePoint rejects with
-/// InvalidClientQueryException — widen it to midnight UTC.
+/// OData v3 `datetime'…'` literals take a full timestamp with no offset and
+/// no more than .NET's 7 fractional digits; SharePoint rejects anything else
+/// with InvalidClientQueryException. Persisted sync state can carry a bare
+/// date (`2026-07-27`) and the scheduled scan passes `to_rfc3339()` output
+/// (`…:33.123456789+00:00`, whose raw `+` also decodes to a space in the
+/// query string), so normalise both to whole seconds in UTC.
 fn odata_datetime(since_iso: &str) -> String {
     if !since_iso.contains('T') {
-        format!("{since_iso}T00:00:00Z")
-    } else {
-        since_iso.to_string()
+        return format!("{since_iso}T00:00:00Z");
+    }
+    match chrono::DateTime::parse_from_rfc3339(since_iso) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+        Err(_) => since_iso.to_string(),
     }
 }
 
@@ -141,6 +149,7 @@ pub(crate) fn build_search_query_url(root_host: &str, since_iso: &str) -> String
 fn encode_server_relative_path(path: &str) -> String {
     path.chars()
         .map(|c| match c {
+            '%' => "%25".to_string(),
             ' ' => "%20".to_string(),
             '\'' => "%27".to_string(),
             '#' => "%23".to_string(),
@@ -189,7 +198,7 @@ pub(crate) fn parse_onedrive_files(
             });
             Some(SharePointRecording {
                 stream_url: stream_url_for(my_host, &rel),
-                file_url: format!("https://{my_host}{rel}"),
+                file_url: format!("https://{my_host}{}", encode_server_relative_path(&rel)),
                 name,
                 created,
                 size_bytes,
@@ -1496,6 +1505,18 @@ mod tests {
     }
 
     #[test]
+    fn rfc3339_since_with_offset_and_nanos_becomes_a_plain_utc_odata_datetime() {
+        // `Utc::now().to_rfc3339()` shape: nanoseconds and a `+00:00` offset.
+        // A raw `+` decodes to a space in the query string, and OData v3
+        // datetime literals take neither an offset nor 9 fractional digits.
+        let out = odata_datetime("2026-09-16T08:12:33.123456789+00:00");
+        assert_eq!(out, "2026-09-16T08:12:33Z");
+        assert_eq!(odata_datetime("2026-09-16T10:12:33+02:00"), "2026-09-16T08:12:33Z");
+        assert_eq!(odata_datetime("2026-07-27T00:00:00Z"), "2026-07-27T00:00:00Z");
+        assert_eq!(odata_datetime("2026-07-27"), "2026-07-27T00:00:00Z");
+    }
+
+    #[test]
     fn odata_quotes_are_doubled_in_paths() {
         let url = build_recordings_query_url(
             "t-my.sharepoint.com",
@@ -1514,6 +1535,30 @@ mod tests {
         assert_eq!(
             url,
             "https://t-my.sharepoint.com/_layouts/15/stream.aspx?id=/personal/u/Documents/Recordings/Team%20Sync%20%26%20Q%27A%20%231.mp4"
+        );
+    }
+
+    #[test]
+    fn percent_sign_in_a_file_name_is_escaped() {
+        let path = "/personal/u/Documents/Recordings/Q3 100% Review.mp4";
+        assert_eq!(
+            stream_url_for("t-my.sharepoint.com", path),
+            "https://t-my.sharepoint.com/_layouts/15/stream.aspx?id=/personal/u/Documents/Recordings/Q3%20100%25%20Review.mp4"
+        );
+        let json = serde_json::json!({"value":[{
+            "Name":"Q3 100% Review.mp4",
+            "ServerRelativeUrl": path,
+            "TimeCreated":"2026-07-10T15:00:00Z",
+            "Length": 1
+        }]});
+        let recs = parse_onedrive_files(&json, "t-my.sharepoint.com");
+        assert_eq!(
+            recs[0].file_url,
+            "https://t-my.sharepoint.com/personal/u/Documents/Recordings/Q3%20100%25%20Review.mp4"
+        );
+        assert_eq!(
+            percent_decode_component(direct_sharepoint_media_url(&recs[0].file_url).unwrap().path()),
+            path
         );
     }
 
