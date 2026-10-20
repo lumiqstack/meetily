@@ -57,9 +57,8 @@ impl<R: Runtime> NotificationManager<R> {
 
         // Try to request system permission if not already granted
         if !self.consent_manager.has_system_permission().await {
-            match self.system_handler.request_permission().await {
+            match self.request_permission().await {
                 Ok(granted) => {
-                    self.consent_manager.set_system_permission(granted).await?;
                     if granted {
                         log_info!("System notification permission granted");
                     } else {
@@ -341,4 +340,32 @@ pub struct NotificationStats {
     pub system_dnd_active: bool,
     pub recording_notifications_enabled: bool,
     pub meeting_reminders_enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn initialize_records_granted_permission_in_memory() {
+        // The data root is process-wide and may be claimed first by another test,
+        // so the directory must outlive this one.
+        let _ = crate::storage::DATA_ROOT.set(tempfile::tempdir().unwrap().keep());
+        let settings_path = crate::storage::config_dir().join("notifications.json");
+        assert!(
+            settings_path.starts_with(std::env::temp_dir()),
+            "notification settings are not sandboxed; this test cannot run safely"
+        );
+        let _ = std::fs::remove_file(&settings_path);
+
+        let app = tauri::test::mock_app();
+        let manager = NotificationManager::new(app.handle().clone()).await.unwrap();
+        manager.initialize().await.unwrap();
+
+        assert!(manager.get_settings().await.system_permission_granted);
+    }
 }
