@@ -920,6 +920,31 @@ mod tests {
         (format!("http://{address}/model.gguf"), handle)
     }
 
+    /// Answers one request per connection with each full response in turn,
+    /// and yields the raw requests it received.
+    async fn serve_each(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0, "request ended before its headers");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+                requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+            }
+            requests
+        });
+        (format!("http://{address}/model.gguf"), handle)
+    }
+
     /// Serves one GGUF body with its full Content-Length up front, writing each
     /// piece after its delay, so the body spans the sum of the delays.
     async fn serve_drip(pieces: Vec<(Duration, &'static [u8])>) -> String {
@@ -1028,6 +1053,69 @@ mod tests {
         let request = request.await.unwrap().to_ascii_lowercase();
         assert!(request.contains("range: bytes=12-"), "retry did not resume: {request}");
         assert_eq!(fs::read(&final_path).await.unwrap(), b"GGUF-partial-the-end");
+    }
+
+    #[tokio::test]
+    async fn complete_part_file_answered_416_is_moved_into_place() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+        let mut model = test_model(String::new());
+        model.size_mb = 1;
+        let part_path = models_dir.path().join(format!("{}.part", model.gguf_file));
+        std::fs::write(&part_path, b"GGUF-partial-the-end").unwrap();
+        let (url, requests) = serve_each(vec![
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */20\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        ])
+        .await;
+        model.download_url = url;
+
+        manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect("a .part already holding the whole file must complete");
+
+        assert!(requests.await.unwrap()[0].contains("range: bytes=20-"));
+        assert_eq!(
+            fs::read(models_dir.path().join(&model.gguf_file)).await.unwrap(),
+            b"GGUF-partial-the-end"
+        );
+        assert!(!part_path.exists());
+        assert_eq!(
+            manager.get_model_info(&model.name).await.unwrap().status,
+            ModelStatus::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_part_file_answered_416_restarts_fresh() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let manager = ModelManager::new_with_models_dir(Some(models_dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+        let mut model = test_model(String::new());
+        model.size_mb = 1;
+        let part_path = models_dir.path().join(format!("{}.part", model.gguf_file));
+        std::fs::write(&part_path, b"GGUF-partial").unwrap();
+        let (url, requests) = serve_each(vec![
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nGGUF-new".to_string(),
+        ])
+        .await;
+        model.download_url = url;
+
+        manager
+            .download_model_def(&model, None, IDLE_LIMIT)
+            .await
+            .expect("a .part the server cannot extend must be replaced by a fresh download");
+
+        let requests = requests.await.unwrap();
+        assert!(requests[0].contains("range: bytes=12-"), "first request: {}", requests[0]);
+        assert!(!requests[1].contains("range:"), "fresh retry must not send Range: {}", requests[1]);
+        assert_eq!(
+            fs::read(models_dir.path().join(&model.gguf_file)).await.unwrap(),
+            b"GGUF-new"
+        );
+        assert!(!part_path.exists());
     }
 
     #[tokio::test]
