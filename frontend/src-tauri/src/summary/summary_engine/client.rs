@@ -214,6 +214,14 @@ async fn run_generation(
     timeout: Duration,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String> {
+    let _generation = match cancellation_token {
+        Some(token) => tokio::select! {
+            guard = manager.lock_generation() => guard,
+            _ = token.cancelled() => return Err(anyhow!("Generation cancelled before starting")),
+        },
+        None => manager.lock_generation().await,
+    };
+
     // Ensure sidecar is running with this model
     manager.ensure_running(model_path).await?;
 

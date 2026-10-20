@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, MutexGuard, RwLock};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -38,8 +39,13 @@ pub struct SidecarManager {
     /// Health status
     is_healthy: Arc<AtomicBool>,
 
-    /// Shutdown flag
-    should_shutdown: Arc<AtomicBool>,
+    /// Cancelled when the current process is shut down; each spawn gets a
+    /// fresh token so the previous process's background loops exit
+    loop_token: Arc<std::sync::Mutex<CancellationToken>>,
+
+    /// Held for a whole generation: the helper serves one request at a time,
+    /// so a cancel or timeout that kills the process only hits its holder
+    generation_lock: Arc<Mutex<()>>,
 
     /// Active request count (for graceful shutdown)
     active_request_count: Arc<AtomicUsize>,
@@ -99,7 +105,8 @@ impl SidecarManager {
             stdout_reader: Arc::new(Mutex::new(None)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
             is_healthy: Arc::new(AtomicBool::new(false)),
-            should_shutdown: Arc::new(AtomicBool::new(false)),
+            loop_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
+            generation_lock: Arc::new(Mutex::new(())),
             active_request_count: Arc::new(AtomicUsize::new(0)),
             helper_binary_path,
             current_model_path: Arc::new(RwLock::new(None)),
@@ -339,16 +346,23 @@ impl SidecarManager {
         }
 
         self.is_healthy.store(true, Ordering::SeqCst);
-        self.should_shutdown.store(false, Ordering::SeqCst);
         self.update_activity().await;
 
         log::info!("Sidecar spawned successfully");
 
+        let loop_token = CancellationToken::new();
+        *self.loop_token.lock().unwrap() = loop_token.clone();
+
         // Start background tasks
-        self.start_health_check_loop();
-        self.start_idle_check_loop();
+        self.start_health_check_loop(loop_token.clone());
+        self.start_idle_check_loop(loop_token);
 
         Ok(())
+    }
+
+    /// Exclusive access to the sidecar for one generation request
+    pub async fn lock_generation(&self) -> MutexGuard<'_, ()> {
+        self.generation_lock.lock().await
     }
 
     /// Send a request to the sidecar and wait for response
@@ -448,8 +462,8 @@ impl SidecarManager {
     pub async fn shutdown_gracefully(&self) -> Result<()> {
         log::info!("Initiating graceful shutdown of sidecar");
         
-        // Set shutdown flag to prevent new internal tasks
-        self.should_shutdown.store(true, Ordering::SeqCst);
+        // Stop background loops so they don't ping or idle-kill meanwhile
+        self.loop_token.lock().unwrap().cancel();
         
         // Wait for active requests to complete
         // We poll every 500ms
@@ -477,8 +491,7 @@ impl SidecarManager {
 
     /// Force shutdown the sidecar
     pub async fn shutdown(&self) -> Result<()> {
-        // Set shutdown flag
-        self.should_shutdown.store(true, Ordering::SeqCst);
+        self.loop_token.lock().unwrap().cancel();
 
         // Send shutdown command
         if self.is_healthy() {
@@ -557,14 +570,15 @@ impl SidecarManager {
     }
 
     /// Start health check loop (runs in background)
-    fn start_health_check_loop(&self) {
+    fn start_health_check_loop(&self, loop_token: CancellationToken) {
         let manager = Self {
             child_process: self.child_process.clone(),
             stdin_writer: self.stdin_writer.clone(),
             stdout_reader: self.stdout_reader.clone(),
             last_activity: self.last_activity.clone(),
             is_healthy: self.is_healthy.clone(),
-            should_shutdown: self.should_shutdown.clone(),
+            loop_token: self.loop_token.clone(),
+            generation_lock: self.generation_lock.clone(),
             active_request_count: self.active_request_count.clone(),
             helper_binary_path: self.helper_binary_path.clone(),
             current_model_path: self.current_model_path.clone(),
@@ -576,11 +590,9 @@ impl SidecarManager {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                interval.tick().await;
-
-                if manager.should_shutdown.load(Ordering::SeqCst) {
-                    log::debug!("Health check loop: shutdown flag set, exiting");
-                    break;
+                tokio::select! {
+                    _ = loop_token.cancelled() => break,
+                    _ = interval.tick() => {}
                 }
 
                 if !manager.is_healthy() {
@@ -605,14 +617,15 @@ impl SidecarManager {
     }
 
     /// Start idle check loop (runs in background)
-    fn start_idle_check_loop(&self) {
+    fn start_idle_check_loop(&self, loop_token: CancellationToken) {
         let manager = Self {
             child_process: self.child_process.clone(),
             stdin_writer: self.stdin_writer.clone(),
             stdout_reader: self.stdout_reader.clone(),
             last_activity: self.last_activity.clone(),
             is_healthy: self.is_healthy.clone(),
-            should_shutdown: self.should_shutdown.clone(),
+            loop_token: self.loop_token.clone(),
+            generation_lock: self.generation_lock.clone(),
             active_request_count: self.active_request_count.clone(),
             helper_binary_path: self.helper_binary_path.clone(),
             current_model_path: self.current_model_path.clone(),
@@ -624,11 +637,9 @@ impl SidecarManager {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                interval.tick().await;
-
-                if manager.should_shutdown.load(Ordering::SeqCst) {
-                    log::debug!("Idle check loop: shutdown flag set, exiting");
-                    break;
+                tokio::select! {
+                    _ = loop_token.cancelled() => break,
+                    _ = interval.tick() => {}
                 }
 
                 // Don't shutdown if we are busy
@@ -658,17 +669,6 @@ impl SidecarManager {
 
             log::debug!("Idle check loop exited");
         });
-    }
-}
-
-impl Drop for SidecarManager {
-    fn drop(&mut self) {
-        // Set shutdown flag
-        self.should_shutdown.store(true, Ordering::SeqCst);
-
-        // Note: Actual cleanup happens in shutdown() method
-        // We can't do async work in Drop, so this is best-effort
-        log::debug!("SidecarManager dropped");
     }
 }
 
