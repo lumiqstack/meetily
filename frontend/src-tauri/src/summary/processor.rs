@@ -376,6 +376,11 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
     chunks
 }
 
+/// Splits a transcript into chunks sized for a model whose usable context is `token_threshold`
+fn chunk_for_context(text: &str, token_threshold: usize) -> Vec<String> {
+    chunk_text(text, token_threshold - 300, 100)
+}
+
 /// Extracts meeting name from the first heading in markdown
 ///
 /// # Arguments
@@ -440,7 +445,7 @@ pub(crate) async fn generate_meeting_summary(
             if (provider == &LLMProvider::Ollama || provider == &LLMProvider::BuiltInAI)
                 && total_tokens >= token_threshold
             {
-                let chunks = chunk_text(text, token_threshold - 300, 100);
+                let chunks = chunk_for_context(text, token_threshold);
                 let num_chunks = chunks.len();
                 let mut chunk_summaries = Vec::with_capacity(num_chunks);
                 for (index, chunk) in chunks.iter().enumerate() {
@@ -738,6 +743,19 @@ mod tests {
         for chunk in &chunks {
             let tokens = rough_token_count(chunk);
             assert!(tokens <= 200, "chunk estimated at {tokens} tokens exceeds 200");
+        }
+    }
+
+    #[test]
+    fn chunk_for_context_handles_small_context_threshold() {
+        // An Ollama model with num_ctx 512 yields a threshold of 212.
+        let text = "the team reviewed the release plan ".repeat(200);
+        let chunks = chunk_for_context(&text, 212);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            let tokens = rough_token_count(chunk);
+            assert!(tokens <= 212, "chunk estimated at {tokens} tokens exceeds 212");
         }
     }
 
