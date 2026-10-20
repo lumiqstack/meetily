@@ -19,9 +19,9 @@ use tracing::{info, warn};
 
 const COPILOT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Retired (or retiring in October 2026) Copilot model IDs. Must match
-/// `RETIRED_COPILOT_CLI_MODELS` in frontend/src/lib/copilot-cli-models.ts; a
-/// test below enforces that. Never remapped: the user picks a replacement.
+/// Retired Copilot model IDs per GitHub's model retirement history. Must
+/// match `RETIRED_COPILOT_CLI_MODELS` in frontend/src/lib/copilot-cli-models.ts;
+/// a test below enforces that. Never remapped: the user picks a replacement.
 pub(crate) const RETIRED_COPILOT_CLI_MODELS: &[&str] = &[
     "claude-sonnet-4.5",
     "claude-sonnet-4",
@@ -29,6 +29,12 @@ pub(crate) const RETIRED_COPILOT_CLI_MODELS: &[&str] = &[
     "gpt-4.1",
     "gemini-2.5-pro",
     "gemini-3.1-pro",
+    "gemini-3-flash",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+    "raptor-mini",
+    "mai-code-1-flash",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
     "kimi-k2.7-code",
@@ -38,7 +44,6 @@ pub(crate) const RETIRED_COPILOT_CLI_MODELS: &[&str] = &[
     "gpt-5.4-mini",
     "gpt-5.5",
     "gemini-3.7-flash",
-    "grok-4.5",
 ];
 
 /// Reject a retired model with an actionable message; anything else
