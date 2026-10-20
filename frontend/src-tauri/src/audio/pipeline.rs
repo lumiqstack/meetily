@@ -933,6 +933,16 @@ impl AudioCapture {
 
         self.state.report_error(audio_error);
     }
+
+    /// The capture stream produced its last sample. After a stop that is
+    /// expected; during a recording it means this source has gone silent for
+    /// good, so it goes through the same error path as a cpal stream error.
+    pub fn handle_stream_end(&self) {
+        if self.state.is_recording() {
+            error!("Audio stream for {} ended while recording", self.device.name);
+            self.state.report_error(AudioError::StreamFailed);
+        }
+    }
 }
 
 /// VAD-driven audio processing pipeline

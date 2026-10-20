@@ -2,7 +2,7 @@
 
 #[cfg(target_os = "macos")]
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use anyhow::Result;
@@ -47,8 +47,9 @@ struct AudioContext {
     producer: HeapProd<f32>,
     waker_state: Arc<Mutex<WakerState>>,
     current_sample_rate: Arc<AtomicU32>,
-    consecutive_drops: Arc<AtomicU32>,
-    should_terminate: Arc<AtomicBool>,
+    /// Samples dropped on overflow since the last overflow warning.
+    dropped_samples: u64,
+    last_overflow_warning: Option<std::time::Instant>,
 }
 
 #[cfg(target_os = "macos")]
@@ -275,8 +276,8 @@ impl CoreAudioCapture {
             producer,
             waker_state: waker_state.clone(),
             current_sample_rate: current_sample_rate.clone(),
-            consecutive_drops: Arc::new(AtomicU32::new(0)),
-            should_terminate: Arc::new(AtomicBool::new(false)),
+            dropped_samples: 0,
+            last_overflow_warning: None,
         });
 
         info!("🎙️ CoreAudio: Starting audio device...");
@@ -300,18 +301,26 @@ impl CoreAudioCapture {
 fn process_audio_data(ctx: &mut AudioContext, data: &[f32]) {
     // Push raw samples directly to ring buffer
     // Let the pipeline handle all gain adjustments (post-mix 3x gain + mic normalization)
-    let buffer_size = data.len();
     let pushed = ctx.producer.push_slice(data);
 
-    if pushed < buffer_size {
-        let consecutive = ctx.consecutive_drops.fetch_add(1, Ordering::AcqRel) + 1;
-
-        if consecutive > 10 {
-            ctx.should_terminate.store(true, Ordering::Release);
-            return;
+    // A full buffer means the consumer fell ~2.7 s behind. Drop what does not
+    // fit and keep capturing: ending the stream here silenced system audio for
+    // the rest of the meeting. The consumer side cannot be popped from this
+    // thread, so the newest samples are the ones dropped.
+    if pushed < data.len() {
+        ctx.dropped_samples += (data.len() - pushed) as u64;
+        let now = std::time::Instant::now();
+        let due = ctx
+            .last_overflow_warning
+            .map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(5));
+        if due {
+            warn!(
+                "CoreAudio: ring buffer full, dropped {} system audio samples",
+                ctx.dropped_samples
+            );
+            ctx.dropped_samples = 0;
+            ctx.last_overflow_warning = Some(now);
         }
-    } else {
-        ctx.consecutive_drops.store(0, Ordering::Release);
     }
 
     if pushed > 0 {
@@ -352,15 +361,6 @@ impl Stream for CoreAudioStream {
             return Poll::Ready(Some(sample));
         }
 
-        // Check if we should terminate
-        if self._ctx.should_terminate.load(Ordering::Acquire) {
-            warn!("Stream terminating due to buffer pressure");
-            return match self.consumer.try_pop() {
-                Some(sample) => Poll::Ready(Some(sample)),
-                None => Poll::Ready(None),
-            };
-        }
-
         // No data available, register waker and return pending
         {
             let mut state = self.waker_state.lock().unwrap();
@@ -369,14 +369,6 @@ impl Stream for CoreAudioStream {
         }
 
         Poll::Pending
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for CoreAudioStream {
-    fn drop(&mut self) {
-        info!("CoreAudioStream dropped, signaling termination");
-        self._ctx.should_terminate.store(true, Ordering::Release);
     }
 }
 
