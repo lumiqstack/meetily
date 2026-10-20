@@ -38,7 +38,8 @@ impl DatabaseManager {
                     backend_db_path,
                     tauri_db_path
                 );
-                fs::copy(backend_db_path, tauri_db_path).map_err(|e| sqlx::Error::Io(e))?;
+                Self::copy_into_place(Path::new(backend_db_path), Path::new(tauri_db_path))
+                    .map_err(sqlx::Error::Io)?;
             } else {
                 log::info!("Creating database at {}", tauri_db_path);
                 Sqlite::create_database(tauri_db_path).await?;
@@ -177,11 +178,26 @@ impl DatabaseManager {
                 legacy_db_path,
                 target_legacy_path.display()
             );
-            fs::copy(legacy_db_path, &target_legacy_path).map_err(|e| sqlx::Error::Io(e))?;
+            Self::copy_into_place(Path::new(legacy_db_path), &target_legacy_path)
+                .map_err(sqlx::Error::Io)?;
         }
 
         // Now use the standard initialization which will detect and migrate the legacy db
         Self::new_from_app_handle(app_handle).await
+    }
+
+    /// Copy `src` to `dst` through `<dst>.copying`, so a copy that fails
+    /// partway never leaves a truncated database under the real name, where
+    /// the next launch would open it and report it as damaged.
+    fn copy_into_place(src: &Path, dst: &Path) -> std::io::Result<()> {
+        let mut partial = dst.as_os_str().to_owned();
+        partial.push(".copying");
+        let partial = Path::new(&partial);
+        let copied = fs::copy(src, partial).and_then(|_| fs::rename(partial, dst));
+        if copied.is_err() {
+            let _ = fs::remove_file(partial);
+        }
+        copied.map(|_| ())
     }
 
     /// True only when both paths exist and resolve to the same file. Compared
