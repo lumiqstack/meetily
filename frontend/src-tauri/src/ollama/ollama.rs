@@ -358,15 +358,21 @@ async fn pull_model_stream<R: Runtime>(
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut last_progress = 0u8;
+    let mut succeeded = false;
 
     loop {
         let chunk = match timeout(idle_timeout, stream.next()).await {
             Err(_) => return Err(pull_stall_error(idle_timeout)),
-            Ok(None) => break,
-            Ok(Some(chunk)) => chunk.map_err(|e| format!("Failed to read stream: {}", e))?,
+            Ok(None) => None,
+            Ok(Some(chunk)) => Some(chunk.map_err(|e| format!("Failed to read stream: {}", e))?),
         };
+        let at_eof = chunk.is_none();
 
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        match chunk {
+            Some(chunk) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
+            // Terminate a final line that arrived without a newline so it is parsed below.
+            None => buffer.push('\n'),
+        }
 
         // Process complete lines
         while let Some(newline_pos) = buffer.find('\n') {
@@ -409,8 +415,25 @@ async fn pull_model_stream<R: Runtime>(
                 if let Some(error) = json.get("error").and_then(|v| v.as_str()) {
                     return Err(format!("Ollama error: {}", error));
                 }
+
+                if json.get("status").and_then(|v| v.as_str()) == Some("success") {
+                    succeeded = true;
+                }
             }
         }
+
+        if at_eof {
+            break;
+        }
+    }
+
+    // Ollama ends a completed pull with a "success" line; a stream that closes
+    // without one was cut off and the model is not usable.
+    if !succeeded {
+        return Err(format!(
+            "Model download for {} ended before Ollama reported success",
+            model_name
+        ));
     }
 
     Ok(())
