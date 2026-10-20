@@ -653,7 +653,7 @@ fn archive_logs(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<
         let name = entry.file_name();
         let mut to = dst.join(&name);
         if to.exists() {
-            // e.g. meetily.log -> meetily.premigration.log
+            // e.g. meetily.log -> meetily.premigration.log, meetily.premigration.2.log, ...
             let stem = Path::new(&name)
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
@@ -662,7 +662,20 @@ fn archive_logs(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<
                 .extension()
                 .map(|s| format!(".{}", s.to_string_lossy()))
                 .unwrap_or_default();
-            to = dst.join(format!("{stem}.premigration{ext}"));
+            // Several old log folders can each hold a log by the same name, so a
+            // taken name is only a duplicate when the contents match.
+            let mut n = 1;
+            loop {
+                to = if n == 1 {
+                    dst.join(format!("{stem}.premigration{ext}"))
+                } else {
+                    dst.join(format!("{stem}.premigration.{n}{ext}"))
+                };
+                if !to.exists() || verify(&from, &to).unwrap_or(false) {
+                    break;
+                }
+                n += 1;
+            }
         }
         if to.exists() {
             // Already archived on an earlier run; drop the duplicate source.
