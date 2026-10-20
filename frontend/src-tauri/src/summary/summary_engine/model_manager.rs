@@ -517,7 +517,7 @@ impl ModelManager {
         }
 
         // Check for existing partial download to resume
-        let existing_size: u64 = if part_path.exists() {
+        let mut existing_size: u64 = if part_path.exists() {
             fs::metadata(&part_path)
                 .await
                 .map(|m| m.len())
@@ -534,38 +534,72 @@ impl ModelManager {
             .build()
             .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
-        // Build request with Range header if resuming
-        let mut request = client.get(&model_def.download_url);
-        if existing_size > 0 {
-            log::info!(
-                "Resuming download from byte {} ({:.1} MB)",
-                existing_size,
-                existing_size as f64 / (1024.0 * 1024.0)
-            );
-            request = request.header("Range", format!("bytes={}-", existing_size));
-        }
-
-        let response = match timeout(idle_timeout, request.send()).await {
-            Err(_) => {
-                return Err(anyhow!("Download stalled - No response for {:?}", idle_timeout));
+        // `None` means the .part already holds the whole file and there is no body to read.
+        let response = loop {
+            // Build request with Range header if resuming
+            let mut request = client.get(&model_def.download_url);
+            if existing_size > 0 {
+                log::info!(
+                    "Resuming download from byte {} ({:.1} MB)",
+                    existing_size,
+                    existing_size as f64 / (1024.0 * 1024.0)
+                );
+                request = request.header("Range", format!("bytes={}-", existing_size));
             }
-            Ok(response) => response.map_err(|e| anyhow!("Failed to start download: {}", e))?,
+
+            let response = match timeout(idle_timeout, request.send()).await {
+                Err(_) => {
+                    return Err(anyhow!("Download stalled - No response for {:?}", idle_timeout));
+                }
+                Ok(response) => response.map_err(|e| anyhow!("Failed to start download: {}", e))?,
+            };
+
+            // A request without Range always breaks here, so this retries at most once.
+            if existing_size == 0
+                || response.status() != reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+            {
+                break Some(response);
+            }
+            let server_size = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("bytes */"))
+                .and_then(|total| total.parse::<u64>().ok());
+            if server_size == Some(existing_size) {
+                log::info!("Partial file already holds all {} bytes", existing_size);
+                break None;
+            }
+            log::warn!(
+                "Server cannot resume from byte {} (file size {:?}), restarting download",
+                existing_size,
+                server_size
+            );
+            fs::remove_file(&part_path)
+                .await
+                .map_err(|e| anyhow!("Failed to remove stale partial download: {}", e))?;
+            existing_size = 0;
         };
 
         // Check response status - 200 OK (full download) or 206 Partial Content (resume)
-        let (total_size, resuming) = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            // Server supports resume - total size = existing + remaining
-            let remaining = response.content_length().unwrap_or(0);
-            log::info!("Server supports resume, {} MB remaining", remaining / (1024 * 1024));
-            (existing_size + remaining, true)
-        } else if response.status().is_success() {
-            // Server doesn't support resume or fresh download
-            if existing_size > 0 {
-                log::warn!("Server doesn't support resume, starting fresh download");
+        let (total_size, resuming) = match &response {
+            None => (existing_size, true),
+            Some(response) if response.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                // Server supports resume - total size = existing + remaining
+                let remaining = response.content_length().unwrap_or(0);
+                log::info!("Server supports resume, {} MB remaining", remaining / (1024 * 1024));
+                (existing_size + remaining, true)
             }
-            (response.content_length().unwrap_or(0), false)
-        } else {
-            return Err(anyhow!("Download failed with status: {}", response.status()));
+            Some(response) if response.status().is_success() => {
+                // Server doesn't support resume or fresh download
+                if existing_size > 0 {
+                    log::warn!("Server doesn't support resume, starting fresh download");
+                }
+                (response.content_length().unwrap_or(0), false)
+            }
+            Some(response) => {
+                return Err(anyhow!("Download failed with status: {}", response.status()));
+            }
         };
 
         log::info!("Total size: {} MB", total_size / (1024 * 1024));
@@ -610,7 +644,10 @@ impl ModelManager {
         let start_downloaded = downloaded;
 
         use futures_util::StreamExt;
-        let mut stream = response.bytes_stream();
+        let mut stream = match response {
+            Some(response) => response.bytes_stream().boxed(),
+            None => futures_util::stream::empty().boxed(),
+        };
 
         loop {
             // Check for cancellation
