@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { RefreshCw, Mic, Speaker } from 'lucide-react';
 import { AudioLevelMeter, CompactAudioLevelMeter } from './AudioLevelMeter';
 import { AudioBackendSelector } from './AudioBackendSelector';
@@ -126,34 +126,19 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   }, [devices, loading, disabled, selectedDevices]);
 
   // Set up audio level event listener
+  useTauriEvent<AudioLevelUpdate>('audio-levels', (levelUpdate) => {
+    const newLevels = new Map<string, AudioLevelData>();
+
+    levelUpdate.levels.forEach(level => {
+      newLevels.set(level.device_name, level);
+    });
+
+    setAudioLevels(newLevels);
+  });
+
+  // Stop monitoring when component unmounts
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-
-    const setupAudioLevelListener = async () => {
-      try {
-        unlisten = await listen<AudioLevelUpdate>('audio-levels', (event) => {
-          const levelUpdate = event.payload;
-          const newLevels = new Map<string, AudioLevelData>();
-
-          levelUpdate.levels.forEach(level => {
-            newLevels.set(level.device_name, level);
-          });
-
-          setAudioLevels(newLevels);
-        });
-      } catch (err) {
-        console.error('Failed to setup audio level listener:', err);
-      }
-    };
-
-    setupAudioLevelListener();
-
-    // Cleanup function
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
-      // Stop monitoring when component unmounts
       if (isMonitoring) {
         stopAudioLevelMonitoring();
       }
