@@ -1722,6 +1722,83 @@ mod tests {
         assert_eq!(lengths, vec![9_600]);
     }
 
+    /// Stop sends in-band flush signals while the ring buffer still holds a
+    /// partial window of the utterance in progress. That tail must reach the
+    /// transcript exactly once: not dropped by a VAD flushed before it was
+    /// mixed, and not re-sent alongside the part flushed earlier.
+    #[tokio::test]
+    async fn flush_signal_mid_speech_keeps_partial_window_speech_once() {
+        let state = RecordingState::new();
+        let (audio_tx, audio_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let (transcription_tx, mut transcription_rx) = mpsc::unbounded_channel::<AudioChunk>();
+        let pipeline = AudioPipeline::new(
+            audio_rx,
+            transcription_tx,
+            state,
+            0,
+            48_000,
+            "mic".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            "system".to_string(),
+            crate::audio::device_detection::InputDeviceKind::Wired,
+            true,
+        )
+        .expect("pipeline construction");
+
+        // 1s of silence, then speech still running when the recording stops at
+        // 4.5s: seven full windows plus a 300ms partial window.
+        let mut mic = vec![0.0f32; 48_000];
+        mic.extend(crate::audio::vad::tests::generate_voiced_speech(3.5, 48_000));
+        assert_eq!(mic.len() % 28_800, 14_400);
+
+        for (i, data) in mic.chunks(CHUNK).enumerate() {
+            let timestamp = (i + 1) as f64 * CHUNK as f64 / 48_000.0;
+            let gap = if i == 0 { None } else { Some(0.0) };
+            for (device_type, data) in [
+                (DeviceType::Microphone, data.to_vec()),
+                (DeviceType::System, vec![0.0f32; data.len()]),
+            ] {
+                audio_tx
+                    .send(AudioChunk {
+                        capture_gap: gap,
+                        data,
+                        sample_rate: 48_000,
+                        timestamp,
+                        chunk_id: i as u64,
+                        device_type,
+                        dominant_source: None,
+                    })
+                    .unwrap();
+            }
+        }
+        // Same signals, same order as force_flush_and_stop().
+        for i in 0..4u64 {
+            audio_tx
+                .send(AudioChunk {
+                    capture_gap: None,
+                    data: vec![],
+                    sample_rate: 16_000,
+                    timestamp: 0.0,
+                    chunk_id: u64::MAX - i,
+                    device_type: DeviceType::Microphone,
+                    dominant_source: None,
+                })
+                .unwrap();
+        }
+        drop(audio_tx);
+
+        pipeline.run().await.expect("pipeline run");
+
+        let mut segments = Vec::new();
+        while let Ok(chunk) = transcription_rx.try_recv() {
+            let start = chunk.timestamp;
+            segments.push((start, start + chunk.data.len() as f64 / 16_000.0));
+        }
+        let covering = |t: f64| segments.iter().filter(|(s, e)| *s <= t && t < *e).count();
+        assert_eq!(covering(4.4), 1, "speech in the partial window, segments: {segments:?}");
+        assert_eq!(covering(3.0), 1, "speech before the flush signal, segments: {segments:?}");
+    }
+
     const CHUNK: usize = 480;
 
     fn drain_ready_windows(
