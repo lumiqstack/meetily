@@ -610,4 +610,42 @@ mod tests {
             plan.join("\n")
         );
     }
+
+    #[tokio::test]
+    async fn delete_meeting_removes_obsidian_export_and_pipeline_meta_rows() {
+        let pool = test_pool().await;
+        for id in ["doomed", "survivor"] {
+            insert_meeting(&pool, id, Some("C:/rec/x")).await;
+            sqlx::query(
+                "INSERT INTO obsidian_exports (meeting_id, filename, exported_at)
+                 VALUES (?, 'Note.md', '2026-07-24T10:00:00Z')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO pipeline_meta (meeting_id, attempts, suppressed, updated_at)
+                 VALUES (?, 3, 1, '2026-07-24T10:00:00Z')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert!(MeetingsRepository::delete_meeting(&pool, "doomed").await.unwrap());
+
+        for table in ["obsidian_exports", "pipeline_meta"] {
+            let sql = format!("SELECT COUNT(*) FROM {} WHERE meeting_id = ?", table);
+            for (id, expected) in [("doomed", 0), ("survivor", 1)] {
+                let count: i64 = sqlx::query_scalar(&sql)
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(count, expected, "{} rows for meeting {}", table, id);
+            }
+        }
+    }
 }
