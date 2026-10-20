@@ -184,7 +184,7 @@ impl AudioStream {
         let device_name = device.name.clone();
         info!("🔊 Stream: Spawning tokio task to poll Core Audio stream...");
         let task = tokio::spawn({
-            let capture = capture.clone();
+            let mut capture = capture.clone();
             let mut stream = core_stream;
 
             async move {
@@ -208,6 +208,9 @@ impl AudioStream {
 
                     // Process when we have enough samples
                     if frame_count >= frames_per_chunk {
+                        // The IO proc tracks the device's nominal rate (a
+                        // Bluetooth headset switching to HFP changes it).
+                        capture.set_input_sample_rate(stream.sample_rate());
                         capture.process_audio_data(&buffer);
                         buffer.clear();
                         frame_count = 0;
