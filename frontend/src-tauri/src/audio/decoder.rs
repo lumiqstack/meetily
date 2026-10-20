@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -478,7 +479,7 @@ pub fn decode_audio_file_with_progress(
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| anyhow!("No audio track found in file"))?;
 
-    let track_id = track.id;
+    let mut track_id = track.id;
 
     // Get audio parameters
     let mut sample_rate = track
@@ -520,21 +521,37 @@ pub fn decode_audio_file_with_progress(
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     let mut last_progress = 0u32;
+    let mut skipped_packets = 0u64;
 
     loop {
-        // Get the next packet
         let packet = match format.next_packet() {
             Ok(packet) => packet,
-            Err(symphonia::core::errors::Error::IoError(ref e))
+            Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
-                // End of file
                 break;
             }
-            Err(e) => {
-                warn!("Error reading packet: {}", e);
-                break;
+            Err(SymphoniaError::DecodeError(e)) => {
+                skipped_packets += 1;
+                warn!("Skipping unreadable packet: {}", e);
+                continue;
             }
+            // A new stream started (e.g. the next link of a chained Ogg); its
+            // tracks replace the old ones, so the decoder must be rebuilt.
+            Err(SymphoniaError::ResetRequired) => {
+                let track = format
+                    .tracks()
+                    .iter()
+                    .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+                    .ok_or_else(|| anyhow!("No audio track found after stream reset"))?;
+                track_id = track.id;
+                decoder = symphonia::default::get_codecs()
+                    .make(&track.codec_params, &DecoderOptions::default())
+                    .map_err(|e| anyhow!("Failed to create decoder after stream reset: {}", e))?;
+                sample_buf = None;
+                continue;
+            }
+            Err(e) => return Err(anyhow!("Failed to read audio packet: {}", e)),
         };
 
         // Skip packets from other tracks
@@ -607,6 +624,23 @@ pub fn decode_audio_file_with_progress(
 
     let total_frames = all_samples.len() / channels as usize;
     let duration_seconds = total_frames as f64 / sample_rate as f64;
+
+    if skipped_packets > 0 {
+        warn!("Skipped {} unreadable packets", skipped_packets);
+    }
+
+    // A file that ends early reads as a clean end of stream, so compare against
+    // the length the container declared. Returning the short audio as Ok would
+    // let retranscription replace a full transcript with a partial one.
+    if let Some(expected) = expected_duration {
+        if duration_seconds < expected * 0.9 {
+            return Err(anyhow!(
+                "Decoded only {:.1}s of the {:.1}s the file declares; it appears truncated or damaged",
+                duration_seconds,
+                expected
+            ));
+        }
+    }
 
     info!(
         "Decoded {} samples ({:.2}s) at {}Hz, {} channels",
