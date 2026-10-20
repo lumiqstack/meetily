@@ -77,7 +77,10 @@ impl SidecarManager {
     /// Create a new sidecar manager
     pub fn new(_app_data_dir: PathBuf) -> Result<Self> {
         let helper_binary_path = Self::resolve_helper_binary()?;
+        Ok(Self::with_helper_binary(helper_binary_path))
+    }
 
+    fn with_helper_binary(helper_binary_path: PathBuf) -> Self {
         // Get idle timeout from env var or use default
         let idle_timeout_secs = std::env::var("LLAMA_IDLE_TIMEOUT")
             .ok()
@@ -90,7 +93,7 @@ impl SidecarManager {
         );
         log::info!("Helper binary path: {}", helper_binary_path.display());
 
-        Ok(Self {
+        Self {
             child_process: Arc::new(Mutex::new(None)),
             stdin_writer: Arc::new(Mutex::new(None)),
             stdout_reader: Arc::new(Mutex::new(None)),
@@ -101,7 +104,7 @@ impl SidecarManager {
             helper_binary_path,
             current_model_path: Arc::new(RwLock::new(None)),
             idle_timeout_secs,
-        })
+        }
     }
 
     /// Resolve the path to llama-helper binary
@@ -666,5 +669,64 @@ impl Drop for SidecarManager {
         // Note: Actual cleanup happens in shutdown() method
         // We can't do async work in Drop, so this is best-effort
         log::debug!("SidecarManager dropped");
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(super) mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// A stand-in for llama-helper speaking the same line protocol; each
+    /// generate request takes about a second, like a real (short) generation.
+    pub(in crate::summary::summary_engine) fn fake_helper_manager(dir: &Path) -> SidecarManager {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-llama-helper");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"ping"'*) echo '{"type":"pong"}' ;;
+    *'"type":"shutdown"'*) exit 0 ;;
+    *'"type":"generate"'*) sleep 1; echo '{"type":"response","text":"done","error":null}' ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SidecarManager::with_helper_binary(script)
+    }
+
+    /// Every background loop holds its own clone of the manager's shared state.
+    fn live_background_loops(manager: &SidecarManager) -> usize {
+        Arc::strong_count(&manager.last_activity) - 1
+    }
+
+    #[tokio::test]
+    async fn respawn_stops_the_previous_processes_background_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = fake_helper_manager(dir.path());
+
+        manager.ensure_running(PathBuf::from("model-a.gguf")).await.unwrap();
+        assert_eq!(live_background_loops(&manager), 2);
+        // Let both loops take their immediate first tick and park on the interval.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        manager.ensure_running(PathBuf::from("model-b.gguf")).await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while live_background_loops(&manager) != 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            live_background_loops(&manager),
+            2,
+            "only the current process's health and idle loops should be alive"
+        );
+        assert!(manager.is_healthy());
+
+        manager.shutdown().await.unwrap();
     }
 }
