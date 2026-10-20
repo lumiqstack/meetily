@@ -148,9 +148,17 @@ impl DatabaseManager {
 
     /// Check if this is the first launch (sqlite database doesn't exist yet)
     pub async fn is_first_launch(_app_handle: &tauri::AppHandle) -> Result<bool> {
-        let tauri_db_path = crate::storage::db_dir().join("meeting_minutes.sqlite");
+        Ok(Self::is_first_launch_in(
+            &crate::storage::db_dir(),
+            crate::storage::unavailable_root().as_deref(),
+        ))
+    }
 
-        Ok(!tauri_db_path.exists())
+    /// The user's database lives on an unreachable configured root, so its
+    /// absence from the fallback is no sign of a first launch. Onboarding there
+    /// would start a fresh database whose meetings vanish once the drive is back.
+    pub(crate) fn is_first_launch_in(db_dir: &Path, unavailable_root: Option<&Path>) -> bool {
+        unavailable_root.is_none() && !db_dir.join("meeting_minutes.sqlite").exists()
     }
 
     /// Import a legacy database from the specified path and initialize

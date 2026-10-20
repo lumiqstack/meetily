@@ -11,6 +11,16 @@ pub async fn initialize_database_on_startup(app: &AppHandle) -> Result<(), Strin
     // behind; sweep them before anything else (needs no database).
     crate::audio::sharepoint::sweep_stale_cookie_files(app);
 
+    // Opening a database here would create an empty one in the fallback root.
+    // The frontend asks get_unavailable_data_root and blocks the app instead.
+    if let Some(path) = crate::storage::unavailable_root() {
+        log::error!(
+            "Not opening the database: data root {} is unavailable",
+            path.display()
+        );
+        return Ok(());
+    }
+
     // Check if this is the first launch (no database exists yet)
     let is_first_launch = DatabaseManager::is_first_launch(app)
         .await

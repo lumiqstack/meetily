@@ -37,6 +37,9 @@ const ENV_OVERRIDE: &str = "MEETILY_DATA_DIR";
 /// needs to know where to move things *from*.
 static LEGACY_ROOT: OnceLock<PathBuf> = OnceLock::new();
 pub(crate) static DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// The configured root that could not be created at startup, when [`DATA_ROOT`]
+/// is the legacy fallback because of it.
+static UNAVAILABLE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Pointer {
@@ -74,25 +77,39 @@ fn platform_app_data_dir() -> Option<PathBuf> {
     }
 }
 
+struct Resolution {
+    root: PathBuf,
+    /// The configured root, when it could not be created and `root` is the
+    /// legacy fallback instead.
+    unavailable: Option<PathBuf>,
+}
+
 /// Resolve the data root given the legacy directory, applying the precedence
 /// documented on the module. Falls back to `legacy` whenever the configured root
 /// cannot be created — an unplugged external drive must not brick the app.
-fn resolve(legacy: &Path) -> PathBuf {
+fn resolve(legacy: &Path) -> Resolution {
     let configured = std::env::var_os(ENV_OVERRIDE)
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| read_pointer(legacy).and_then(|p| p.data_root));
 
+    let in_legacy = Resolution {
+        root: legacy.to_path_buf(),
+        unavailable: None,
+    };
     let Some(candidate) = configured else {
-        return legacy.to_path_buf();
+        return in_legacy;
     };
 
     if same_dir(&candidate, legacy) {
-        return legacy.to_path_buf();
+        return in_legacy;
     }
 
     match std::fs::create_dir_all(&candidate) {
-        Ok(()) => candidate,
+        Ok(()) => Resolution {
+            root: candidate,
+            unavailable: None,
+        },
         Err(e) => {
             // Deliberately loud: silently writing gigabytes back to C: after the
             // user moved everything to D: is worse than a noisy log line.
@@ -102,7 +119,20 @@ fn resolve(legacy: &Path) -> PathBuf {
                 e,
                 legacy.display()
             );
-            legacy.to_path_buf()
+            Resolution {
+                root: legacy.to_path_buf(),
+                unavailable: Some(candidate),
+            }
+        }
+    }
+}
+
+fn install(legacy: PathBuf) {
+    let resolved = resolve(&legacy);
+    let _ = LEGACY_ROOT.set(legacy);
+    if DATA_ROOT.set(resolved.root).is_ok() {
+        if let Some(path) = resolved.unavailable {
+            let _ = UNAVAILABLE_ROOT.set(path);
         }
     }
 }
@@ -136,9 +166,7 @@ fn write_pointer(legacy: &Path, pointer: &Pointer) -> Result<()> {
 /// Call this as the first statement in `main()`. [`init`] is a no-op afterwards,
 /// so ordering between the two does not matter beyond "standalone first".
 pub fn init_standalone() {
-    let legacy = platform_app_data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let _ = LEGACY_ROOT.set(legacy.clone());
-    let _ = DATA_ROOT.set(resolve(&legacy));
+    install(platform_app_data_dir().unwrap_or_else(|| PathBuf::from(".")));
 }
 
 /// Initialise from the Tauri `AppHandle`, which is authoritative for
@@ -154,8 +182,7 @@ pub fn init<R: Runtime>(app: &AppHandle<R>) {
         .ok()
         .or_else(platform_app_data_dir)
         .unwrap_or_else(|| PathBuf::from("."));
-    let _ = LEGACY_ROOT.set(legacy.clone());
-    let _ = DATA_ROOT.set(resolve(&legacy));
+    install(legacy);
 }
 
 /// Tauri's `app_data_dir()` — the historical home of everything, and where the
@@ -175,7 +202,14 @@ pub fn root() -> PathBuf {
     // Only reachable if a code path runs before init (e.g. a unit test calling
     // an accessor directly). Resolve on the fly rather than panicking.
     let legacy = legacy_root();
-    resolve(&legacy)
+    resolve(&legacy).root
+}
+
+/// The configured data root that could not be reached at startup (an unmounted
+/// drive). While set, [`root`] is the legacy fallback and holds none of the
+/// user's meetings.
+pub fn unavailable_root() -> Option<PathBuf> {
+    UNAVAILABLE_ROOT.get().cloned()
 }
 
 /// True when the data root has been moved off `app_data_dir()`, i.e. there is
@@ -415,20 +449,20 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolve(legacy.path()), target.path());
+        assert_eq!(resolve(legacy.path()).root, target.path());
     }
 
     #[test]
     fn resolve_falls_back_to_legacy_without_pointer() {
         let legacy = tempdir().unwrap();
-        assert_eq!(resolve(legacy.path()), legacy.path());
+        assert_eq!(resolve(legacy.path()).root, legacy.path());
     }
 
     #[test]
     fn resolve_falls_back_when_pointer_is_malformed() {
         let legacy = tempdir().unwrap();
         std::fs::write(legacy.path().join(POINTER_FILE), "{ not json").unwrap();
-        assert_eq!(resolve(legacy.path()), legacy.path());
+        assert_eq!(resolve(legacy.path()).root, legacy.path());
     }
 
     #[test]
@@ -451,7 +485,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolve(legacy.path()), legacy.path());
+        assert_eq!(resolve(legacy.path()).root, legacy.path());
     }
 
     /// An unmounted drive behind the configured root must not look like a fresh
