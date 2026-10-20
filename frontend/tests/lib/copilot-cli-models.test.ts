@@ -7,14 +7,18 @@ import {
   resolveSavedCopilotCliModel,
 } from '../../src/lib/copilot-cli-models';
 
-const OCTOBER_EXCLUSIONS = [
+// Retired per GitHub's model retirement history since the provider shipped.
+const RECENT_RETIREMENTS = [
+  'gemini-3-flash',
+  'claude-opus-4.5', 'claude-opus-4.6', 'claude-sonnet-4.6', 'raptor-mini',
+  'mai-code-1-flash',
   'gemini-3.5-flash', 'gemini-3.6-flash', 'kimi-k2.7-code', 'claude-opus-4.7',
-  'gpt-5-mini', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gemini-3.7-flash', 'grok-4.5',
+  'gpt-5-mini', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gemini-3.7-flash',
 ];
 
 describe('Copilot CLI model catalog', () => {
-  test('no October-retiring or retired model is offered', () => {
-    for (const id of [...OCTOBER_EXCLUSIONS, 'claude-sonnet-4.5', 'claude-sonnet-4', 'gpt-5', 'gpt-4.1', 'gemini-2.5-pro']) {
+  test('no retired model is offered', () => {
+    for (const id of [...RECENT_RETIREMENTS, 'claude-sonnet-4.5', 'claude-sonnet-4', 'gpt-5', 'gpt-4.1', 'gemini-2.5-pro']) {
       expect(COPILOT_CLI_MODELS).not.toContain(id);
       expect(RETIRED_COPILOT_CLI_MODELS).toContain(id);
     }
@@ -25,10 +29,35 @@ describe('Copilot CLI model catalog', () => {
     expect(COPILOT_CLI_MODELS).toEqual([
       'auto',
       'claude-haiku-4.5',
-      'gemini-3.8-flash',
+      'claude-haiku-5.5',
+      'claude-opus-4.8',
+      'claude-opus-5',
       'claude-opus-5.5',
+      'claude-fable-5',
+      'claude-fable-5.1',
+      'claude-sonnet-5',
+      'claude-sonnet-5.5',
+      'gemini-3.8-flash',
+      'gemini-4-argon',
+      'mai-code-1.1-flash',
+      'gpt-5.3-codex',
+      'gpt-5.6-luna',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-6-astra',
+      'gpt-6-luna',
+      'gpt-6-sol',
+      'grok-4.5',
+      'grok-4.6',
+      'grok-4.7',
+      'kimi-k3',
     ]);
     expect(new Set(COPILOT_CLI_MODELS).size).toBe(COPILOT_CLI_MODELS.length);
+  });
+
+  test('grok-4.5 is offered, not retired: GitHub lists it for Copilot CLI', () => {
+    expect(COPILOT_CLI_MODELS).toContain('grok-4.5');
+    expect(isRetiredCopilotCliModel('grok-4.5')).toBe(false);
   });
 
   test('a saved retired selection is kept and flagged, never remapped', () => {
