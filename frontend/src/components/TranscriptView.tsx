@@ -149,12 +149,17 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
   // Listen for speech-detected event
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
+    let disposed = false;
 
     const setupListener = async () => {
       const { listen } = await import('@tauri-apps/api/event');
-      unsubscribe = await listen<SpeechDetectedEvent>('speech-detected', () => {
+      if (disposed) return;
+      const fn = await listen<SpeechDetectedEvent>('speech-detected', () => {
         setSpeechDetected(true);
       });
+      // listen() resolves after the effect may already have been cleaned up.
+      if (disposed) fn();
+      else unsubscribe = fn;
     };
 
     if (isRecording) {
@@ -165,9 +170,8 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
     }
 
     return () => {
-      if (unsubscribe) {
-        unsubscribe();
-      }
+      disposed = true;
+      unsubscribe?.();
     };
   }, [isRecording]);
 
