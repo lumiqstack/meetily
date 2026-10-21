@@ -249,6 +249,9 @@ impl ContinuousVadProcessor {
             self.current_speech.clear();
             self.last_large_buffer_warn = 0;
             self.in_speech = false;
+            // Silero still has this utterance open; without a reset it would
+            // swallow the next SpeechStart and later re-emit from the old start.
+            self.session.reset();
         }
 
         // Extract all remaining segments
@@ -479,7 +482,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Generate synthetic speech-like audio with alternating speech/silence
@@ -808,6 +811,81 @@ mod tests {
         assert!(
             processor.flush().expect("second flush failed").is_empty(),
             "flush() must not emit the same forced segment twice"
+        );
+    }
+
+    /// Synthetic voiced speech Silero reliably classifies as one continuous
+    /// utterance at both 16 and 48 kHz: a 200 Hz pulse train (with vibrato)
+    /// through three vowel formant resonators, vowel changing every 180 ms,
+    /// with a 4 Hz syllable-rate envelope. Peak-normalized to 0.4.
+    pub(crate) fn generate_voiced_speech(seconds: f32, sample_rate: u32) -> Vec<f32> {
+        use std::f32::consts::PI;
+        const VOWELS: [[f32; 3]; 4] = [
+            [700.0, 1220.0, 2600.0],
+            [300.0, 2300.0, 3000.0],
+            [500.0, 900.0, 2400.0],
+            [400.0, 1900.0, 2550.0],
+        ];
+        let sr = sample_rate as f32;
+        let n = (seconds * sr) as usize;
+        let mut out = Vec::with_capacity(n);
+        let mut phase = 0.0f32;
+        let mut state = [[0.0f32; 2]; 3];
+        for i in 0..n {
+            let t = i as f32 / sr;
+            phase += 200.0 * (1.0 + 0.08 * (2.0 * PI * 3.0 * t).sin()) / sr;
+            let mut y = if phase >= 1.0 {
+                phase -= 1.0;
+                1.0
+            } else {
+                0.0
+            };
+            let vowel = VOWELS[(t / 0.18) as usize % VOWELS.len()];
+            for (k, (fc, st)) in vowel.iter().zip(state.iter_mut()).enumerate() {
+                let r = (-PI * (80.0 + 40.0 * k as f32) / sr).exp();
+                let o = (1.0 - r) * y + 2.0 * r * (2.0 * PI * fc / sr).cos() * st[0] - r * r * st[1];
+                st[1] = st[0];
+                st[0] = o;
+                y = o;
+            }
+            out.push(y * (0.55 + 0.45 * (2.0 * PI * 4.0 * t).sin()));
+        }
+        let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        out.iter_mut().for_each(|x| *x *= 0.4 / peak);
+        out
+    }
+
+    /// `flush()` force-ends an utterance Silero still considers open. The
+    /// processor must come out of it clean: audio fed afterwards starts a new
+    /// utterance, not one that silently continues (and later re-emits) the old.
+    #[test]
+    fn test_speech_after_flush_starts_a_new_segment() {
+        let mut processor =
+            ContinuousVadProcessor::new(16000, 500).expect("Failed to create processor");
+
+        let mut first = vec![0.0f32; 16_000];
+        first.extend(generate_voiced_speech(3.0, 16_000));
+        assert!(processor.process_audio(&first).expect("process_audio failed").is_empty());
+        assert!(processor.in_speech, "expected to be mid-speech before flush()");
+        let forced = processor.flush().expect("flush failed");
+        assert_eq!(forced.len(), 1, "flush() must force-end the open utterance");
+        let forced_end_ms = forced[0].end_timestamp_ms;
+
+        // 2s of silence, 3s of speech, 2s of silence: one complete utterance.
+        let mut second = vec![0.0f32; 32_000];
+        second.extend(generate_voiced_speech(3.0, 16_000));
+        second.extend(vec![0.0f32; 32_000]);
+        let mut segments = processor.process_audio(&second).expect("process_audio failed");
+        segments.extend(processor.flush().expect("final flush failed"));
+
+        let spans: Vec<_> = segments
+            .iter()
+            .map(|s| (s.start_timestamp_ms, s.end_timestamp_ms))
+            .collect();
+        assert_eq!(segments.len(), 1, "expected one segment for the new utterance, got {spans:?}");
+        assert!(
+            segments[0].start_timestamp_ms >= forced_end_ms,
+            "new segment {spans:?} starts inside the utterance flush() already emitted (ended {forced_end_ms:.0}ms)"
         );
     }
 }
