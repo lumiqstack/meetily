@@ -99,13 +99,17 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
 
-  // Extract fetchMeetings as a reusable function
+  // meetings-changed often fires several times in a row and responses can arrive
+  // out of order, so only the most recent request may update the list.
+  const meetingsRequestIdRef = React.useRef(0);
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
+      const requestId = ++meetingsRequestIdRef.current;
       try {
         const meetings = await invoke('api_get_meetings') as Array<{
           id: string, title: string, transcribed: boolean, summarized: boolean, obsidian_exported: boolean
         }>;
+        if (requestId !== meetingsRequestIdRef.current) return;
         const transformedMeetings = meetings.map(({ obsidian_exported, ...meeting }) => ({
           ...meeting,
           obsidianExported: obsidian_exported,
@@ -114,7 +118,6 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         Analytics.trackBackendConnection(true);
       } catch (error) {
         console.error('Error fetching meetings:', error);
-        setMeetings([]);
         Analytics.trackBackendConnection(false, errorMessage(error));
       }
     }
