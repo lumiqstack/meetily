@@ -358,15 +358,21 @@ async fn pull_model_stream<R: Runtime>(
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut last_progress = 0u8;
+    let mut succeeded = false;
 
     loop {
         let chunk = match timeout(idle_timeout, stream.next()).await {
             Err(_) => return Err(pull_stall_error(idle_timeout)),
-            Ok(None) => break,
-            Ok(Some(chunk)) => chunk.map_err(|e| format!("Failed to read stream: {}", e))?,
+            Ok(None) => None,
+            Ok(Some(chunk)) => Some(chunk.map_err(|e| format!("Failed to read stream: {}", e))?),
         };
+        let at_eof = chunk.is_none();
 
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        match chunk {
+            Some(chunk) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
+            // Terminate a final line that arrived without a newline so it is parsed below.
+            None => buffer.push('\n'),
+        }
 
         // Process complete lines
         while let Some(newline_pos) = buffer.find('\n') {
@@ -409,8 +415,25 @@ async fn pull_model_stream<R: Runtime>(
                 if let Some(error) = json.get("error").and_then(|v| v.as_str()) {
                     return Err(format!("Ollama error: {}", error));
                 }
+
+                if json.get("status").and_then(|v| v.as_str()) == Some("success") {
+                    succeeded = true;
+                }
             }
         }
+
+        if at_eof {
+            break;
+        }
+    }
+
+    // Ollama ends a completed pull with a "success" line; a stream that closes
+    // without one was cut off and the model is not usable.
+    if !succeeded {
+        return Err(format!(
+            "Model download for {} ended before Ollama reported success",
+            model_name
+        ));
     }
 
     Ok(())
@@ -550,6 +573,67 @@ mod tests {
             }
         });
         format!("http://{address}")
+    }
+
+    /// Serves one pull response whose body is written verbatim, then closes.
+    async fn serve_pull_body(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.write_all(body.as_bytes()).await;
+            let _ = stream.flush().await;
+        });
+        format!("http://{address}")
+    }
+
+    // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
+    // imports Common Controls v6 functions. tauri-build embeds the v6 manifest only in
+    // bin targets, so the lib's unit-test exe fails to load (STATUS_ENTRYPOINT_NOT_FOUND).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn pull_fails_when_stream_ends_without_success() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling manifest"}"#),
+            (Duration::ZERO, r#"{"status":"pulling","completed":10,"total":100}"#),
+            (Duration::ZERO, r#"{"status":"pulling","completed":50,"total":100}"#),
+        ])
+        .await;
+        let result = pull_model_stream(app.handle(), "truncated-pull-model", Some(&endpoint), IDLE_LIMIT).await;
+        assert!(result.is_err(), "a pull that ends without a success line must fail: {result:?}");
+    }
+
+    // Not built on Windows: mock_app() needs the Common Controls v6 manifest (see above).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn pull_fails_when_stream_reports_error() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_script(vec![
+            (Duration::ZERO, r#"{"status":"pulling manifest"}"#),
+            (Duration::ZERO, r#"{"error":"pull model manifest: file does not exist"}"#),
+        ])
+        .await;
+        let result = pull_model_stream(app.handle(), "error-pull-model", Some(&endpoint), IDLE_LIMIT).await;
+        let error = result.expect_err("a pull that reports an error must fail");
+        assert!(error.contains("file does not exist"), "unexpected error: {error}");
+    }
+
+    // Not built on Windows: mock_app() needs the Common Controls v6 manifest (see above).
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn pull_succeeds_when_success_line_has_no_trailing_newline() {
+        let app = tauri::test::mock_app();
+        let endpoint = serve_pull_body(
+            "{\"status\":\"pulling\",\"completed\":100,\"total\":100}\n{\"status\":\"success\"}",
+        )
+        .await;
+        let result = pull_model_stream(app.handle(), "unterminated-success-model", Some(&endpoint), IDLE_LIMIT).await;
+        assert_eq!(result, Ok(()));
     }
 
     // Not built on Windows: mock_app() makes tauri's menu/dialog code reachable, which
