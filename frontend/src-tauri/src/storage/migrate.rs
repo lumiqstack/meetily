@@ -31,6 +31,13 @@ pub(super) const STATE_FILE: &str = ".migration-state.json";
 /// finished once all of them are recorded as done.
 const STEPS: [&str; 7] = ["bin", "sp-webview", "models", "config", "logs", "recordings", "db"];
 
+/// One SQLite database: the main file first, then the files beside it.
+const DB_SET: [&str; 3] = [
+    "meeting_minutes.sqlite",
+    "meeting_minutes.sqlite-wal",
+    "meeting_minutes.sqlite-shm",
+];
+
 /// Settings files that lived in `dirs::config_dir()/meetily` before they moved
 /// under the data root.
 const CONFIG_FILES: [&str; 2] = ["notifications.json", "meeting_detection.json"];
@@ -366,6 +373,36 @@ pub(super) fn unfinished_move(legacy: &Path, current: &Path) -> Option<String> {
     })
 }
 
+/// Why the database in `root` must not be opened yet, or `None` when it may be.
+///
+/// Until the move records its `db` step, whatever sits at `root` is missing,
+/// partial or a leftover, and the real database is still at the source. Opening
+/// it would show an empty or damaged library, and creating one there would be
+/// overwritten by the next attempt.
+pub(crate) fn unfinished_database_move(root: &Path) -> Option<String> {
+    if !root.join(STATE_FILE).exists() {
+        return None;
+    }
+    let state = load_state(root);
+    if state.done("db") {
+        return None;
+    }
+    let from = state
+        .source
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "its previous location".into());
+    Some(format!(
+        "Meetily has not finished moving its database from {} to {}, so it will not open \
+         the database at the new location yet. Your meetings are still in {}. Restart \
+         Meetily to retry the move; if it keeps failing, make sure {} is writable and has \
+         enough free space.",
+        from,
+        root.display(),
+        from,
+        root.display()
+    ))
+}
 
 /// Forget a finished move so later launches do not run it again.
 fn clear_previous_root(legacy: &Path) -> Result<()> {
@@ -616,7 +653,7 @@ fn archive_logs(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<
         let name = entry.file_name();
         let mut to = dst.join(&name);
         if to.exists() {
-            // e.g. meetily.log -> meetily.premigration.log
+            // e.g. meetily.log -> meetily.premigration.log, meetily.premigration.2.log, ...
             let stem = Path::new(&name)
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
@@ -625,7 +662,20 @@ fn archive_logs(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<
                 .extension()
                 .map(|s| format!(".{}", s.to_string_lossy()))
                 .unwrap_or_default();
-            to = dst.join(format!("{stem}.premigration{ext}"));
+            // Several old log folders can each hold a log by the same name, so a
+            // taken name is only a duplicate when the contents match.
+            let mut n = 1;
+            loop {
+                to = if n == 1 {
+                    dst.join(format!("{stem}.premigration{ext}"))
+                } else {
+                    dst.join(format!("{stem}.premigration.{n}{ext}"))
+                };
+                if !to.exists() || verify(&from, &to).unwrap_or(false) {
+                    break;
+                }
+                n += 1;
+            }
         }
         if to.exists() {
             // Already archived on an earlier run; drop the duplicate source.
@@ -774,17 +824,70 @@ fn rewrite_stored_recordings_folder(legacy: &Path, new_root: &Path) -> Result<()
     Ok(())
 }
 
-fn migrate_database(legacy: &Path, root: &Path, report: &mut MigrationReport) -> Result<()> {
-    for name in [
-        "meeting_minutes.sqlite",
-        "meeting_minutes.sqlite-wal",
-        "meeting_minutes.sqlite-shm",
-        "meeting_minutes.db",
-    ] {
-        let src = legacy.join(name);
-        if src.exists() {
-            move_file(&src, &root.join(name), report)?;
+fn migrate_database(source: &Path, root: &Path, report: &mut MigrationReport) -> Result<()> {
+    // move_database_set removes the main file first, so its absence means an
+    // earlier run already put the whole set in place.
+    if source.join(DB_SET[0]).exists() {
+        move_database_set(source, root, report)?;
+    }
+    move_file(
+        &source.join("meeting_minutes.db"),
+        &root.join("meeting_minutes.db"),
+        report,
+    )
+}
+
+/// Move the SQLite set all-or-nothing: copy every file to a temporary name,
+/// rename them all into place, and only then remove the originals. A main file
+/// without its WAL is missing recent meetings, and a WAL beside a different
+/// main file gets replayed into it, so on any failure nothing is left at `root`
+/// and the set stays whole at `source`.
+fn move_database_set(source: &Path, root: &Path, report: &mut MigrationReport) -> Result<()> {
+    let staged = |name: &str| root.join(format!("{name}.migrating"));
+    let present: Vec<&str> = DB_SET.into_iter().filter(|n| source.join(n).exists()).collect();
+    let mut placed = Vec::new();
+
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(root)?;
+        for name in &present {
+            let (src, tmp) = (source.join(name), staged(name));
+            std::fs::copy(&src, &tmp)
+                .with_context(|| format!("copying {} -> {}", src.display(), tmp.display()))?;
+            if !verify(&src, &tmp)? {
+                return Err(anyhow!("verification failed for {} -> {}", src.display(), tmp.display()));
+            }
         }
+        for name in DB_SET {
+            let dst = root.join(name);
+            if present.contains(&name) {
+                std::fs::rename(staged(name), &dst)
+                    .with_context(|| format!("placing {}", dst.display()))?;
+                placed.push(dst);
+            } else if dst.exists() {
+                // Left by an earlier move; SQLite would replay it into this database.
+                std::fs::remove_file(&dst)
+                    .with_context(|| format!("removing stale {}", dst.display()))?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        for name in DB_SET {
+            let _ = std::fs::remove_file(staged(name));
+        }
+        for dst in &placed {
+            let _ = std::fs::remove_file(dst);
+        }
+        return Err(e);
+    }
+
+    for name in &present {
+        let src = source.join(name);
+        let len = std::fs::metadata(root.join(name))?.len();
+        std::fs::remove_file(&src).with_context(|| format!("removing {}", src.display()))?;
+        report.files_moved += 1;
+        report.bytes_moved += len;
     }
     Ok(())
 }
@@ -886,8 +989,10 @@ fn move_file(src: &Path, dst: &Path, report: &mut MigrationReport) -> Result<()>
         return Ok(());
     }
 
-    std::fs::copy(src, dst)
-        .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
+    if let Err(e) = std::fs::copy(src, dst) {
+        let _ = std::fs::remove_file(dst);
+        return Err(e).with_context(|| format!("copying {} -> {}", src.display(), dst.display()));
+    }
 
     if !verify(src, dst)? {
         let _ = std::fs::remove_file(dst);
@@ -1137,6 +1242,44 @@ mod tests {
         assert_eq!(
             std::fs::read(dst.join("meetily.premigration.log")).unwrap(),
             b"pre-migration content"
+        );
+    }
+
+    /// Both old log folders hold a meetily.log; the second must not be taken
+    /// for an already-archived copy of the first and deleted.
+    #[test]
+    fn archiving_two_log_folders_keeps_both_logs() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        let platform_logs = tmp.path().join("platform-logs");
+        write(&platform_logs.join("meetily.log"), b"platform log");
+        write(&root1.join("logs/meetily.log"), b"previous root log");
+        write(&root2.join("logs/meetily.log"), b"the log this process is writing");
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root2.clone()),
+                previous_root: Some(root1.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root2, Some(platform_logs), |_| {}).unwrap();
+
+        let mut logs: Vec<Vec<u8>> = std::fs::read_dir(root2.join("logs"))
+            .unwrap()
+            .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        logs.sort();
+        assert_eq!(
+            logs,
+            vec![
+                b"platform log".to_vec(),
+                b"previous root log".to_vec(),
+                b"the log this process is writing".to_vec(),
+            ]
         );
     }
 
@@ -1816,5 +1959,70 @@ mod tests {
 
         assert_eq!(std::fs::read(root.join("sentinel.txt")).unwrap(), b"keep");
         assert!(!root.join(STATE_FILE).exists());
+    }
+
+    /// The database, its WAL and its shm are one unit: a move that fails partway
+    /// must leave nothing at the new root and the whole set at the old one.
+    #[test]
+    fn a_database_move_that_fails_partway_leaves_the_set_where_it_was() {
+        let tmp = tempdir().unwrap();
+        let legacy = tmp.path().join("legacy");
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(&root1.join("meeting_minutes.sqlite"), b"main file");
+        write(&root1.join("meeting_minutes.sqlite-wal"), b"recent meetings");
+        write(&root1.join("meeting_minutes.sqlite-shm"), b"shm");
+        // Something the WAL can never be written over.
+        std::fs::create_dir_all(root2.join("meeting_minutes.sqlite-wal")).unwrap();
+        write_pointer(
+            &legacy,
+            &Pointer {
+                data_root: Some(root2.clone()),
+                previous_root: Some(root1.clone()),
+            },
+        )
+        .unwrap();
+
+        run_files_in(&legacy, &root2, None, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(root1.join("meeting_minutes.sqlite")).unwrap(), b"main file");
+        assert_eq!(
+            std::fs::read(root1.join("meeting_minutes.sqlite-wal")).unwrap(),
+            b"recent meetings"
+        );
+        assert_eq!(std::fs::read(root1.join("meeting_minutes.sqlite-shm")).unwrap(), b"shm");
+        let leftovers: Vec<_> = std::fs::read_dir(&root2)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("meeting_minutes"))
+            .collect();
+        assert!(leftovers.is_empty(), "partial database files at the new root: {leftovers:?}");
+        assert!(!load_state(&root2).done("db"));
+    }
+
+    /// Opening (or creating) a database at the new root while the old one has
+    /// not arrived would show an empty or damaged library, and the next move
+    /// attempt would then overwrite whatever was written to it.
+    #[tokio::test]
+    async fn the_database_is_not_opened_while_its_move_is_unfinished() {
+        let tmp = tempdir().unwrap();
+        let root1 = tmp.path().join("root1");
+        let root2 = tmp.path().join("root2");
+        write(
+            &root2.join(STATE_FILE),
+            serde_json::json!({
+                "completed": ["bin", "sp-webview", "models", "config", "logs", "recordings"],
+                "source": root1,
+                "target": root2,
+            })
+            .to_string()
+            .as_bytes(),
+        );
+
+        let opened = crate::database::manager::DatabaseManager::open_in_dir(&root2).await;
+
+        assert!(opened.is_err(), "database opened while its move is unfinished");
+        assert!(!root2.join("meeting_minutes.sqlite").exists());
     }
 }
