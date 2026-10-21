@@ -285,6 +285,7 @@ async fn run_retranscription<R: Runtime>(
     })
     .await
     .map_err(|e| anyhow!("Decode task panicked: {}", e))??;
+    refuse_truncated(&decoded)?;
     let duration_seconds = decoded.duration_seconds;
 
     info!(
@@ -1107,8 +1108,35 @@ pub async fn is_retranscription_in_progress_command() -> bool {
     is_retranscription_in_progress()
 }
 
+/// A cut-off recording must not replace a full transcript with a partial one.
+fn refuse_truncated(decoded: &crate::audio::decoder::DecodedAudio) -> Result<()> {
+    match decoded.truncation() {
+        Some((decoded_s, declared_s)) => Err(anyhow!(
+            "Only {:.1}s of the {:.1}s this recording declares could be decoded; it appears cut off or damaged, so the existing transcript was kept",
+            decoded_s,
+            declared_s
+        )),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn truncated_recording_is_refused_and_complete_one_passes() {
+        use crate::audio::decoder::DecodedAudio;
+        let audio = |duration_seconds: f64, declared: Option<f64>| DecodedAudio {
+            samples: vec![],
+            sample_rate: 16_000,
+            channels: 1,
+            duration_seconds,
+            declared_duration_seconds: declared,
+        };
+        assert!(super::refuse_truncated(&audio(3.0, Some(10.0))).is_err());
+        assert!(super::refuse_truncated(&audio(9.5, Some(10.0))).is_ok());
+        assert!(super::refuse_truncated(&audio(3.0, None)).is_ok());
+    }
+
     use super::*;
     use crate::audio::engine_coordinator::{
         global_coordinator_test_lock, LocalEngineUser, LOCAL_ENGINE_COORDINATOR,

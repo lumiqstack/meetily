@@ -666,6 +666,24 @@ async fn import_into_folder<R: Runtime>(
     })
     .await
     .map_err(|e| anyhow!("Decode task join error: {}", e))??;
+    if let Some((decoded_s, declared_s)) = decoded.truncation() {
+        warn!(
+            "Imported file holds {:.1}s of a declared {:.1}s; importing what could be decoded",
+            decoded_s, declared_s
+        );
+        let _ = app.emit(
+            "import-warning",
+            ImportWarning {
+                import_id: import_id.clone(),
+                warning: "The audio file appears cut off".to_string(),
+                details: Some(format!(
+                    "Only {:.1} of the {:.1} seconds the file declares could be decoded. \
+                     The readable part was imported.",
+                    decoded_s, declared_s
+                )),
+            },
+        );
+    }
     let duration_seconds = decoded.duration_seconds;
 
     info!(

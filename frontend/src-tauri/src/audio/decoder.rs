@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -43,9 +44,19 @@ pub struct DecodedAudio {
     pub channels: u16,
     /// Duration in seconds
     pub duration_seconds: f64,
+    /// Duration the container declared, when it declared one
+    pub declared_duration_seconds: Option<f64>,
 }
 
 impl DecodedAudio {
+    /// `(decoded, declared)` when the file holds well under what its container
+    /// declares: the recording was cut off mid-write or damaged. The decoder
+    /// only reports this; each caller decides whether partial audio is usable.
+    pub fn truncation(&self) -> Option<(f64, f64)> {
+        let declared = self.declared_duration_seconds?;
+        (self.duration_seconds < declared * 0.9).then_some((self.duration_seconds, declared))
+    }
+
     /// Convert decoded audio to Whisper-compatible 16kHz mono f32 format.
     ///
     /// Performs mono conversion, normalization, and resampling. Large files
@@ -69,6 +80,7 @@ impl DecodedAudio {
             sample_rate,
             channels,
             duration_seconds: _,
+            declared_duration_seconds: _,
         } = self;
 
         // Step 1: Convert to mono if needed
@@ -478,7 +490,7 @@ pub fn decode_audio_file_with_progress(
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or_else(|| anyhow!("No audio track found in file"))?;
 
-    let track_id = track.id;
+    let mut track_id = track.id;
 
     // Get audio parameters
     let mut sample_rate = track
@@ -520,21 +532,37 @@ pub fn decode_audio_file_with_progress(
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     let mut last_progress = 0u32;
+    let mut skipped_packets = 0u64;
 
     loop {
-        // Get the next packet
         let packet = match format.next_packet() {
             Ok(packet) => packet,
-            Err(symphonia::core::errors::Error::IoError(ref e))
+            Err(SymphoniaError::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
-                // End of file
                 break;
             }
-            Err(e) => {
-                warn!("Error reading packet: {}", e);
-                break;
+            Err(SymphoniaError::DecodeError(e)) => {
+                skipped_packets += 1;
+                warn!("Skipping unreadable packet: {}", e);
+                continue;
             }
+            // A new stream started (e.g. the next link of a chained Ogg); its
+            // tracks replace the old ones, so the decoder must be rebuilt.
+            Err(SymphoniaError::ResetRequired) => {
+                let track = format
+                    .tracks()
+                    .iter()
+                    .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+                    .ok_or_else(|| anyhow!("No audio track found after stream reset"))?;
+                track_id = track.id;
+                decoder = symphonia::default::get_codecs()
+                    .make(&track.codec_params, &DecoderOptions::default())
+                    .map_err(|e| anyhow!("Failed to create decoder after stream reset: {}", e))?;
+                sample_buf = None;
+                continue;
+            }
+            Err(e) => return Err(anyhow!("Failed to read audio packet: {}", e)),
         };
 
         // Skip packets from other tracks
@@ -608,6 +636,10 @@ pub fn decode_audio_file_with_progress(
     let total_frames = all_samples.len() / channels as usize;
     let duration_seconds = total_frames as f64 / sample_rate as f64;
 
+    if skipped_packets > 0 {
+        warn!("Skipped {} unreadable packets", skipped_packets);
+    }
+
     info!(
         "Decoded {} samples ({:.2}s) at {}Hz, {} channels",
         all_samples.len(),
@@ -621,6 +653,7 @@ pub fn decode_audio_file_with_progress(
         sample_rate,
         channels,
         duration_seconds,
+        declared_duration_seconds: expected_duration,
     })
 }
 
@@ -659,6 +692,60 @@ mod tests {
         );
     }
 
+    /// Header of a 16-bit mono PCM WAV whose data chunk declares `data_len` bytes.
+    fn wav_header(sample_rate: u32, data_len: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(44);
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&(36 + data_len).to_le_bytes());
+        h.extend_from_slice(b"WAVEfmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        h.extend_from_slice(&1u16.to_le_bytes()); // mono
+        h.extend_from_slice(&sample_rate.to_le_bytes());
+        h.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        h.extend_from_slice(&2u16.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&data_len.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn truncated_file_reports_its_declared_length() {
+        // The header promises 10 s but only 3 s of samples were written, as with
+        // a recording cut off mid-write. A short Ok here let retranscription
+        // replace the full transcript with one covering only the first 3 s.
+        let rate = 8000u32;
+        let mut bytes = wav_header(rate, rate * 2 * 10);
+        bytes.extend(std::iter::repeat([0x00u8, 0x10]).take((rate * 3) as usize).flatten());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.wav");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let decoded = decode_audio_file(&path).unwrap();
+        let (decoded_s, declared_s) = decoded
+            .truncation()
+            .expect("a file holding 3s of a declared 10s must report truncation");
+        assert!((decoded_s - 3.0).abs() < 0.05, "decoded {decoded_s}");
+        assert!((declared_s - 10.0).abs() < 0.05, "declared {declared_s}");
+    }
+
+    #[test]
+    fn chained_ogg_decodes_every_link() {
+        // Two 3 s Ogg FLAC streams concatenated. Symphonia signals the second
+        // link with ResetRequired, which used to be treated as end of file.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chained_ogg_flac_8k_2x3s.ogg");
+        let decoded = decode_audio_file(&path).expect("failed to decode chained Ogg");
+
+        assert!(
+            (decoded.duration_seconds - 6.0).abs() < 0.1,
+            "expected both 3s links (~6s), got {:.2}s",
+            decoded.duration_seconds
+        );
+    }
+
     #[test]
     fn test_to_whisper_format_mono_16k() {
         // Already in correct format
@@ -667,6 +754,7 @@ mod tests {
             sample_rate: 16000,
             channels: 1,
             duration_seconds: 0.0001875,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
@@ -686,6 +774,7 @@ mod tests {
             sample_rate: 16000,
             channels: 1,
             duration_seconds: 4096.0 / 16000.0,
+            declared_duration_seconds: None,
         }
         .into_whisper_format()
         .unwrap();
@@ -701,6 +790,7 @@ mod tests {
             sample_rate: 16000,
             channels: 2,
             duration_seconds: 0.000125,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
@@ -720,6 +810,7 @@ mod tests {
             sample_rate: 48000,
             channels: 1,
             duration_seconds: 4800.0 / 48000.0,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
@@ -821,6 +912,7 @@ mod tests {
             sample_rate: 48000,
             channels: 1,
             duration_seconds: 1.0,
+            declared_duration_seconds: None,
         };
 
         // Duration should be samples / sample_rate for mono
@@ -835,6 +927,7 @@ mod tests {
             sample_rate: 48000,
             channels: 2,
             duration_seconds: 1.0,
+            declared_duration_seconds: None,
         };
 
         // Duration should be samples / (sample_rate * channels) for stereo
@@ -853,6 +946,7 @@ mod tests {
             sample_rate: 48000,
             channels: 1,
             duration_seconds: 1000.0 / 48000.0,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
