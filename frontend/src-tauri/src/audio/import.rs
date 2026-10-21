@@ -2058,7 +2058,17 @@ async fn hand_off_to_pipeline<R: Runtime>(
     };
 
     // The import guard now owns this job; cancellation flows through IMPORT_JOBS.
-    URL_DOWNLOADS.remove(&import_id);
+    // A cancel that arrived before `acquire` was cleared from IMPORT_JOBS by
+    // it, but it cancelled the download token first, so the token is what
+    // records it. Checked after `acquire` so no cancel can fall between the two.
+    let cancelled_before_hand_off = URL_DOWNLOADS
+        .remove(&import_id)
+        .is_some_and(|(_, token)| token.is_cancelled());
+    if cancelled_before_hand_off {
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Err(anyhow!("Import cancelled").into());
+    }
 
     let media_path_str = media_path.to_string_lossy().to_string();
     let result = start_import_with_guard(
@@ -2946,5 +2956,51 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         assert_eq!(resolved, expected);
+    }
+
+    // A cancel that lands after the URL download finished but before the
+    // pipeline hand-off must abort the import, not be wiped by `acquire`.
+    // Not built on Windows: see the mock_app() note in ollama.rs tests.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cancel_between_url_download_and_hand_off_aborts_the_import() {
+        let _serial = global_coordinator_test_lock();
+        let app = tauri::test::mock_app();
+        let import_id = "import-cancel-before-hand-off".to_string();
+
+        URL_DOWNLOADS.insert(import_id.clone(), tokio_util::sync::CancellationToken::new());
+        cancel_import_command(Some(import_id.clone()))
+            .await
+            .expect("cancel must be accepted while the URL download is registered");
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let result = hand_off_to_pipeline(
+            app.handle(),
+            import_id.clone(),
+            "https://contoso.sharepoint.com/recording.mp4".to_string(),
+            "Cancelled import".to_string(),
+            None,
+            None,
+            Some(crate::config::PROVIDER_GEMINI_TRANSCRIBE.to_string()),
+            None,
+            None,
+            work_dir.path().join("recording.mp4"),
+            work_dir.path().to_path_buf(),
+        )
+        .await;
+
+        match result {
+            Err(UrlImportError::BeforePipeline(e)) => assert!(
+                e.to_string().contains("cancelled"),
+                "hand-off must fail as a cancellation, got: {e}"
+            ),
+            Err(UrlImportError::InPipeline(e)) => {
+                panic!("a cancelled import must not reach the pipeline, got: {e}")
+            }
+            Ok(()) => panic!("a cancelled import must not complete"),
+        }
+        assert!(!IMPORT_JOBS.is_active(&import_id), "the aborted job must release its guard");
+        assert!(!IMPORT_JOBS.is_cancelled(&import_id), "no cancel flag may linger for the ID");
+        assert!(!is_url_download_active(&import_id));
     }
 }
