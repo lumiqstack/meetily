@@ -17,7 +17,6 @@ interface RecordingControlsProps {
   onRecordingStop: (callApi?: boolean) => void;
   onRecordingStart: () => void;
   onTranscriptReceived: (summary: SummaryResponse) => void;
-  onTranscriptionError?: (message: string) => void;
   onStopInitiated?: () => void; // Called immediately when stop button is clicked
   isRecordingDisabled: boolean;
   isParentProcessing: boolean;
@@ -33,7 +32,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   onRecordingStop,
   onRecordingStart,
   onTranscriptReceived,
-  onTranscriptionError,
   onStopInitiated,
   isRecordingDisabled,
   isParentProcessing,
@@ -268,25 +266,6 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       // Cleanup on unmount if needed
     };
   }, []);
-
-  // Transcript error listener - handles both regular and actionable errors
-  useTauriEvent<string>('transcript-error', (errorMessage) => {
-    console.log('transcript-error event received');
-
-    Analytics.trackTranscriptionError(errorMessage);
-
-    setTranscriptionErrors(prev => {
-      const newCount = prev + 1;
-      console.log('Transcription error count incremented:', newCount);
-      return newCount;
-    });
-    setIsProcessing(false);
-    console.log('Calling onRecordingStop(false) due to transcript error');
-    onRecordingStop(false);
-    if (onTranscriptionError) {
-      onTranscriptionError(errorMessage);
-    }
-  });
 
   // Transcription error listener - handles structured error objects with actionable flag
   useTauriEvent<TranscriptionErrorPayload>('transcription-error', (payload) => {

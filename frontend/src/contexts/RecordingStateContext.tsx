@@ -161,7 +161,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
    * Set up event listeners for backend state changes
    */
   useEffect(() => {
-    console.log('[RecordingStateContext] Setting up event listeners');
+    let disposed = false;
     const unsubscribers: (() => void)[] = [];
 
     const setupListeners = async () => {
@@ -178,6 +178,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           }));
           startPolling();
         });
+        if (disposed) { unlistenStarted(); return; }
         unsubscribers.push(unlistenStarted);
 
         // Recording starting (startup in progress)
@@ -187,6 +188,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             ? prev
             : { ...prev, status: RecordingStatus.STARTING, statusMessage: 'Starting recording...' });
         });
+        if (disposed) { unlistenStarting(); return; }
         unsubscribers.push(unlistenStarting);
 
         // Recording stopped
@@ -216,6 +218,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
           });
           stopPolling();
         });
+        if (disposed) { unlistenStopped(); return; }
         unsubscribers.push(unlistenStopped);
 
         // Recording paused
@@ -227,6 +230,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isActive: false,
           }));
         });
+        if (disposed) { unlistenPaused(); return; }
         unsubscribers.push(unlistenPaused);
 
         // Recording resumed
@@ -238,9 +242,8 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             isActive: true,
           }));
         });
+        if (disposed) { unlistenResumed(); return; }
         unsubscribers.push(unlistenResumed);
-
-        console.log('[RecordingStateContext] Event listeners set up successfully');
       } catch (error) {
         console.error('[RecordingStateContext] Failed to set up event listeners:', error);
       }
@@ -249,7 +252,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     setupListeners();
 
     return () => {
-      console.log('[RecordingStateContext] Cleaning up event listeners');
+      disposed = true;
       unsubscribers.forEach(unsub => unsub());
       stopPolling();
     };

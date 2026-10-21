@@ -103,17 +103,6 @@ export class TranscriptService {
   }
 
   /**
-   * Listen for transcript-error event (legacy error format)
-   * @param callback - Function to call when transcript error occurs
-   * @returns Promise that resolves to unlisten function
-   */
-  async onTranscriptError(callback: (error: string) => void): Promise<UnlistenFn> {
-    return listen<string>('transcript-error', (event) => {
-      callback(event.payload);
-    });
-  }
-
-  /**
    * Listen for Whisper model download complete event
    * @param callback - Function to call when Whisper model download completes
    * @returns Promise that resolves to unlisten function

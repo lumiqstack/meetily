@@ -199,10 +199,6 @@ export default function Home() {
   );
   const handleStopInitiated = useCallback(() => setIsStopping(true), [setIsStopping]);
   const handleTranscriptReceived = useCallback(() => { }, []);
-  const handleTranscriptionError = useCallback(
-    (message: string) => showModal('errorAlert', message),
-    [showModal]
-  );
 
   // Computed values using global status
   const isProcessingStop = status === RecordingStatus.PROCESSING_TRANSCRIPTS || isProcessing;
@@ -251,7 +247,6 @@ export default function Home() {
                       onRecordingStart={handleRecordingStart}
                       onTranscriptReceived={handleTranscriptReceived} // Not actually used by RecordingControls
                       onStopInitiated={handleStopInitiated}
-                      onTranscriptionError={handleTranscriptionError}
                       isRecordingDisabled={isRecordingDisabled}
                       isParentProcessing={isProcessingStop}
                       selectedDevices={selectedDevices}
