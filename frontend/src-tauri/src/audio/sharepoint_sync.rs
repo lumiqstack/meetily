@@ -1195,6 +1195,21 @@ fn load_sync_state<R: Runtime>(app: &AppHandle<R>) -> SharePointSyncState {
         .unwrap_or_default()
 }
 
+/// Serializes load-modify-save of the sync state. The scan pipeline and the
+/// frontend commands write concurrently, and each save rewrites the whole
+/// record, so without this the last writer drops the others' changes.
+static SYNC_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn update_sync_state<R: Runtime>(
+    app: &AppHandle<R>,
+    modify: impl FnOnce(&mut SharePointSyncState),
+) -> Result<()> {
+    let _guard = SYNC_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = load_sync_state(app);
+    modify(&mut state);
+    save_sync_state(app, &state)
+}
+
 fn save_sync_state<R: Runtime>(app: &AppHandle<R>, state: &SharePointSyncState) -> Result<()> {
     let store = app
         .store(SYNC_STORE_FILE)
@@ -1217,20 +1232,18 @@ pub fn load_sync_state_public<R: Runtime>(app: &AppHandle<R>) -> SharePointSyncS
 /// Record a file as imported. The pipeline calls this only after the import
 /// actually landed, so a failed download is retried on the next scan.
 pub fn mark_imported_public<R: Runtime>(app: &AppHandle<R>, file_url: &str) {
-    let mut state = load_sync_state(app);
-    state
-        .imported
-        .insert(file_url.to_string(), chrono::Utc::now().to_rfc3339());
-    if let Err(e) = save_sync_state(app, &state) {
+    if let Err(e) = update_sync_state(app, |state| {
+        state
+            .imported
+            .insert(file_url.to_string(), chrono::Utc::now().to_rfc3339());
+    }) {
         warn!("[sp-scan] could not record import of a recording: {e}");
     }
 }
 
 /// Advance the "scanned up to" watermark.
 pub fn set_last_sync_date<R: Runtime>(app: &AppHandle<R>, iso: &str) {
-    let mut state = load_sync_state(app);
-    state.last_sync_date = Some(iso.to_string());
-    if let Err(e) = save_sync_state(app, &state) {
+    if let Err(e) = update_sync_state(app, |state| state.last_sync_date = Some(iso.to_string())) {
         warn!("[sp-scan] could not persist last sync date: {e}");
     }
 }
@@ -1248,14 +1261,15 @@ pub async fn set_sharepoint_sync_prefs_command<R: Runtime>(
     hub_url: Option<String>,
     last_sync_date: Option<String>,
 ) -> Result<(), String> {
-    let mut state = load_sync_state(&app);
-    if hub_url.is_some() {
-        state.hub_url = hub_url;
-    }
-    if last_sync_date.is_some() {
-        state.last_sync_date = last_sync_date;
-    }
-    save_sync_state(&app, &state).map_err(|e| e.to_string())
+    update_sync_state(&app, |state| {
+        if hub_url.is_some() {
+            state.hub_url = hub_url;
+        }
+        if last_sync_date.is_some() {
+            state.last_sync_date = last_sync_date;
+        }
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1263,11 +1277,12 @@ pub async fn mark_sharepoint_imported_command<R: Runtime>(
     app: AppHandle<R>,
     file_url: String,
 ) -> Result<(), String> {
-    let mut state = load_sync_state(&app);
-    state
-        .imported
-        .insert(file_url, chrono::Utc::now().to_rfc3339());
-    save_sync_state(&app, &state).map_err(|e| e.to_string())
+    update_sync_state(&app, |state| {
+        state
+            .imported
+            .insert(file_url, chrono::Utc::now().to_rfc3339());
+    })
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2213,5 +2228,43 @@ Content-Length: 1000
         .expect("a closed stream must fail promptly");
         assert!(outcome.is_err(), "a stream cut short of Content-Length must fail");
         assert!(!tmp.path().join("rec.mp4").exists(), "partial file must be removed");
+    }
+
+    // Linux only: the store resolves under the app data dir, which only
+    // XDG_DATA_HOME can point at a temp dir. mock_app() is also not buildable
+    // on Windows (see database/manager.rs).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_sync_state_writers_keep_every_update() {
+        let data_home = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", data_home.path());
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_store::Builder::default().build())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        assert!(
+            app.path().app_data_dir().unwrap().starts_with(data_home.path()),
+            "sync store is outside the temp dir; this test cannot sandbox its writes"
+        );
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 50;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let handle = app.handle().clone();
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        mark_imported_public(&handle, &format!("https://x/t{t}/r{i}.mp4"));
+                        if i % 10 == 0 {
+                            set_last_sync_date(&handle, "2026-01-01");
+                        }
+                    }
+                });
+            }
+        });
+
+        let state = load_sync_state_public(app.handle());
+        assert_eq!(state.imported.len(), THREADS * PER_THREAD, "imported ledger lost entries");
+        assert_eq!(state.last_sync_date.as_deref(), Some("2026-01-01"));
     }
 }
