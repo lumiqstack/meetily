@@ -421,10 +421,10 @@ impl RecordingManager {
             error!("Error stopping audio streams: {}", e);
         }
 
-        // CRITICAL: Force pipeline to flush ALL accumulated audio before stopping
-        debug!("💨 Forcing pipeline to flush accumulated audio immediately");
-        if let Err(e) = self.pipeline_manager.force_flush_and_stop().await {
-            error!("Error during force flush: {}", e);
+        // Dropping the sender lets the pipeline drain, mix the partial window
+        // and flush the VAD before it exits.
+        if let Err(e) = self.pipeline_manager.stop().await {
+            error!("Error stopping pipeline: {}", e);
         }
 
         // CRITICAL: Full cleanup to release all Arc references and resources
