@@ -275,6 +275,13 @@ pub async fn get_data_root() -> Result<String, String> {
     Ok(crate::storage::root().to_string_lossy().to_string())
 }
 
+/// The configured data root, when it could not be reached at startup. The app
+/// is then running from a fallback that holds none of the user's meetings.
+#[tauri::command]
+pub async fn get_unavailable_data_root() -> Result<Option<String>, String> {
+    Ok(crate::storage::unavailable_root().map(|p| p.to_string_lossy().to_string()))
+}
+
 /// Prompt for a new data root and persist it. Returns `None` on cancel.
 ///
 /// Takes effect on the next launch; the caller is expected to tell the user to

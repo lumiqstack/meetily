@@ -847,6 +847,7 @@ pub fn run() {
             audio::recording_preferences::open_recordings_folder,
             audio::recording_preferences::select_recording_folder,
             audio::recording_preferences::get_data_root,
+            audio::recording_preferences::get_unavailable_data_root,
             audio::recording_preferences::select_data_root,
             audio::recording_preferences::get_available_audio_backends,
             audio::recording_preferences::get_current_audio_backend,
