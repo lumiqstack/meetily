@@ -19,7 +19,7 @@ export interface TranscriptionErrorPayload {
   error: string;
   userMessage: string;
   actionable: boolean;
-  /** 'active' ends the recording in the UI. Gemini Live omits it: losing the live session keeps the recording running. */
+  /** 'active' stops the recording (fatal engine failure). Per-chunk and Gemini Live errors omit it: the recording keeps running. */
   phase?: 'startup' | 'active';
 }
 
