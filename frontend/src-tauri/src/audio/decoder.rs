@@ -44,9 +44,19 @@ pub struct DecodedAudio {
     pub channels: u16,
     /// Duration in seconds
     pub duration_seconds: f64,
+    /// Duration the container declared, when it declared one
+    pub declared_duration_seconds: Option<f64>,
 }
 
 impl DecodedAudio {
+    /// `(decoded, declared)` when the file holds well under what its container
+    /// declares: the recording was cut off mid-write or damaged. The decoder
+    /// only reports this; each caller decides whether partial audio is usable.
+    pub fn truncation(&self) -> Option<(f64, f64)> {
+        let declared = self.declared_duration_seconds?;
+        (self.duration_seconds < declared * 0.9).then_some((self.duration_seconds, declared))
+    }
+
     /// Convert decoded audio to Whisper-compatible 16kHz mono f32 format.
     ///
     /// Performs mono conversion, normalization, and resampling. Large files
@@ -70,6 +80,7 @@ impl DecodedAudio {
             sample_rate,
             channels,
             duration_seconds: _,
+            declared_duration_seconds: _,
         } = self;
 
         // Step 1: Convert to mono if needed
@@ -629,19 +640,6 @@ pub fn decode_audio_file_with_progress(
         warn!("Skipped {} unreadable packets", skipped_packets);
     }
 
-    // A file that ends early reads as a clean end of stream, so compare against
-    // the length the container declared. Returning the short audio as Ok would
-    // let retranscription replace a full transcript with a partial one.
-    if let Some(expected) = expected_duration {
-        if duration_seconds < expected * 0.9 {
-            return Err(anyhow!(
-                "Decoded only {:.1}s of the {:.1}s the file declares; it appears truncated or damaged",
-                duration_seconds,
-                expected
-            ));
-        }
-    }
-
     info!(
         "Decoded {} samples ({:.2}s) at {}Hz, {} channels",
         all_samples.len(),
@@ -655,6 +653,7 @@ pub fn decode_audio_file_with_progress(
         sample_rate,
         channels,
         duration_seconds,
+        declared_duration_seconds: expected_duration,
     })
 }
 
@@ -712,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_file_is_an_error_not_a_short_decode() {
+    fn truncated_file_reports_its_declared_length() {
         // The header promises 10 s but only 3 s of samples were written, as with
         // a recording cut off mid-write. A short Ok here let retranscription
         // replace the full transcript with one covering only the first 3 s.
@@ -724,13 +723,12 @@ mod tests {
         let path = dir.path().join("truncated.wav");
         std::fs::write(&path, &bytes).unwrap();
 
-        match decode_audio_file(&path) {
-            Err(_) => {}
-            Ok(decoded) => panic!(
-                "truncated file decoded as Ok with {:.2}s of a declared 10s",
-                decoded.duration_seconds
-            ),
-        }
+        let decoded = decode_audio_file(&path).unwrap();
+        let (decoded_s, declared_s) = decoded
+            .truncation()
+            .expect("a file holding 3s of a declared 10s must report truncation");
+        assert!((decoded_s - 3.0).abs() < 0.05, "decoded {decoded_s}");
+        assert!((declared_s - 10.0).abs() < 0.05, "declared {declared_s}");
     }
 
     #[test]
@@ -756,6 +754,7 @@ mod tests {
             sample_rate: 16000,
             channels: 1,
             duration_seconds: 0.0001875,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
@@ -775,6 +774,7 @@ mod tests {
             sample_rate: 16000,
             channels: 1,
             duration_seconds: 4096.0 / 16000.0,
+            declared_duration_seconds: None,
         }
         .into_whisper_format()
         .unwrap();
@@ -790,6 +790,7 @@ mod tests {
             sample_rate: 16000,
             channels: 2,
             duration_seconds: 0.000125,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
@@ -809,6 +810,7 @@ mod tests {
             sample_rate: 48000,
             channels: 1,
             duration_seconds: 4800.0 / 48000.0,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
@@ -910,6 +912,7 @@ mod tests {
             sample_rate: 48000,
             channels: 1,
             duration_seconds: 1.0,
+            declared_duration_seconds: None,
         };
 
         // Duration should be samples / sample_rate for mono
@@ -924,6 +927,7 @@ mod tests {
             sample_rate: 48000,
             channels: 2,
             duration_seconds: 1.0,
+            declared_duration_seconds: None,
         };
 
         // Duration should be samples / (sample_rate * channels) for stereo
@@ -942,6 +946,7 @@ mod tests {
             sample_rate: 48000,
             channels: 1,
             duration_seconds: 1000.0 / 48000.0,
+            declared_duration_seconds: None,
         };
 
         let result = audio.into_whisper_format().unwrap();
