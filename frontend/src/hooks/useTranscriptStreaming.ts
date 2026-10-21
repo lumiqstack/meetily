@@ -99,15 +99,15 @@ export function useTranscriptStreaming(
         }
       }, INTERVAL_MS);
     }
-
-    // Cleanup on unmount or when dependencies change
-    return () => {
-      if (streamingIntervalRef.current) {
-        clearInterval(streamingIntervalRef.current);
-        streamingIntervalRef.current = null;
-      }
-    };
+    // No per-run cleanup: a new array with the same last segment (a late
+    // segment sorted in, a reload sync) must not cancel the reveal in flight.
   }, [segments, isRecording, enableStreaming]);
+
+  useEffect(() => () => {
+    if (streamingIntervalRef.current) {
+      clearInterval(streamingIntervalRef.current);
+    }
+  }, []);
 
   /**
    * Get the display text for a segment, with streaming effect if applicable
