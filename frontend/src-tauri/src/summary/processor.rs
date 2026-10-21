@@ -253,10 +253,35 @@ fn build_final_report_system_prompt(
     )
 }
 
-/// Rough token count estimation using character count
+// Token estimates are kept in integer units of 1/20 token so a Latin
+// character costs exactly 0.35 tokens (7 units) and a CJK character 1 token.
+const UNITS_PER_TOKEN: usize = 20;
+const NARROW_CHAR_UNITS: usize = 7;
+
+fn char_units(c: char) -> usize {
+    // CJK, kana, Hangul and full-width text tokenize at about one token per
+    // character, roughly 3x the Latin rate.
+    let wide = matches!(
+        c,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{2E80}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{20000}'..='\u{3FFFF}'
+    );
+    if wide {
+        UNITS_PER_TOKEN
+    } else {
+        NARROW_CHAR_UNITS
+    }
+}
+
+/// Rough token count estimation: ~0.35 tokens per Latin character and one
+/// token per CJK character
 pub fn rough_token_count(s: &str) -> usize {
-    let char_count = s.chars().count();
-    (char_count as f64 * 0.35).ceil() as usize
+    let units: usize = s.chars().map(char_units).sum();
+    units.div_ceil(UNITS_PER_TOKEN)
 }
 
 /// Chunks text into overlapping segments based on token count
@@ -279,17 +304,25 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
         return vec![];
     }
 
-    // Convert token-based sizes to character-based sizes
-    // Using ~2.85 chars per token (inverse of 0.35 tokens per char from rough_token_count)
-    let chars_per_token = 1.0 / 0.35;
-    let chunk_size_chars = (chunk_size_tokens as f64 * chars_per_token).ceil() as usize;
-    let overlap_chars = (overlap_tokens as f64 * chars_per_token).ceil() as usize;
+    // Budgets are rounded up to whole Latin characters, matching the old
+    // ceil(tokens / 0.35) character windows for Latin text.
+    let to_units = |tokens: usize| {
+        (tokens * UNITS_PER_TOKEN).div_ceil(NARROW_CHAR_UNITS) * NARROW_CHAR_UNITS
+    };
+    let chunk_size_units = to_units(chunk_size_tokens);
+    let overlap_units = to_units(overlap_tokens);
 
     // Collect characters for indexing (needed for proper Unicode support)
     let chars: Vec<char> = text.chars().collect();
     let total_chars = chars.len();
+    // units_before[i] is the estimated size of chars[..i]
+    let mut units_before = Vec::with_capacity(total_chars + 1);
+    units_before.push(0);
+    for c in &chars {
+        units_before.push(units_before[units_before.len() - 1] + char_units(*c));
+    }
 
-    if total_chars <= chunk_size_chars {
+    if units_before[total_chars] <= chunk_size_units {
         info!("Text is shorter than chunk size, returning as a single chunk.");
         return vec![text.to_string()];
     }
@@ -298,7 +331,10 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
     let mut start_char = 0;
 
     while start_char < total_chars {
-        let end_char = (start_char + chunk_size_chars).min(total_chars);
+        let end_char = (units_before
+            .partition_point(|units| *units <= units_before[start_char] + chunk_size_units)
+            - 1)
+        .max(start_char + 1);
         let mut emitted_end_char = end_char;
 
         // Convert character indices to byte indices for string slicing
@@ -310,11 +346,13 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
             let slice = &text[start_byte..end_byte];
             let sentence_boundary = slice.rfind(". ").map(|index| index + 2);
             let word_boundary = slice.rfind(' ').map(|index| index + 1);
+            let exceeds_overlap = |end: &usize| {
+                let end_char = start_char + slice[..*end].chars().count();
+                units_before[end_char] - units_before[start_char] > overlap_units
+            };
             let boundary = sentence_boundary
-                .filter(|end| slice[..*end].chars().count() > overlap_chars)
-                .or_else(|| {
-                    word_boundary.filter(|end| slice[..*end].chars().count() > overlap_chars)
-                });
+                .filter(exceeds_overlap)
+                .or_else(|| word_boundary.filter(exceeds_overlap));
 
             if let Some(boundary) = boundary {
                 end_byte = start_byte + boundary;
@@ -329,13 +367,21 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
             break;
         }
 
-        start_char = emitted_end_char
-            .saturating_sub(overlap_chars)
+        start_char = units_before
+            .partition_point(|units| *units + overlap_units < units_before[emitted_end_char])
             .max(start_char + 1);
     }
 
     info!("Created {} chunks from text", chunks.len());
     chunks
+}
+
+/// Splits a transcript into chunks sized for a model whose usable context is `token_threshold`
+fn chunk_for_context(text: &str, token_threshold: usize) -> Vec<String> {
+    // Small-context models (e.g. num_ctx 512) have a threshold below the 300-token
+    // prompt reserve; keep a floor so chunks stay small instead of underflowing.
+    const MIN_CHUNK_TOKENS: usize = 200;
+    chunk_text(text, token_threshold.saturating_sub(300).max(MIN_CHUNK_TOKENS), 100)
 }
 
 /// Extracts meeting name from the first heading in markdown
@@ -402,7 +448,7 @@ pub(crate) async fn generate_meeting_summary(
             if (provider == &LLMProvider::Ollama || provider == &LLMProvider::BuiltInAI)
                 && total_tokens >= token_threshold
             {
-                let chunks = chunk_text(text, token_threshold - 300, 100);
+                let chunks = chunk_for_context(text, token_threshold);
                 let num_chunks = chunks.len();
                 let mut chunk_summaries = Vec::with_capacity(num_chunks);
                 for (index, chunk) in chunks.iter().enumerate() {
@@ -669,6 +715,51 @@ mod tests {
     #[test]
     fn chunk_text_progresses_when_overlap_matches_window() {
         assert_eq!(chunk_text("abcd", 1, 1), vec!["abc", "bcd"]);
+    }
+
+    fn chinese_text(chars: usize) -> String {
+        "我们今天讨论项目进度和下周的发布计划，大家请准时参加会议。"
+            .chars()
+            .cycle()
+            .take(chars)
+            .collect()
+    }
+
+    #[test]
+    fn rough_token_count_keeps_latin_estimate() {
+        let text = "a".repeat(1000);
+        assert_eq!(rough_token_count(&text), 350);
+    }
+
+    #[test]
+    fn rough_token_count_counts_cjk_characters_as_tokens() {
+        assert!(rough_token_count(&chinese_text(1000)) >= 900);
+        assert!(rough_token_count(&"ひらがなカタカナ한국어".repeat(100)) >= 1000);
+    }
+
+    #[test]
+    fn chunk_text_keeps_cjk_chunks_within_token_budget() {
+        let text = chinese_text(3000);
+        let chunks = chunk_text(&text, 200, 50);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            let tokens = rough_token_count(chunk);
+            assert!(tokens <= 200, "chunk estimated at {tokens} tokens exceeds 200");
+        }
+    }
+
+    #[test]
+    fn chunk_for_context_handles_small_context_threshold() {
+        // An Ollama model with num_ctx 512 yields a threshold of 212.
+        let text = "the team reviewed the release plan ".repeat(200);
+        let chunks = chunk_for_context(&text, 212);
+
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            let tokens = rough_token_count(chunk);
+            assert!(tokens <= 212, "chunk estimated at {tokens} tokens exceeds 212");
+        }
     }
 
     #[test]
