@@ -388,6 +388,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
   - `fix/*`: Bug fixes
   - `enhance/*`: Feature enhancements
   - Current: `fix/audio-mixing` (working on audio pipeline improvements)
+  - Merging: follow "Merging pull requests" in [AGENTS.md](AGENTS.md) (PR-triggered checks only, merge commits, parent before stacked child)
 
 ## Key Files Reference
 
