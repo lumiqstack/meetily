@@ -174,16 +174,6 @@ pub async fn generate_with_builtin(
         global_manager.clone().unwrap()
     };
 
-    // Ensure sidecar is running with this model
-    manager.ensure_running(model_path.clone()).await?;
-
-    // Check cancellation after sidecar startup
-    if let Some(token) = cancellation_token {
-        if token.is_cancelled() {
-            return Err(anyhow!("Generation cancelled during sidecar startup"));
-        }
-    }
-
     // Prepare generation request with model-specific sampling parameters
     let sampling = model_def.sampling.sanitize_for_llama_helper();
     let request = Request::Generate {
@@ -205,6 +195,42 @@ pub async fn generate_with_builtin(
 
     // Send request with timeout
     let timeout = Duration::from_secs(models::GENERATION_TIMEOUT_SECS);
+
+    let response_json =
+        run_generation(&manager, model_path, request_json, timeout, cancellation_token).await?;
+
+    // Parse response
+    let response: Response = serde_json::from_str(&response_json)
+        .with_context(|| format!("Failed to parse response: {}", response_json))?;
+
+    interpret_response(response)
+}
+
+/// Runs one generation request on the sidecar and returns the raw response line.
+async fn run_generation(
+    manager: &SidecarManager,
+    model_path: PathBuf,
+    request_json: String,
+    timeout: Duration,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<String> {
+    let _generation = match cancellation_token {
+        Some(token) => tokio::select! {
+            guard = manager.lock_generation() => guard,
+            _ = token.cancelled() => return Err(anyhow!("Generation cancelled before starting")),
+        },
+        None => manager.lock_generation().await,
+    };
+
+    // Ensure sidecar is running with this model
+    manager.ensure_running(model_path).await?;
+
+    // Check cancellation after sidecar startup
+    if let Some(token) = cancellation_token {
+        if token.is_cancelled() {
+            return Err(anyhow!("Generation cancelled during sidecar startup"));
+        }
+    }
 
     log::info!("Sending generation request to sidecar");
 
@@ -234,11 +260,7 @@ pub async fn generate_with_builtin(
         }
     }
 
-    // Parse response
-    let response: Response = serde_json::from_str(&response_json)
-        .with_context(|| format!("Failed to parse response: {}", response_json))?;
-
-    interpret_response(response)
+    Ok(response_json)
 }
 
 /// Turns a sidecar reply into the generated text, rejecting truncated output.
@@ -394,5 +416,76 @@ mod tests {
         let json = r###"{"type":"response","text":"## Summary\n- done","error":null}"###;
         let response: Response = serde_json::from_str(json).unwrap();
         assert_eq!(interpret_response(response).unwrap(), "## Summary\n- done");
+    }
+
+    const GENERATE: &str = r#"{"type":"generate","prompt":"p"}"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_queued_generation_leaves_the_running_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(super::super::sidecar::tests::fake_helper_manager(dir.path()));
+        let model = PathBuf::from("model.gguf");
+        let timeout = Duration::from_secs(10);
+
+        let token_a = CancellationToken::new();
+        let a = tokio::spawn({
+            let (manager, model, token_a) = (manager.clone(), model.clone(), token_a.clone());
+            async move {
+                run_generation(&manager, model, GENERATE.to_string(), timeout, Some(&token_a)).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let token_b = CancellationToken::new();
+        let b = tokio::spawn({
+            let (manager, model, token_b) = (manager.clone(), model.clone(), token_b.clone());
+            async move {
+                run_generation(&manager, model, GENERATE.to_string(), timeout, Some(&token_b)).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token_b.cancel();
+
+        let b_result = b.await.unwrap();
+        assert!(b_result.is_err(), "cancelled request must not succeed");
+        assert!(manager.is_healthy(), "cancelling B must not shut down the sidecar A is using");
+
+        let a_result = a.await.unwrap();
+        assert_eq!(
+            a_result.unwrap(),
+            r#"{"type":"response","text":"done","error":null}"#
+        );
+
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_the_in_flight_generation_shuts_down_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(super::super::sidecar::tests::fake_helper_manager(dir.path()));
+        let timeout = Duration::from_secs(10);
+
+        let token_a = CancellationToken::new();
+        let a = tokio::spawn({
+            let (manager, token_a) = (manager.clone(), token_a.clone());
+            async move {
+                run_generation(
+                    &manager,
+                    PathBuf::from("model.gguf"),
+                    GENERATE.to_string(),
+                    timeout,
+                    Some(&token_a),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token_a.cancel();
+
+        let error = a.await.unwrap().expect_err("cancelled request must not succeed");
+        assert_eq!(error.to_string(), "Generation cancelled by user");
+        assert!(!manager.is_healthy(), "the cancelled in-flight generation must be stopped");
     }
 }
