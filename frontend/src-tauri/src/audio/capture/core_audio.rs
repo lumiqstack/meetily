@@ -47,9 +47,46 @@ struct AudioContext {
     producer: HeapProd<f32>,
     waker_state: Arc<Mutex<WakerState>>,
     current_sample_rate: Arc<AtomicU32>,
-    /// Samples dropped on overflow since the last overflow warning.
-    dropped_samples: u64,
-    last_overflow_warning: Option<std::time::Instant>,
+    overflow: OverflowLog,
+}
+
+/// Overflow accounting for the realtime callback: one line when an episode
+/// of drops starts, one with the true total when it ends. If the ring keeps
+/// flapping between full and not, totals are reported at most every 5 s and
+/// the count carries over, so a drop is never reported as smaller than it was.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct OverflowLog {
+    dropped: u64,
+    overflowing: bool,
+    last_total: Option<std::time::Instant>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl OverflowLog {
+    const MIN_TOTAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn record(&mut self, requested: usize, pushed: usize, now: std::time::Instant) -> Option<String> {
+        if pushed < requested {
+            self.dropped += (requested - pushed) as u64;
+            if self.overflowing {
+                return None;
+            }
+            self.overflowing = true;
+            return Some("ring buffer full, dropping system audio samples".to_string());
+        }
+        if !self.overflowing {
+            return None;
+        }
+        self.overflowing = false;
+        if self.last_total.map_or(false, |t| now.duration_since(t) < Self::MIN_TOTAL_INTERVAL) {
+            return None;
+        }
+        self.last_total = Some(now);
+        let message = format!("ring buffer overflow ended, dropped {} system audio samples", self.dropped);
+        self.dropped = 0;
+        Some(message)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -276,8 +313,7 @@ impl CoreAudioCapture {
             producer,
             waker_state: waker_state.clone(),
             current_sample_rate: current_sample_rate.clone(),
-            dropped_samples: 0,
-            last_overflow_warning: None,
+            overflow: OverflowLog::default(),
         });
 
         info!("🎙️ CoreAudio: Starting audio device...");
@@ -307,20 +343,8 @@ fn process_audio_data(ctx: &mut AudioContext, data: &[f32]) {
     // fit and keep capturing: ending the stream here silenced system audio for
     // the rest of the meeting. The consumer side cannot be popped from this
     // thread, so the newest samples are the ones dropped.
-    if pushed < data.len() {
-        ctx.dropped_samples += (data.len() - pushed) as u64;
-        let now = std::time::Instant::now();
-        let due = ctx
-            .last_overflow_warning
-            .map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(5));
-        if due {
-            warn!(
-                "CoreAudio: ring buffer full, dropped {} system audio samples",
-                ctx.dropped_samples
-            );
-            ctx.dropped_samples = 0;
-            ctx.last_overflow_warning = Some(now);
-        }
+    if let Some(message) = ctx.overflow.record(data.len(), pushed, std::time::Instant::now()) {
+        warn!("CoreAudio: {}", message);
     }
 
     if pushed > 0 {
@@ -434,5 +458,43 @@ mod tests {
 
         info!("Collected {} samples", sample_count);
         assert!(sample_count >= 48000);
+    }
+
+    /// An episode of drops is one warning at the start and the true total at
+    /// the end, however many callbacks it spanned.
+    #[test]
+    fn overflow_episode_reports_the_full_total_once() {
+        let t0 = std::time::Instant::now();
+        let mut log = OverflowLog::default();
+        assert!(log.record(512, 512, t0).is_none());
+        assert_eq!(
+            log.record(512, 0, t0).as_deref(),
+            Some("ring buffer full, dropping system audio samples")
+        );
+        assert!(log.record(512, 100, t0).is_none());
+        assert!(log.record(512, 0, t0).is_none());
+        assert_eq!(
+            log.record(512, 512, t0 + std::time::Duration::from_millis(30)).as_deref(),
+            Some("ring buffer overflow ended, dropped 1436 system audio samples")
+        );
+        assert!(log.record(512, 512, t0 + std::time::Duration::from_secs(1)).is_none());
+    }
+
+    /// A ring flapping between full and not reports a total at most every
+    /// 5 s, and the drops in between are carried into the next total.
+    #[test]
+    fn flapping_overflow_carries_drops_into_the_next_total() {
+        let t0 = std::time::Instant::now();
+        let s = std::time::Duration::from_secs;
+        let mut log = OverflowLog::default();
+        log.record(512, 0, t0);
+        assert!(log.record(512, 512, t0 + s(1)).is_some());
+        log.record(512, 12, t0 + s(2));
+        assert!(log.record(512, 512, t0 + s(3)).is_none(), "second total inside 5 s is suppressed");
+        assert!(log.record(512, 0, t0 + s(4)).is_some(), "a new episode still announces itself");
+        assert_eq!(
+            log.record(512, 512, t0 + s(7)).as_deref(),
+            Some("ring buffer overflow ended, dropped 1012 system audio samples")
+        );
     }
 }
