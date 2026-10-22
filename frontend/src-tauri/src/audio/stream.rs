@@ -184,7 +184,7 @@ impl AudioStream {
         let device_name = device.name.clone();
         info!("🔊 Stream: Spawning tokio task to poll Core Audio stream...");
         let task = tokio::spawn({
-            let capture = capture.clone();
+            let mut capture = capture.clone();
             let mut stream = core_stream;
 
             async move {
@@ -208,6 +208,9 @@ impl AudioStream {
 
                     // Process when we have enough samples
                     if frame_count >= frames_per_chunk {
+                        // The IO proc tracks the device's nominal rate (a
+                        // Bluetooth headset switching to HFP changes it).
+                        capture.set_input_sample_rate(stream.sample_rate());
                         capture.process_audio_data(&buffer);
                         buffer.clear();
                         frame_count = 0;
@@ -220,6 +223,7 @@ impl AudioStream {
                 }
 
                 info!("⚠️ Stream: Core Audio processing task ended for {}", device_name);
+                capture.handle_stream_end();
             }
         });
 
@@ -333,14 +337,12 @@ impl AudioStream {
             }
             #[cfg(target_os = "macos")]
             StreamBackend::CoreAudio { task } => {
-                // Abort the processing task and wait briefly for cleanup
+                // stop() is sync and runs on async callers' runtime threads, so
+                // it must not sleep waiting for the abort. The runtime drops
+                // the task (and the Core Audio device it owns) on its own.
                 if let Some(task_handle) = task {
                     info!("Aborting Core Audio task...");
                     task_handle.abort();
-                    // Give the runtime a moment to clean up the aborted task
-                    // This helps ensure Arc references in the closure are dropped
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    info!("Core Audio task aborted");
                 }
             }
         }

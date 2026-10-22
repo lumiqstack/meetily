@@ -419,6 +419,58 @@ impl CaptureContinuity {
     }
 }
 
+// CRITICAL FIX: Persistent resampler to preserve energy across chunks.
+// Creating a new resampler per chunk causes energy amplification and incorrect output sizes.
+// Fixed chunk size of 512 samples, with buffering for variable-size input.
+const RESAMPLER_CHUNK_SIZE: usize = 512;
+
+/// Resampler from `sample_rate` to the pipeline's 48 kHz, or `None` if it
+/// cannot be built (callers then fall back to per-chunk resampling).
+fn build_resampler(device_name: &str, sample_rate: u32) -> Option<SincFixedIn<f32>> {
+    const TARGET_SAMPLE_RATE: u32 = 48000;
+    let ratio = TARGET_SAMPLE_RATE as f64 / sample_rate as f64;
+
+    // Adaptive parameters based on sample rate ratio (same logic as resample_audio)
+    let (sinc_len, interpolation_type, oversampling) = if ratio >= 2.0 {
+        (512, SincInterpolationType::Cubic, 512)
+    } else if ratio >= 1.5 {
+        (384, SincInterpolationType::Cubic, 384)
+    } else if ratio > 1.0 {
+        (256, SincInterpolationType::Linear, 256)
+    } else if ratio <= 0.5 {
+        (512, SincInterpolationType::Cubic, 512)
+    } else {
+        (384, SincInterpolationType::Linear, 384)
+    };
+
+    let params = SincInterpolationParameters {
+        sinc_len,
+        f_cutoff: 0.95,
+        interpolation: interpolation_type,
+        oversampling_factor: oversampling,
+        window: WindowFunction::BlackmanHarris2,
+    };
+
+    match SincFixedIn::<f32>::new(
+        ratio,
+        2.0,  // Maximum relative deviation
+        params,
+        RESAMPLER_CHUNK_SIZE,
+        1,    // Mono
+    ) {
+        Ok(resampler) => {
+            info!("✅ Persistent resampler initialized for '{}' ({}Hz → {}Hz, chunk_size={})",
+                  device_name, sample_rate, TARGET_SAMPLE_RATE, RESAMPLER_CHUNK_SIZE);
+            info!("   Buffering enabled for variable-size chunks (e.g., 320, 512, 1024, etc.)");
+            Some(resampler)
+        }
+        Err(e) => {
+            warn!("⚠️ Failed to create persistent resampler: {}, will use fallback", e);
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AudioCapture {
     device: Arc<AudioDevice>,
@@ -538,53 +590,8 @@ impl AudioCapture {
             (None, None, None)
         };
 
-        // CRITICAL FIX: Initialize persistent resampler to preserve energy across chunks
-        // Creating a new resampler per chunk causes energy amplification and incorrect output sizes
-        // Use fixed chunk size of 512 samples with buffering for variable-size input
-        const RESAMPLER_CHUNK_SIZE: usize = 512;
-
         let resampler = if needs_resampling {
-            let ratio = TARGET_SAMPLE_RATE as f64 / sample_rate as f64;
-
-            // Adaptive parameters based on sample rate ratio (same logic as resample_audio)
-            let (sinc_len, interpolation_type, oversampling) = if ratio >= 2.0 {
-                (512, SincInterpolationType::Cubic, 512)
-            } else if ratio >= 1.5 {
-                (384, SincInterpolationType::Cubic, 384)
-            } else if ratio > 1.0 {
-                (256, SincInterpolationType::Linear, 256)
-            } else if ratio <= 0.5 {
-                (512, SincInterpolationType::Cubic, 512)
-            } else {
-                (384, SincInterpolationType::Linear, 384)
-            };
-
-            let params = SincInterpolationParameters {
-                sinc_len,
-                f_cutoff: 0.95,
-                interpolation: interpolation_type,
-                oversampling_factor: oversampling,
-                window: WindowFunction::BlackmanHarris2,
-            };
-
-            match SincFixedIn::<f32>::new(
-                ratio,
-                2.0,  // Maximum relative deviation
-                params,
-                RESAMPLER_CHUNK_SIZE,
-                1,    // Mono
-            ) {
-                Ok(resampler) => {
-                    info!("✅ Persistent resampler initialized for '{}' ({}Hz → {}Hz, chunk_size={})",
-                          device.name, sample_rate, TARGET_SAMPLE_RATE, RESAMPLER_CHUNK_SIZE);
-                    info!("   Buffering enabled for variable-size chunks (e.g., 320, 512, 1024, etc.)");
-                    Some(resampler)
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to create persistent resampler: {}, will use fallback", e);
-                    None
-                }
-            }
+            build_resampler(&device.name, sample_rate)
         } else {
             None
         };
@@ -618,6 +625,29 @@ impl AudioCapture {
             mic_chain,
             continuity: Arc::new(std::sync::Mutex::new(CaptureContinuity::default())),
         }
+    }
+
+    /// Switch to a new input sample rate mid-stream, rebuilding the resampler.
+    /// Samples still buffered at the old rate are discarded (under one
+    /// resampler chunk). The new resampler state is private to this clone.
+    pub fn set_input_sample_rate(&mut self, sample_rate: u32) {
+        if sample_rate == self.sample_rate {
+            return;
+        }
+        warn!(
+            "🔄 [{:?}] '{}' sample rate changed {} Hz → {} Hz, retuning resampler",
+            self.device_type, self.device.name, self.sample_rate, sample_rate
+        );
+        self.sample_rate = sample_rate;
+        self.needs_resampling = sample_rate != 48000;
+        let resampler = if self.needs_resampling {
+            build_resampler(&self.device.name, sample_rate)
+        } else {
+            None
+        };
+        self.resampler = Arc::new(std::sync::Mutex::new(resampler));
+        self.resampler_input_buffer =
+            Arc::new(std::sync::Mutex::new(Vec::with_capacity(RESAMPLER_CHUNK_SIZE * 2)));
     }
 
     /// Process audio data from a source without device timestamps.
@@ -932,6 +962,16 @@ impl AudioCapture {
         };
 
         self.state.report_error(audio_error);
+    }
+
+    /// The capture stream produced its last sample. After a stop that is
+    /// expected; during a recording it means this source has gone silent for
+    /// good, so it goes through the same error path as a cpal stream error.
+    pub fn handle_stream_end(&self) {
+        if self.state.is_recording() {
+            error!("Audio stream for {} ended while recording", self.device.name);
+            self.state.report_error(AudioError::StreamFailed);
+        }
     }
 }
 
@@ -2043,5 +2083,69 @@ mod tests {
             total_samples += chunk.data.len();
         }
         assert_eq!(total_samples, total);
+    }
+
+    fn system_capture(state: &Arc<RecordingState>, sample_rate: u32) -> AudioCapture {
+        let device = Arc::new(AudioDevice::new(
+            "system".to_string(),
+            crate::audio::devices::DeviceType::Output,
+        ));
+        AudioCapture::new(device, state.clone(), sample_rate, 1, DeviceType::System, None)
+    }
+
+    /// Feed `input_len` samples through `capture` in 1024-sample callbacks and
+    /// return how many samples reached the pipeline and at what rate.
+    fn captured_output(
+        capture: &AudioCapture,
+        rx: &mut mpsc::UnboundedReceiver<AudioChunk>,
+        input_len: usize,
+    ) -> (usize, u32) {
+        for _ in 0..input_len / 1024 {
+            capture.process_audio_data(&vec![0.1f32; 1024]);
+        }
+        let (mut total, mut rate) = (0usize, 0u32);
+        while let Ok(chunk) = rx.try_recv() {
+            total += chunk.data.len();
+            rate = chunk.sample_rate;
+        }
+        (total, rate)
+    }
+
+    /// Core Audio's nominal rate changes mid-recording (Bluetooth headset
+    /// switching to HFP). The capture must resample from the new rate, or
+    /// system audio plays at the wrong pitch and drifts against the mic.
+    #[test]
+    fn input_rate_change_retunes_resampler() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AudioChunk>();
+        state.set_audio_sender(tx);
+
+        let mut capture = system_capture(&state, 48_000);
+        capture.set_input_sample_rate(16_000);
+        // About one second at 16 kHz must come out as about one second at 48 kHz.
+        let (total, rate) = captured_output(&capture, &mut rx, 16_384);
+        assert_eq!(rate, 48_000);
+        assert!((45_000..=50_000).contains(&total), "16 kHz second resampled to {} samples", total);
+
+        capture.set_input_sample_rate(48_000);
+        let (total, rate) = captured_output(&capture, &mut rx, 48_128);
+        assert_eq!(rate, 48_000);
+        assert_eq!(total, 48_128, "48 kHz input must pass through unresampled");
+    }
+
+    /// A capture stream that ends while still recording must be reported,
+    /// not left to pad system audio with silence for the rest of the meeting.
+    #[test]
+    fn stream_end_while_recording_reports_stream_failed() {
+        let state = RecordingState::new();
+        let capture = system_capture(&state, 48_000);
+
+        capture.handle_stream_end();
+        assert!(state.get_last_error().is_none(), "an end after stop is not an error");
+
+        state.start_recording().unwrap();
+        capture.handle_stream_end();
+        assert!(matches!(state.get_last_error(), Some(AudioError::StreamFailed)));
     }
 }
