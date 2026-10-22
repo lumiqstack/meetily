@@ -16,6 +16,15 @@ Follow `docs/windows/DATABASE_UPGRADE_CHECK.md` step by step: build without
 launching, run `scripts\windows\meetily-check.ps1`, then launch. The first
 launch of a new build upgrades the user's database irreversibly.
 
+## Merging pull requests
+
+- The `main` ruleset accepts only checks from pull-request-triggered runs. `windows-tests.yml` runs on `pull_request`, so a PR normally has them within minutes of a push. A manually dispatched run does not count.
+- `windows-tests.yml` runs on every pull request (its `pull_request` trigger has no path filter on purpose; the `push` trigger keeps one). If a PR still shows no checks, close and reopen it to trigger them, then `gh pr merge N --merge --auto`.
+- `--auto` merges immediately once the PR is already clean. The GitHub API's enable-auto-merge call refuses a clean PR for the same reason; merge it directly in that case.
+- Use merge commits, never squash or rebase, so the test-then-fix commit order stays in history.
+- Stacked PRs: merge the parent first, retarget the child to `main` (`gh pr edit N --base main`), wait for its mergeability to recompute, then merge it.
+- After landing a batch, re-run `npx tsc --noEmit --incremental false`, `bun test` and `cargo test -p meetily --lib` on `main`: the per-PR checks ran against the base each PR was cut from, not against the combined result.
+
 ## Windows Build Rule
 
 For local Windows builds, create the raw **application executable** only. Do not intentionally create or rely on MSI or NSIS installer artifacts going forward.
