@@ -19,7 +19,7 @@ launch of a new build upgrades the user's database irreversibly.
 ## Merging pull requests
 
 - The `main` ruleset accepts only checks from pull-request-triggered runs. `windows-tests.yml` runs on `pull_request`, so a PR normally has them within minutes of a push. A manually dispatched run does not count.
-- If a PR shows no checks, close and reopen it to trigger them, then `gh pr merge N --merge --auto`.
+- `windows-tests.yml` runs on every pull request (its `pull_request` trigger has no path filter on purpose; the `push` trigger keeps one). If a PR still shows no checks, close and reopen it to trigger them, then `gh pr merge N --merge --auto`.
 - `--auto` merges immediately once the PR is already clean. The GitHub API's enable-auto-merge call refuses a clean PR for the same reason; merge it directly in that case.
 - Use merge commits, never squash or rebase, so the test-then-fix commit order stays in history.
 - Stacked PRs: merge the parent first, retarget the child to `main` (`gh pr edit N --base main`), wait for its mergeability to recompute, then merge it.

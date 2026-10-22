@@ -17,16 +17,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-tests.yml'
+  # No path filter here: the main ruleset requires these checks on every
+  # pull request, and a filtered-out PR would have no runs to satisfy it.
   pull_request:
-    paths:
-      - 'frontend/**'
-      - 'llama-helper/**'
-      - 'vendor/**'
-      - 'tests/whisper-native/**'
-      - 'scripts/windows/meetily-check.ps1'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/windows-tests.yml'
   workflow_dispatch:
 
 concurrency:
