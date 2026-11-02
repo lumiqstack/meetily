@@ -959,6 +959,11 @@ pub fn run() {
             audio::sharepoint_sync::get_sharepoint_sync_state_command,
             audio::sharepoint_sync::set_sharepoint_sync_prefs_command,
             audio::sharepoint_sync::mark_sharepoint_imported_command,
+            // Teams recap sync
+            audio::teams_recap_sync::sync_teams_recaps_command,
+            audio::teams_recap_sync::get_teams_recap_sync_state_command,
+            audio::teams_recap_sync::set_teams_recap_sync_prefs_command,
+            audio::teams_recap_sync::teams_recap_list_debug_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
