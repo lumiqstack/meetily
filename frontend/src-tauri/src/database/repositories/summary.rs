@@ -134,6 +134,69 @@ impl SummaryProcessesRepository {
         Ok(meeting_id)
     }
 
+    /// Store an imported recap as the completed summary of an existing
+    /// meeting, whether or not it was ever summarized. A row in progress is
+    /// replaced too: the recap is the summary the user asked for. Returns
+    /// false when the meeting does not exist.
+    pub async fn attach_imported_summary(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        summary: &Value,
+    ) -> Result<bool, sqlx::Error> {
+        let result_json = serde_json::to_string(summary)
+            .map_err(|e| sqlx::Error::Protocol(format!("Failed to serialize recap: {e}")))?;
+        let metadata = serde_json::to_string(&serde_json::json!({
+            "source": "microsoft_copilot_recap",
+            "source_url": summary.get("source_url"),
+        }))
+        .map_err(|e| sqlx::Error::Protocol(format!("Failed to serialize recap metadata: {e}")))?;
+        let now = Utc::now();
+
+        let mut transaction = pool.begin().await?;
+        let meeting_exists: bool = sqlx::query("SELECT 1 FROM meetings WHERE id = ?")
+            .bind(meeting_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
+        if !meeting_exists {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO summary_processes (
+                meeting_id, status, created_at, updated_at, start_time, end_time,
+                result, chunk_count, processing_time, metadata
+            ) VALUES (?, 'completed', ?, ?, ?, ?, ?, 0, 0.0, ?)
+            ON CONFLICT(meeting_id) DO UPDATE SET
+                status = 'completed',
+                updated_at = excluded.updated_at,
+                end_time = excluded.end_time,
+                result = excluded.result,
+                error = NULL,
+                result_backup = NULL,
+                result_backup_timestamp = NULL,
+                metadata = excluded.metadata
+            "#,
+        )
+        .bind(meeting_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(result_json)
+        .bind(metadata)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(meeting_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     pub async fn create_or_reset_process(
         pool: &SqlitePool,
         meeting_id: &str,
@@ -330,6 +393,33 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn attach_imported_summary_creates_or_replaces_the_summary_row() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'T', '2026-07-21T15:00:00Z', '2026-07-21T15:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let recap = json!({"markdown": "- first", "source_url": "https://t/r"});
+
+        // Never summarized: a completed row appears.
+        assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "m1", &recap).await.unwrap());
+        let row = SummaryProcessesRepository::get_summary_data(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert!(row.result.unwrap().contains("first"));
+
+        // Summarizing right now: the recap replaces the pending attempt.
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m1", Utc::now()).await.unwrap();
+        let again = json!({"markdown": "- second"});
+        assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "m1", &again).await.unwrap());
+        let row = SummaryProcessesRepository::get_summary_data(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert!(row.result.unwrap().contains("second"));
+        assert!(row.result_backup.is_none());
+
+        assert!(!SummaryProcessesRepository::attach_imported_summary(&pool, "missing", &again).await.unwrap());
     }
 
     #[tokio::test]
