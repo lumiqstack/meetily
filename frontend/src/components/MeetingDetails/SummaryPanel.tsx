@@ -24,12 +24,14 @@ import {
   SummaryLanguageStorage,
 } from '@/lib/summary-language-preferences';
 import { hasVisibleSummaryContent } from '@/lib/summary-content';
+import type { MeetingCalendar } from '@/types/calendar';
 
 interface SummaryPanelProps {
   meeting: {
     id: string;
     title: string;
     created_at: string;
+    calendar?: MeetingCalendar | null;
   };
   meetingTitle: string;
   isSummaryDirty: boolean;
@@ -287,6 +289,7 @@ export function SummaryPanel({
           transcripts={transcripts}
           provenance={summaryProvenance}
           availableTemplates={availableTemplates}
+          calendar={meeting.calendar ?? null}
         />
         <div className="flex items-center justify-center w-full min-w-0 gap-2 flex-wrap">
           <div className="flex-shrink-0 min-w-0">

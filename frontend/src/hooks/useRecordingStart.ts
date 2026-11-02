@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { setActiveCalendarEvent, takeCalendarEventForAutoStart } from '@/lib/calendar-handoff';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -200,6 +201,7 @@ export function useRecordingStart(
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
+      setActiveCalendarEvent(null);
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
@@ -273,6 +275,9 @@ export function useRecordingStart(
             const nudgedTitle = sessionStorage.getItem('autoStartMeetingName');
             sessionStorage.removeItem('autoStartMeetingName');
             const generatedMeetingTitle = nudgedTitle?.trim() || generateMeetingTitle();
+            // The calendar event (if the prompt carried one) travels with this
+            // recording until the save attaches it to the meeting.
+            setActiveCalendarEvent(takeCalendarEventForAutoStart());
 
             // Set STARTING status before initiating backend recording
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
@@ -357,6 +362,7 @@ export function useRecordingStart(
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
         console.log('Starting backend recording with meeting:', generatedMeetingTitle);
+        setActiveCalendarEvent(null);
         const result = await recordingService.startRecordingWithDevices(
           selectedDevices?.micDevice || null,
           selectedDevices?.systemDevice || null,

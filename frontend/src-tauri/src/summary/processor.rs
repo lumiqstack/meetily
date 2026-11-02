@@ -415,6 +415,7 @@ pub(crate) async fn generate_meeting_summary(
     api_key: &str,
     text: &str,
     custom_prompt: &str,
+    calendar_context: Option<&str>,
     template_id: &str,
     template: &Template,
     token_threshold: usize,
@@ -547,6 +548,9 @@ pub(crate) async fn generate_meeting_summary(
                 final_user_prompt.push_str("\n\nUser Provided Context:\n\n<user_context>\n");
                 final_user_prompt.push_str(custom_prompt);
                 final_user_prompt.push_str("\n</user_context>");
+            }
+            if let Some(calendar_context) = calendar_context {
+                final_user_prompt.push_str(calendar_context);
             }
             let completion = generate_summary(
                 client, provider, model_name, api_key, &final_system_prompt, &final_user_prompt,

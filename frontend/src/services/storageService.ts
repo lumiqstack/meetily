@@ -7,6 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { Transcript } from '@/types';
+import type { CalendarEvent } from '@/types/calendar';
 
 export interface SaveMeetingRequest {
   meetingTitle: string;
@@ -34,19 +35,22 @@ export class StorageService {
    * @param meetingTitle - Title of the meeting
    * @param transcripts - Array of transcript segments
    * @param folderPath - Optional folder path for audio file
+   * @param calendarEvent - Outlook event the recording was matched to, if any
    * @returns Promise with { meeting_id: string }
    */
   async saveMeeting(
     meetingTitle: string,
     transcripts: Transcript[],
     folderPath: string | null,
-    transcriptionIncomplete = false
+    transcriptionIncomplete = false,
+    calendarEvent: CalendarEvent | null = null
   ): Promise<SaveMeetingResponse> {
     return invoke<SaveMeetingResponse>('api_save_transcript', {
       meetingTitle,
       transcripts,
       folderPath,
       transcriptionIncomplete,
+      calendarEvent,
     });
   }
 

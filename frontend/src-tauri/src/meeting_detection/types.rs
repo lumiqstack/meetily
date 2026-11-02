@@ -1,3 +1,4 @@
+use crate::calendar::CalendarEvent;
 use serde::{Deserialize, Serialize};
 
 pub const START_EVENT: &str = "teams-call-likely-started";
@@ -60,6 +61,9 @@ pub struct TeamsCallLikelyStartedPayload {
     /// Subject of the Teams meeting window at prompt time. `None` off Windows
     /// or when no meeting window is visible.
     pub window_title: Option<String>,
+    /// The Outlook calendar event this call lines up with, when the calendar
+    /// is enabled and one starts within the match window.
+    pub calendar_event: Option<CalendarEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

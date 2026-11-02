@@ -133,9 +133,12 @@ impl<R: Runtime> MeetingDetectionManager<R> {
                         match action {
                             Some(DetectionAction::PromptStart) if current_settings.teams_prompt_start => {
                                 let window_title = capture_meeting_window_title(&teams_process.process_ids);
+                                let calendar_event =
+                                    crate::calendar::match_event_for_detected_call(&app_handle).await;
                                 info!(
-                                    "Teams call likely started; meeting window title: {:?}",
-                                    window_title
+                                    "Teams call likely started; meeting window title: {:?}; calendar match: {:?}",
+                                    window_title,
+                                    calendar_event.as_ref().map(|event| &event.title)
                                 );
                                 let payload = TeamsCallLikelyStartedPayload {
                                     event_type: START_EVENT.to_string(),
@@ -144,6 +147,7 @@ impl<R: Runtime> MeetingDetectionManager<R> {
                                     teams_audio_active: sample.teams_audio_active,
                                     poll_interval_seconds: POLL_INTERVAL_SECONDS,
                                     window_title,
+                                    calendar_event,
                                 };
                                 if let Err(error) = app_handle.emit(START_EVENT, payload) {
                                     error!("Failed to emit Teams start prompt event: {}", error);

@@ -147,6 +147,7 @@ rrule = "0.14"
 chrono-tz = "0.10"
 windows-timezones = { version = "0.5", features = ["chrono-tz"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+open = "5"
 
 
 # System monitoring for resource management

@@ -1,7 +1,7 @@
 //! Decides which Teams meetings get a nudge on this tick. Pure, so the timing
 //! rules are tested without a clock or a feed.
 
-use super::types::{CalendarEvent, NUDGE_GRACE_SECONDS};
+use super::types::{CalendarEvent, MATCH_AFTER_START_MINUTES, MATCH_BEFORE_START_MINUTES, NUDGE_GRACE_SECONDS};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashSet;
 
@@ -50,6 +50,21 @@ impl NudgePlanner {
 
         due
     }
+}
+
+/// The Teams event a call detected at `now` most likely belongs to: its
+/// start lies between `MATCH_AFTER_START_MINUTES` ago and
+/// `MATCH_BEFORE_START_MINUTES` ahead, and it has not ended. Ties go to the
+/// start closest to `now`.
+pub fn match_event_for_call(events: &[CalendarEvent], now: DateTime<Utc>) -> Option<CalendarEvent> {
+    let earliest = now - Duration::minutes(MATCH_AFTER_START_MINUTES);
+    let latest = now + Duration::minutes(MATCH_BEFORE_START_MINUTES);
+    events
+        .iter()
+        .filter(|event| event.is_teams_meeting() && event.end > now)
+        .filter(|event| event.start >= earliest && event.start <= latest)
+        .min_by_key(|event| (event.start - now).num_seconds().abs())
+        .cloned()
 }
 
 #[cfg(test)]
@@ -135,5 +150,34 @@ mod tests {
         assert_eq!(planner.due(&events, at(9, 58), Duration::minutes(2)).len(), 1);
         planner.due(&[], at(11, 0), Duration::minutes(2));
         assert!(planner.nudged.is_empty());
+    }
+
+    #[test]
+    fn match_prefers_the_start_closest_to_now() {
+        let now = at(10, 0);
+        let events = vec![
+            event("earlier", at(9, 45), true),
+            event("closest", at(9, 55), true),
+            event("later", at(10, 8), true),
+        ];
+        assert_eq!(match_event_for_call(&events, now).unwrap().id, "closest");
+    }
+
+    #[test]
+    fn match_window_is_20_minutes_back_and_10_ahead() {
+        let now = at(10, 0);
+        assert!(match_event_for_call(&[event("old", at(9, 39), true)], now).is_none());
+        assert!(match_event_for_call(&[event("edge-back", at(9, 40), true)], now).is_some());
+        assert!(match_event_for_call(&[event("edge-ahead", at(10, 10), true)], now).is_some());
+        assert!(match_event_for_call(&[event("far", at(10, 11), true)], now).is_none());
+    }
+
+    #[test]
+    fn match_skips_non_teams_and_ended_events() {
+        let now = at(10, 0);
+        let mut ended = event("ended", at(9, 50), true);
+        ended.end = at(9, 58);
+        let events = vec![event("in-room", at(9, 58), false), ended];
+        assert!(match_event_for_call(&events, now).is_none());
     }
 }

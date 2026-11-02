@@ -24,6 +24,7 @@ import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
 import { parseSummaryContent } from "@/lib/summary-content";
+import type { MeetingMetadata } from "@/types";
 
 interface MeetingDetailsResponse {
   id: string;
@@ -32,6 +33,7 @@ interface MeetingDetailsResponse {
   updated_at: string;
   transcripts: Transcript[];
   folder_path?: string;
+  calendar?: MeetingMetadata['calendar'];
 }
 
 function MeetingDetailsContent() {
@@ -152,6 +154,7 @@ function MeetingDetailsContent() {
         updated_at: metadata.updated_at,
         transcripts: transcripts, // Paginated transcripts from hook
         folder_path: metadata.folder_path, // For retranscription feature
+        calendar: metadata.calendar,
       });
 
       // Sync with sidebar context

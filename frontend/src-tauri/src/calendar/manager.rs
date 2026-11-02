@@ -1,6 +1,6 @@
 use super::{
     ics_feed::IcsFeedSource,
-    scheduler::NudgePlanner,
+    scheduler::{match_event_for_call, NudgePlanner},
     secret,
     source::CalendarSource,
     types::{
@@ -248,6 +248,16 @@ impl<R: Runtime> CalendarManager<R> {
             .collect()
     }
 
+    /// The event a Teams call detected now most likely belongs to. `None`
+    /// while the calendar is disabled, so a stale event list never names a
+    /// recording.
+    pub async fn match_for_call(&self, now: DateTime<Utc>) -> Option<CalendarEvent> {
+        if !self.settings.read().await.calendar_enabled {
+            return None;
+        }
+        match_event_for_call(&self.events.read().await, now)
+    }
+
     async fn persist_settings(&self, next: CalendarSettings) -> Result<()> {
         save_settings(&next).await?;
         *self.settings.write().await = next.clone();
@@ -282,7 +292,10 @@ fn settings_path() -> PathBuf {
     crate::storage::config_dir().join("calendar.json")
 }
 
-async fn load_settings() -> Result<CalendarSettings> {
+/// Reads `calendar.json`, creating it with defaults on first use. Also used
+/// outside the manager (the summary stage reads `include_body_in_summary`
+/// at generation time).
+pub async fn load_settings() -> Result<CalendarSettings> {
     let path = settings_path();
     if !path.exists() {
         let defaults = CalendarSettings::default();

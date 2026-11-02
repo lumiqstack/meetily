@@ -1,6 +1,8 @@
 # Outlook calendar and Teams meeting auto-detect (Windows)
 
-Status: 2026-11-02. PR 1 (ICS feed source, nudge, settings UI) implemented;
+Status: 2026-11-02. PRs 1 to 3 implemented (ICS feed source, nudge, settings UI;
+window titles; calendar match, "Join and record", storage, details pane, summary
+context); PR 4 (classic Outlook COM) pending. Earlier text:
 PRs 2 to 4 pending.
 
 ## Goal
@@ -160,16 +162,21 @@ key the calendar nudge uses.
   once, at start minus lead time, and shows a system notification through
   `notifications::NotificationManager` with the event title. Events already
   running when Meetily starts are not nudged, but still match.
-- Matching: when the detector produces a start prompt, the scheduler returns
-  the Teams event whose start is within minus 10 to plus 20 minutes of now. If
-  several match, the one with the closest start wins. The payload carries the
-  match and the window title.
+- Matching: when the detector produces a start prompt, it asks the calendar
+  manager for the Teams event whose start lies between 20 minutes ago and 10
+  minutes ahead and that has not ended (`scheduler::match_event_for_call`).
+  If several match, the one with the start closest to now wins. The payload
+  carries the match and the window title. A disabled calendar never matches,
+  even if an event list is still in memory.
 - Prompt title priority: calendar match title, then window title, then
   "Teams meeting".
-- Armed recording: after "Join and record" the frontend opens the join URL via
-  `tauri-plugin-opener` and sets an armed flag with a 10 minute expiry. The
-  next `teams-call-likely-started` while armed starts recording without a
-  second prompt. The detector itself still only emits prompts; arming is
+- Armed recording: after "Join and record" the frontend opens the join URL
+  through the `open_teams_join_url` command (the `open` crate, limited to
+  `https` links on `teams.microsoft.com` and `teams.live.com`) and arms the
+  event for 10 minutes in session storage. The next `teams-call-likely-started`
+  while armed starts recording without a second prompt and attaches the event.
+  The button is offered only when Teams call detection is on, since that is
+  what fires the start. The detector itself still only emits prompts; arming is
   frontend state.
 - A Teams call that starts with no calendar match behaves as today, with the
   window title added to the prompt.
@@ -225,8 +232,12 @@ ALTER TABLE meetings ADD COLUMN calendar_body TEXT;
 ```
 
 Filled when a recording starts from a prompt that carried a match. The
-`start_recording` command takes an optional `calendar_event` argument for
-this. The meeting details pane shows organizer, attendees, join link and body
+The frontend starts recordings without a meeting argument and names
+them at save time, so the match travels the same way: the prompt stashes the
+event in session storage, the start marks it as the running recording's
+event (every manual start clears it), and the save passes it to
+`api_save_transcript` as the optional `calendar_event` argument, which
+writes the columns after the meeting row exists. The meeting details pane shows organizer, attendees, join link and body
 when present.
 
 ## Summary integration

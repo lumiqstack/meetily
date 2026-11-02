@@ -1,26 +1,16 @@
 'use client';
 
 import React, { useEffect, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import Analytics from '@/lib/analytics';
+import { armJoinAndRecord, stashCalendarEventForAutoStart } from '@/lib/calendar-handoff';
+import type { CalendarEvent } from '@/types/calendar';
 
-// Mirrors calendar::types::CalendarEvent in the Rust core.
-export interface CalendarEvent {
-  id: string;
-  source: 'ics_feed' | 'outlook_com';
-  title: string;
-  start: string;
-  end: string;
-  organizer: string | null;
-  attendees: string[];
-  location: string | null;
-  body: string | null;
-  teams_join_url: string | null;
-  is_recurring_instance: boolean;
-}
+export type { CalendarEvent } from '@/types/calendar';
 
 interface CalendarMeetingUpcomingPayload {
   type: string;
@@ -50,10 +40,15 @@ function describeStart(startsInSeconds: number): string {
  */
 export function CalendarNudgeProvider({ children }: { children: React.ReactNode }) {
   const recordingState = useRecordingState();
-  const { calendarSettings } = useConfig();
+  const { calendarSettings, meetingDetectionSettings } = useConfig();
 
   const recordingStateRef = useRef(recordingState);
   const settingsRef = useRef(calendarSettings);
+  const detectionRef = useRef(meetingDetectionSettings);
+
+  useEffect(() => {
+    detectionRef.current = meetingDetectionSettings;
+  }, [meetingDetectionSettings]);
 
   useEffect(() => {
     recordingStateRef.current = recordingState;
@@ -95,6 +90,32 @@ export function CalendarNudgeProvider({ children }: { children: React.ReactNode 
     if (current.isRecording || current.isStopping) return;
 
     const { event, starts_in_seconds } = payload;
+    // "Join and record" needs the Teams call detector to fire the start, so
+    // it is only offered when detection is on and the event has a link.
+    const canJoinAndRecord = Boolean(
+      event.teams_join_url &&
+      detectionRef.current?.meeting_detection_enabled &&
+      detectionRef.current?.teams_detection_enabled
+    );
+
+    const joinAndRecord = async () => {
+      Analytics.trackButtonClick('calendar_nudge_join_and_record', 'calendar_nudge');
+      try {
+        await invoke('open_teams_join_url', { url: event.teams_join_url });
+      } catch (error) {
+        console.error('[CalendarNudge] Failed to open the Teams link:', error);
+        toast.error('Could not open the Teams link', {
+          description: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      armJoinAndRecord(event);
+      toast.success(`Recording will start when the Teams call begins`, {
+        description: `Meetily is waiting for "${event.title}". The wait ends after 10 minutes.`,
+        duration: 8000,
+      });
+    };
+
     let toastId: string | number;
     toastId = toast.info(`${event.title} ${describeStart(starts_in_seconds)}`, {
       description: (
@@ -104,15 +125,27 @@ export function CalendarNudgeProvider({ children }: { children: React.ReactNode 
             Record this Teams meeting with Meetily?
           </p>
           <div className="flex flex-wrap gap-2">
+            {canJoinAndRecord && (
+              <button
+                onClick={() => {
+                  toast.dismiss(toastId);
+                  void joinAndRecord();
+                }}
+                className="px-3 py-1.5 text-xs font-medium rounded bg-gray-900 text-white hover:bg-gray-800"
+              >
+                Join and record
+              </button>
+            )}
             <button
               onClick={() => {
                 toast.dismiss(toastId);
                 Analytics.trackButtonClick('calendar_nudge_record', 'calendar_nudge');
-                sessionStorage.setItem('autoStartMeetingName', event.title);
-                sessionStorage.setItem('autoStartRecording', 'true');
+                stashCalendarEventForAutoStart(event);
                 window.location.assign('/');
               }}
-              className="px-3 py-1.5 text-xs font-medium rounded bg-gray-900 text-white hover:bg-gray-800"
+              className={canJoinAndRecord
+                ? 'px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50'
+                : 'px-3 py-1.5 text-xs font-medium rounded bg-gray-900 text-white hover:bg-gray-800'}
             >
               Record now
             </button>
