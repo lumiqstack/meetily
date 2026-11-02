@@ -479,16 +479,19 @@ export function ImportAudioDialog({
         if (!canImport) return;
         setIsImportingRecap(true);
         try {
-          const result = await invoke<{ meetingId: string; title: string; obsidianFilePath: string }>(
-            'api_import_copilot_recap_from_link',
-            { title: title.trim(), sourceUrl: linkUrl.trim() }
-          );
+          const result = await invoke<{
+            meetingId: string;
+            title: string;
+            obsidianFilePath: string;
+            attached: boolean;
+          }>('api_import_copilot_recap_from_link', { title: title.trim(), sourceUrl: linkUrl.trim() });
           await refetchMeetings();
           onComplete?.();
           onOpenChange(false);
-          toast.success('Copilot recap imported', {
-            description: `Saved to Meetily and Obsidian: ${result.obsidianFilePath}`,
-          });
+          toast.success(
+            result.attached ? `Copilot recap attached to "${result.title}"` : 'Copilot recap imported',
+            { description: `Saved to Meetily and Obsidian: ${result.obsidianFilePath}` }
+          );
           router.push(`/meeting-details?id=${result.meetingId}`);
         } catch (e) {
           toast.error('Could not import Copilot recap', { description: String(e) });

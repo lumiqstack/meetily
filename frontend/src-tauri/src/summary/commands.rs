@@ -69,6 +69,9 @@ pub struct ImportedRecapFromLinkResponse {
     pub meeting_id: String,
     pub title: String,
     pub obsidian_file_path: String,
+    /// The recap joined a meeting Meetily already had (from its recording
+    /// or an earlier import of the same link) instead of creating one.
+    pub attached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +109,35 @@ enum MeetingFolderResolution {
     NoFolder,
 }
 
+/// Validate recap text and shape the summary record imported recaps are
+/// stored as. Shared by creating a meeting and attaching to an existing one.
+fn imported_recap_summary(
+    recap: &str,
+    source_url: Option<&str>,
+    recorded_at: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let recap = recap.trim();
+    if recap.is_empty() {
+        return Err("Copilot recap is required.".into());
+    }
+    if recap.chars().count() > 500_000 {
+        return Err("Copilot recap is too large (maximum 500,000 characters).".into());
+    }
+    if contains_reasoning_marker(recap) {
+        return Err("The recap contains a model reasoning marker and was not imported.".into());
+    }
+    let summary = serde_json::json!({
+        "markdown": recap,
+        "imported_from": "microsoft_copilot_recap",
+        "source_url": source_url,
+        "recorded_at": recorded_at,
+    });
+    if !summary_is_renderable(&summary) {
+        return Err("Copilot recap contains no visible content and was not imported.".into());
+    }
+    Ok(summary)
+}
+
 /// Persist a recap already extracted from the authenticated Teams webview.
 /// This intentionally bypasses recording download, speech-to-text, and LLM
 /// summary generation.
@@ -124,15 +156,6 @@ async fn save_extracted_copilot_recap(
     if title.chars().count() > 500 {
         return Err("Meeting title is too long (maximum 500 characters).".into());
     }
-    if recap.is_empty() {
-        return Err("Copilot recap is required.".into());
-    }
-    if recap.chars().count() > 500_000 {
-        return Err("Copilot recap is too large (maximum 500,000 characters).".into());
-    }
-    if contains_reasoning_marker(recap) {
-        return Err("The recap contains a model reasoning marker and was not imported.".into());
-    }
 
     let source_url = source_url
         .map(|value| value.trim().to_string())
@@ -147,15 +170,7 @@ async fn save_extracted_copilot_recap(
         }
     }
 
-    let summary = serde_json::json!({
-        "markdown": recap,
-        "imported_from": "microsoft_copilot_recap",
-        "source_url": source_url.as_deref(),
-        "recorded_at": recorded_at,
-    });
-    if !summary_is_renderable(&summary) {
-        return Err("Copilot recap contains no visible content and was not imported.".into());
-    }
+    let summary = imported_recap_summary(recap, source_url.as_deref(), recorded_at.as_deref())?;
 
     let created_at = crate::audio::import::resolve_meeting_date(title, None, recorded_at.as_deref());
     let meeting_id = SummaryProcessesRepository::create_meeting_with_imported_summary(
@@ -222,6 +237,24 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         return Err("The configured Obsidian vault folder is not available on this machine.".into());
     }
 
+    // Find the meeting this recap belongs to before the slow extraction:
+    // one Meetily already imported from the same recording, or an earlier
+    // import of this very link. The recap attaches there rather than
+    // creating a second meeting and a second vault note.
+    let pool = state.db_manager.pool();
+    let identity = crate::audio::teams_recap::meeting_identity_key(source_url);
+    let existing = crate::database::repositories::meeting_sources::MeetingSource::find_meeting_by_identity(
+        pool, &identity,
+    )
+    .await
+    .map_err(|e| format!("Failed to check for an existing meeting: {e}"))?;
+    let existing = match existing {
+        Some(meeting_id) => MeetingsRepository::get_meeting_metadata(pool, &meeting_id)
+            .await
+            .map_err(|e| format!("Failed to load meeting {meeting_id}: {e}"))?,
+        None => None,
+    };
+
     let recap = crate::audio::teams_recap::extract_teams_recap(&app, source_url)
         .await
         .map_err(|e| e.to_string())?;
@@ -230,32 +263,79 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         recap.markdown.trim(),
         source_url
     );
-    let imported = save_extracted_copilot_recap(
-        state,
-        title,
-        recap_markdown.clone(),
-        Some(source_url.to_string()),
-        recording.as_ref().map(|metadata| metadata.recorded_at.clone()),
-    )
-    .await?;
-    crate::api::emit_meetings_changed(&app, &imported.meeting_id);
-    let exported = crate::obsidian::export_copilot_recap_note(
-        &app,
-        &imported.meeting_id,
-        &imported.title,
-        &imported.created_at,
-        &recap_markdown,
-        recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
-    )
-    .await
+    let recorded_at = recording.as_ref().map(|metadata| metadata.recorded_at.as_str());
+
+    let Some(meeting) = existing else {
+        let imported = save_extracted_copilot_recap(
+            state,
+            title,
+            recap_markdown.clone(),
+            Some(source_url.to_string()),
+            recorded_at.map(str::to_owned),
+        )
+        .await?;
+        crate::api::emit_meetings_changed(&app, &imported.meeting_id);
+        let exported = crate::obsidian::export_copilot_recap_note(
+            &app,
+            &imported.meeting_id,
+            &imported.title,
+            &imported.created_at,
+            &recap_markdown,
+            recorded_at,
+        )
+        .await
+        .map_err(|e| format!(
+            "The recap was saved in Meetily as meeting {}, but the Obsidian export failed: {e}",
+            imported.meeting_id
+        ))?;
+        return Ok(ImportedRecapFromLinkResponse {
+            meeting_id: imported.meeting_id,
+            title: imported.title,
+            obsidian_file_path: exported.file_path,
+            attached: false,
+        });
+    };
+
+    let summary = imported_recap_summary(&recap_markdown, Some(source_url), recorded_at)?;
+    let attached = SummaryProcessesRepository::attach_imported_summary(pool, &meeting.id, &summary)
+        .await
+        .map_err(|e| format!("Failed to attach the recap to meeting {}: {e}", meeting.id))?;
+    if !attached {
+        return Err(format!("Meeting {} no longer exists.", meeting.id));
+    }
+    log_info!(
+        "Attached Microsoft Copilot recap to existing meeting {} ({})",
+        meeting.id, meeting.title
+    );
+    crate::api::emit_meetings_changed(&app, &meeting.id);
+
+    // A meeting that has a transcript keeps it in its note; a recap-only
+    // meeting keeps the readable date-and-title filename.
+    let (segments, _) = MeetingsRepository::get_meeting_transcripts_paginated(pool, &meeting.id, i64::MAX, 0)
+        .await
+        .map_err(|e| format!("Failed to load the transcript of meeting {}: {e}", meeting.id))?;
+    let created_at = meeting.created_at.0.to_rfc3339();
+    let exported = if segments.is_empty() {
+        crate::obsidian::export_copilot_recap_note(
+            &app, &meeting.id, &meeting.title, &created_at, &recap_markdown, recorded_at,
+        )
+        .await
+    } else {
+        let transcript_markdown = crate::obsidian::format_transcript_markdown(&segments);
+        crate::obsidian::export_meeting_note(
+            &app, &meeting.id, &meeting.title, &created_at, &recap_markdown, &transcript_markdown,
+        )
+        .await
+    }
     .map_err(|e| format!(
-        "The recap was saved in Meetily as meeting {}, but the Obsidian export failed: {e}",
-        imported.meeting_id
+        "The recap was attached to meeting {} in Meetily, but the Obsidian export failed: {e}",
+        meeting.id
     ))?;
     Ok(ImportedRecapFromLinkResponse {
-        meeting_id: imported.meeting_id,
-        title: imported.title,
+        meeting_id: meeting.id,
+        title: meeting.title,
         obsidian_file_path: exported.file_path,
+        attached: true,
     })
 }
 
