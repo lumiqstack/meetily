@@ -223,6 +223,8 @@ windows = { version = "0.61.3", features = [
     # GetLastInputInfo / GetTickCount: idle gating for the automatic pipeline
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemInformation",
+    # EnumWindows / GetWindowTextW: Teams meeting window title capture
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Linux-specific dependencies

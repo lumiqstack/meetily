@@ -136,13 +136,22 @@ tested.
 
 ### Window title capture
 
-`meeting_detection/window_title.rs`, `#[cfg(windows)]`. `EnumWindows` filtered
-by `GetWindowThreadProcessId` against the Teams PIDs the process detector
-already has, keeping visible windows with a non-empty title. The meeting
-window title is the meeting subject followed by `| Microsoft Teams`. Returns
-the first title that is not the main Teams window ("Microsoft Teams" alone,
-"Chat | Microsoft Teams", "Calendar | Microsoft Teams"). The strip rules are a
-pure function with tests. Needs the `Win32_UI_WindowsAndMessaging` feature.
+`meeting_detection/window_title.rs`. The enumeration is `#[cfg(windows)]`:
+`EnumWindows` filtered by `GetWindowThreadProcessId` against the Teams PIDs
+the process detector already has, keeping visible windows with a non-empty
+title. The meeting window title is the meeting subject followed by
+`| Microsoft Teams`. Returns the first title (Z order, foreground first) that
+is not the main Teams window: "Microsoft Teams" alone, or a navigation section
+in front of the suffix (Activity, Chat, Teams, Calendar, Calls, Files,
+OneDrive, Apps). The strip rules are a pure function with tests on every
+platform; off Windows the capture always returns `None`. Needs the
+`Win32_UI_WindowsAndMessaging` feature.
+
+The manager captures the title only when it emits `teams-call-likely-started`,
+so there is no per-poll window enumeration. The frontend shows it as the
+prompt title ("Teams call: <subject>") and, on "Start Recording", hands it to
+the recording start through `sessionStorage` `autoStartMeetingName`, the same
+key the calendar nudge uses.
 
 ### Scheduler and matching
 
