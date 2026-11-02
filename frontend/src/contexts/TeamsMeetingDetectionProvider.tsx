@@ -15,6 +15,8 @@ interface TeamsCallLikelyStartedPayload {
   teams_running: boolean;
   teams_audio_active: boolean;
   poll_interval_seconds: number;
+  /** Teams meeting window subject; null off Windows or when no meeting window is visible. */
+  window_title: string | null;
 }
 
 interface TeamsCallLikelyEndedPayload {
@@ -136,8 +138,10 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
     if (currentRecordingState.isRecording || currentRecordingState.isStopping) return;
     if (isInCooldown(START_COOLDOWN_KEY)) return;
 
+    const meetingTitle = payload.window_title?.trim() || null;
+
     let toastId: string | number;
-    toastId = toast.info('Teams appears to be in a call', {
+    toastId = toast.info(meetingTitle ? `Teams call: ${meetingTitle}` : 'Teams appears to be in a call', {
       description: (
         <div className="space-y-3 min-w-[280px]">
           <p className="text-sm text-gray-700">Start a Meetily recording?</p>
@@ -146,6 +150,11 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
               onClick={() => {
                 toast.dismiss(toastId);
                 Analytics.trackButtonClick('teams_detection_start_recording', 'teams_detection_prompt');
+                if (meetingTitle) {
+                  sessionStorage.setItem('autoStartMeetingName', meetingTitle);
+                } else {
+                  sessionStorage.removeItem('autoStartMeetingName');
+                }
                 sessionStorage.setItem('autoStartRecording', 'true');
                 window.location.assign('/');
               }}
@@ -179,7 +188,7 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
       duration: 15000,
     });
 
-    console.log('[TeamsMeetingDetection] Start prompt displayed');
+    console.log('[TeamsMeetingDetection] Start prompt displayed', { meetingTitle });
   };
 
   const handleStopPrompt = (payload: TeamsCallLikelyEndedPayload) => {

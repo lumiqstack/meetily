@@ -6,6 +6,7 @@ use super::{
         TeamsCallLikelyEndedPayload, TeamsCallLikelyStartedPayload, END_EVENT,
         POLL_INTERVAL_SECONDS, START_EVENT,
     },
+    window_title::capture_meeting_window_title,
     windows_audio::is_any_process_render_audio_active,
 };
 use anyhow::Result;
@@ -131,12 +132,18 @@ impl<R: Runtime> MeetingDetectionManager<R> {
 
                         match action {
                             Some(DetectionAction::PromptStart) if current_settings.teams_prompt_start => {
+                                let window_title = capture_meeting_window_title(&teams_process.process_ids);
+                                info!(
+                                    "Teams call likely started; meeting window title: {:?}",
+                                    window_title
+                                );
                                 let payload = TeamsCallLikelyStartedPayload {
                                     event_type: START_EVENT.to_string(),
                                     confidence: sample.confidence(),
                                     teams_running: sample.teams_running,
                                     teams_audio_active: sample.teams_audio_active,
                                     poll_interval_seconds: POLL_INTERVAL_SECONDS,
+                                    window_title,
                                 };
                                 if let Err(error) = app_handle.emit(START_EVENT, payload) {
                                     error!("Failed to emit Teams start prompt event: {}", error);

@@ -3,6 +3,7 @@ pub mod confidence;
 pub mod manager;
 pub mod process_detector;
 pub mod types;
+pub mod window_title;
 pub mod windows_audio;
 
 pub use commands::{

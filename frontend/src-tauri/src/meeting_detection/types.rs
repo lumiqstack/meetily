@@ -57,6 +57,9 @@ pub struct TeamsCallLikelyStartedPayload {
     pub teams_running: bool,
     pub teams_audio_active: bool,
     pub poll_interval_seconds: u64,
+    /// Subject of the Teams meeting window at prompt time. `None` off Windows
+    /// or when no meeting window is visible.
+    pub window_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
