@@ -7,6 +7,8 @@ import { invoke } from "@tauri-apps/api/core"
 import Analytics from "@/lib/analytics"
 import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
+import { OutlookCalendarSettings } from "./OutlookCalendarSettings"
+import { usePlatform } from "@/hooks/usePlatform"
 import { toast } from "sonner"
 
 const isTauriRuntime = () => (
@@ -39,6 +41,7 @@ interface ObsidianSettingsView {
 }
 
 export function PreferenceSettings() {
+  const platform = usePlatform();
   const {
     notificationSettings,
     meetingDetectionSettings,
@@ -402,6 +405,9 @@ export function PreferenceSettings() {
           </div>
         </div>
       </div>
+
+      {/* Outlook Calendar Section: Windows only, see docs/CALENDAR_MEETING_DETECTION_SPEC.md */}
+      {platform === 'windows' && <OutlookCalendarSettings />}
 
       {/* Data Storage Locations Section */}
       <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">

@@ -24,6 +24,7 @@ import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgr
 import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
 import { TeamsMeetingDetectionProvider } from '@/contexts/TeamsMeetingDetectionProvider'
+import { CalendarNudgeProvider } from '@/contexts/CalendarNudgeProvider'
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
@@ -247,6 +248,7 @@ export default function RootLayout({
                         <TooltipProvider>
                           <RecordingPostProcessingProvider>
                             <TeamsMeetingDetectionProvider>
+                            <CalendarNudgeProvider>
                               <ImportDialogProvider onOpen={handleOpenImportDialog}>
                                 {/* Download progress toast provider - listens for background downloads */}
                                 <DownloadProgressToastProvider />
@@ -272,6 +274,7 @@ export default function RootLayout({
                                   importFilePath={importFilePath}
                                 />
                               </ImportDialogProvider>
+                            </CalendarNudgeProvider>
                             </TeamsMeetingDetectionProvider>
                           </RecordingPostProcessingProvider>
                         </TooltipProvider>

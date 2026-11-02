@@ -42,6 +42,7 @@ pub mod config;
 pub mod console_utils;
 pub mod database;
 pub mod meeting_detection;
+pub mod calendar;
 pub mod notifications;
 pub mod obsidian;
 pub mod ollama;
@@ -62,6 +63,7 @@ pub mod whisper_engine;
 use audio::{list_audio_devices, AudioDevice, trigger_audio_permission};
 use log::{error as log_error, info as log_info};
 use meeting_detection::commands::MeetingDetectionManagerState;
+use calendar::CalendarManagerState;
 use notifications::commands::NotificationManagerState;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
@@ -484,6 +486,7 @@ pub fn run() {
         .manage(Arc::new(RwLock::new(
             None::<meeting_detection::manager::MeetingDetectionManager>,
         )) as MeetingDetectionManagerState)
+        .manage(Arc::new(RwLock::new(None::<calendar::CalendarManager>)) as CalendarManagerState)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
         .setup(|_app| {
@@ -585,6 +588,25 @@ pub fn run() {
                 }
                 Err(e) => {
                     log::error!("Failed to initialize Teams meeting detection manager: {}", e);
+                }
+            }
+
+            // Initialize the Outlook calendar manager. Polling starts only when enabled.
+            log::info!("Initializing calendar manager...");
+            let calendar_state = _app.handle().state::<CalendarManagerState>();
+            match tauri::async_runtime::block_on(calendar::commands::initialize_calendar_manager(
+                _app.handle().clone(),
+            )) {
+                Ok(manager) => {
+                    tauri::async_runtime::block_on(manager.start_if_enabled());
+                    tauri::async_runtime::block_on(async {
+                        let mut state_lock = calendar_state.write().await;
+                        *state_lock = Some(manager);
+                    });
+                    log::info!("Calendar manager initialized");
+                }
+                Err(e) => {
+                    log::error!("Failed to initialize calendar manager: {}", e);
                 }
             }
 
@@ -876,6 +898,14 @@ pub fn run() {
             meeting_detection::commands::get_meeting_detection_status,
             meeting_detection::commands::start_meeting_detection,
             meeting_detection::commands::stop_meeting_detection,
+            // Outlook calendar commands
+            calendar::commands::get_calendar_settings,
+            calendar::commands::set_calendar_settings,
+            calendar::commands::set_calendar_feed_url,
+            calendar::commands::clear_calendar_feed_url,
+            calendar::commands::get_calendar_status,
+            calendar::commands::get_upcoming_calendar_events,
+            calendar::commands::refresh_calendar_now,
             // System audio capture commands
             audio::system_audio_commands::start_system_audio_capture_command,
             audio::system_audio_commands::list_system_audio_devices_command,
