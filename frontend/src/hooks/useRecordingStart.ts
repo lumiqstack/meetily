@@ -268,8 +268,11 @@ export function useRecordingStart(
 
           // Start the actual backend recording
           try {
-            // Generate meeting title
-            const generatedMeetingTitle = generateMeetingTitle();
+            // A calendar nudge can hand over the meeting's real title; otherwise
+            // fall back to the timestamp title.
+            const nudgedTitle = sessionStorage.getItem('autoStartMeetingName');
+            sessionStorage.removeItem('autoStartMeetingName');
+            const generatedMeetingTitle = nudgedTitle?.trim() || generateMeetingTitle();
 
             // Set STARTING status before initiating backend recording
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');

@@ -60,6 +60,24 @@ const DEFAULT_MEETING_DETECTION_SETTINGS: MeetingDetectionSettings = {
   teams_prompt_cooldown_minutes: 30,
 };
 
+// Mirrors calendar::types::CalendarSettings in the Rust core.
+export interface CalendarSettings {
+  calendar_enabled: boolean;
+  /** Owned by the keyring; the backend overwrites whatever is sent. */
+  ics_feed_configured: boolean;
+  outlook_com_enabled: boolean;
+  nudge_lead_minutes: number;
+  include_body_in_summary: boolean;
+}
+
+export const DEFAULT_CALENDAR_SETTINGS: CalendarSettings = {
+  calendar_enabled: false,
+  ics_feed_configured: false,
+  outlook_com_enabled: false,
+  nudge_lead_minutes: 2,
+  include_body_in_summary: true,
+};
+
 const isTauriRuntime = () => (
   typeof window !== 'undefined' &&
   '__TAURI_INTERNALS__' in window
@@ -117,6 +135,11 @@ interface ConfigContextType {
   loadPreferences: () => Promise<void>;
   updateNotificationSettings: (settings: NotificationSettings) => Promise<void>;
   updateMeetingDetectionSettings: (settings: MeetingDetectionSettings) => Promise<void>;
+  calendarSettings: CalendarSettings | null;
+  updateCalendarSettings: (settings: CalendarSettings) => Promise<void>;
+  /** Backend-validated; resolves with the settings the backend now holds. */
+  setCalendarFeedUrl: (url: string) => Promise<CalendarSettings>;
+  clearCalendarFeedUrl: () => Promise<CalendarSettings>;
 }
 
 const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
@@ -202,6 +225,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
   // Preference settings state (lazy loaded)
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null);
   const [meetingDetectionSettings, setMeetingDetectionSettings] = useState<MeetingDetectionSettings | null>(null);
+  const [calendarSettings, setCalendarSettings] = useState<CalendarSettings | null>(null);
   const [storageLocations, setStorageLocations] = useState<StorageLocations | null>(null);
   const [isLoadingPreferences, setIsLoadingPreferences] = useState(false);
   const preferencesLoadedRef = useRef(false);
@@ -505,6 +529,17 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
         setMeetingDetectionSettings(DEFAULT_MEETING_DETECTION_SETTINGS);
       }
 
+      try {
+        if (isTauriRuntime()) {
+          setCalendarSettings(await invoke<CalendarSettings>('get_calendar_settings'));
+        } else {
+          setCalendarSettings(DEFAULT_CALENDAR_SETTINGS);
+        }
+      } catch (calendarError) {
+        console.error('[ConfigContext] Failed to load calendar settings:', calendarError);
+        setCalendarSettings(DEFAULT_CALENDAR_SETTINGS);
+      }
+
       // Load storage locations
       const [dbDir, modelsDir, recordingsDir] = await Promise.all([
         invoke<string>('get_database_directory'),
@@ -554,6 +589,31 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const updateCalendarSettings = useCallback(async (settings: CalendarSettings) => {
+    if (!isTauriRuntime()) {
+      setCalendarSettings(settings);
+      return;
+    }
+    try {
+      setCalendarSettings(await invoke<CalendarSettings>('set_calendar_settings', { settings }));
+    } catch (error) {
+      console.error('[ConfigContext] Failed to update calendar settings:', error);
+      throw error;
+    }
+  }, []);
+
+  const setCalendarFeedUrl = useCallback(async (url: string) => {
+    const next = await invoke<CalendarSettings>('set_calendar_feed_url', { url });
+    setCalendarSettings(next);
+    return next;
+  }, []);
+
+  const clearCalendarFeedUrl = useCallback(async () => {
+    const next = await invoke<CalendarSettings>('clear_calendar_feed_url');
+    setCalendarSettings(next);
+    return next;
+  }, []);
+
   // Wrapper for setSelectedLanguage that persists to localStorage and syncs to Rust
   const handleSetSelectedLanguage = useCallback((lang: string) => {
     setSelectedLanguage(lang);
@@ -594,6 +654,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     loadPreferences,
     updateNotificationSettings,
     updateMeetingDetectionSettings,
+    calendarSettings,
+    updateCalendarSettings,
+    setCalendarFeedUrl,
+    clearCalendarFeedUrl,
   }), [
     modelConfig,
     isModelConfigLoading,
@@ -619,6 +683,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     loadPreferences,
     updateNotificationSettings,
     updateMeetingDetectionSettings,
+    calendarSettings,
+    updateCalendarSettings,
+    setCalendarFeedUrl,
+    clearCalendarFeedUrl,
   ]);
 
   return (
