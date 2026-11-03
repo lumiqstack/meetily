@@ -307,9 +307,11 @@ mod platform {
                 .sender
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let request = match guard.as_ref().map(|sender| sender.send(request)) {
-                Some(Ok(())) => return Ok(()),
-                Some(Err(mpsc::SendError(request))) => request,
+            let request = match guard.as_ref() {
+                Some(sender) => match sender.send(request) {
+                    Ok(()) => return Ok(()),
+                    Err(mpsc::SendError(request)) => request,
+                },
                 None => request,
             };
             let sender = spawn_thread().ok_or(ReadError::Failed("The Outlook reader thread could not start.".to_string()))?;
