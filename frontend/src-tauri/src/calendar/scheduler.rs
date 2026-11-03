@@ -65,7 +65,7 @@ mod tests {
     fn event(id: &str, start: DateTime<Utc>, teams: bool) -> CalendarEvent {
         CalendarEvent {
             id: id.to_string(),
-            source: SourceKind::IcsFeed,
+            source: SourceKind::OutlookCom,
             title: id.to_string(),
             start,
             end: start + Duration::minutes(30),

@@ -8,9 +8,9 @@ pub const STATUS_EVENT: &str = "calendar-status-changed";
 
 /// How often the manager wakes to check for due nudges.
 pub const TICK_SECONDS: u64 = 30;
-/// How often the ICS feed is re-fetched. Outlook refreshes published
-/// calendars with a lag of minutes to an hour, so polling faster buys nothing.
-pub const ICS_POLL_INTERVAL_SECONDS: u64 = 300;
+/// How often classic Outlook is re-read. It is a local cache, so this is
+/// cheap, and two minutes keeps a meeting added at the last moment nudgeable.
+pub const POLL_INTERVAL_SECONDS: u64 = 120;
 /// Events are kept from this far back, so a meeting that started before the
 /// app launched still matches a Teams call.
 pub const LOOKBACK_HOURS: i64 = 1;
@@ -22,14 +22,13 @@ pub const NUDGE_GRACE_SECONDS: i64 = 120;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
-    IcsFeed,
     OutlookCom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarEvent {
-    /// Stable across polls: the UID, plus the occurrence start for instances
-    /// of a recurring series.
+    /// Stable across polls: Outlook's global appointment id, plus the
+    /// occurrence start for instances of a recurring series.
     pub id: String,
     pub source: SourceKind,
     pub title: String,
@@ -38,6 +37,8 @@ pub struct CalendarEvent {
     pub organizer: Option<String>,
     pub attendees: Vec<String>,
     pub location: Option<String>,
+    /// Never filled by the COM source (the body is not read); kept so the
+    /// meeting record and the summary prompt have one shape.
     pub body: Option<String>,
     pub teams_join_url: Option<String>,
     pub is_recurring_instance: bool,
@@ -60,27 +61,23 @@ impl CalendarEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SourceHealth {
-    /// No URL (feed) or no client (COM) has been set up yet.
+    /// The source has not been polled yet.
     NotConfigured,
     Ok,
-    /// The source exists but cannot be used until the user acts: the feed link
-    /// was revoked, or classic Outlook is not installed.
+    /// The source cannot be used until the user acts: classic Outlook is not
+    /// installed, or it could not be started.
     Unavailable { reason: String },
     /// A transient failure. The last good event list is kept.
     Error { reason: String },
 }
 
+/// Settings file shape. Older files carry `ics_feed_configured` and
+/// `outlook_com_enabled` from the removed feed source; serde ignores them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarSettings {
+    /// The one switch: read classic Outlook and nudge before Teams meetings.
     #[serde(default)]
     pub calendar_enabled: bool,
-    /// Derived from the keyring at load time, never trusted from the file or
-    /// the frontend.
-    #[serde(default)]
-    pub ics_feed_configured: bool,
-    /// Reserved for the classic Outlook COM source. No effect yet.
-    #[serde(default)]
-    pub outlook_com_enabled: bool,
     #[serde(default = "default_nudge_lead_minutes")]
     pub nudge_lead_minutes: u64,
     #[serde(default = "default_true")]
@@ -101,8 +98,6 @@ impl Default for CalendarSettings {
     fn default() -> Self {
         Self {
             calendar_enabled: false,
-            ics_feed_configured: false,
-            outlook_com_enabled: false,
             nudge_lead_minutes: default_nudge_lead_minutes(),
             include_body_in_summary: true,
         }
@@ -156,15 +151,28 @@ mod tests {
         assert!(parsed.calendar_enabled);
         assert_eq!(parsed.nudge_lead_minutes, 2);
         assert!(parsed.include_body_in_summary);
-        assert!(!parsed.outlook_com_enabled);
+    }
+
+    #[test]
+    fn settings_written_by_the_feed_build_still_load() {
+        let parsed: CalendarSettings = serde_json::from_str(
+            r#"{"calendar_enabled": true, "ics_feed_configured": true, "outlook_com_enabled": false, "nudge_lead_minutes": 5, "include_body_in_summary": false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            CalendarSettings {
+                calendar_enabled: true,
+                nudge_lead_minutes: 5,
+                include_body_in_summary: false,
+            }
+        );
     }
 
     #[test]
     fn settings_round_trip() {
         let settings = CalendarSettings {
             calendar_enabled: true,
-            ics_feed_configured: true,
-            outlook_com_enabled: false,
             nudge_lead_minutes: 5,
             include_body_in_summary: false,
         };

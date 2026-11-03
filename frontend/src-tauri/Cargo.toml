@@ -139,14 +139,6 @@ dirs = "5.0.1"
 # Additional dependencies for notification system
 url = "2.5.0"
 
-# Outlook calendar integration (docs/CALENDAR_MEETING_DETECTION_SPEC.md):
-# published ICS feed parsing, recurrence expansion, Outlook's Windows time
-# zone names, and keyring storage for the feed URL (a bearer secret).
-icalendar = "0.17"
-rrule = "0.14"
-chrono-tz = "0.10"
-windows-timezones = { version = "0.5", features = ["chrono-tz"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 
 
 # System monitoring for resource management
@@ -225,6 +217,8 @@ windows = { version = "0.61.3", features = [
     "Win32_System_SystemInformation",
     # EnumWindows / GetWindowTextW: Teams meeting window title capture
     "Win32_UI_WindowsAndMessaging",
+    # IDispatch::Invoke, GetActiveObject: classic Outlook calendar via COM
+    "Win32_System_Ole",
 ] }
 
 # Linux-specific dependencies
