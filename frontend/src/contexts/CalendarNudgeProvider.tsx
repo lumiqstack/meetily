@@ -10,7 +10,7 @@ import Analytics from '@/lib/analytics';
 // Mirrors calendar::types::CalendarEvent in the Rust core.
 export interface CalendarEvent {
   id: string;
-  source: 'ics_feed' | 'outlook_com';
+  source: 'outlook_com';
   title: string;
   start: string;
   end: string;

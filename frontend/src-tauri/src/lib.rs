@@ -901,8 +901,6 @@ pub fn run() {
             // Outlook calendar commands
             calendar::commands::get_calendar_settings,
             calendar::commands::set_calendar_settings,
-            calendar::commands::set_calendar_feed_url,
-            calendar::commands::clear_calendar_feed_url,
             calendar::commands::get_calendar_status,
             calendar::commands::get_upcoming_calendar_events,
             calendar::commands::refresh_calendar_now,

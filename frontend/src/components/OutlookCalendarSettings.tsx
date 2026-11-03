@@ -17,7 +17,7 @@ type SourceHealth =
   | { state: 'error'; reason: string };
 
 interface SourceStatus {
-  kind: 'ics_feed' | 'outlook_com';
+  kind: 'outlook_com';
   health: SourceHealth;
   last_poll_at: string | null;
   event_count: number;
@@ -38,31 +38,30 @@ const isTauriRuntime = () => (
   '__TAURI_INTERNALS__' in window
 );
 
-function describeHealth(source: SourceStatus | undefined, configured: boolean): { text: string; tone: 'muted' | 'ok' | 'warn' } {
-  if (!configured) return { text: 'No calendar link saved yet', tone: 'muted' };
-  if (!source) return { text: 'Waiting for the first refresh', tone: 'muted' };
+/** One line under the switch: what the last read of classic Outlook found. */
+export function describeHealth(source: SourceStatus | undefined, enabled: boolean): { text: string; tone: 'muted' | 'ok' | 'warn' } {
+  if (!enabled) return { text: 'Off. Turn on to read your Outlook calendar.', tone: 'muted' };
+  if (!source) return { text: 'Waiting for the first read of Outlook', tone: 'muted' };
   switch (source.health.state) {
     case 'ok': {
       const polled = source.last_poll_at ? new Date(source.last_poll_at).toLocaleTimeString() : 'just now';
-      return { text: `Connected. ${source.event_count} events in the next two days, refreshed ${polled}`, tone: 'ok' };
+      return { text: `Reading classic Outlook. ${source.event_count} events in the next two days, read ${polled}`, tone: 'ok' };
     }
     case 'unavailable':
       return { text: source.health.reason, tone: 'warn' };
     case 'error':
-      return { text: `Last refresh failed: ${source.health.reason}`, tone: 'warn' };
+      return { text: `Last read failed: ${source.health.reason}`, tone: 'warn' };
     case 'not_configured':
     default:
-      return { text: 'No calendar link saved yet', tone: 'muted' };
+      return { text: 'Waiting for the first read of Outlook', tone: 'muted' };
   }
 }
 
 export function OutlookCalendarSettings() {
-  const { calendarSettings, updateCalendarSettings, setCalendarFeedUrl, clearCalendarFeedUrl } = useConfig();
+  const { calendarSettings, updateCalendarSettings } = useConfig();
   const settings = calendarSettings ?? DEFAULT_CALENDAR_SETTINGS;
 
   const [status, setStatus] = useState<CalendarStatus | null>(null);
-  const [feedUrlInput, setFeedUrlInput] = useState('');
-  const [isSavingUrl, setIsSavingUrl] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   const loadStatus = useCallback(async () => {
@@ -80,7 +79,10 @@ export function OutlookCalendarSettings() {
 
     let unlisten: (() => void) | null = null;
     let cleanedUp = false;
-    listen<CalendarStatus>(STATUS_EVENT, (event) => setStatus(event.payload))
+    listen<CalendarStatus>(STATUS_EVENT, (event) => {
+      setStatus(event.payload);
+      setIsRefreshing(false);
+    })
       .then((fn) => {
         if (cleanedUp) fn(); else unlisten = fn;
       })
@@ -107,45 +109,20 @@ export function OutlookCalendarSettings() {
     }
   };
 
-  const saveFeedUrl = async () => {
-    setIsSavingUrl(true);
-    try {
-      await setCalendarFeedUrl(feedUrlInput);
-      setFeedUrlInput('');
-      toast.success('Calendar link saved');
-      Analytics.trackButtonClick('calendar_feed_url_saved', 'calendar_settings');
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error));
-    } finally {
-      setIsSavingUrl(false);
-    }
-  };
-
-  const removeFeedUrl = async () => {
-    try {
-      await clearCalendarFeedUrl();
-      setStatus(null);
-      toast.success('Calendar link removed');
-      Analytics.trackButtonClick('calendar_feed_url_cleared', 'calendar_settings');
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error));
-    }
-  };
-
   const refreshNow = async () => {
     setIsRefreshing(true);
     try {
       await invoke('refresh_calendar_now');
-      // The status event arrives when the poll completes.
-      setTimeout(() => setIsRefreshing(false), 3000);
+      // The status event clears the spinner; this is the fallback if a read hangs.
+      setTimeout(() => setIsRefreshing(false), 35000);
     } catch (error) {
       setIsRefreshing(false);
       toast.error(error instanceof Error ? error.message : String(error));
     }
   };
 
-  const feedStatus = status?.sources.find((source) => source.kind === 'ics_feed');
-  const health = describeHealth(feedStatus, settings.ics_feed_configured);
+  const outlookStatus = status?.sources.find((source) => source.kind === 'outlook_com');
+  const health = describeHealth(outlookStatus, settings.calendar_enabled);
   const healthClass = health.tone === 'ok' ? 'text-green-700' : health.tone === 'warn' ? 'text-amber-700' : 'text-gray-500';
   const nextEvent = status?.next_event ?? null;
 
@@ -167,54 +144,24 @@ export function OutlookCalendarSettings() {
 
         <div className="space-y-4 border-t border-gray-100 pt-4">
           <div>
-            <div className="font-medium text-gray-900">Published calendar link</div>
+            <div className="font-medium text-gray-900">Classic Outlook on this PC</div>
             <p className="text-sm text-gray-600 mb-2">
-              In Outlook on the web open Settings, Calendar, Shared calendars, then publish a calendar
-              with &quot;Can view all details&quot; and paste the ICS link here. The link is stored in the
-              Windows credential store.
+              Meetily reads your calendar from the classic Outlook app on this computer, so nothing
+              needs to be shared or published. The new Outlook app cannot be read this way. Invitation
+              bodies are not read; the Teams link and the people come from the appointment itself.
             </p>
-            {settings.ics_feed_configured ? (
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-mono text-gray-700 bg-gray-50 border border-gray-200 rounded px-2 py-1">
-                  https://••••••••/calendar.ics
-                </span>
-                <button
-                  onClick={refreshNow}
-                  disabled={!settings.calendar_enabled || isRefreshing}
-                  className="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                >
-                  {isRefreshing ? 'Refreshing…' : 'Refresh now'}
-                </button>
-                <button
-                  onClick={removeFeedUrl}
-                  className="px-3 py-1.5 text-xs font-medium rounded border border-red-200 text-red-700 hover:bg-red-50"
-                >
-                  Remove link
-                </button>
-              </div>
-            ) : (
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="url"
-                  value={feedUrlInput}
-                  onChange={(e) => setFeedUrlInput(e.target.value)}
-                  placeholder="https://outlook.office365.com/owa/calendar/…/calendar.ics"
-                  className="flex-1 min-w-[260px] px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-gray-900"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <button
-                  onClick={saveFeedUrl}
-                  disabled={isSavingUrl || feedUrlInput.trim() === ''}
-                  className="px-3 py-1.5 text-xs font-medium rounded bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
-                >
-                  {isSavingUrl ? 'Saving…' : 'Save link'}
-                </button>
-              </div>
-            )}
-            <p className={`text-xs mt-2 ${healthClass}`}>{health.text}</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`text-xs ${healthClass}`}>{health.text}</span>
+              <button
+                onClick={refreshNow}
+                disabled={!settings.calendar_enabled || isRefreshing}
+                className="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                {isRefreshing ? 'Reading…' : 'Refresh now'}
+              </button>
+            </div>
             {settings.calendar_enabled && nextEvent && (
-              <p className="text-xs text-gray-600 mt-1">
+              <p className="text-xs text-gray-600 mt-2">
                 Next Teams meeting: {nextEvent.title}, {new Date(nextEvent.start).toLocaleString()}
               </p>
             )}
