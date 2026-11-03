@@ -1,0 +1,442 @@
+//! Pull every Copilot recap the Teams Meet app lists into Meetily and the
+//! Obsidian vault, one button press at a time. Each recap is keyed on the
+//! recording it belongs to (see `teams_recap::meeting_identity_key`), so a
+//! recap never creates a second meeting or a second note, and a content hash
+//! per key turns an unchanged recap into a skip instead of a rewrite.
+//!
+//! The list itself comes from [`list_recaps`]. Until the Meet app scanner
+//! exists it returns nothing, so a sync reports zero scanned rather than
+//! inventing work; everything downstream of the list is complete and tested.
+//! See docs/TEAMS_RECAP_SYNC_SPEC.md.
+
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use log::{info, warn};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri_plugin_store::StoreExt;
+
+const SYNC_STORE_FILE: &str = "teams_recap_sync.json";
+const SYNC_STORE_KEY: &str = "state";
+/// How far back the first sync reaches when the user has not chosen a date.
+const DEFAULT_BACKFILL_DAYS: i64 = 30;
+/// A recap appears hours after a meeting and Teams may finish generating one
+/// days later, so each sync re-reads this much of the previous window.
+const OVERLAP_DAYS: i64 = 7;
+pub const PROGRESS_EVENT: &str = "teams-recap-sync-progress";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedRecap {
+    pub meeting_id: String,
+    /// RFC 3339.
+    pub imported_at: String,
+    /// SHA-256 of the recap markdown last written, hex.
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamsRecapSyncState {
+    /// `YYYY-MM-DD` the first sync starts from. Unset means
+    /// [`DEFAULT_BACKFILL_DAYS`] before the first sync.
+    #[serde(default)]
+    pub since_date: Option<String>,
+    /// RFC 3339 start time of the last completed sync.
+    #[serde(default)]
+    pub last_sync_date: Option<String>,
+    /// Identity key -> what was written for it.
+    #[serde(default)]
+    pub imported: HashMap<String, ImportedRecap>,
+}
+
+/// What the settings panel shows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamsRecapSyncStateView {
+    pub since_date: Option<String>,
+    pub last_sync_date: Option<String>,
+    pub known_recaps: usize,
+    /// The Meet app can be read on this platform.
+    pub available: bool,
+}
+
+/// One meeting row the Meet app lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapCandidate {
+    pub recap_url: String,
+    pub title: String,
+    /// When the meeting started, as the list shows it (RFC 3339 when known).
+    pub started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapSyncFailure {
+    pub title: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapSyncReport {
+    pub scanned: usize,
+    pub new: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub not_ready: usize,
+    pub failed: Vec<RecapSyncFailure>,
+    pub meetings_folder: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncProgress<'a> {
+    done: usize,
+    total: usize,
+    current_title: &'a str,
+}
+
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    New,
+    Updated,
+    Skipped,
+    NotReady,
+    Failed(String),
+}
+
+// ---------------------------------------------------------------------------
+// State store
+// ---------------------------------------------------------------------------
+
+fn load_state<R: Runtime>(app: &AppHandle<R>) -> TeamsRecapSyncState {
+    let Ok(store) = app.store(SYNC_STORE_FILE) else {
+        return TeamsRecapSyncState::default();
+    };
+    store
+        .get(SYNC_STORE_KEY)
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+/// Load-modify-save under one lock: the sync loop and the settings panel
+/// both write, and each save rewrites the whole record.
+static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn update_state<R: Runtime>(
+    app: &AppHandle<R>,
+    modify: impl FnOnce(&mut TeamsRecapSyncState),
+) -> Result<()> {
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = load_state(app);
+    modify(&mut state);
+    let store = app
+        .store(SYNC_STORE_FILE)
+        .map_err(|e| anyhow!("Could not open the recap sync store: {e}"))?;
+    store.set(
+        SYNC_STORE_KEY,
+        serde_json::to_value(&state).context("Could not serialize recap sync state")?,
+    );
+    store
+        .save()
+        .map_err(|e| anyhow!("Could not persist the recap sync store: {e}"))
+}
+
+fn parse_since_date(value: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
+        .map_err(|_| anyhow!("Enter the since date as YYYY-MM-DD."))
+}
+
+/// Where this sync starts reading: the previous sync's start minus the
+/// overlap, else the chosen since date, else the default backfill.
+fn scan_window_start(state: &TeamsRecapSyncState, now: DateTime<Utc>) -> DateTime<Utc> {
+    if let Some(last) = state
+        .last_sync_date
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    {
+        return last.with_timezone(&Utc) - Duration::days(OVERLAP_DAYS);
+    }
+    if let Some(date) = state.since_date.as_deref().and_then(|value| parse_since_date(value).ok()) {
+        return date.and_hms_opt(0, 0, 0).expect("midnight exists").and_utc();
+    }
+    now - Duration::days(DEFAULT_BACKFILL_DAYS)
+}
+
+fn content_hash(markdown: &str) -> String {
+    let digest = Sha256::digest(markdown.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Whether an extraction error means "no AI summary yet" rather than a
+/// broken session or layout. Such a recap stays unrecorded and is retried
+/// on the next sync.
+fn is_not_ready(error: &str) -> bool {
+    error.contains("did not show an AI summary")
+}
+
+// ---------------------------------------------------------------------------
+// Scanner (stub until the Meet app script lands)
+// ---------------------------------------------------------------------------
+
+/// The Meet app can only be read through the Windows WebView2 profile.
+pub const fn sync_available() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Every meeting row the Meet app lists from `since` onwards, newest first.
+/// Rows without a recap link are not returned; the Meet app scanner reports
+/// them as not ready when it exists.
+async fn list_recaps<R: Runtime>(
+    app: &AppHandle<R>,
+    since: DateTime<Utc>,
+) -> Result<Vec<RecapCandidate>> {
+    let _ = (app, since);
+    if !sync_available() {
+        return Err(anyhow!(
+            "Teams recap sync requires Meetily on Windows with WebView2."
+        ));
+    }
+    info!("[recap-sync] Meet app scanner not implemented; nothing listed");
+    Ok(Vec::new())
+}
+
+// ---------------------------------------------------------------------------
+// Sync loop
+// ---------------------------------------------------------------------------
+
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn import_candidate<R: Runtime>(
+    app: &AppHandle<R>,
+    pool: &sqlx::SqlitePool,
+    known: &HashMap<String, ImportedRecap>,
+    candidate: &RecapCandidate,
+) -> Outcome {
+    let validated = match crate::audio::teams_recap::validate_recap_url(&candidate.recap_url) {
+        Ok(url) => url,
+        Err(e) => return Outcome::Failed(e.to_string()),
+    };
+    let source_url = validated.as_str();
+    let key = crate::audio::teams_recap::meeting_identity_key(source_url);
+    let recording = crate::audio::teams_recap::recording_metadata(&validated);
+
+    let recap = match crate::audio::teams_recap::extract_teams_recap(app, source_url).await {
+        Ok(recap) => recap,
+        Err(e) if is_not_ready(&e.to_string()) => return Outcome::NotReady,
+        Err(e) => return Outcome::Failed(e.to_string()),
+    };
+    let markdown = crate::summary::commands::recap_markdown_with_source(&recap.markdown, source_url);
+    let hash = content_hash(&markdown);
+    let seen_before = known.get(&key);
+    if seen_before.is_some_and(|entry| entry.content_hash == hash) {
+        return Outcome::Skipped;
+    }
+
+    let persisted = match crate::summary::commands::persist_recap_from_link(
+        app,
+        pool,
+        candidate.title.clone(),
+        source_url,
+        recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
+        &markdown,
+    )
+    .await
+    {
+        Ok(persisted) => persisted,
+        Err(e) => return Outcome::Failed(e),
+    };
+
+    if let Err(e) = update_state(app, |state| {
+        state.imported.insert(
+            key,
+            ImportedRecap {
+                meeting_id: persisted.meeting_id.clone(),
+                imported_at: Utc::now().to_rfc3339(),
+                content_hash: hash,
+            },
+        );
+    }) {
+        warn!("[recap-sync] could not record recap import: {e}");
+    }
+    if seen_before.is_some() {
+        Outcome::Updated
+    } else {
+        Outcome::New
+    }
+}
+
+/// Run one sync: list recaps from the scan window, import each, record the
+/// window. Re-running converges: every imported recap is in the store
+/// before the next one starts, and unchanged recaps are skipped.
+pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncReport, String> {
+    let Ok(_running) = SYNC_LOCK.try_lock() else {
+        return Err("A Teams recap sync is already running.".into());
+    };
+    let vault_path = crate::summary::commands::require_obsidian_vault(app).await?;
+    let meetings_folder = crate::obsidian::meetings_path(&vault_path)
+        .to_string_lossy()
+        .to_string();
+
+    let started_at = Utc::now();
+    let state = load_state(app);
+    let since = scan_window_start(&state, started_at);
+    info!("[recap-sync] listing recaps since {}", since.to_rfc3339());
+    let candidates = list_recaps(app, since).await.map_err(|e| e.to_string())?;
+
+    let app_state = app.state::<crate::state::AppState>();
+    let pool = app_state.db_manager.pool();
+    let mut report = RecapSyncReport {
+        scanned: candidates.len(),
+        meetings_folder,
+        ..Default::default()
+    };
+    // Oldest first so a sync interrupted midway leaves a contiguous prefix.
+    let mut ordered = candidates;
+    ordered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    let total = ordered.len();
+    for (done, candidate) in ordered.iter().enumerate() {
+        let _ = app.emit(
+            PROGRESS_EVENT,
+            SyncProgress { done, total, current_title: &candidate.title },
+        );
+        match import_candidate(app, pool, &state.imported, candidate).await {
+            Outcome::New => report.new += 1,
+            Outcome::Updated => report.updated += 1,
+            Outcome::Skipped => report.skipped += 1,
+            Outcome::NotReady => report.not_ready += 1,
+            Outcome::Failed(error) => {
+                warn!("[recap-sync] {}: {error}", candidate.title);
+                report.failed.push(RecapSyncFailure { title: candidate.title.clone(), error });
+            }
+        }
+    }
+    let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
+
+    if let Err(e) = update_state(app, |state| state.last_sync_date = Some(started_at.to_rfc3339())) {
+        warn!("[recap-sync] could not persist last sync date: {e}");
+    }
+    info!(
+        "[recap-sync] scanned {} new {} updated {} skipped {} not ready {} failed {}",
+        report.scanned, report.new, report.updated, report.skipped, report.not_ready, report.failed.len()
+    );
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn sync_teams_recaps_command<R: Runtime>(app: AppHandle<R>) -> Result<RecapSyncReport, String> {
+    sync_recaps(&app).await
+}
+
+#[tauri::command]
+pub async fn get_teams_recap_sync_state_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TeamsRecapSyncStateView, String> {
+    let state = load_state(&app);
+    Ok(TeamsRecapSyncStateView {
+        since_date: state.since_date,
+        last_sync_date: state.last_sync_date,
+        known_recaps: state.imported.len(),
+        available: sync_available(),
+    })
+}
+
+#[tauri::command]
+pub async fn set_teams_recap_sync_prefs_command<R: Runtime>(
+    app: AppHandle<R>,
+    since_date: Option<String>,
+) -> Result<(), String> {
+    let since_date = match since_date.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => Some(parse_since_date(value).map_err(|e| e.to_string())?.to_string()),
+        None => None,
+    };
+    update_state(&app, |state| state.since_date = since_date).map_err(|e| e.to_string())
+}
+
+/// The raw candidate list, without importing anything. For learning the
+/// Meet app layout and for the QA doc.
+#[tauri::command]
+pub async fn teams_recap_list_debug_command<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<RecapCandidate>, String> {
+    let state = load_state(&app);
+    let since = scan_window_start(&state, Utc::now());
+    list_recaps(&app, since).await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn first_sync_defaults_to_thirty_days_back() {
+        let now = at("2026-11-02T10:00:00Z");
+        assert_eq!(scan_window_start(&TeamsRecapSyncState::default(), now), at("2026-10-03T10:00:00Z"));
+    }
+
+    #[test]
+    fn chosen_since_date_wins_until_a_sync_has_run() {
+        let state = TeamsRecapSyncState { since_date: Some("2026-09-01".into()), ..Default::default() };
+        assert_eq!(scan_window_start(&state, at("2026-11-02T10:00:00Z")), at("2026-09-01T00:00:00Z"));
+        let bad = TeamsRecapSyncState { since_date: Some("September".into()), ..Default::default() };
+        assert_eq!(scan_window_start(&bad, at("2026-11-02T10:00:00Z")), at("2026-10-03T10:00:00Z"));
+    }
+
+    #[test]
+    fn later_syncs_overlap_the_previous_window() {
+        let state = TeamsRecapSyncState {
+            since_date: Some("2026-01-01".into()),
+            last_sync_date: Some("2026-10-30T08:00:00+00:00".into()),
+            ..Default::default()
+        };
+        assert_eq!(scan_window_start(&state, at("2026-11-02T10:00:00Z")), at("2026-10-23T08:00:00Z"));
+    }
+
+    #[test]
+    fn since_date_must_be_a_calendar_date() {
+        assert_eq!(parse_since_date(" 2026-02-28 ").unwrap().to_string(), "2026-02-28");
+        assert!(parse_since_date("2026-02-30").is_err());
+        assert!(parse_since_date("28/02/2026").is_err());
+    }
+
+    #[test]
+    fn unchanged_markdown_hashes_the_same_and_edits_do_not() {
+        assert_eq!(content_hash("- a\n"), content_hash("- a\n"));
+        assert_ne!(content_hash("- a\n"), content_hash("- b\n"));
+        assert_eq!(content_hash("").len(), 64);
+    }
+
+    #[test]
+    fn only_a_missing_ai_summary_counts_as_not_ready() {
+        assert!(is_not_ready("Teams did not show an AI summary for this link. Sign in if prompted."));
+        assert!(!is_not_ready("WebView2 is unavailable: boom"));
+        assert!(!is_not_ready("Teams stayed on its app-choice page."));
+    }
+
+    #[test]
+    fn state_round_trips_through_json() {
+        let mut state = TeamsRecapSyncState::default();
+        state.imported.insert(
+            "host/path.mp4".into(),
+            ImportedRecap { meeting_id: "m1".into(), imported_at: "2026-11-02T10:00:00+00:00".into(), content_hash: "ab".into() },
+        );
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["imported"]["host/path.mp4"]["meetingId"], "m1");
+        let back: TeamsRecapSyncState = serde_json::from_value(json).unwrap();
+        assert_eq!(back.imported["host/path.mp4"].content_hash, "ab");
+        let empty: TeamsRecapSyncState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.imported.is_empty());
+    }
+}

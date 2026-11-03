@@ -142,7 +142,7 @@ fn imported_recap_summary(
 /// This intentionally bypasses recording download, speech-to-text, and LLM
 /// summary generation.
 async fn save_extracted_copilot_recap(
-    state: tauri::State<'_, AppState>,
+    pool: &sqlx::SqlitePool,
     title: String,
     recap: String,
     source_url: Option<String>,
@@ -174,7 +174,7 @@ async fn save_extracted_copilot_recap(
 
     let created_at = crate::audio::import::resolve_meeting_date(title, None, recorded_at.as_deref());
     let meeting_id = SummaryProcessesRepository::create_meeting_with_imported_summary(
-        state.db_manager.pool(),
+        pool,
         title,
         &summary,
         source_url.as_deref(),
@@ -193,7 +193,7 @@ async fn save_extracted_copilot_recap(
     if recorded_at.is_some() {
         meeting_source.recorded_at = recorded_at.clone();
     }
-    if let Err(e) = meeting_source.insert(state.db_manager.pool(), &meeting_id).await {
+    if let Err(e) = meeting_source.insert(pool, &meeting_id).await {
         log::warn!("Failed to record source for imported recap {}: {}", meeting_id, e);
     }
 
@@ -225,9 +225,27 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         .unwrap_or(title);
     let source_url = validated_url.as_str();
 
-    // An explicit "import to Obsidian" must not silently succeed only in
-    // Meetily because the vault has not been configured on this machine.
-    let settings = crate::obsidian::load_obsidian_settings(&app)
+    require_obsidian_vault(&app).await?;
+
+    let recap = crate::audio::teams_recap::extract_teams_recap(&app, source_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let recap_markdown = recap_markdown_with_source(&recap.markdown, source_url);
+    persist_recap_from_link(
+        &app,
+        state.db_manager.pool(),
+        title,
+        source_url,
+        recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
+        &recap_markdown,
+    )
+    .await
+}
+
+/// Refuse recap-to-Obsidian work when the vault is not usable here: an
+/// explicit "import to Obsidian" must not silently succeed only in Meetily.
+pub(crate) async fn require_obsidian_vault<R: Runtime>(app: &AppHandle<R>) -> Result<String, String> {
+    let settings = crate::obsidian::load_obsidian_settings(app)
         .await
         .map_err(|e| e.to_string())?;
     let vault_path = settings
@@ -236,12 +254,26 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
     if !std::path::Path::new(&vault_path).is_dir() {
         return Err("The configured Obsidian vault folder is not available on this machine.".into());
     }
+    Ok(vault_path)
+}
 
-    // Find the meeting this recap belongs to before the slow extraction:
-    // one Meetily already imported from the same recording, or an earlier
-    // import of this very link. The recap attaches there rather than
-    // creating a second meeting and a second vault note.
-    let pool = state.db_manager.pool();
+/// The note body an extracted recap is stored and exported as.
+pub(crate) fn recap_markdown_with_source(markdown: &str, source_url: &str) -> String {
+    format!("{}\n[Open original Teams recap](<{}>)", markdown.trim(), source_url)
+}
+
+/// Store an extracted recap and write its vault note. The recap joins the
+/// meeting Meetily already holds for the same recording (or an earlier
+/// import of the same link) when there is one; otherwise it becomes a new
+/// transcript-free meeting. Shared by the link import and the recap sync.
+pub(crate) async fn persist_recap_from_link<R: Runtime>(
+    app: &AppHandle<R>,
+    pool: &sqlx::SqlitePool,
+    title: String,
+    source_url: &str,
+    recorded_at: Option<&str>,
+    recap_markdown: &str,
+) -> Result<ImportedRecapFromLinkResponse, String> {
     let identity = crate::audio::teams_recap::meeting_identity_key(source_url);
     let existing = crate::database::repositories::meeting_sources::MeetingSource::find_meeting_by_identity(
         pool, &identity,
@@ -255,32 +287,22 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         None => None,
     };
 
-    let recap = crate::audio::teams_recap::extract_teams_recap(&app, source_url)
-        .await
-        .map_err(|e| e.to_string())?;
-    let recap_markdown = format!(
-        "{}\n[Open original Teams recap](<{}>)",
-        recap.markdown.trim(),
-        source_url
-    );
-    let recorded_at = recording.as_ref().map(|metadata| metadata.recorded_at.as_str());
-
     let Some(meeting) = existing else {
         let imported = save_extracted_copilot_recap(
-            state,
+            pool,
             title,
-            recap_markdown.clone(),
+            recap_markdown.to_string(),
             Some(source_url.to_string()),
             recorded_at.map(str::to_owned),
         )
         .await?;
-        crate::api::emit_meetings_changed(&app, &imported.meeting_id);
+        crate::api::emit_meetings_changed(app, &imported.meeting_id);
         let exported = crate::obsidian::export_copilot_recap_note(
-            &app,
+            app,
             &imported.meeting_id,
             &imported.title,
             &imported.created_at,
-            &recap_markdown,
+            recap_markdown,
             recorded_at,
         )
         .await
@@ -296,7 +318,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         });
     };
 
-    let summary = imported_recap_summary(&recap_markdown, Some(source_url), recorded_at)?;
+    let summary = imported_recap_summary(recap_markdown, Some(source_url), recorded_at)?;
     let attached = SummaryProcessesRepository::attach_imported_summary(pool, &meeting.id, &summary)
         .await
         .map_err(|e| format!("Failed to attach the recap to meeting {}: {e}", meeting.id))?;
@@ -307,7 +329,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         "Attached Microsoft Copilot recap to existing meeting {} ({})",
         meeting.id, meeting.title
     );
-    crate::api::emit_meetings_changed(&app, &meeting.id);
+    crate::api::emit_meetings_changed(app, &meeting.id);
 
     // A meeting that has a transcript keeps it in its note; a recap-only
     // meeting keeps the readable date-and-title filename.
@@ -317,13 +339,13 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
     let created_at = meeting.created_at.0.to_rfc3339();
     let exported = if segments.is_empty() {
         crate::obsidian::export_copilot_recap_note(
-            &app, &meeting.id, &meeting.title, &created_at, &recap_markdown, recorded_at,
+            app, &meeting.id, &meeting.title, &created_at, recap_markdown, recorded_at,
         )
         .await
     } else {
         let transcript_markdown = crate::obsidian::format_transcript_markdown(&segments);
         crate::obsidian::export_meeting_note(
-            &app, &meeting.id, &meeting.title, &created_at, &recap_markdown, &transcript_markdown,
+            app, &meeting.id, &meeting.title, &created_at, recap_markdown, &transcript_markdown,
         )
         .await
     }
