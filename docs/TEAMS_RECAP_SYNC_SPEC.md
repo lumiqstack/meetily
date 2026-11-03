@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-02. Step 1 (identity and dedupe in the link import) merged. Step 2 (sync state, commands, settings UI, scanner stub) in review. Steps 3 and 4 pending.
+Status: 2026-11-02. Steps 1 (identity and dedupe in the link import) and 2 (sync state, commands, settings UI) merged. Step 3 (Meet app scanner) in review: the script and its probe mode are written, the selectors are still being learned on the Windows machine. Step 4 pending.
 
 ## Goal
 
@@ -126,6 +126,28 @@ machine. Learning them is the first delivery step and the main risk; the
 script must fail with `waiting` and then a clear timeout error on any layout it
 does not recognise, never with a partial list presented as complete.
 
+How the layout is learned (`teams_recap_list.rs`, `teams_recap_list.js`):
+
+- The window opens the Teams web shell (`https://teams.microsoft.com/v2/`),
+  since no direct URL for the Meet app's recap tab is documented. The script
+  clicks, once each, a rail button named Meet or Recap and a tab named Recap
+  or similar; after the silent phase the window is shown so the user can
+  navigate by hand, and the script reads the list wherever it appears.
+- A row is any list item, row or article with a date it can parse or a recap
+  link it can find. The link comes from an `href`, from a recap URL embedded
+  in the row's markup, or, failing both, is built from a `19:meeting_…@thread.v2`
+  id in the row's markup. Rows with no link count as not ready.
+- In probe mode (the "Check recap list" button) the script also returns a
+  compact description of the page: rail and tab names, headings, list
+  containers, the first rows with their lines, parsed date, link and
+  attributes, every `data-tid`, recap-looking hrefs and thread ids in the
+  page. The debug command writes it to `teams_recap_list_probe.json` in the
+  app data folder. It contains meeting titles and page text, so it stays on
+  that machine unless the user shares it.
+- `MEETILY_RECAP_LIST_SCRIPT=<file>` replaces the bundled script with that
+  file, so selectors can be tuned on Windows without a rebuild. The file must
+  keep the `%SINCE%` and `%PROBE%` placeholders.
+
 ### Sync loop
 
 For each candidate, oldest first:
@@ -250,5 +272,8 @@ persisted additions.
 - Whether `extract_teams_recap` can distinguish "still generating" from "no
   recap for this meeting". If not, both count as "not ready" and retry on every
   sync until the overlap window passes them.
-- How many rows the Meet app keeps. If it caps at a few weeks, the since date
+- How many rows the Meet app keeps. Microsoft's admin documentation for the
+  Meeting Recaps app says it shows recaps from the previous 30 days, which
+  matches the default backfill; to be confirmed on the real list. If it is
+  so, the since date
   cannot reach further back and the settings UI should say so.
