@@ -64,7 +64,7 @@ mod tests {
 
     fn calendar(body: Option<&str>) -> MeetingCalendar {
         MeetingCalendar {
-            source: "ics_feed".to_string(),
+            source: "outlook_com".to_string(),
             event_id: "uid".to_string(),
             start: Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 11, 2, 10, 30, 0).unwrap(),

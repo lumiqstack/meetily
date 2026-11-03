@@ -15,6 +15,52 @@ pub(crate) fn recording_metadata(url: &Url) -> Option<metadata::RecordingMetadat
     metadata::from_filename(file_url.path().rsplit('/').next()?)
 }
 
+/// The meeting a link stands for, as a key for matching a recap against a
+/// meeting Meetily already holds. A recap link's `fileUrl` names the recording
+/// or transcript file, which is what recording imports store as
+/// `recording_url`, so both sides reduce to that file: host plus decoded,
+/// lowercased path, with the query dropped (it carries only tokens). A
+/// `stream.aspx?id=/path/file.mp4` player link reduces to the same file. A
+/// recap link without `fileUrl` keys on its own host and path plus its query,
+/// so repeated imports of that link still collide with each other.
+pub fn meeting_identity_key(link: &str) -> String {
+    let link = link.trim();
+    let Ok(url) = Url::parse(link) else {
+        return link.to_lowercase();
+    };
+    if url.path() == "/l/meetingrecap" {
+        let file_url = url
+            .query_pairs()
+            .find(|(key, _)| key == "fileUrl")
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.trim().is_empty());
+        return match file_url.as_deref().and_then(|value| Url::parse(value.trim()).ok()) {
+            Some(file) => file_identity(&file),
+            None => format!(
+                "{}{}?{}",
+                url.host_str().unwrap_or("").to_ascii_lowercase(),
+                url.path(),
+                url.query().unwrap_or("")
+            ),
+        };
+    }
+    file_identity(&url)
+}
+
+fn file_identity(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let raw_path = url.path();
+    let path = if raw_path.to_ascii_lowercase().ends_with("/stream.aspx") {
+        url.query_pairs()
+            .find(|(key, _)| key == "id")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| crate::audio::sharepoint_sync::percent_decode_component(raw_path))
+    } else {
+        crate::audio::sharepoint_sync::percent_decode_component(raw_path)
+    };
+    format!("{host}{}", path.to_lowercase())
+}
+
 #[cfg(any(target_os = "windows", test))]
 #[path = "teams_recap_navigation.rs"]
 mod navigation;
@@ -342,5 +388,33 @@ mod tests {
         assert!(validate_recap_url("https://teams.microsoft.com/v2/").is_err());
         assert!(validate_recap_url("https://evil.example/l/meetingrecap").is_err());
         assert!(validate_recap_url("http://teams.microsoft.com/l/meetingrecap").is_err());
+    }
+
+    #[test]
+    fn recap_link_and_recording_link_share_one_identity() {
+        let direct = "https://contoso-my.sharepoint.com/personal/jdoe/Documents/Recordings/Weekly sync-20260721_100221-Meeting Recording.mp4";
+        let encoded = "https://Contoso-my.sharepoint.com/personal/jdoe/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4?tempauth=abc";
+        let recap = format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting&fileUrl={}",
+            url::form_urlencoded::byte_serialize(encoded.as_bytes()).collect::<String>()
+        );
+        let stream = "https://contoso-my.sharepoint.com/personal/jdoe/_layouts/15/stream.aspx?id=%2Fpersonal%2Fjdoe%2FDocuments%2FRecordings%2FWeekly%20sync-20260721_100221-Meeting%20Recording.mp4";
+        let key = meeting_identity_key(direct);
+        assert_eq!(
+            key,
+            "contoso-my.sharepoint.com/personal/jdoe/documents/recordings/weekly sync-20260721_100221-meeting recording.mp4"
+        );
+        assert_eq!(meeting_identity_key(encoded), key);
+        assert_eq!(meeting_identity_key(&recap), key);
+        assert_eq!(meeting_identity_key(stream), key);
+    }
+
+    #[test]
+    fn recap_link_without_file_url_keys_on_itself() {
+        let a = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Aabc&organizerId=1";
+        let b = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Aabc&organizerId=2";
+        assert_eq!(meeting_identity_key(a), meeting_identity_key(&format!(" {a} ")));
+        assert_ne!(meeting_identity_key(a), meeting_identity_key(b));
+        assert_eq!(meeting_identity_key("not a url"), "not a url");
     }
 }

@@ -1,7 +1,7 @@
 // Mirrors calendar::types::CalendarEvent in the Rust core.
 export interface CalendarEvent {
   id: string;
-  source: 'ics_feed' | 'outlook_com';
+  source: 'outlook_com';
   title: string;
   start: string;
   end: string;
@@ -16,7 +16,7 @@ export interface CalendarEvent {
 // Mirrors database::repositories::meeting_calendar::MeetingCalendar: the event
 // a saved meeting was recorded against.
 export interface MeetingCalendar {
-  source: 'ics_feed' | 'outlook_com';
+  source: 'outlook_com';
   event_id: string;
   start: string;
   end: string;

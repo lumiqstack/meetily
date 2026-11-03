@@ -8,7 +8,7 @@ use sqlx::{FromRow, SqlitePool};
 /// details pane and the summary prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeetingCalendar {
-    /// `ics_feed` or `outlook_com`.
+    /// The `SourceKind` the event came from, as its serde name (`outlook_com`).
     pub source: String,
     pub event_id: String,
     pub start: DateTime<Utc>,
@@ -72,7 +72,7 @@ impl MeetingCalendarRepository {
         let source = serde_json::to_value(event.source)
             .ok()
             .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "ics_feed".to_string());
+            .unwrap_or_else(|| "outlook_com".to_string());
         let attendees = serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".to_string());
         sqlx::query(
             "UPDATE meetings SET calendar_source = ?, calendar_event_id = ?, calendar_start = ?, \
@@ -132,7 +132,7 @@ mod tests {
     fn event() -> CalendarEvent {
         CalendarEvent {
             id: "uid-1@2026-11-02T10:00:00+00:00".to_string(),
-            source: SourceKind::IcsFeed,
+            source: SourceKind::OutlookCom,
             title: "Standup".to_string(),
             start: Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 11, 2, 10, 30, 0).unwrap(),
@@ -151,7 +151,7 @@ mod tests {
         MeetingCalendarRepository::attach(&pool, "m1", &event()).await.unwrap();
 
         let stored = MeetingCalendarRepository::get(&pool, "m1").await.unwrap().unwrap();
-        assert_eq!(stored.source, "ics_feed");
+        assert_eq!(stored.source, "outlook_com");
         assert_eq!(stored.event_id, event().id);
         assert_eq!(stored.start, event().start);
         assert_eq!(stored.end, event().end);

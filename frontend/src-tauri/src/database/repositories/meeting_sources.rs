@@ -64,6 +64,29 @@ impl MeetingSource {
         Ok(())
     }
 
+    /// The meeting imported from the same recording as `key` (see
+    /// [`crate::audio::teams_recap::meeting_identity_key`]), so a recap can
+    /// attach to the meeting that already holds the recording or an earlier
+    /// copy of the recap. The oldest matching meeting wins. Stored URLs are
+    /// raw, so the comparison runs in Rust over the rows that have one.
+    pub async fn find_meeting_by_identity(
+        pool: &SqlitePool,
+        key: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT ms.meeting_id, ms.recording_url FROM meeting_sources ms \
+             JOIN meetings m ON m.id = ms.meeting_id \
+             WHERE ms.recording_url IS NOT NULL \
+             ORDER BY m.created_at, m.id",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .find(|(_, url)| crate::audio::teams_recap::meeting_identity_key(url) == key)
+            .map(|(meeting_id, _)| meeting_id))
+    }
+
     pub async fn get(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Self>, sqlx::Error> {
         sqlx::query_as::<_, Self>(
             "SELECT import_source, recording_url, recording_file, recorded_at, duration_seconds \
@@ -164,5 +187,79 @@ mod tests {
         assert_eq!(source.recording_url, None);
         assert_eq!(source.duration_seconds, None);
         assert_eq!(url_import_source("https://www.youtube.com/watch?v=1"), "url");
+    }
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE meeting_sources (meeting_id TEXT PRIMARY KEY, import_source TEXT NOT NULL, \
+             recording_url TEXT, recording_file TEXT, recorded_at TEXT, duration_seconds REAL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn insert_meeting(pool: &SqlitePool, id: &str, created_at: &str, source: &str, url: Option<&str>) {
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES (?, 'T', ?, ?)")
+            .bind(id)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        MeetingSource::for_import(source, "T", url, None, None)
+            .insert(pool, id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finds_the_meeting_that_holds_the_recording_behind_a_recap_link() {
+        let pool = test_pool().await;
+        let recording = "https://contoso-my.sharepoint.com/personal/jdoe/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4";
+        let recap = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fcontoso-my.sharepoint.com%2Fpersonal%2Fjdoe%2FDocuments%2FRecordings%2FWeekly%20sync-20260721_100221-Meeting%20Recording.mp4";
+        let other_recap = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ay";
+        insert_meeting(&pool, "m-recording", "2026-07-21T15:00:00Z", "sharepoint", Some(recording)).await;
+        insert_meeting(&pool, "m-local", "2026-07-22T15:00:00Z", "file", None).await;
+        insert_meeting(&pool, "m-other-recap", "2026-07-23T15:00:00Z", "copilot-recap", Some(other_recap)).await;
+
+        let key = crate::audio::teams_recap::meeting_identity_key(recap);
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap().as_deref(),
+            Some("m-recording")
+        );
+        let other_key = crate::audio::teams_recap::meeting_identity_key(other_recap);
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &other_key).await.unwrap().as_deref(),
+            Some("m-other-recap")
+        );
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, "nothing").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_sources_whose_meeting_was_deleted_and_prefers_the_oldest() {
+        let pool = test_pool().await;
+        let recap = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fh.sharepoint.com%2Fa%2FRec.mp4";
+        insert_meeting(&pool, "m-new", "2026-07-22T15:00:00Z", "copilot-recap", Some(recap)).await;
+        insert_meeting(&pool, "m-old", "2026-07-21T15:00:00Z", "copilot-recap", Some(recap)).await;
+        insert_meeting(&pool, "m-gone", "2026-07-20T15:00:00Z", "copilot-recap", Some(recap)).await;
+        sqlx::query("DELETE FROM meetings WHERE id = 'm-gone'").execute(&pool).await.unwrap();
+
+        let key = crate::audio::teams_recap::meeting_identity_key(recap);
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap().as_deref(),
+            Some("m-old")
+        );
     }
 }

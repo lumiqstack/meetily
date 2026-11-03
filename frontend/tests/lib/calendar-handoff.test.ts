@@ -13,7 +13,7 @@ import type { CalendarEvent } from '@/types/calendar';
 
 const event: CalendarEvent = {
   id: 'uid@2026-11-02T10:00:00+00:00',
-  source: 'ics_feed',
+  source: 'outlook_com',
   title: 'Weekly sync',
   start: '2026-11-02T10:00:00Z',
   end: '2026-11-02T10:30:00Z',

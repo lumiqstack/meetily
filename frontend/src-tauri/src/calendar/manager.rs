@@ -1,16 +1,15 @@
 use super::{
-    ics_feed::IcsFeedSource,
+    outlook_com::OutlookComSource,
     scheduler::{match_event_for_call, NudgePlanner},
-    secret,
     source::CalendarSource,
     types::{
-        CalendarEvent, CalendarMeetingUpcomingPayload, CalendarSettings, CalendarStatus, SourceKind,
-        SourceStatus, ICS_POLL_INTERVAL_SECONDS, LOOKAHEAD_HOURS, LOOKBACK_HOURS, MAX_NUDGE_LEAD_MINUTES,
-        STATUS_EVENT, TICK_SECONDS, UPCOMING_EVENT,
+        CalendarEvent, CalendarMeetingUpcomingPayload, CalendarSettings, CalendarStatus, SourceStatus,
+        LOOKAHEAD_HOURS, LOOKBACK_HOURS, MAX_NUDGE_LEAD_MINUTES, POLL_INTERVAL_SECONDS, STATUS_EVENT,
+        TICK_SECONDS, UPCOMING_EVENT,
     },
 };
 use crate::notifications::{commands::NotificationManagerState, types::Notification};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use log::{error, info, warn};
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -23,35 +22,22 @@ pub struct CalendarManager<R: Runtime = Wry> {
     settings: Arc<RwLock<CalendarSettings>>,
     status: Arc<RwLock<CalendarStatus>>,
     events: Arc<RwLock<Vec<CalendarEvent>>>,
-    feed: Arc<IcsFeedSource>,
-    /// Woken by a URL change or a manual refresh to poll before the interval.
+    source: Arc<dyn CalendarSource>,
+    /// Woken by a settings change or a manual refresh to poll before the interval.
     refresh: Arc<Notify>,
     cancellation: Arc<RwLock<Option<CancellationToken>>>,
 }
 
 impl<R: Runtime> CalendarManager<R> {
     pub async fn new(app_handle: AppHandle<R>) -> Result<Self> {
-        let mut settings = load_settings().await.unwrap_or_default();
-
-        let feed_url = match tokio::task::spawn_blocking(secret::load_feed_url).await {
-            Ok(Ok(url)) => url,
-            Ok(Err(error)) => {
-                warn!("Calendar feed URL could not be read from the credential store: {error}");
-                None
-            }
-            Err(error) => {
-                warn!("Calendar feed URL lookup task failed: {error}");
-                None
-            }
-        };
-        settings.ics_feed_configured = feed_url.is_some();
+        let settings = load_settings().await.unwrap_or_default();
 
         Ok(Self {
             app_handle,
             status: Arc::new(RwLock::new(CalendarStatus::stopped(settings.clone()))),
             settings: Arc::new(RwLock::new(settings)),
             events: Arc::new(RwLock::new(Vec::new())),
-            feed: Arc::new(IcsFeedSource::new(feed_url)),
+            source: Arc::new(OutlookComSource::new()),
             refresh: Arc::new(Notify::new()),
             cancellation: Arc::new(RwLock::new(None)),
         })
@@ -80,7 +66,7 @@ impl<R: Runtime> CalendarManager<R> {
         let settings = Arc::clone(&self.settings);
         let status = Arc::clone(&self.status);
         let events = Arc::clone(&self.events);
-        let feed = Arc::clone(&self.feed);
+        let source = Arc::clone(&self.source);
         let refresh = Arc::clone(&self.refresh);
 
         tauri::async_runtime::spawn(async move {
@@ -108,13 +94,13 @@ impl<R: Runtime> CalendarManager<R> {
                 let now = Utc::now();
 
                 let poll_due = last_poll.map_or(true, |at| {
-                    at.elapsed() >= std::time::Duration::from_secs(ICS_POLL_INTERVAL_SECONDS)
+                    at.elapsed() >= std::time::Duration::from_secs(POLL_INTERVAL_SECONDS)
                 });
                 if poll_due {
                     last_poll = Some(Instant::now());
                     let from = now - Duration::hours(LOOKBACK_HOURS);
                     let to = now + Duration::hours(LOOKAHEAD_HOURS);
-                    let poll = feed.poll(from, to).await;
+                    let poll = source.poll(from, to).await;
 
                     if let Some(list) = poll.events {
                         *events.write().await = list;
@@ -124,7 +110,7 @@ impl<R: Runtime> CalendarManager<R> {
                         let mut status = status.write().await;
                         status.settings = current.clone();
                         status.sources = vec![SourceStatus {
-                            kind: SourceKind::IcsFeed,
+                            kind: source.kind(),
                             health: poll.health,
                             last_poll_at: Some(now),
                             event_count: list.len(),
@@ -143,7 +129,7 @@ impl<R: Runtime> CalendarManager<R> {
                 };
                 for event in due {
                     let starts_in_seconds = (event.start - now).num_seconds();
-                    info!("Calendar nudge: '{}' starts in {}s", event.title, starts_in_seconds);
+                    info!("Calendar nudge: a Teams meeting starts in {}s", starts_in_seconds);
                     show_nudge_notification(&app_handle, &event, starts_in_seconds).await;
                     let payload = CalendarMeetingUpcomingPayload {
                         event_type: UPCOMING_EVENT.to_string(),
@@ -170,61 +156,19 @@ impl<R: Runtime> CalendarManager<R> {
         self.settings.read().await.clone()
     }
 
-    /// `ics_feed_configured` is owned by the keyring, so the caller's value is
-    /// replaced with the real one.
     pub async fn update_settings(&self, mut next: CalendarSettings) -> Result<()> {
         next.nudge_lead_minutes = next.nudge_lead_minutes.min(MAX_NUDGE_LEAD_MINUTES);
-        next.ics_feed_configured = self.feed.is_configured().await;
+        let was_enabled = self.settings.read().await.calendar_enabled;
         self.persist_settings(next.clone()).await?;
 
         if next.calendar_enabled {
             self.start().await;
+            if !was_enabled {
+                self.refresh.notify_one();
+            }
         } else {
             self.stop().await;
         }
-        Ok(())
-    }
-
-    pub async fn set_feed_url(&self, raw_url: &str) -> Result<()> {
-        let url = secret::normalize_feed_url(raw_url)?;
-        let stored = url.clone();
-        tokio::task::spawn_blocking(move || secret::store_feed_url(&stored))
-            .await
-            .context("credential store task")??;
-
-        self.feed.set_url(Some(url)).await;
-        let mut next = self.settings.read().await.clone();
-        next.ics_feed_configured = true;
-        self.persist_settings(next.clone()).await?;
-
-        self.refresh.notify_one();
-        if next.calendar_enabled {
-            self.start().await;
-        }
-        Ok(())
-    }
-
-    pub async fn clear_feed_url(&self) -> Result<()> {
-        tokio::task::spawn_blocking(secret::clear_feed_url)
-            .await
-            .context("credential store task")??;
-
-        self.feed.set_url(None).await;
-        self.events.write().await.clear();
-        let mut next = self.settings.read().await.clone();
-        next.ics_feed_configured = false;
-        self.persist_settings(next).await?;
-
-        let snapshot = {
-            let mut status = self.status.write().await;
-            status.sources.clear();
-            status.next_event = None;
-            status.clone()
-        };
-        if let Err(error) = self.app_handle.emit(STATUS_EVENT, snapshot) {
-            error!("Failed to emit calendar status: {error}");
-        }
-        self.refresh.notify_one();
         Ok(())
     }
 

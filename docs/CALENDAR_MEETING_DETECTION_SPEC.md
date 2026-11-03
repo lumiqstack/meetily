@@ -1,9 +1,12 @@
 # Outlook calendar and Teams meeting auto-detect (Windows)
 
-Status: 2026-11-02. PRs 1 to 3 implemented (ICS feed source, nudge, settings UI;
-window titles; calendar match, "Join and record", storage, details pane, summary
-context); PR 4 (classic Outlook COM) pending. Earlier text:
-PRs 2 to 4 pending.
+Status: 2026-11-03. The calendar module, nudge and settings UI are on main.
+The published ICS feed source shipped on 2026-11-02 and was removed on
+2026-11-03: the tenant this is built for blocks calendar publishing and
+sharing in Outlook, so the link could never be obtained. Classic Outlook COM
+is now the only source. Window title capture (PR 2) is on main. PR 3 (calendar
+match, "Join and record", storage, details pane, summary context) is built on
+the COM source.
 
 ## Goal
 
@@ -21,11 +24,11 @@ and run no calendar code.
 | Question | Decision |
 | --- | --- |
 | Calendar access | No Microsoft Graph, no Entra app registration. |
-| Sources | Published ICS link (new Outlook, Outlook on the web) and classic Outlook COM object model. Both behind one trait. |
+| Sources | Classic Outlook COM object model on the same machine, behind the `CalendarSource` trait so another source can be added. The published ICS link source was removed on 2026-11-03 (tenant blocks publishing). |
 | Trigger | Prompt, never auto-start. The prompt is prefilled with the matched event. |
 | Which events | Teams events only: an event counts if its location or body contains a Teams join link, or if Teams audio is detected at its start time. |
 | Metadata stored | Title, start, end, organizer, attendees, join link, body. |
-| Body on COM | Not read. The Outlook Object Model Guard can raise a security dialog on body access. Body comes from the ICS feed only. |
+| Body on COM | Not read. The Outlook Object Model Guard can raise a security dialog on body access. `CalendarEvent.body` stays `None`; the summary toggle only matters when a future source fills it. |
 | Body use | Always stored and shown in meeting details. A setting controls whether it is added to the summary prompt. Default on. |
 | Nudge actions | "Join and record" opens the Teams link and arms recording to start when Teams audio is detected. "Record" starts now. "Dismiss". |
 | Licensing | Available to everyone. No PRO gate. |
@@ -50,8 +53,7 @@ calendar/
 ├── mod.rs
 ├── types.rs            CalendarEvent, CalendarSettings, CalendarStatus, event names
 ├── source.rs           trait CalendarSource
-├── ics_feed.rs         ICS URL poller + parser (all platforms, used on Windows)
-├── outlook_com.rs      classic Outlook COM reader (#[cfg(windows)])
+├── outlook_com.rs      classic Outlook COM reader; COM code #[cfg(windows)], mapping is pure
 ├── teams_link.rs       Teams join-link extraction from text
 ├── scheduler.rs        upcoming-event nudges, event matching
 └── commands.rs         Tauri commands + managed state
@@ -70,7 +72,7 @@ pub struct SourcePoll {
 }
 
 pub trait CalendarSource: Send + Sync {
-    fn kind(&self) -> SourceKind;        // IcsFeed | OutlookCom
+    fn kind(&self) -> SourceKind;        // OutlookCom
     async fn poll(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> SourcePoll;
 }
 ```
@@ -80,12 +82,23 @@ pub trait CalendarSource: Send + Sync {
 `location: Option<String>`, `body: Option<String>`, `teams_join_url:
 Option<String>`, `is_recurring_instance`.
 
-The scheduler merges events from every enabled source. Two events are the same
-meeting when their start times are within two minutes and their titles match
-case-insensitively. The ICS copy wins for body; the COM copy wins for attendee
-names when the feed only carries addresses.
+With one source there is nothing to merge. If a second source returns, two
+events are the same meeting when their start times are within two minutes and
+their titles match case-insensitively.
 
-### ICS feed source
+### ICS feed source (removed 2026-11-03)
+
+Kept for the record. The feed needed a link from Outlook on the web (Settings,
+Calendar, Shared calendars, Publish a calendar). On the target tenant that
+page does not exist and the calendar's Sharing dialog offers no publishing,
+which is the Outlook on the web mailbox policy with calendar publishing off.
+Nothing on the user's side unlocks it, so the source, its keyring storage of
+the link, the `icalendar`, `rrule`, `chrono-tz`, `windows-timezones` and
+`keyring` crates, and the link block in the settings UI were removed. The
+settings file still loads with the old `ics_feed_configured` and
+`outlook_com_enabled` keys present; they are ignored.
+
+What it did, in case it comes back for a tenant that allows publishing:
 
 - User pastes the URL from Outlook on the web: Settings, Calendar, Shared
   calendars, Publish a calendar, "Can view all details", ICS link. The "all
@@ -106,28 +119,49 @@ names when the feed only carries addresses.
 
 ### Classic Outlook COM source
 
-- `#[cfg(windows)]`. Late-bound `IDispatch` calls through the `windows` crate
-  (`Win32_System_Com`, `Win32_System_Ole`, `Win32_System_Variant` features;
-  the first two are new).
+Implemented in `calendar/outlook_com.rs`.
+
+- The COM code is `#[cfg(target_os = "windows")]`. Late-bound `IDispatch`
+  calls through the `windows` crate (`Win32_System_Com`, `Win32_System_Ole`,
+  `Win32_System_Variant` features). Property and method names are resolved
+  with `GetIDsOfNames` on every call.
 - `Outlook.Application` is obtained with `GetActiveObject` first, so a running
-  Outlook is reused, then `CoCreateInstance` as a fallback. If neither works,
-  or `Outlook.Application` is not registered, the source reports
-  `Unavailable("classic Outlook not installed")` and the settings toggle is
-  shown disabled with that reason.
-- Reads `Namespace("MAPI").GetDefaultFolder(9).Items` with `IncludeRecurrences
-  = true`, `Sort("[Start]")`, then `Restrict` on `[Start]` and `[End]` for the
-  lookahead window. Properties read per item: `EntryID`, `Subject`, `Start`,
-  `End`, `Location`, `Organizer`, `RequiredAttendees`, `OptionalAttendees`
-  (display names, semicolon separated). `Body` is never read.
-- Teams join URL is taken from `Location`. Classic Outlook puts the Teams link
-  in the body, so many COM events will have no URL. Those still count as Teams
-  events if the location text says "Microsoft Teams Meeting".
-- Runs on a dedicated thread with `CoInitializeEx(COINIT_APARTMENTTHREADED)`,
-  because the Outlook object model is single-threaded apartment. Calls are
-  sent to that thread over a channel; the async side awaits a oneshot reply.
-  Poll interval 2 minutes.
-- Every `IDispatch` and `BSTR` is released before the thread goes idle, or
-  Outlook refuses to exit while Meetily is running.
+  Outlook is reused, then `CoCreateInstance(CLSCTX_LOCAL_SERVER)` as a
+  fallback, which starts classic Outlook in the background. `CLSIDFromProgID`
+  failing means classic Outlook is not installed; both start paths failing
+  means it could not be started. Each is `Unavailable` with that fixed reason,
+  shown under the switch in settings. The new Outlook app has no object model
+  and is never read.
+- Reads `GetNamespace("MAPI").GetDefaultFolder(9).Items` with
+  `IncludeRecurrences = true`, `Sort("[Start]")`, then `Restrict` on
+  `[Start]` and `[End]` for the window (one hour back, 48 hours ahead), walked
+  with `GetFirst` and `GetNext`, at most 500 items. Properties read per item:
+  `GlobalAppointmentID`, `Subject`, `Start`, `End`, `Location`, `Organizer`,
+  `RequiredAttendees`, `OptionalAttendees` (display names, semicolon
+  separated), `IsRecurring`. `Body` is never read.
+- The event id is `GlobalAppointmentID`, plus the occurrence start for
+  instances of a recurring series, so each occurrence is nudged once.
+- The Teams join URL is read through `PropertyAccessor.GetProperty` from the
+  named MAPI property Teams writes on the appointment
+  (`SkypeTeamsMeetingUrl`, then `OnlineMeetingExternalLink`), then from the
+  `Location` text. An appointment with neither still counts as a Teams
+  meeting when its location says "Microsoft Teams Meeting". Whether the
+  PropertyAccessor read raises the Object Model Guard on a managed PC is a
+  Windows QA check; if it does, the fallback is location text only.
+- `Restrict` is given dates as `MM/dd/yyyy hh:mm AM` and parses them with the
+  machine locale. That is right for an English Windows locale; a non-English
+  locale is a known gap and would surface as an `Error` status, not as
+  missing meetings.
+- Runs on one dedicated thread that calls `CoInitializeEx(COINIT_APARTMENTTHREADED)`
+  and lives for the process, because the Outlook object model is
+  single-threaded apartment. Polls are sent over a channel and awaited on a
+  oneshot with a 30 second timeout; a timeout is an `Error` and keeps the
+  previous event list. Poll interval 2 minutes, plus an immediate poll when
+  the switch is turned on or Refresh now is pressed.
+- Every `IDispatch`, `VARIANT` and `BSTR` is released at the end of each poll,
+  so Outlook can exit while Meetily keeps running.
+- Logs carry fixed state names and HRESULT codes only, never subjects, people
+  or links.
 
 ### Teams join-link extraction
 
@@ -191,18 +225,15 @@ key the calendar nudge uses.
 
 ### Tauri commands
 
-`get_calendar_settings`, `set_calendar_settings`, `set_calendar_feed_url`
-(writes keyring, triggers immediate poll), `clear_calendar_feed_url`,
-`get_calendar_status`, `get_upcoming_calendar_events` (for a small "next
-meetings" list in the UI), `refresh_calendar_now`.
+`get_calendar_settings`, `set_calendar_settings`, `get_calendar_status`,
+`get_upcoming_calendar_events` (for a small "next meetings" list in the UI),
+`refresh_calendar_now`.
 
 ### Settings
 
 ```rust
 pub struct CalendarSettings {
-    pub calendar_enabled: bool,            // default false
-    pub ics_feed_configured: bool,         // derived, read-only in UI
-    pub outlook_com_enabled: bool,         // default false; disabled when COM source Unavailable
+    pub calendar_enabled: bool,            // default false; the one switch
     pub nudge_lead_minutes: u64,           // default 2
     pub include_body_in_summary: bool,     // default true
 }
@@ -221,7 +252,7 @@ session storage.
 New sqlx migration `20261102000000_add_meeting_calendar.sql`:
 
 ```sql
-ALTER TABLE meetings ADD COLUMN calendar_source TEXT;        -- 'ics_feed' | 'outlook_com'
+ALTER TABLE meetings ADD COLUMN calendar_source TEXT;        -- 'outlook_com' (was also 'ics_feed' before 2026-11-03)
 ALTER TABLE meetings ADD COLUMN calendar_event_id TEXT;
 ALTER TABLE meetings ADD COLUMN calendar_start TEXT;         -- ISO 8601 UTC
 ALTER TABLE meetings ADD COLUMN calendar_end TEXT;
@@ -273,34 +304,39 @@ later stops the body from being sent.
 Each step is its own PR and leaves the app working.
 
 1. `calendar` module with the ICS feed source, keyring storage, scheduler,
-   upcoming nudge, settings UI. Testable on the Mac with a local ICS fixture
-   and a fake HTTP server, then on Windows against a real Outlook feed.
+   upcoming nudge, settings UI. Shipped 2026-11-02; the feed source was
+   removed the next day (see above).
 2. Window title capture and the richer start prompt. Windows only, tested via
-   the Stash handoff.
+   the Stash handoff. Shipped.
 3. Calendar match in the start prompt, "Join and record" arming, database
-   migration, meeting details pane, summary context.
-4. Classic Outlook COM source. Last, since it can only be developed and tested
-   on the Windows machine where both Outlooks are installed.
+   migration, meeting details pane, summary context. In review.
+4. Classic Outlook COM source, replacing the feed. Mapping and window logic
+   unit-tested on the Mac; the COM calls verified on the Windows machine.
 
 ## Testing
 
-- Unit, cross-platform: ICS parsing incl. recurrence expansion, `EXDATE`,
-  `RECURRENCE-ID`; Teams link extraction; window-title stripping; event
-  matching windows; nudge de-duplication; settings round-trip.
-- Unit, Windows only: COM source against a running classic Outlook with a
-  seeded test calendar; window title enumeration against a running Teams
-  call. Tests that touch `tauri::test::mock_app()` stay `#[cfg(not(windows))]`
-  per the existing rule.
-- Manual, Windows: publish a calendar from Outlook on the web, paste the link,
-  confirm the next event appears in status, wait for the nudge, click "Join
-  and record", confirm recording starts when Teams audio begins and the
-  meeting is saved with the calendar fields.
+- Unit, cross-platform: OLE date conversion, the `Restrict` filter text,
+  attendee splitting, appointment to event mapping (join link precedence,
+  recurring ids, blank subjects, dropped items), window filtering and
+  capping; Teams link extraction; window-title stripping; event matching
+  windows; nudge de-duplication; settings round-trip including a settings
+  file written by the feed build.
+- Unit, Windows only: window title enumeration against a running Teams call.
+  Tests that touch `tauri::test::mock_app()` stay `#[cfg(not(windows))]` per
+  the existing rule. The COM reader has no automated test; it is checked by
+  hand.
+- Manual, Windows, with classic Outlook running: turn the calendar switch on,
+  confirm the status line says "Reading classic Outlook" with a plausible
+  event count and the next Teams meeting matches Outlook's calendar, confirm
+  no Outlook security dialog appeared, wait for the nudge, then close Outlook
+  and confirm it exits with Meetily still running. With Outlook closed, the
+  next poll should start it again in the background. Then "Join and record"
+  and the saved calendar fields once PR 3 lands.
 
 ## Open questions
 
-- Should the feed poll pause while a recording is running, to keep the audio
-  pipeline free of network work? Proposed: no, the poller is a separate task
-  and does not touch the audio threads.
-- When the same event appears in both sources with different titles (user
-  edited a recurring instance locally), which title wins? Proposed: COM,
-  because it reflects the local cache the user sees in Outlook.
+- Should the Outlook poll pause while a recording is running? Proposed: no,
+  the reader is a separate STA thread and does not touch the audio threads.
+- Starting classic Outlook from `CoCreateInstance` when the user closed it on
+  purpose: acceptable for now, since the nudge needs the calendar, but a
+  "only read Outlook while it is running" option may be wanted.

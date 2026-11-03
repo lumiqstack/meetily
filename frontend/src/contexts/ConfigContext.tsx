@@ -62,18 +62,14 @@ const DEFAULT_MEETING_DETECTION_SETTINGS: MeetingDetectionSettings = {
 
 // Mirrors calendar::types::CalendarSettings in the Rust core.
 export interface CalendarSettings {
+  /** The one switch: read classic Outlook and nudge before Teams meetings. */
   calendar_enabled: boolean;
-  /** Owned by the keyring; the backend overwrites whatever is sent. */
-  ics_feed_configured: boolean;
-  outlook_com_enabled: boolean;
   nudge_lead_minutes: number;
   include_body_in_summary: boolean;
 }
 
 export const DEFAULT_CALENDAR_SETTINGS: CalendarSettings = {
   calendar_enabled: false,
-  ics_feed_configured: false,
-  outlook_com_enabled: false,
   nudge_lead_minutes: 2,
   include_body_in_summary: true,
 };
@@ -138,8 +134,6 @@ interface ConfigContextType {
   calendarSettings: CalendarSettings | null;
   updateCalendarSettings: (settings: CalendarSettings) => Promise<void>;
   /** Backend-validated; resolves with the settings the backend now holds. */
-  setCalendarFeedUrl: (url: string) => Promise<CalendarSettings>;
-  clearCalendarFeedUrl: () => Promise<CalendarSettings>;
 }
 
 const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
@@ -602,18 +596,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const setCalendarFeedUrl = useCallback(async (url: string) => {
-    const next = await invoke<CalendarSettings>('set_calendar_feed_url', { url });
-    setCalendarSettings(next);
-    return next;
-  }, []);
-
-  const clearCalendarFeedUrl = useCallback(async () => {
-    const next = await invoke<CalendarSettings>('clear_calendar_feed_url');
-    setCalendarSettings(next);
-    return next;
-  }, []);
-
   // Wrapper for setSelectedLanguage that persists to localStorage and syncs to Rust
   const handleSetSelectedLanguage = useCallback((lang: string) => {
     setSelectedLanguage(lang);
@@ -656,8 +638,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     updateMeetingDetectionSettings,
     calendarSettings,
     updateCalendarSettings,
-    setCalendarFeedUrl,
-    clearCalendarFeedUrl,
   }), [
     modelConfig,
     isModelConfigLoading,
@@ -685,8 +665,6 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     updateMeetingDetectionSettings,
     calendarSettings,
     updateCalendarSettings,
-    setCalendarFeedUrl,
-    clearCalendarFeedUrl,
   ]);
 
   return (

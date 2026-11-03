@@ -33,22 +33,6 @@ pub async fn set_calendar_settings(
 }
 
 #[tauri::command]
-pub async fn set_calendar_feed_url(url: String, state: State<'_, CalendarManagerState>) -> Result<CalendarSettings, String> {
-    let guard = state.read().await;
-    let manager = guard.as_ref().ok_or_else(|| NOT_READY.to_string())?;
-    manager.set_feed_url(&url).await.map_err(|error| error.to_string())?;
-    Ok(manager.get_settings().await)
-}
-
-#[tauri::command]
-pub async fn clear_calendar_feed_url(state: State<'_, CalendarManagerState>) -> Result<CalendarSettings, String> {
-    let guard = state.read().await;
-    let manager = guard.as_ref().ok_or_else(|| NOT_READY.to_string())?;
-    manager.clear_feed_url().await.map_err(|error| error.to_string())?;
-    Ok(manager.get_settings().await)
-}
-
-#[tauri::command]
 pub async fn get_calendar_status(state: State<'_, CalendarManagerState>) -> Result<CalendarStatus, String> {
     let guard = state.read().await;
     let manager = guard.as_ref().ok_or_else(|| NOT_READY.to_string())?;

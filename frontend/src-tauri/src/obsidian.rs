@@ -129,7 +129,7 @@ fn validate_vault_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn meetings_path(vault_path: &str) -> PathBuf {
+pub(crate) fn meetings_path(vault_path: &str) -> PathBuf {
     PathBuf::from(vault_path).join(MEETINGS_FOLDER)
 }
 
