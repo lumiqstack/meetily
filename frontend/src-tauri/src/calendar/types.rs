@@ -11,9 +11,10 @@ pub const TICK_SECONDS: u64 = 30;
 /// How often classic Outlook is re-read. It is a local cache, so this is
 /// cheap, and two minutes keeps a meeting added at the last moment nudgeable.
 pub const POLL_INTERVAL_SECONDS: u64 = 120;
-/// Events are kept from this far back, so a meeting that started before the
-/// app launched still matches a Teams call.
-pub const LOOKBACK_HOURS: i64 = 1;
+/// Events are kept from this far back: the whole of today's working day, so
+/// the home dashboard can show which of today's meetings were recorded. Call
+/// matching has its own, much narrower window (see `match_event_for_call`).
+pub const LOOKBACK_HOURS: i64 = 14;
 /// Events are kept this far ahead: today and tomorrow.
 pub const LOOKAHEAD_HOURS: i64 = 48;
 /// A nudge whose event has started this long ago is no longer worth showing.

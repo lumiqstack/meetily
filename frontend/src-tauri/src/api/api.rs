@@ -34,6 +34,8 @@ pub struct ApiResponse<T> {
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    /// When the meeting was recorded or imported (RFC 3339, UTC).
+    pub created_at: crate::database::models::DateTimeUtc,
     /// Has a transcript that live transcription finished writing.
     pub transcribed: bool,
     /// Has a completed AI summary.

@@ -51,7 +51,9 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
-    serverAddress
+    serverAddress,
+    missingFilter,
+    setMissingFilter,
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
@@ -60,7 +62,6 @@ const Sidebar: React.FC = () => {
   const { betaFeatures } = useConfig();
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
   const [searchQuery, setSearchQuery] = useState<string>('');
-  const [missingFilter, setMissingFilter] = useState<MeetingStage | null>(null);
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'ollama',

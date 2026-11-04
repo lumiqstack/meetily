@@ -181,6 +181,10 @@ impl<R: Runtime> CalendarManager<R> {
     }
 
     /// Events that have not ended, soonest first.
+    pub async fn all_events(&self) -> Vec<CalendarEvent> {
+        self.events.read().await.clone()
+    }
+
     pub async fn upcoming_events(&self) -> Vec<CalendarEvent> {
         let now = Utc::now();
         self.events
