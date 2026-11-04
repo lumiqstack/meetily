@@ -9,6 +9,7 @@ use super::common::{
 use super::constants::AUDIO_EXTENSIONS;
 use super::job_registry::{JobGuard, JobRegistry};
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use crate::diarization::{self, assign, SpeakerPiece, SpeakerSpan, TimedWord};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -200,6 +201,38 @@ async fn start_retranscription_with_guard<R: Runtime>(
     result
 }
 
+/// One transcribed VAD segment. `words` is present only when the engine reported token
+/// timing (Parakeet) and speakers were requested.
+struct TranscribedChunk {
+    text: String,
+    start_ms: f64,
+    end_ms: f64,
+    words: Option<Vec<TimedWord>>,
+}
+
+/// Attach speaker labels: word-timed chunks are split at speaker changes, text-only chunks
+/// take the speaker who dominates them. Labels are `Speaker N` by first appearance.
+fn attribute_speakers(
+    chunks: &[TranscribedChunk],
+    spans: &[SpeakerSpan],
+) -> Vec<(String, f64, f64, Option<String>)> {
+    let mut pieces: Vec<SpeakerPiece> = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        match chunk.words.as_deref() {
+            Some(words) if !words.is_empty() => {
+                pieces.extend(assign::split_words_by_speaker(words, spans, chunk.start_ms, chunk.end_ms));
+            }
+            _ => pieces.push(SpeakerPiece {
+                text: chunk.text.clone(),
+                start_ms: chunk.start_ms,
+                end_ms: chunk.end_ms,
+                speaker: assign::dominant_speaker(spans, chunk.start_ms, chunk.end_ms),
+            }),
+        }
+    }
+    assign::label_pieces(pieces)
+}
+
 /// Find audio file in meeting folder
 /// Tries common names first, then scans for any file with an audio extension
 fn find_audio_file(folder: &Path) -> Result<PathBuf> {
@@ -249,9 +282,18 @@ async fn run_retranscription<R: Runtime>(
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let use_remote = provider.as_deref().is_some_and(crate::config::is_remote_transcription_provider);
 
+    // Local speaker identification runs the diarizer over the recording after
+    // transcription. Remote providers that support it (Gemini) do it server-side.
+    let diarization_requested = diarization && !use_remote;
+    if diarization_requested && !diarization::engine::is_model_available() {
+        return Err(anyhow!(
+            "The speaker model is not downloaded. Download it from the retranscribe dialog first."
+        ));
+    }
+
     info!(
-        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}",
-        meeting_id, language, model, provider
+        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}, speakers {}",
+        meeting_id, language, model, provider, diarization_requested
     );
 
     // Gemini has its own batch strategy: it uploads the recording whole rather
@@ -337,9 +379,13 @@ async fn run_retranscription<R: Runtime>(
     let app_for_vad = app.clone();
     let meeting_id_for_vad = meeting_id.clone();
 
+    // Shared with the diarizer, which runs over the whole recording after transcription.
+    let audio_samples = Arc::new(audio_samples);
+    let audio_for_vad = Arc::clone(&audio_samples);
+
     let speech_segments = tokio::task::spawn_blocking(move || {
         get_speech_chunks_with_progress(
-            &audio_samples,
+            &audio_for_vad,
             VAD_REDEMPTION_TIME_MS,
             |vad_progress, segments_found| {
                 // Map VAD progress (0-100) to overall progress (20-25)
@@ -448,7 +494,7 @@ async fn run_retranscription<R: Runtime>(
     info!("Processing {} segments (after splitting)", processable_count);
 
     // Process each speech segment with progress updates
-    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
+    let mut all_transcripts: Vec<TranscribedChunk> = Vec::new();
     let mut total_confidence = 0.0f32;
 
     for (i, segment) in processable_segments.iter().enumerate() {
@@ -479,28 +525,38 @@ async fn run_retranscription<R: Runtime>(
             continue;
         }
 
-        // Transcribe this segment
-        let (text, conf) = if use_remote {
+        // Transcribe this segment. Parakeet also yields token start times, which let
+        // speaker attribution split the segment where the speaker changes; the other
+        // engines only give text, so they get one speaker per VAD segment.
+        let (text, conf, words) = if use_remote {
             let engine = remote_provider.as_ref().unwrap();
             let result = engine
                 .transcribe(segment.samples.clone(), language.clone())
                 .await
                 .map_err(|e| anyhow!("Remote transcription failed on segment {}: {}", i, e))?;
-            (result.text, result.confidence.unwrap_or(0.9))
+            (result.text, result.confidence.unwrap_or(0.9), None)
         } else if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
+            let result = engine
+                .transcribe_audio_timestamped(segment.samples.clone())
                 .await
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
+            let words = diarization_requested.then(|| {
+                assign::words_from_tokens(
+                    &result.tokens,
+                    &result.timestamps,
+                    segment.start_timestamp_ms,
+                    segment.end_timestamp_ms,
+                )
+            });
+            (result.text, 0.9f32, words)
         } else {
             let engine = whisper_engine.as_ref().unwrap();
             let (text, conf, _) = engine
                 .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
+            (text, conf, None)
         };
 
         // Skip empty transcripts
@@ -511,7 +567,12 @@ async fn run_retranscription<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            all_transcripts.push(TranscribedChunk {
+                text,
+                start_ms: segment.start_timestamp_ms,
+                end_ms: segment.end_timestamp_ms,
+                words,
+            });
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -535,8 +596,36 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
-    // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
+    let segments = if diarization_requested {
+        emit_progress(&app, &meeting_id, "diarizing", 80, "Identifying speakers...");
+        let app_for_diar = app.clone();
+        let meeting_for_diar = meeting_id.clone();
+        let spans = diarization::engine::diarize_recording(
+            Arc::clone(&audio_samples),
+            move |fraction| {
+                // 80% -> 92% overall
+                let overall = 80 + (fraction * 12.0) as u32;
+                emit_progress(
+                    &app_for_diar,
+                    &meeting_for_diar,
+                    "diarizing",
+                    overall,
+                    &format!("Identifying speakers... {}%", (fraction * 100.0) as u32),
+                );
+                !is_retranscription_cancelled(&meeting_for_diar)
+            },
+        )
+        .await?;
+        create_transcript_segments_with_speakers(attribute_speakers(&all_transcripts, &spans))
+    } else {
+        // Create transcript segments with proper timestamps from VAD
+        create_transcript_segments(
+            &all_transcripts
+                .iter()
+                .map(|c| (c.text.clone(), c.start_ms, c.end_ms))
+                .collect::<Vec<_>>(),
+        )
+    };
 
     persist_retranscription(
         &app,

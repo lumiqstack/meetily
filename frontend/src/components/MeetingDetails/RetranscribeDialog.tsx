@@ -23,6 +23,7 @@ import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { useDiarizationModel } from '@/hooks/useDiarizationModel';
 import Analytics from '@/lib/analytics';
 
 interface RetranscribeDialogProps {
@@ -97,6 +98,11 @@ export function RetranscribeDialog({
   const isParakeetModel = selectedModelDetails?.provider === 'parakeet';
   const isRemoteModel = isRemoteTranscriptionProvider(selectedModelDetails?.provider);
   const isGeminiModel = selectedModelDetails?.provider === 'geminiTranscribe';
+  // Local engines identify speakers with the on-device speaker model; Gemini does it server-side.
+  const isLocalModel = isParakeetModel || selectedModelDetails?.provider === 'whisper';
+  const canIdentifySpeakers = isGeminiModel || isLocalModel;
+  const speakerModel = useDiarizationModel(open && isLocalModel);
+  const localSpeakersBlocked = isLocalModel && diarization && !speakerModel.isAvailable;
 
   useEffect(() => {
     if (isParakeetModel && selectedLang !== 'auto') {
@@ -205,6 +211,10 @@ export function RetranscribeDialog({
       setError('Meeting folder path not available');
       return;
     }
+    if (localSpeakersBlocked) {
+      setError('Download the speaker model before identifying speakers, or untick "Identify speakers".');
+      return;
+    }
 
     setIsProcessing(true);
     setError(null);
@@ -224,7 +234,7 @@ export function RetranscribeDialog({
         language: languageToSend,
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
-        diarization: isGeminiModel ? diarization : false,
+        diarization: canIdentifySpeakers ? diarization : false,
       });
 
       if (isRemoteModel) {
@@ -357,7 +367,7 @@ export function RetranscribeDialog({
             )
           )}
 
-          {!isProcessing && !error && isGeminiModel && (
+          {!isProcessing && !error && canIdentifySpeakers && (
             <div className="space-y-2 rounded-md border border-gray-200 px-3 py-3">
               <label className="flex items-start gap-3 cursor-pointer">
                 <input
@@ -369,15 +379,60 @@ export function RetranscribeDialog({
                 <span>
                   <span className="text-sm font-medium">Identify speakers</span>
                   <span className="block text-xs text-muted-foreground">
-                    Labels each segment with a speaker. Speaker numbering may restart partway
-                    through recordings longer than 30 minutes.
+                    {isGeminiModel
+                      ? 'Labels each segment with a speaker. Speaker numbering may restart partway through recordings longer than 30 minutes.'
+                      : isParakeetModel
+                        ? 'Labels who said what, splitting a segment where the speaker changes. Runs on this computer; up to 8 speakers.'
+                        : 'Labels each segment with the speaker who said most of it. Runs on this computer; up to 8 speakers.'}
                   </span>
                 </span>
               </label>
-              <p className="text-xs text-muted-foreground">
-                The whole recording is uploaded in one request (two if it is longer than 30
-                minutes), rather than one request per segment.
-              </p>
+              {isGeminiModel ? (
+                <p className="text-xs text-muted-foreground">
+                  The whole recording is uploaded in one request (two if it is longer than 30
+                  minutes), rather than one request per segment.
+                </p>
+              ) : speakerModel.isDownloading ? (
+                <div className="space-y-1" data-testid="speaker-model-download">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Downloading speaker model…</span>
+                    <span>{speakerModel.downloadPercent ?? 0}%</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div
+                      className="bg-blue-600 h-2 rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${speakerModel.downloadPercent ?? 0}%` }}
+                    />
+                  </div>
+                  <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={speakerModel.cancelDownload}>
+                    Cancel download
+                  </Button>
+                </div>
+              ) : speakerModel.isAvailable ? (
+                <p className="text-xs text-muted-foreground">
+                  Speaker model installed (NVIDIA Nemotron-3 Diarization, {speakerModel.report?.size_mb ?? 402} MB).
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground">
+                    {speakerModel.report?.status === 'corrupted'
+                      ? 'The speaker model file is incomplete and needs to be downloaded again.'
+                      : 'The speaker model is a one-time download; it stays on this computer.'}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={speakerModel.download}
+                    disabled={speakerModel.report === null}
+                  >
+                    Download speaker model ({speakerModel.report?.size_mb ?? 402} MB)
+                  </Button>
+                  {speakerModel.error && (
+                    <p className="text-xs text-red-700">{speakerModel.error}</p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -441,7 +496,7 @@ export function RetranscribeDialog({
               <Button
                 onClick={handleStartRetranscription}
                 className="bg-blue-600 hover:bg-blue-700"
-                disabled={!meetingFolderPath}
+                disabled={!meetingFolderPath || localSpeakersBlocked}
               >
                 <RefreshCw className="h-4 w-4 mr-2" />
                 Start Retranscription
