@@ -419,15 +419,29 @@ export function RetranscribeDialog({
                       ? 'The speaker model file is incomplete and needs to be downloaded again.'
                       : 'The speaker model is a one-time download; it stays on this computer.'}
                   </p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-xs"
-                    onClick={speakerModel.download}
-                    disabled={speakerModel.report === null}
-                  >
-                    Download speaker model ({speakerModel.report?.size_mb ?? 402} MB)
-                  </Button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      onClick={speakerModel.download}
+                      disabled={speakerModel.report === null}
+                    >
+                      Download speaker model ({speakerModel.report?.size_mb ?? 402} MB)
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={speakerModel.openFolder}>
+                      Open model folder
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={speakerModel.refresh}>
+                      Check again
+                    </Button>
+                  </div>
+                  {speakerModel.report?.path && (
+                    <p className="text-xs text-muted-foreground break-all">
+                      If this computer cannot download it, copy the file to{' '}
+                      <code className="text-[11px]">{speakerModel.report.path}</code> and press Check again.
+                    </p>
+                  )}
                   {speakerModel.error && (
                     <p className="text-xs text-red-700">{speakerModel.error}</p>
                   )}

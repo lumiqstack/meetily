@@ -752,6 +752,7 @@ pub fn run() {
             diarization::commands::diarization_download_model,
             diarization::commands::diarization_cancel_download,
             diarization::commands::diarization_delete_model,
+            diarization::commands::diarization_open_model_folder,
             // Parallel processing commands
             whisper_engine::parallel_commands::initialize_parallel_processor,
             whisper_engine::parallel_commands::start_parallel_processing,

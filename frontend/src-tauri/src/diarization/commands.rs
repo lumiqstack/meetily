@@ -49,6 +49,26 @@ pub async fn diarization_cancel_download() -> Result<(), String> {
     Ok(())
 }
 
+/// Open the folder the speaker model is read from, creating it first, so the file can be
+/// put there by hand on a PC that cannot reach the download host.
+#[command]
+pub async fn diarization_open_model_folder() -> Result<(), String> {
+    let dir = engine::model_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
+    let folder = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let opener = "xdg-open";
+    std::process::Command::new(opener)
+        .arg(&folder)
+        .spawn()
+        .map_err(|e| format!("Failed to open {folder}: {e}"))?;
+    Ok(())
+}
+
 #[command]
 pub async fn diarization_delete_model() -> Result<ModelReport, String> {
     engine::delete_model().map_err(|e| e.to_string())?;

@@ -87,6 +87,14 @@ export function useDiarizationModel(active: boolean) {
     }
   }, []);
 
+  const openFolder = useCallback(async () => {
+    try {
+      await invoke('diarization_open_model_folder');
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }, []);
+
   return {
     report,
     isAvailable: report?.status === 'available',
@@ -96,5 +104,6 @@ export function useDiarizationModel(active: boolean) {
     refresh,
     download,
     cancelDownload,
+    openFolder,
   };
 }
