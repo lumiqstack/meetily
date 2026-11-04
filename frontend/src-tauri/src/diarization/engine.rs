@@ -24,8 +24,11 @@ pub const MODEL_NAME: &str = "nemotron-3-diarization";
 pub const MODEL_FILE: &str = "nemotron3_diar_v3.onnx";
 pub const MODEL_BYTES: u64 = 402_167_515;
 pub const MODEL_SIZE_MB: u32 = 402;
-/// Pinned revision of the parakeet-rs export of NVIDIA's checkpoint (OpenMDW-1.1).
-pub const MODEL_URL: &str = "https://huggingface.co/altunenes/parakeet-rs/resolve/664cc742197053fa11afd12f5100749fb8000181/nemotron-3-diarization/nemotron3_diar_v3.onnx";
+/// The parakeet-rs export of NVIDIA's checkpoint (OpenMDW-1.1), re-hosted on a Meetily
+/// release because corporate networks that block Hugging Face usually allow GitHub. The
+/// release notes name the pinned source revision and the file's SHA-256:
+/// https://github.com/lumiqstack/meetily/releases/tag/model-nemotron-3-diarization-v3
+pub const MODEL_URL: &str = "https://github.com/lumiqstack/meetily/releases/download/model-nemotron-3-diarization-v3/nemotron3_diar_v3.onnx";
 
 /// Two spans of the same speaker closer than this are one utterance split by a window edge.
 const MERGE_GAP_MS: f64 = 1.0;
