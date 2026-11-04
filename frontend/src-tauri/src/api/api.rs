@@ -8,7 +8,9 @@ use crate::{
     database::{
         models::{MeetingModel, PendingMeetingModel},
         repositories::{
-            meeting::MeetingsRepository, meeting_tags::MeetingTagsRepository,
+            meeting::MeetingsRepository,
+            meeting_calendar::{MeetingCalendar, MeetingCalendarRepository},
+            meeting_tags::MeetingTagsRepository,
             setting::SettingsRepository,
             transcript::TranscriptsRepository,
         },
@@ -178,6 +180,9 @@ pub struct MeetingMetadata {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_path: Option<String>,
+    /// The Outlook event the recording was matched to; `None` for most meetings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calendar: Option<MeetingCalendar>,
 }
 
 /// Paginated transcripts response with total count
@@ -982,12 +987,19 @@ pub async fn api_get_meeting_metadata<R: Runtime>(
     match MeetingsRepository::get_meeting_metadata(pool, &meeting_id).await {
         Ok(Some(meeting)) => {
             log_info!("Successfully retrieved meeting metadata {}", meeting_id);
+            let calendar = MeetingCalendarRepository::get(pool, &meeting_id)
+                .await
+                .unwrap_or_else(|e| {
+                    log_warn!("Calendar details unavailable for meeting {}: {}", meeting_id, e);
+                    None
+                });
             Ok(MeetingMetadata {
                 id: meeting.id,
                 title: meeting.title,
                 created_at: meeting.created_at.0.to_rfc3339(),
                 updated_at: meeting.updated_at.0.to_rfc3339(),
                 folder_path: meeting.folder_path,
+                calendar,
             })
         }
         Ok(None) => {
@@ -1132,6 +1144,7 @@ pub async fn api_save_meeting_title<R: Runtime>(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn api_save_transcript<R: Runtime>(
     app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
@@ -1140,6 +1153,7 @@ pub async fn api_save_transcript<R: Runtime>(
     folder_path: Option<String>,
     transcription_incomplete: Option<bool>,
     auth_token: Option<String>,
+    calendar_event: Option<crate::calendar::CalendarEvent>,
 ) -> Result<serde_json::Value, String> {
     let transcription_incomplete = transcription_incomplete.unwrap_or(false);
     log_info!(
@@ -1186,6 +1200,15 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            if let Some(event) = calendar_event.as_ref() {
+                // The meeting is saved either way; a failed attach only loses
+                // the calendar details.
+                if let Err(e) = MeetingCalendarRepository::attach(pool, &meeting_id, event).await {
+                    log_error!("Failed to attach calendar event to meeting {}: {}", meeting_id, e);
+                } else {
+                    log_info!("Attached calendar event {} to meeting {}", event.id, meeting_id);
+                }
+            }
             emit_meetings_changed(&app, &meeting_id);
             Ok(serde_json::json!({
                 "status": "success",

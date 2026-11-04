@@ -18,6 +18,10 @@ pub const LOOKBACK_HOURS: i64 = 1;
 pub const LOOKAHEAD_HOURS: i64 = 48;
 /// A nudge whose event has started this long ago is no longer worth showing.
 pub const NUDGE_GRACE_SECONDS: i64 = 120;
+/// A detected Teams call matches an event that started up to this long ago...
+pub const MATCH_AFTER_START_MINUTES: i64 = 20;
+/// ...or that starts up to this long from now (joined early).
+pub const MATCH_BEFORE_START_MINUTES: i64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

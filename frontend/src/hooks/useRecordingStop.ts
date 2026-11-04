@@ -7,6 +7,7 @@ import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
+import { takeActiveCalendarEvent } from '@/lib/calendar-handoff';
 import { transcriptService } from '@/services/transcriptService';
 import { describeIncompleteRecovery, postRecordingDestination, waitForLiveTranscription } from '@/lib/live-transcription-wait';
 import Analytics from '@/lib/analytics';
@@ -271,7 +272,8 @@ export function useRecordingStop(
             savedMeetingName || meetingTitle || 'New Meeting',  // PREFER savedMeetingName (backend source)
             freshTranscripts,
             folderPath,
-            transcriptionIncomplete
+            transcriptionIncomplete,
+            takeActiveCalendarEvent()
           );
 
           const meetingId = responseData.meeting_id;

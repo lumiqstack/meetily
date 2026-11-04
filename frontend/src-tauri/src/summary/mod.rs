@@ -45,6 +45,7 @@ pub struct CopilotCliConfig {
     pub github_token: Option<String>,
 }
 
+pub mod calendar_context;
 pub mod commands;
 pub mod copilot_cli;
 pub(crate) mod language_detection;

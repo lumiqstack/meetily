@@ -16,6 +16,19 @@ pub mod source;
 pub mod teams_link;
 pub mod types;
 
+use chrono::Utc;
+use tauri::{Manager, Runtime};
+
+/// The calendar event a Teams call detected right now belongs to, if the
+/// calendar manager is running and has one. Safe to call from any runtime:
+/// without the managed state (tests) it is `None`.
+pub async fn match_event_for_detected_call<R: Runtime>(app_handle: &tauri::AppHandle<R>) -> Option<CalendarEvent> {
+    let state = app_handle.try_state::<CalendarManagerState>()?;
+    let guard = state.read().await;
+    let manager = guard.as_ref()?;
+    manager.match_for_call(Utc::now()).await
+}
+
 pub use commands::CalendarManagerState;
-pub use manager::CalendarManager;
+pub use manager::{load_settings, CalendarManager};
 pub use types::{CalendarEvent, CalendarSettings, CalendarStatus};

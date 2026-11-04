@@ -4,6 +4,8 @@ import { Transcript, SummaryProvenance } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
 import { labelForCode } from '@/lib/summary-languages';
 import { Calendar, Clock, MessageSquare, Cpu, LayoutTemplate, Languages } from 'lucide-react';
+import { CalendarDetails } from '@/components/MeetingDetails/CalendarDetails';
+import type { MeetingCalendar } from '@/types/calendar';
 
 interface SummaryMetaHeaderProps {
   title: string;
@@ -16,6 +18,8 @@ interface SummaryMetaHeaderProps {
   /** Null for summaries generated before provenance was stamped. */
   provenance: SummaryProvenance | null;
   availableTemplates: Array<{ id: string; name: string; description: string }>;
+  /** Outlook event the recording was matched to; null for most meetings. */
+  calendar?: MeetingCalendar | null;
 }
 
 function formatCreatedAt(createdAt: string): string | null {
@@ -93,6 +97,7 @@ export function SummaryMetaHeader({
   transcripts,
   provenance,
   availableTemplates,
+  calendar = null,
 }: SummaryMetaHeaderProps) {
   const createdLabel = formatCreatedAt(createdAt);
   const durationSeconds = meetingDurationSeconds(transcripts);
@@ -144,6 +149,8 @@ export function SummaryMetaHeader({
 
         {languageLabel && <MetaItem icon={Languages}>{languageLabel}</MetaItem>}
       </div>
+
+      {calendar && <CalendarDetails calendar={calendar} />}
     </div>
   );
 }

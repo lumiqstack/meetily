@@ -6,7 +6,7 @@ import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { Switch } from './ui/switch';
 import { useConfig, CalendarSettings, DEFAULT_CALENDAR_SETTINGS } from '@/contexts/ConfigContext';
-import type { CalendarEvent } from '@/contexts/CalendarNudgeProvider';
+import type { CalendarEvent } from '@/types/calendar';
 import Analytics from '@/lib/analytics';
 
 // Mirrors calendar::types in the Rust core.

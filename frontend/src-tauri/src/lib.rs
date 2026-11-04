@@ -904,6 +904,7 @@ pub fn run() {
             calendar::commands::get_calendar_status,
             calendar::commands::get_upcoming_calendar_events,
             calendar::commands::refresh_calendar_now,
+            calendar::commands::open_teams_join_url,
             // System audio capture commands
             audio::system_audio_commands::start_system_audio_capture_command,
             audio::system_audio_commands::list_system_audio_devices_command,

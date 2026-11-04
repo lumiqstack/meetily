@@ -145,6 +145,8 @@ export interface MeetingMetadata {
   created_at: string;
   updated_at: string;
   folder_path?: string;
+  /** Outlook event the recording was matched to; absent for most meetings. */
+  calendar?: import('./calendar').MeetingCalendar;
 }
 
 export interface PaginatedTranscriptsResponse {

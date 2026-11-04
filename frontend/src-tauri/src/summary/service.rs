@@ -1,6 +1,8 @@
 use crate::database::repositories::{
-    meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
+    meeting::MeetingsRepository, meeting_calendar::MeetingCalendarRepository,
+    setting::SettingsRepository, summary::SummaryProcessesRepository,
 };
+use crate::summary::calendar_context::build_calendar_context;
 use crate::summary::llm_client::LLMProvider;
 use crate::summary::language_detection::detect_summary_language;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
@@ -386,6 +388,32 @@ impl SummaryService {
         }
     }
 
+    /// The `<calendar_context>` block for a meeting recorded against an
+    /// Outlook event; `None` for every other meeting or on any read failure.
+    async fn read_calendar_context(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
+        let calendar = match MeetingCalendarRepository::get(pool, meeting_id).await {
+            Ok(calendar) => calendar?,
+            Err(e) => {
+                warn!("Calendar details unavailable for meeting {}: {}", meeting_id, e);
+                return None;
+            }
+        };
+        let include_body = match crate::calendar::load_settings().await {
+            Ok(settings) => settings.include_body_in_summary,
+            Err(e) => {
+                warn!("Calendar settings unreadable, leaving the invitation body out: {}", e);
+                false
+            }
+        };
+        let title = MeetingsRepository::get_meeting_metadata(pool, meeting_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|meeting| meeting.title)
+            .unwrap_or_default();
+        build_calendar_context(&title, &calendar, include_body)
+    }
+
     pub(crate) fn detect_summary_language_from_text(text: &str) -> Option<String> {
         let transcript_texts = [text.to_string()];
         let detection = detect_summary_language(&transcript_texts);
@@ -610,9 +638,22 @@ impl SummaryService {
         };
         let template_fingerprint = template_cache_fingerprint(&template);
 
+        // Read at summary time so turning the body toggle off later stops the
+        // invitation text from being sent.
+        let calendar_context = Self::read_calendar_context(&pool, &meeting_id).await;
+        if calendar_context.is_some() {
+            info!("📅 Adding calendar context to the summary prompt for meeting_id: {}", meeting_id);
+        }
+        // The calendar block changes the prompt, so it is part of the cache key.
+        let prompt_context_for_cache = format!(
+            "{}{}",
+            custom_prompt,
+            calendar_context.as_deref().unwrap_or_default()
+        );
+
         let cache_source = build_summary_cache_source(
             &text,
-            &custom_prompt,
+            &prompt_context_for_cache,
             &template_id,
             &template_fingerprint,
             token_threshold,
@@ -660,6 +701,7 @@ impl SummaryService {
             &final_api_key,
             &text,
             &custom_prompt,
+            calendar_context.as_deref(),
             &template_id,
             &template,
             token_threshold,

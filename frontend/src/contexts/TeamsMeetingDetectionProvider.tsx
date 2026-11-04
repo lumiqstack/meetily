@@ -8,6 +8,12 @@ import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import Analytics from '@/lib/analytics';
+import {
+  stashCalendarEventForAutoStart,
+  startPromptTitle,
+  takeArmedJoin,
+} from '@/lib/calendar-handoff';
+import type { CalendarEvent } from '@/types/calendar';
 
 interface TeamsCallLikelyStartedPayload {
   type: string;
@@ -17,6 +23,8 @@ interface TeamsCallLikelyStartedPayload {
   poll_interval_seconds: number;
   /** Teams meeting window subject; null off Windows or when no meeting window is visible. */
   window_title: string | null;
+  /** Outlook event this call lines up with; null without the calendar or a match. */
+  calendar_event: CalendarEvent | null;
 }
 
 interface TeamsCallLikelyEndedPayload {
@@ -136,9 +144,23 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
 
     if (!settings?.meeting_detection_enabled || !settings.teams_prompt_start) return;
     if (currentRecordingState.isRecording || currentRecordingState.isStopping) return;
+
+    // "Join and record" from a calendar nudge: this call is the one the user
+    // asked to record, so start without a second prompt. The arm clears on
+    // read, so a later call is prompted as usual.
+    const armed = takeArmedJoin();
+    if (armed) {
+      Analytics.trackButtonClick('teams_detection_armed_start', 'teams_detection_prompt');
+      console.log('[TeamsMeetingDetection] Armed start for', armed.id);
+      stashCalendarEventForAutoStart({ ...armed, title: startPromptTitle(payload.window_title, armed) ?? armed.title });
+      window.location.assign('/');
+      return;
+    }
+
     if (isInCooldown(START_COOLDOWN_KEY)) return;
 
-    const meetingTitle = payload.window_title?.trim() || null;
+    const calendarEvent = payload.calendar_event ?? null;
+    const meetingTitle = startPromptTitle(payload.window_title, calendarEvent);
 
     let toastId: string | number;
     toastId = toast.info(meetingTitle ? `Teams call: ${meetingTitle}` : 'Teams appears to be in a call', {
@@ -150,12 +172,16 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
               onClick={() => {
                 toast.dismiss(toastId);
                 Analytics.trackButtonClick('teams_detection_start_recording', 'teams_detection_prompt');
-                if (meetingTitle) {
-                  sessionStorage.setItem('autoStartMeetingName', meetingTitle);
+                if (calendarEvent) {
+                  stashCalendarEventForAutoStart({ ...calendarEvent, title: meetingTitle ?? calendarEvent.title });
                 } else {
-                  sessionStorage.removeItem('autoStartMeetingName');
+                  if (meetingTitle) {
+                    sessionStorage.setItem('autoStartMeetingName', meetingTitle);
+                  } else {
+                    sessionStorage.removeItem('autoStartMeetingName');
+                  }
+                  sessionStorage.setItem('autoStartRecording', 'true');
                 }
-                sessionStorage.setItem('autoStartRecording', 'true');
                 window.location.assign('/');
               }}
               className="px-3 py-1.5 text-xs font-medium rounded bg-gray-900 text-white hover:bg-gray-800"
@@ -188,7 +214,10 @@ export function TeamsMeetingDetectionProvider({ children }: { children: React.Re
       duration: 15000,
     });
 
-    console.log('[TeamsMeetingDetection] Start prompt displayed', { meetingTitle });
+    console.log('[TeamsMeetingDetection] Start prompt displayed', {
+      meetingTitle,
+      calendarEventId: calendarEvent?.id ?? null,
+    });
   };
 
   const handleStopPrompt = (payload: TeamsCallLikelyEndedPayload) => {

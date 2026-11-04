@@ -139,6 +139,9 @@ dirs = "5.0.1"
 # Additional dependencies for notification system
 url = "2.5.0"
 
+# Opens a Teams join link in the default browser ("Join and record" in the
+# calendar nudge; docs/CALENDAR_MEETING_DETECTION_SPEC.md).
+open = "5"
 
 
 # System monitoring for resource management
