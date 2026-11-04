@@ -11,7 +11,8 @@ import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { usePermissionCheck } from '@/hooks/usePermissionCheck';
 import { ModalType } from '@/hooks/useModalState';
 import { useIsLinux } from '@/hooks/usePlatform';
-import { useMemo } from 'react';
+import { useMemo, type ReactNode } from 'react';
+import { HomeDashboard } from './HomeDashboard';
 
 /**
  * TranscriptPanel Component
@@ -25,12 +26,16 @@ interface TranscriptPanelProps {
   isProcessingStop: boolean;
   isStopping: boolean;
   showModal: (name: ModalType, message?: string) => void;
+  /** While idle the dashboard shows the start button in its hero card; null
+      once a recording is under way and the floating pill takes over. */
+  idleRecordingControls: ReactNode;
 }
 
 export function TranscriptPanel({
   isProcessingStop,
   isStopping,
-  showModal
+  showModal,
+  idleRecordingControls,
 }: TranscriptPanelProps) {
   // Contexts
   const { transcripts, transcriptContainerRef, copyTranscript, liveCaption } = useTranscripts();
@@ -51,6 +56,27 @@ export function TranscriptPanel({
     })),
     [transcripts]
   );
+
+  // Nothing recorded and nothing in flight: the home dashboard owns the panel.
+  const showDashboard = !isRecording && !isProcessingStop && !isStopping && transcripts.length === 0;
+
+  if (showDashboard) {
+    return (
+      <div ref={transcriptContainerRef} className="w-full border-r border-gray-200 bg-gray-50 flex flex-col overflow-hidden">
+        {!isChecking && !isLinux && (
+          <div className="flex-shrink-0 flex justify-center px-4 pt-4 empty:hidden">
+            <PermissionWarning
+              hasMicrophone={hasMicrophone}
+              hasSystemAudio={hasSystemAudio}
+              onRecheck={checkPermissions}
+              isRechecking={isChecking}
+            />
+          </div>
+        )}
+        <HomeDashboard recordingControls={idleRecordingControls} showModal={showModal} />
+      </div>
+    );
+  }
 
   return (
     <div ref={transcriptContainerRef} className="w-full border-r border-gray-200 bg-white flex flex-col overflow-hidden">

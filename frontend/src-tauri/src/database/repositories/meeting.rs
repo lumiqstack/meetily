@@ -42,7 +42,7 @@ const PENDING_MEETINGS_SQL: &str = r#"
 /// finished, so it agrees with [`PENDING_MEETINGS_SQL`] on what still needs
 /// transcribing.
 const MEETING_LIST_SQL: &str = r#"
-    SELECT m.id, m.title,
+    SELECT m.id, m.title, m.created_at,
            (m.transcription_incomplete = 0
             AND EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id)) AS transcribed,
            EXISTS (SELECT 1 FROM summary_processes sp
