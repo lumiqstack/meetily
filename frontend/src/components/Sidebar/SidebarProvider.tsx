@@ -6,7 +6,7 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
-import type { MeetingStages } from './meetingStages';
+import type { MeetingStage, MeetingStages } from './meetingStages';
 import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { errorMessage } from '@/lib/utils';
 
@@ -22,6 +22,8 @@ export interface SidebarItem extends Partial<MeetingStages> {
 export interface CurrentMeeting extends Partial<MeetingStages> {
   id: string;
   title: string;
+  /** RFC 3339; absent for the placeholder "+ New Call" row. */
+  createdAt?: string;
 }
 
 // Search result type for transcript search
@@ -68,7 +70,9 @@ interface SidebarContextType {
   stopSummaryPolling: (meetingId: string, processId?: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
-
+  /** The sidebar's "missing stage" chip; the home dashboard sets it too. */
+  missingFilter: MeetingStage | null;
+  setMissingFilter: (stage: MeetingStage | null) => void;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
@@ -91,6 +95,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [isSearching, setIsSearching] = useState(false);
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
+  const [missingFilter, setMissingFilter] = useState<MeetingStage | null>(null);
   const summaryPollsRef = React.useRef(new Map<string, SummaryPoll>());
 
   // Use recording state from RecordingStateContext (single source of truth)
@@ -107,11 +112,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       const requestId = ++meetingsRequestIdRef.current;
       try {
         const meetings = await invoke('api_get_meetings') as Array<{
-          id: string, title: string, transcribed: boolean, summarized: boolean, obsidian_exported: boolean
+          id: string, title: string, created_at: string,
+          transcribed: boolean, summarized: boolean, obsidian_exported: boolean
         }>;
         if (requestId !== meetingsRequestIdRef.current) return;
-        const transformedMeetings = meetings.map(({ obsidian_exported, ...meeting }) => ({
+        const transformedMeetings = meetings.map(({ obsidian_exported, created_at, ...meeting }) => ({
           ...meeting,
+          createdAt: created_at,
           obsidianExported: obsidian_exported,
         }));
         setMeetings(transformedMeetings);
@@ -364,6 +371,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     startSummaryPolling,
     stopSummaryPolling,
     refetchMeetings: fetchMeetings,
+    missingFilter,
+    setMissingFilter,
   }), [
     currentMeeting,
     setCurrentMeeting,
@@ -385,6 +394,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     startSummaryPolling,
     stopSummaryPolling,
     fetchMeetings,
+    missingFilter,
   ]);
 
   return (

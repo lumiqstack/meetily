@@ -46,6 +46,16 @@ pub async fn get_upcoming_calendar_events(state: State<'_, CalendarManagerState>
     Ok(manager.upcoming_events().await)
 }
 
+/// Every event the manager holds: the poll window reaches back over today
+/// and ahead two days, so this covers today's finished meetings as well as
+/// the upcoming ones. Soonest first.
+#[tauri::command]
+pub async fn get_calendar_events(state: State<'_, CalendarManagerState>) -> Result<Vec<CalendarEvent>, String> {
+    let guard = state.read().await;
+    let manager = guard.as_ref().ok_or_else(|| NOT_READY.to_string())?;
+    Ok(manager.all_events().await)
+}
+
 /// Hosts a Teams join link may point at. The command opens nothing else, so
 /// a stored event body cannot turn into an arbitrary URL launch.
 const TEAMS_HOSTS: [&str; 2] = ["teams.microsoft.com", "teams.live.com"];
