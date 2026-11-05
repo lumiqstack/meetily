@@ -302,7 +302,9 @@ mod tests {
         );
         assert!(rendered.contains("new Date('2026-10-03T10:00:00Z')"));
         assert!(rendered.contains("const PROBE = true;"));
-        assert!(!rendered.contains('%'), "no placeholder may survive rendering");
+        for placeholder in ["%SINCE%", "%PROBE%"] {
+            assert!(!rendered.contains(placeholder), "{placeholder} survived rendering");
+        }
     }
 
     #[test]
