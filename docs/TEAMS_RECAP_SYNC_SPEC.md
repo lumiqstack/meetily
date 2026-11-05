@@ -224,20 +224,21 @@ Three additions:
 
 ### Matching a recording to a live recording
 
-A recording found by the SharePoint scan is the same problem from the other
-side: nothing ties its file URL to a meeting Meetily recorded live, so it gets
-downloaded, transcribed and saved as a second meeting. This rule closes that for
-the automatic scan and marks the candidates in the import dialog. A pasted link
-is an explicit request to import that file, so it imports as before.
+Nothing ties the file URL of a recording found by the SharePoint scan to a meeting
+Meetily recorded live, so Meetily downloads it, transcribes it and saves a second
+meeting. This rule stops that in the automatic scan and marks the candidates in
+the import dialog. A pasted link is an explicit request to import that file, so it
+imports as before.
 
-**What attaching means.** The file is not downloaded or transcribed. The live
-meeting keeps its title, date, tags, transcript and summary, and gets a
+**What attaching means.** Meetily does not download or transcribe the file. The
+live meeting keeps its title, date, tags, transcript and summary, and gets a
 `meeting_sources` row with `import_source` `live-recording`, the file's URL and
-its stamp. The SharePoint ledger marks the file imported. A recap of the same
-file then attaches by identity. The cost is that Teams' own transcript of that
-meeting is never imported, and that a wrong match leaves a recording unimported.
-The note is not rewritten, because nothing it shows has changed; its front matter
-picks up the source at the next export.
+its stamp. A stamp marked `UTC` stays out of that row, because `recorded_at` means
+local time. The SharePoint ledger lists the file as imported, and a recap of the
+same file then attaches by identity. The cost is that Meetily never imports Teams'
+own transcript of that meeting, and that a wrong match leaves a recording
+unimported. Attaching does not rewrite the note, because nothing it shows has
+changed. Its front matter picks up the source at the next export.
 
 **A recording has less evidence than a recap.** It has no thread id in any field
 Meetily reads, so nothing can veto a meeting in the same slot, and tenant-wide
@@ -249,11 +250,11 @@ is stricter than the recap rule, and compares with the event's subject:
 - *Only Teams recordings qualify.* The file name must read
   `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-Meeting Recording|Transcript[ <part>].<ext>`.
   Other videos the search finds never match.
-- *When it happened.* Tried in this order, each only if the earlier ones fit no
-  live recording: a stamp marked `UTC`; SharePoint's `created`, which is an
-  instant; an unmarked stamp read in this machine's zone. The instant comes before
-  the unmarked stamp because most recordings live in colleagues' OneDrives, stamped
-  in their zones.
+- *When it happened.* The rule tries up to three times in order, each only if the
+  earlier ones fit no live recording. First a stamp marked `UTC`, then SharePoint's
+  `created`, which is an instant, then an unmarked stamp read in this machine's
+  zone. The instant comes before the unmarked stamp because most recordings are in
+  colleagues' OneDrives, stamped in their zones.
 - *The window.* The same 15 minute tolerance as the recap rule.
 - *Title.* The file name's title must equal `calendar_title`, on lowercase letters
   and digits only. One exception: a file title of at least 100 letters and digits
@@ -272,8 +273,8 @@ yet: no `recording_url`, or a recap link that names no file. A candidate that
 wins the match but has no transcript does not attach, because the recording may
 be the only record of what was said. It imports as its own meeting.
 
-**Already held.** A file is treated as imported when a `live-recording` row holds
-it or another part of it, whether the URL there came from this rule or from a
+**Already held.** A file counts as imported when a `live-recording` row holds it
+or another part of it, whether the URL there came from this rule or from a
 recap link's `fileUrl`. That covers the order live, recap, recording, and the second
 part of a long meeting. The live transcript covers every part, so no part is
 downloaded. Other import sources stay as they were: a recording imported through
@@ -291,19 +292,20 @@ A meeting has room for one URL. When a recap naming no file attaches to a meetin
 holding a recording, the recap link replaces the file's URL and the ledger keeps
 the file imported.
 
-**In the automatic scan.** Recordings are taken oldest first, and the match is
-decided again for each one, so a recording earlier in the same scan can claim a
-meeting. Attaching does not use one of the scan's import slots. It counts as a
-success for the watermark, so the watermark passes it. A file held through a recap
-is written to the ledger too, so deleting that meeting later does not bring the
-recording back. While a recording is in progress the scan imports nothing,
-whichever transcription provider is set, because the meeting being recorded has
-no row to match until it is saved.
+**In the automatic scan.** The scan takes recordings oldest first and decides again
+for each one, so a recording earlier in the same scan can claim a meeting, and
+another part of that recording then counts as held. Attaching does not use one of
+the scan's import slots. It counts as a success for the watermark, so the watermark
+passes it. A held file goes into the ledger too, so deleting that meeting later
+does not bring the recording back. While a recording is in progress the scan
+imports nothing, whichever transcription provider is set, because the meeting being
+recorded has no row to match until it is saved.
 
 **In the import dialog.** The scan reports the live meeting for each file a
 `live-recording` row holds and each file the rule would attach. Those files show
-`Recorded live` and start unticked. The dialog writes nothing unless the user acts:
-leaving one unticked changes nothing, and the next automatic scan attaches it.
+`Recorded live` and start unticked. Leaving one unticked writes nothing. A later
+automatic scan attaches it while the file is still inside the scan window, and
+otherwise its recap can still attach by the recap rule.
 
 **Undoing a wrong match.** Ticking such a file imports it as its own meeting. When
 that import lands, any `live-recording` row holding exactly that file gives it up,
@@ -312,9 +314,9 @@ so a later recap of the file follows the new meeting.
 **A recap can still refuse.** A recap that finds its file on a live meeting compares
 threads before attaching. If its thread id and the one in `calendar_join_url` are
 both known and differ, the recording rule attached that file to the wrong meeting.
-The live meeting gives up the key, keeps its summary, and the recap carries on as
-if identity had found nothing. The recording itself stays unimported until the user
-ticks it in the dialog. Without this, one wrong title match could replace the
+The live meeting gives up the key and keeps its summary, and the recap rule
+continues as if identity had found nothing. The recording itself stays unimported
+until the user ticks it in the dialog. Without this, one wrong title match could replace the
 meeting's summary, which is the mistake the recap rule exists to prevent.
 
 **What this rule does not cover.**

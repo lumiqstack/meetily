@@ -78,8 +78,42 @@ Record these from the calendar prompt with classic Outlook running, so the meeti
 - Record a meeting live and paste its recap link into the import dialog instead: the toast says `Copilot recap attached to` the meeting.
 - Record two occurrences of a recurring meeting live, then sync: each recap attaches to its own occurrence.
 - A recap whose meeting was recorded live under a different title (rename it in Meetily first) still attaches when the calendar event's join link and the recap share a thread id.
-- A `/meet/<code>` invitation or an Outlook event with no join link attaches when the titles agree.
+- A `/meet/<code>` invitation or an Outlook event with no join link attaches when the recap's title agrees with the event's subject, also after the summary has renamed the meeting.
 - Be double-booked: record meeting A live while meeting B runs in the same slot, and sync B's recap. If A's join link carries a thread id, B is a new meeting with no warning. If not, and the titles differ, B is a new meeting, and the toast says it may duplicate a live recording. Meeting A keeps its own summary in both cases.
 - Stop and restart the Meetily recording during one call, then sync: the recap is its own meeting, the toast says it may duplicate a live recording, and both parts are untouched.
 - Record a Teams call that has no calendar event, then sync: the recap is its own meeting, with no warning.
 - The log's line for a possible duplicate holds meeting ids only.
+
+## Recordings Of Live Meetings
+
+The build that brings this adds a migration, so follow `docs/windows/DATABASE_UPGRADE_CHECK.md` before its first launch. Set the SharePoint hub and leave automatic processing on, so a scan runs every 30 minutes. Record these from the calendar prompt with classic Outlook running, and have Teams record the same call. Wait for the file to appear on SharePoint before judging a scan.
+
+### Linking
+
+- Record a Teams meeting live, let Meetily summarize it so that its title changes, and wait for a scan. Nothing downloads, no new meeting appears, and the log says `linked a recording to live meeting`. The meeting keeps its title, date, tags, transcript and summary.
+- `sharepoint_sync.json` lists the file under `imported`. Later scans leave it alone, and the last sync date moves past it.
+- Scan in the import dialog's SharePoint tab: the file shows `Recorded live` and starts unticked.
+- Sync recaps, or paste the recap link: the recap attaches to the live meeting. Its note has `import_source: live-recording`, `recorded_at`, and the file's name and URL.
+- Have a colleague in another time zone record the Teams side, so that the stamp in the file name is not your local time. The file still links.
+- Record a meeting of more than 4 hours, so that Teams writes `…-Meeting Recording.mp4` and `…-Meeting Recording 2.mp4`. Neither downloads, and there is one meeting. Paste a recap that names the second part: it attaches to that meeting.
+
+### The Other Order
+
+- Record a meeting live and sync its recap before the file appears, so that the recap attaches first. When the file appears, a scan imports nothing and the file shows `Recorded live`.
+- Delete the live meeting after that scan. Later scans do not bring the recording back.
+
+### Staying Apart
+
+- Be double-booked: record meeting A live while someone records meeting B in the same slot. B imports as its own meeting, and the log's `may duplicate live meetings` line names A's id and no titles. A is untouched.
+- Stop and restart the Meetily recording during one call. The file imports as its own meeting, the same log line names both parts, and both parts are untouched.
+- Record a Teams call that has no calendar event. Its file imports as its own meeting, with no such log line.
+- Upload a video to a team site, titled like the subject of a meeting you recorded live, with a creation time in that slot. It imports as before, because its file name is not a Teams recording's.
+- Paste the link of a recording you recorded live into the import dialog. It imports as its own meeting: a pasted link is a request to import that file.
+
+### Undoing
+
+- Tick a `Recorded live` file in the dialog and import it. It becomes its own meeting with its own transcript, and the live meeting keeps everything it had. Paste that meeting's recap link: the toast names the new meeting, not the live one.
+
+### Timing
+
+- Choose a remote transcription provider, start a recording, and let a scan run while a new file waits on SharePoint. The scan imports nothing. After the recording is saved, the next scan links or imports the file.
