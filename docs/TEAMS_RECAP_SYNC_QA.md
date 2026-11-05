@@ -96,6 +96,7 @@ The build that brings this adds a migration, so follow `docs/windows/DATABASE_UP
 - Scan in the import dialog's SharePoint tab: the file shows `Recorded live` and starts unticked.
 - Sync recaps, or paste the recap link: the recap attaches to the live meeting. Its note has `import_source: live-recording`, `recorded_at`, and the file's name and URL.
 - Have a colleague in another time zone record the Teams side, so that the stamp in the file name is not your local time. The file still links.
+- Have a colleague whose Teams is in Spanish organize and record a meeting you record live, so that the file is `…-Grabación de la reunión.mp4`. The file still links, and its recap attaches to the same meeting.
 - Record a meeting of more than 4 hours, so that Teams writes `…-Meeting Recording.mp4` and `…-Meeting Recording 2.mp4`. Neither downloads, and there is one meeting. Paste a recap that names the second part: it attaches to that meeting.
 
 ### The Other Order
