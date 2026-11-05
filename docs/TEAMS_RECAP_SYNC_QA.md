@@ -37,6 +37,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Two occurrences of a recurring meeting are two meetings and two notes, each with its own date.
 - A row with no recap link counts as not ready and creates nothing.
 - The last sync date updates, and `Start from` disappears.
+- A sync that reads no recap at all (every row not ready or failed) leaves the last sync date and `Start from` as they were.
 
 ## Repeat Sync
 
@@ -60,7 +61,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 
 - Turn off the network during a sync: the recaps it reaches count as not ready or failed, and none of them is written. A failure toast names the first failed recap. Sync again with the network back: they import, and the others stay unchanged.
 - Point the vault at a missing folder and press `Sync Teams recaps`: the sync refuses before reading Teams, with the same message as the link import.
-- A recap with no AI notes yet counts as not ready on every sync until Teams finishes it, then counts as new.
+- A recap with no AI notes yet counts as not ready on every sync until Teams finishes it, then counts as new. No window appears for it, and it takes about a minute.
 - Delete an imported meeting in Meetily and sync: an unchanged recap stays skipped and does not bring the meeting back.
 
 ## Privacy And Diagnostics

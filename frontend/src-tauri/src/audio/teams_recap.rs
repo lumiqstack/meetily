@@ -115,6 +115,11 @@ pub struct TeamsRecap {
     pub markdown: String,
 }
 
+/// An unattended extraction found no AI summary in time. The recap sync reads
+/// this as "not ready", so keep the phrase `is_not_ready` looks for.
+pub(crate) const UNATTENDED_NO_SUMMARY: &str =
+    "Teams did not show an AI summary for this link within a minute.";
+
 pub fn validate_recap_url(input: &str) -> Result<Url> {
     if input.len() > 8_192 {
         return Err(anyhow!(
@@ -155,6 +160,8 @@ pub(crate) mod windows {
     };
 
     pub(crate) const SILENT_WAIT: Duration = Duration::from_secs(25);
+    /// All an unattended extraction gets, since nobody can help it along.
+    const UNATTENDED_WAIT: Duration = Duration::from_secs(60);
     pub(crate) const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
     pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -287,6 +294,7 @@ pub(crate) mod windows {
         source_url: &Url,
         navigation: &mut navigation::Navigation,
         started: tokio::time::Instant,
+        interactive: bool,
     ) -> Result<Option<TeamsRecap>> {
         let mut launcher_since = None;
         let mut tasks_since = None;
@@ -318,8 +326,10 @@ pub(crate) mod windows {
                             log::info!(
                                 "Teams recap: retrying original link after sign-in restored a chat"
                             );
-                            window.set_title("Teams recap — reopening requested meeting")?;
-                            window.show()?;
+                            if interactive {
+                                window.set_title("Teams recap — reopening requested meeting")?;
+                                window.show()?;
+                            }
                             window.navigate(source_url.clone())?;
                         }
                         navigation::Action::ReportWrongPage => {
@@ -363,7 +373,13 @@ pub(crate) mod windows {
         Ok(None)
     }
 
-    pub async fn extract<R: Runtime>(app: &AppHandle<R>, url: &Url) -> Result<TeamsRecap> {
+    /// `interactive` shows the window when the hidden phase finds nothing, so
+    /// the user can sign in. Without it the window stays hidden throughout.
+    pub async fn extract<R: Runtime>(
+        app: &AppHandle<R>,
+        url: &Url,
+        interactive: bool,
+    ) -> Result<TeamsRecap> {
         // The same lock and profile protect the existing SharePoint cookie
         // flow from a competing Teams window destroying its auth webview.
         let _auth_flow = super::super::sharepoint::AUTH_FLOW_LOCK.lock().await;
@@ -381,13 +397,19 @@ pub(crate) mod windows {
             window.navigate(url.clone())?;
             let started = tokio::time::Instant::now();
             let mut navigation = navigation::Navigation::default();
-            if let Some(recap) = poll(&window, started + SILENT_WAIT, url, &mut navigation, started).await? {
+            let hidden_wait = if interactive { SILENT_WAIT } else { UNATTENDED_WAIT };
+            if let Some(recap) =
+                poll(&window, started + hidden_wait, url, &mut navigation, started, interactive).await?
+            {
                 return Ok(recap);
+            }
+            if !interactive {
+                return Err(anyhow!(UNATTENDED_NO_SUMMARY));
             }
             window.set_title("Teams recap — sign in and open the requested AI summary")?;
             window.show()?;
             window.set_focus()?;
-            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, started)
+            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, started, true)
                 .await?
                 .ok_or_else(|| anyhow!(
                     "Teams did not show an AI summary for this link. Sign in if prompted, then check that the recap's AI summary tab is available."
@@ -399,18 +421,36 @@ pub(crate) mod windows {
     }
 }
 
+/// Read one recap the user asked for: the window appears if Teams needs them.
 pub async fn extract_teams_recap<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     source_url: &str,
 ) -> Result<TeamsRecap> {
+    extract(app, source_url, true).await
+}
+
+/// Read one recap of many, with nobody watching: no window, and at most a
+/// minute before it fails with [`UNATTENDED_NO_SUMMARY`].
+pub async fn extract_teams_recap_unattended<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    source_url: &str,
+) -> Result<TeamsRecap> {
+    extract(app, source_url, false).await
+}
+
+async fn extract<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    source_url: &str,
+    interactive: bool,
+) -> Result<TeamsRecap> {
     let url = validate_recap_url(source_url)?;
     #[cfg(target_os = "windows")]
     {
-        windows::extract(app, &url).await
+        windows::extract(app, &url, interactive).await
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, url);
+        let _ = (app, url, interactive);
         Err(anyhow!(
             "Automatic Teams recap extraction requires Meetily on Windows with WebView2."
         ))

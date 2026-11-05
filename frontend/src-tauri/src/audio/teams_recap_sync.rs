@@ -222,7 +222,9 @@ async fn import_candidate<R: Runtime>(
     let key = crate::audio::teams_recap::meeting_identity_key(source_url);
     let recording = crate::audio::teams_recap::recording_metadata(&validated);
 
-    let recap = match crate::audio::teams_recap::extract_teams_recap(app, source_url).await {
+    // The listing just proved sign-in, so no recap gets a window of its own: a
+    // list with ten unfinished recaps must not cost ten five-minute waits.
+    let recap = match crate::audio::teams_recap::extract_teams_recap_unattended(app, source_url).await {
         Ok(recap) => recap,
         Err(e) if is_not_ready(&e.to_string()) => return Outcome::NotReady,
         Err(e) => return Outcome::Failed(e.to_string()),
@@ -262,6 +264,13 @@ async fn import_candidate<R: Runtime>(
         warn!("[recap-sync] could not record recap import: {e}");
     }
     written_outcome(seen_before.is_some(), &persisted)
+}
+
+/// Whether the scan window may move on. A sync that read no recap learned
+/// nothing, and may have misread the list, so moving on could lose the rest of
+/// the first sync's backfill for good.
+fn read_any_recap(report: &RecapSyncReport) -> bool {
+    report.new + report.updated + report.skipped > 0
 }
 
 /// How a written recap counts: "updated" when it replaced something, whether an
@@ -338,7 +347,9 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     }
     let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
 
-    if let Err(e) = update_state(app, |state| state.last_sync_date = Some(started_at.to_rfc3339())) {
+    if !read_any_recap(&report) {
+        info!("[recap-sync] no recap was read, so the scan window stays where it was");
+    } else if let Err(e) = update_state(app, |state| state.last_sync_date = Some(started_at.to_rfc3339())) {
         warn!("[recap-sync] could not persist last sync date: {e}");
     }
     info!(
@@ -484,6 +495,23 @@ mod tests {
         assert!(is_not_ready("Teams did not show an AI summary for this link. Sign in if prompted."));
         assert!(!is_not_ready("WebView2 is unavailable: boom"));
         assert!(!is_not_ready("Teams stayed on its app-choice page."));
+        assert!(is_not_ready(crate::audio::teams_recap::UNATTENDED_NO_SUMMARY));
+    }
+
+    #[test]
+    fn the_scan_window_moves_only_when_a_recap_was_read() {
+        let mut report = RecapSyncReport { scanned: 40, not_ready: 40, ..Default::default() };
+        assert!(!read_any_recap(&report), "rows without a link prove nothing about the list");
+        report.failed.push(RecapSyncFailure { title: "T".into(), error: "boom".into() });
+        assert!(!read_any_recap(&report));
+        assert!(!read_any_recap(&RecapSyncReport::default()));
+        for read in [
+            RecapSyncReport { new: 1, ..Default::default() },
+            RecapSyncReport { updated: 1, ..Default::default() },
+            RecapSyncReport { skipped: 1, ..Default::default() },
+        ] {
+            assert!(read_any_recap(&read));
+        }
     }
 
     fn written(replaced_summary: bool, possible_duplicate: bool) -> crate::summary::commands::ImportedRecapFromLinkResponse {

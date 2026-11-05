@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-05. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI), 3 (Meet app scanner with its probe mode), 4 (QA checklist, `docs/TEAMS_RECAP_SYNC_QA.md`) and 5 (matching a recap to a live recording) merged; the selectors are still being learned on the Windows machine. Step 6 (matching a recording to a live recording) is in review.
+Status: 2026-11-05. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI) and 3 (Meet app scanner with its probe mode) merged; the selectors are still being learned on the Windows machine. Step 4 (QA checklist, `docs/TEAMS_RECAP_SYNC_QA.md`) and step 5 (matching a recap to a live recording) merged, neither yet exercised on Windows. Step 6 (matching a recording to a live recording) is in review.
 
 ## Goal
 
@@ -392,7 +392,9 @@ For each candidate, oldest first:
 2. Call `extract_teams_recap` with the candidate's link. Outcomes:
    - ready: continue.
    - not ready (no AI notes, or Teams still generating): count "not ready",
-     do not touch the store, continue.
+     do not touch the store, continue. The listing has just proved sign-in, so
+     no recap gets a window of its own: one that shows no AI notes within a
+     minute, hidden, counts as not ready.
    - error: count "failed" with the message, continue.
 3. Build the recap markdown exactly as the link import does, including the
    "Open original Teams recap" link.
@@ -412,7 +414,10 @@ For each candidate, oldest first:
 
 After the loop, `last_sync_date` becomes the sync start time. The next sync
 scans from `last_sync_date` minus 7 days, because a recap appears hours after
-a meeting and Teams may finish generating one days later.
+a meeting and Teams may finish generating one days later. A sync that read no
+recap at all (every row had no link, was not ready, or failed) leaves the date
+where it was: it learned nothing and may have misread the list, and moving on
+would lose the rest of the first sync's backfill.
 
 The whole loop holds a single `RECAP_SYNC_LOCK`; a second click while a sync
 runs returns "already running". The loop is resumable: a crash midway loses

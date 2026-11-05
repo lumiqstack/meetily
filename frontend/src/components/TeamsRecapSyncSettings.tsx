@@ -67,6 +67,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
   const [state, setState] = useState<TeamsRecapSyncStateView | null>(null);
   const [sinceDate, setSinceDate] = useState("");
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isChecking, setIsChecking] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
 
   const loadState = async () => {
@@ -90,6 +91,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
   }, []);
 
   const available = (state?.available ?? platform === 'windows') && vaultConfigured;
+  const busy = isSyncing || isChecking;
 
   const handleSinceDateBlur = async () => {
     if (sinceDate === (state?.sinceDate ?? "")) return;
@@ -127,7 +129,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
   };
 
   const handleCheckList = async () => {
-    setIsSyncing(true);
+    setIsChecking(true);
     try {
       const result = await invoke<RecapListDebug>('teams_recap_list_debug_command');
       const description = `${result.candidates.length} with a recap link, ${result.rowsWithoutLink} without. Details saved to ${result.probeFile}`;
@@ -139,7 +141,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
     } catch (error) {
       toast.error('Recap list check failed', { description: String(error) });
     } finally {
-      setIsSyncing(false);
+      setIsChecking(false);
     }
   };
 
@@ -169,7 +171,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
       <div className="flex items-center gap-3">
         <button
           onClick={handleSync}
-          disabled={!available || isSyncing}
+          disabled={!available || busy}
           className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-60"
         >
           <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
@@ -177,11 +179,11 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
         </button>
         <button
           onClick={handleCheckList}
-          disabled={!available || isSyncing}
+          disabled={!available || busy}
           title="Reads the recap list without importing anything and saves what the page showed next to Meetily's data"
           className="px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-60"
         >
-          Check recap list
+          {isChecking ? 'Checking...' : 'Check recap list'}
         </button>
         {isSyncing && progress && progress.total > 0 && (
           <span className="text-xs text-gray-600">
