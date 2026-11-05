@@ -27,7 +27,8 @@ pub struct LiveWindow {
 /// What a recap says about the meeting it belongs to.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecapFacts {
-    /// Every time the recap carries. A window fit on any of them counts.
+    /// The times the recap carries, most reliable first. A later one is tried
+    /// only when the earlier ones fit no live recording.
     pub times: Vec<DateTime<Utc>>,
     /// The title it was listed or pasted with, and the one in its file name.
     pub titles: Vec<String>,
@@ -63,13 +64,15 @@ impl RecapFacts {
         }
         titles.extend(file_title);
 
+        // Teams shows the row's time in this user's zone. The file stamp's zone
+        // is an assumption, so it comes second.
         let mut times = Vec::new();
-        times.extend(recorded_at.and_then(|stamp| stamp_to_instant(stamp, &Local)));
         times.extend(
             listed_start
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc)),
         );
+        times.extend(recorded_at.and_then(|stamp| stamp_to_instant(stamp, &Local)));
         Self {
             times,
             titles,
@@ -116,39 +119,45 @@ fn title_key(title: &str) -> String {
         .collect()
 }
 
-/// Equal, or one starts the other: long titles get truncated in file names,
-/// and people add to a meeting's title after the call.
-fn titles_agree(a: &str, b: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TitleAgreement {
+    None,
+    /// One starts the other: long titles get truncated in file names, and
+    /// people add to a meeting's title after the call.
+    Prefix,
+    Exact,
+}
+
+fn title_agreement(a: &str, b: &str) -> TitleAgreement {
     let (a, b) = (title_key(a), title_key(b));
     if a.is_empty() || b.is_empty() {
-        return false;
+        return TitleAgreement::None;
     }
-    let (short, long) = if a.chars().count() <= b.chars().count() {
+    if a == b {
+        return TitleAgreement::Exact;
+    }
+    let (short, long) = if a.chars().count() < b.chars().count() {
         (&a, &b)
     } else {
         (&b, &a)
     };
-    short == long
-        || (short.chars().count() >= MIN_TITLE_PREFIX_CHARS && long.starts_with(short.as_str()))
+    if short.chars().count() >= MIN_TITLE_PREFIX_CHARS && long.starts_with(short.as_str()) {
+        TitleAgreement::Prefix
+    } else {
+        TitleAgreement::None
+    }
 }
 
-/// Seconds outside the scheduled slot of the recap's closest time, when that
-/// is within the tolerance.
-fn window_fit(times: &[DateTime<Utc>], window: &LiveWindow) -> Option<i64> {
-    let tolerance = Duration::minutes(TOLERANCE_MINUTES).num_seconds();
-    times
-        .iter()
-        .map(|time| {
-            if *time < window.start {
-                (window.start - *time).num_seconds()
-            } else if *time > window.end {
-                (*time - window.end).num_seconds()
-            } else {
-                0
-            }
-        })
-        .min()
-        .filter(|distance| *distance <= tolerance)
+/// Seconds outside the scheduled slot, when that is within the tolerance.
+fn window_fit(time: DateTime<Utc>, window: &LiveWindow) -> Option<i64> {
+    let distance = if time < window.start {
+        (window.start - time).num_seconds()
+    } else if time > window.end {
+        (time - window.end).num_seconds()
+    } else {
+        0
+    };
+    (distance <= Duration::minutes(TOLERANCE_MINUTES).num_seconds()).then_some(distance)
 }
 
 /// The closest confirmed candidate, or every candidate tied for closest.
@@ -172,11 +181,21 @@ fn closest(candidates: Vec<(i64, &str)>) -> LiveMatch {
 /// title must confirm the meeting. Time alone never attaches, because
 /// double-booked meetings overlap by definition.
 pub fn match_live_meeting(recap: &RecapFacts, windows: &[LiveWindow]) -> LiveMatch {
+    recap
+        .times
+        .iter()
+        .map(|time| match_at_time(*time, recap, windows))
+        .find(|outcome| *outcome != LiveMatch::None)
+        .unwrap_or(LiveMatch::None)
+}
+
+fn match_at_time(time: DateTime<Utc>, recap: &RecapFacts, windows: &[LiveWindow]) -> LiveMatch {
     let mut by_thread = Vec::new();
-    let mut by_title = Vec::new();
+    let mut by_exact_title = Vec::new();
+    let mut by_title_prefix = Vec::new();
     let mut unconfirmed = Vec::new();
     for window in windows {
-        let Some(distance) = window_fit(&recap.times, window) else {
+        let Some(distance) = window_fit(time, window) else {
             continue;
         };
         let entry = (distance, window.meeting_id.as_str());
@@ -185,16 +204,29 @@ pub fn match_live_meeting(recap: &RecapFacts, windows: &[LiveWindow]) -> LiveMat
             (Some(ours), Some(theirs)) if ours == theirs => by_thread.push(entry),
             // Both know their thread and they differ: another meeting.
             (Some(_), Some(_)) => {}
-            _ if recap.titles.iter().any(|title| titles_agree(title, &window.title)) => {
-                by_title.push(entry)
+            _ => {
+                let agreement = recap
+                    .titles
+                    .iter()
+                    .map(|title| title_agreement(title, &window.title))
+                    .max()
+                    .unwrap_or(TitleAgreement::None);
+                match agreement {
+                    TitleAgreement::Exact => by_exact_title.push(entry),
+                    TitleAgreement::Prefix => by_title_prefix.push(entry),
+                    TitleAgreement::None => unconfirmed.push(entry),
+                }
             }
-            _ => unconfirmed.push(entry),
         }
     }
+    // Strongest evidence first. A closer slot never outranks a better match:
+    // "Weekly sync" must not take the recap of "Weekly sync with vendors".
     if !by_thread.is_empty() {
         closest(by_thread)
-    } else if !by_title.is_empty() {
-        closest(by_title)
+    } else if !by_exact_title.is_empty() {
+        closest(by_exact_title)
+    } else if !by_title_prefix.is_empty() {
+        closest(by_title_prefix)
     } else if unconfirmed.is_empty() {
         LiveMatch::None
     } else {
@@ -323,11 +355,25 @@ mod tests {
     }
 
     #[test]
-    fn a_double_booked_slot_with_no_evidence_stays_ambiguous() {
+    fn a_fitting_window_with_no_evidence_stays_ambiguous() {
+        // The recap may belong to a meeting double-booked over this one.
         let windows = [window("m1", "Budget review", (10, 0), (11, 0), None)];
         assert_eq!(
             match_live_meeting(&recap(at(10, 31), "Vendor call", Some(THREAD_A)), &windows),
             LiveMatch::Ambiguous(vec!["m1".into()])
+        );
+    }
+
+    #[test]
+    fn a_double_booked_slot_goes_to_the_meeting_the_evidence_names() {
+        let windows = [
+            window("budget", "Budget review", (10, 0), (11, 0), None),
+            window("vendor", "Vendor call", (10, 30), (11, 0), None),
+            window("other-thread", "Vendor call", (10, 30), (11, 0), Some(JOIN_B)),
+        ];
+        assert_eq!(
+            match_live_meeting(&recap(at(10, 31), "Vendor call", Some(THREAD_A)), &windows),
+            attach("vendor")
         );
     }
 
@@ -354,6 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_title_beats_a_closer_prefix() {
+        // People join a minute early, so the recording of the second meeting
+        // starts inside the first one's slot.
+        let windows = [
+            window("first", "Weekly sync", (10, 0), (10, 30), None),
+            window("second", "Weekly sync with vendors", (10, 30), (11, 0), None),
+        ];
+        assert_eq!(
+            match_live_meeting(&recap(at(10, 29), "Weekly sync with vendors", None), &windows),
+            attach("second")
+        );
+        assert_eq!(
+            match_live_meeting(&recap(at(10, 31), "Weekly sync", None), &windows),
+            attach("first")
+        );
+    }
+
+    #[test]
     fn a_thread_match_beats_a_closer_title_match() {
         let windows = [
             window("by-title", "Weekly sync", (10, 0), (10, 30), None),
@@ -366,15 +430,21 @@ mod tests {
     }
 
     #[test]
-    fn any_of_the_recaps_times_may_fit() {
-        // The file stamp was in another zone; the Meet app row's time fits.
-        let windows = [window("m1", "Weekly sync", (10, 0), (10, 30), Some(JOIN_A))];
-        let facts = RecapFacts {
-            times: vec![at(17, 2), at(10, 1)],
+    fn a_later_time_is_tried_only_when_the_earlier_fits_nothing() {
+        let windows = [
+            window("morning", "Weekly sync", (10, 0), (10, 30), Some(JOIN_A)),
+            window("afternoon", "Weekly sync", (17, 0), (17, 30), Some(JOIN_A)),
+        ];
+        let facts = |times| RecapFacts {
+            times,
             titles: vec!["Weekly sync".into()],
             thread_id: Some(THREAD_A.into()),
         };
-        assert_eq!(match_live_meeting(&facts, &windows), attach("m1"));
+        // The row says morning; a stamp in another zone must not win with its
+        // exact fit on the afternoon occurrence.
+        assert_eq!(match_live_meeting(&facts(vec![at(10, 20), at(17, 2)]), &windows), attach("morning"));
+        // The row showed only a date, which parses to midnight: the stamp decides.
+        assert_eq!(match_live_meeting(&facts(vec![at(0, 0), at(17, 2)]), &windows), attach("afternoon"));
     }
 
     #[test]
@@ -429,7 +499,7 @@ mod tests {
         assert_eq!(facts.thread_id.as_deref(), Some(THREAD_A));
         assert_eq!(facts.titles, vec!["Weekly sync (renamed)", "Weekly sync"]);
         assert_eq!(facts.times.len(), 2);
-        assert_eq!(facts.times[1], at(10, 0));
+        assert_eq!(facts.times[0], at(10, 0), "the row's time comes first");
 
         let bare = RecapFacts::from_link(
             "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax",

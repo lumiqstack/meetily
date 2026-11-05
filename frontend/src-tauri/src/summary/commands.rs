@@ -320,22 +320,24 @@ async fn find_recap_target(
     }
 }
 
-/// Put the recap's key on the live recording it attached to, so the next
-/// import of this recap finds the meeting by identity. A failure only means
-/// the next import decides by the calendar window again, so it is logged.
+/// Put the recap's key on the live recording it is about to attach to, so the
+/// next import of this recap finds the meeting by identity and no other recap
+/// can claim it. Done before the summary is replaced: without the key, a second
+/// recording's recap could overwrite this one.
 async fn claim_live_meeting(
     pool: &sqlx::SqlitePool,
     meeting: &MeetingModel,
     source_url: &str,
     recorded_at: Option<&str>,
-) {
+) -> Result<(), String> {
     let mut source = MeetingSource::for_import(LIVE_RECORDING_SOURCE, &meeting.title, Some(source_url), None, None);
     if recorded_at.is_some() {
         source.recorded_at = recorded_at.map(str::to_owned);
     }
-    if let Err(e) = source.insert(pool, &meeting.id).await {
-        log_warn!("Failed to record the recap's source on live meeting {}: {}", meeting.id, e);
-    }
+    source
+        .insert(pool, &meeting.id)
+        .await
+        .map_err(|e| format!("Failed to link the recap to live meeting {}: {e}", meeting.id))
 }
 
 /// Store an extracted recap and write its vault note. The recap joins the
@@ -404,14 +406,14 @@ pub(crate) async fn persist_recap_from_link<R: Runtime>(
         .await
         .map_err(|e| format!("Failed to read the summary of meeting {}: {e}", meeting.id))?
         .is_some_and(|row| row.result.is_some());
+    if live {
+        claim_live_meeting(pool, &meeting, source_url, recorded_at).await?;
+    }
     let attached = SummaryProcessesRepository::attach_imported_summary(pool, &meeting.id, &summary)
         .await
         .map_err(|e| format!("Failed to attach the recap to meeting {}: {e}", meeting.id))?;
     if !attached {
         return Err(format!("Meeting {} no longer exists.", meeting.id));
-    }
-    if live {
-        claim_live_meeting(pool, &meeting, source_url, recorded_at).await;
     }
     log_info!(
         "Attached Microsoft Copilot recap to existing meeting {} ({})",
@@ -1176,8 +1178,8 @@ mod recap_target_tests {
 
         // What the attach path does to it.
         let recap = imported_recap_summary("- recap", Some(RECAP), Some("2026-11-03T04:02:00")).unwrap();
+        claim_live_meeting(&pool, &meeting, RECAP, Some("2026-11-03T04:02:00")).await.unwrap();
         assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "live", &recap).await.unwrap());
-        claim_live_meeting(&pool, &meeting, RECAP, Some("2026-11-03T04:02:00")).await;
 
         let source = MeetingSource::get(&pool, "live").await.unwrap().unwrap();
         assert_eq!(source.import_source, LIVE_RECORDING_SOURCE);

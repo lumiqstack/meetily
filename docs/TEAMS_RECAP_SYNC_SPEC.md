@@ -122,11 +122,13 @@ The rule runs only when the identity lookup finds nothing. Identity stays first
 because it is exact, and the rule writes the recap's key onto the meeting it
 attaches to, so every later import of that recap goes straight there.
 
-**When the recap happened.** A recap can carry two times, and either may fit:
+**When the recap happened.** A recap can carry two times. They are tried in
+this order, and the second only if the first fits no live recording:
 
+- In the sync loop, the start time the Meet app row shows, which Teams renders
+  in this user's zone.
 - The stamp in the `fileUrl` file name, which is when the recording started,
   read in this machine's time zone (`teams_recap_metadata.rs`).
-- In the sync loop, the start time the Meet app row shows.
 
 A recap with neither, such as a pasted link without `fileUrl`, is not matched.
 
@@ -151,12 +153,14 @@ a fitting candidate also needs evidence that it is the same meeting:
   `/meet/<code>` join link or an Outlook event with no join link. The recap's
   title (the row's or the pasted one) and the title in its file name are each
   compared with the meeting's title, on lowercase letters and digits only,
-  because Teams drops punctuation from file names. They agree when equal, or
-  when one is a prefix of the other of at least 8 characters, because long
-  titles get truncated and users add to them.
+  because Teams drops punctuation from file names. They agree exactly when
+  equal, and weakly when one is a prefix of the other of at least 8 characters,
+  because long titles get truncated and users add to them.
 
-**Deciding.** Thread-confirmed candidates are considered first, then
-title-confirmed ones.
+**Deciding.** Stronger evidence is considered first: thread id, then an exact
+title, then a prefix. A closer slot never outranks better evidence, so "Weekly
+sync" cannot take the recap of "Weekly sync with vendors" recorded a minute
+before its slot ended.
 
 | What is left | Outcome |
 | --- | --- |
@@ -185,10 +189,12 @@ Three additions:
 
 - A `meeting_sources` row with `import_source` `live-recording`, `recording_url`
   from the recap link and `recorded_at` from the stamp. This is what makes the
-  next import an identity hit.
+  next import an identity hit. It is written before the summary is replaced, and
+  if it cannot be written nothing is attached, so a meeting never holds a recap
+  without its key.
 - The summary the recap replaces stays in `summary_processes.result_backup`
-  unless it is itself a recap, so a wrong attach can be recovered by hand.
-  Nothing in the UI shows it yet.
+  unless it is itself a recap, so a wrong attach can be recovered by hand. Nothing
+  in the UI shows it yet, and regenerating the meeting's summary overwrites it.
 - In the sync report the attach counts as "updated" if the meeting already had
   a summary, otherwise "new".
 
@@ -390,9 +396,11 @@ probe file described above, on that machine only.
   sync until the overlap window passes them.
 - Whether the stamp in a recording's file name is always this machine's local
   time. `teams_recap_metadata.rs` assumes so, but a recording started by someone
-  in another zone may carry theirs. A wrong reading misses the window and costs
-  a second meeting, not a wrong attach. The probe's rows show a stamp beside the
-  time the Meet app displays, which will settle it.
+  in another zone may carry theirs. A wrong reading usually misses the window
+  and costs a second meeting. On a pasted link, with no row time to try first, it
+  can reach a wrong attach only if a meeting sharing the thread or title was
+  recorded live at that wrong hour. The probe's rows show a stamp beside the time
+  the Meet app displays, which will settle it.
 - How many rows the Meet app keeps. Microsoft's admin documentation for the
   Meeting Recaps app says it shows recaps from the previous 30 days, which
   matches the default backfill; to be confirmed on the real list. If it is
