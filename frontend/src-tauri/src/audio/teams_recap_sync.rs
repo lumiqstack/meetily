@@ -88,6 +88,9 @@ pub struct RecapSyncReport {
     pub skipped: usize,
     pub not_ready: usize,
     pub failed: Vec<RecapSyncFailure>,
+    /// Titles of recaps imported as their own meeting although a live
+    /// recording overlaps them in time without being confirmed as the same.
+    pub possible_duplicates: Vec<String>,
     pub meetings_folder: String,
 }
 
@@ -101,7 +104,7 @@ struct SyncProgress<'a> {
 
 #[derive(Debug, PartialEq)]
 enum Outcome {
-    New,
+    New { possible_duplicate: bool },
     Updated,
     Skipped,
     NotReady,
@@ -237,6 +240,7 @@ async fn import_candidate<R: Runtime>(
         candidate.title.clone(),
         source_url,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
+        candidate.started_at.as_deref(),
         &markdown,
     )
     .await
@@ -257,10 +261,10 @@ async fn import_candidate<R: Runtime>(
     }) {
         warn!("[recap-sync] could not record recap import: {e}");
     }
-    if seen_before.is_some() {
+    if seen_before.is_some() || persisted.replaced_summary {
         Outcome::Updated
     } else {
-        Outcome::New
+        Outcome::New { possible_duplicate: persisted.possible_duplicate }
     }
 }
 
@@ -301,7 +305,12 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
             SyncProgress { done, total, current_title: &candidate.title },
         );
         match import_candidate(app, pool, &state.imported, candidate).await {
-            Outcome::New => report.new += 1,
+            Outcome::New { possible_duplicate } => {
+                report.new += 1;
+                if possible_duplicate {
+                    report.possible_duplicates.push(candidate.title.clone());
+                }
+            }
             Outcome::Updated => report.updated += 1,
             Outcome::Skipped => report.skipped += 1,
             Outcome::NotReady => report.not_ready += 1,

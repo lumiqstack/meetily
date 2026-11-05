@@ -1,11 +1,17 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, SqlitePool};
 
+/// `import_source` of a meeting Meetily recorded live and later matched to its
+/// Teams recap. The row carries the recap's link so the next import of that
+/// recap finds this meeting by identity.
+pub const LIVE_RECORDING_SOURCE: &str = "live-recording";
+
 /// Where an imported meeting came from. Written once when the import
 /// creates the meeting; read when exporting its Obsidian note.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct MeetingSource {
-    /// `sharepoint`, `url`, `teams-transcript`, `copilot-recap` or `file`.
+    /// `sharepoint`, `url`, `teams-transcript`, `copilot-recap` or `file`, or
+    /// [`LIVE_RECORDING_SOURCE`] for a live recording a recap attached to.
     pub import_source: String,
     pub recording_url: Option<String>,
     pub recording_file: Option<String>,

@@ -67,3 +67,19 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 
 - The log's `[recap-list]` and `[recap-sync]` lines hold states, counts, and meeting titles or error messages on failures. They never hold recap text or recap links.
 - `teams_recap_sync.json` holds the since date, the last sync date, and for each recap its key, meeting id, time and content hash. It holds no recap text.
+
+## Live Recordings
+
+Record these from the calendar prompt with classic Outlook running, so the meeting stores its calendar event. Wait for Teams to publish each recap before syncing.
+
+- Record a Teams meeting live, let Meetily summarize it, then sync recaps: its recap attaches. One meeting, one note at the same file name, transcript, title and tags kept, recap as the summary, and the sync counts it as updated, not new.
+- The note's front matter now has `import_source: live-recording` and `recorded_at`.
+- Sync again: unchanged. Edit the recap in Teams and sync: updated, on the same meeting.
+- Record a meeting live and paste its recap link into the import dialog instead: the toast says `Copilot recap attached to` the meeting.
+- Record two occurrences of a recurring meeting live, then sync: each recap attaches to its own occurrence.
+- A recap whose meeting was recorded live under a different title (rename it in Meetily first) still attaches when the calendar event's join link and the recap share a thread id.
+- A `/meet/<code>` invitation or an Outlook event with no join link attaches when the titles agree.
+- Be double-booked: record meeting A live while meeting B runs in the same slot, and sync B's recap. If A's join link carries a thread id, B is a new meeting with no warning. If not, and the titles differ, B is a new meeting, and the toast says it may duplicate a live recording. Meeting A keeps its own summary in both cases.
+- Stop and restart the Meetily recording during one call, then sync: the recap is its own meeting, the toast says it may duplicate a live recording, and both parts are untouched.
+- Record a Teams call that has no calendar event, then sync: the recap is its own meeting, with no warning.
+- The log's line for a possible duplicate holds meeting ids only.

@@ -136,8 +136,10 @@ impl SummaryProcessesRepository {
 
     /// Store an imported recap as the completed summary of an existing
     /// meeting, whether or not it was ever summarized. A row in progress is
-    /// replaced too: the recap is the summary the user asked for. Returns
-    /// false when the meeting does not exist.
+    /// replaced too: the recap is the summary the user asked for. The summary
+    /// it replaces stays in `result_backup` unless that is itself a recap, so
+    /// repeated recap updates keep the meeting's own summary recoverable.
+    /// Returns false when the meeting does not exist.
     pub async fn attach_imported_summary(
         pool: &SqlitePool,
         meeting_id: &str,
@@ -174,8 +176,16 @@ impl SummaryProcessesRepository {
                 end_time = excluded.end_time,
                 result = excluded.result,
                 error = NULL,
-                result_backup = NULL,
-                result_backup_timestamp = NULL,
+                result_backup = CASE
+                    WHEN INSTR(COALESCE(summary_processes.result, ''), '"imported_from":"microsoft_copilot_recap"') > 0
+                        THEN summary_processes.result_backup
+                    ELSE COALESCE(summary_processes.result, summary_processes.result_backup)
+                END,
+                result_backup_timestamp = CASE
+                    WHEN INSTR(COALESCE(summary_processes.result, ''), '"imported_from":"microsoft_copilot_recap"') > 0
+                        THEN summary_processes.result_backup_timestamp
+                    ELSE excluded.updated_at
+                END,
                 metadata = excluded.metadata
             "#,
         )
@@ -417,9 +427,41 @@ mod tests {
         let row = SummaryProcessesRepository::get_summary_data(&pool, "m1").await.unwrap().unwrap();
         assert_eq!(row.status, "completed");
         assert!(row.result.unwrap().contains("second"));
-        assert!(row.result_backup.is_none());
 
         assert!(!SummaryProcessesRepository::attach_imported_summary(&pool, "missing", &again).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn attaching_a_recap_keeps_the_meetings_own_summary_recoverable() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('m1', 'T', '2026-07-21T15:00:00Z', '2026-07-21T15:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let recap = |text: &str| json!({"markdown": text, "imported_from": "microsoft_copilot_recap"});
+
+        // No summary yet: nothing to keep.
+        assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "m1", &recap("- first recap")).await.unwrap());
+        let row = SummaryProcessesRepository::get_summary_data(&pool, "m1").await.unwrap().unwrap();
+        assert!(row.result_backup.is_none());
+        sqlx::query("DELETE FROM summary_processes WHERE meeting_id = 'm1'").execute(&pool).await.unwrap();
+
+        // The meeting's own summary moves aside for the recap.
+        SummaryProcessesRepository::create_or_reset_process(&pool, "m1", Utc::now()).await.unwrap();
+        SummaryProcessesRepository::update_meeting_summary(&pool, "m1", &json!({"markdown": "- from Meetily"}))
+            .await
+            .unwrap();
+        assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "m1", &recap("- recap")).await.unwrap());
+        let row = SummaryProcessesRepository::get_summary_data(&pool, "m1").await.unwrap().unwrap();
+        assert!(row.result.unwrap().contains("- recap"));
+        assert!(row.result_backup.unwrap().contains("from Meetily"));
+        assert!(row.result_backup_timestamp.is_some());
+
+        // A changed recap replaces the recap and leaves the kept summary alone.
+        assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "m1", &recap("- changed recap")).await.unwrap());
+        let row = SummaryProcessesRepository::get_summary_data(&pool, "m1").await.unwrap().unwrap();
+        assert!(row.result.unwrap().contains("changed recap"));
+        assert!(row.result_backup.unwrap().contains("from Meetily"));
     }
 
     #[tokio::test]
