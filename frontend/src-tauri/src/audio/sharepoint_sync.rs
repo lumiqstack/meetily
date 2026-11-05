@@ -1343,11 +1343,7 @@ pub(crate) fn merge_scan_results(
         if !seen.insert(file_url_key(&recording.file_url)) {
             continue; // own-folder hit already covers this file
         }
-        let live_meeting_id = live_keys
-            .get(super::teams_recap::whole_recording_key(
-                &super::teams_recap::meeting_identity_key(&recording.file_url),
-            ))
-            .cloned();
+        let live_meeting_id = live_keys.get(&MeetingSource::live_key(&recording.file_url)).cloned();
         let already_imported = live_meeting_id.is_some()
             || imported.contains(&file_url_key(&recording.file_url))
             || titles.contains(&title_stem(&recording.name));
@@ -1492,7 +1488,9 @@ pub async fn scan_recordings<R: Runtime>(
     if let Some(pool) = pool {
         for item in recordings.iter_mut().filter(|item| !item.already_imported) {
             match find_recording_target(pool, &item.recording.file_url, &item.recording.created).await {
-                Ok(RecordingTarget::Live(meeting_id)) => item.live_meeting_id = Some(meeting_id),
+                Ok(RecordingTarget::Held(meeting_id) | RecordingTarget::Live(meeting_id)) => {
+                    item.live_meeting_id = Some(meeting_id)
+                }
                 Ok(RecordingTarget::New { .. }) => {}
                 Err(e) => warn!("[sp-scan] Could not match a recording to a live meeting: {e}"),
             }

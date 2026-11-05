@@ -102,18 +102,20 @@ impl MeetingSource {
             .map(|(meeting_id, _)| meeting_id.clone()))
     }
 
-    /// Whole-recording keys held by live meetings, each with its meeting. The
-    /// live transcript covers every part of a recording, so a file whose key is
-    /// here need not be downloaded.
+    /// Whole-recording keys held by live meetings, each with its meeting, for
+    /// looking up [`Self::live_key`]. The live transcript covers every part of a
+    /// recording, so a file whose key is here need not be downloaded.
     pub async fn live_recording_keys(pool: &SqlitePool) -> Result<HashMap<String, String>, sqlx::Error> {
         Ok(Self::live_recording_links(pool)
             .await?
             .into_iter()
-            .map(|(meeting_id, url)| {
-                let key = whole_recording_key(&meeting_identity_key(&url)).to_owned();
-                (key, meeting_id)
-            })
+            .map(|(meeting_id, url)| (Self::live_key(&url), meeting_id))
             .collect())
+    }
+
+    /// The key a link goes by in [`Self::live_recording_keys`].
+    pub fn live_key(link: &str) -> String {
+        whole_recording_key(&meeting_identity_key(link)).to_owned()
     }
 
     async fn live_recording_links(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
@@ -362,7 +364,7 @@ mod tests {
 
         let keys = MeetingSource::live_recording_keys(&pool).await.unwrap();
         assert_eq!(keys.len(), 1);
-        let key = |url: &str| whole_recording_key(&meeting_identity_key(url)).to_owned();
+        let key = MeetingSource::live_key;
         assert_eq!(keys.get(&key(PART_TWO)).map(String::as_str), Some("live-file"));
         assert_eq!(keys.get(&key(RECAP_OF_PART_TWO)).map(String::as_str), Some("live-file"));
         assert!(!keys.contains_key(&key(recap_only)));

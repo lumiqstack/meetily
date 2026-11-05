@@ -244,6 +244,12 @@ where
         // this loop may have claimed the meeting. If the database cannot answer,
         // retry next scan rather than risk a second meeting.
         let overlapping = match find_recording_target(pool, &file_url, &created).await {
+            Ok(RecordingTarget::Held(meeting_id)) => {
+                log::info!("[pipeline] live meeting {} already holds this recording; not importing it", meeting_id);
+                on_linked(&file_url, &meeting_id);
+                outcome.attempts.push((created, true));
+                continue;
+            }
             Ok(RecordingTarget::Live(meeting_id)) => {
                 let linked = attach_recording(pool, &meeting_id, &file_url).await;
                 match &linked {
@@ -527,6 +533,30 @@ mod tests {
             assert_eq!(outcome.ok().unwrap().imported, 1);
             assert_eq!(imported, vec!["Weekly sync-20261103_102000-Meeting Recording.mp4"]);
             assert_eq!(linked, vec![(first_url, "live".to_owned())]);
+        }
+
+        #[tokio::test]
+        async fn both_parts_of_a_long_recording_in_one_scan_leave_one_meeting() {
+            let pool = test_pool().await;
+            live_meeting(&pool, "live", "Weekly sync").await;
+            let first = item("Weekly sync", 2);
+            let mut second = item("Weekly sync", 2);
+            second.recording.name = second.recording.name.replace("Recording.mp4", "Recording 2.mp4");
+            second.recording.file_url = second.recording.file_url.replace("Recording.mp4", "Recording%202.mp4");
+            let urls = [first.recording.file_url.clone(), second.recording.file_url.clone()];
+
+            let (outcome, imported, linked) = run(&pool, vec![first, second], None).await;
+
+            assert!(imported.is_empty(), "the live transcript covers every part: {imported:?}");
+            let outcome = outcome.ok().unwrap();
+            assert_eq!(outcome.attempts.iter().filter(|(_, landed)| *landed).count(), 2);
+            // Both go into the ledger, and the row keeps the first.
+            assert_eq!(
+                linked,
+                vec![(urls[0].clone(), "live".to_owned()), (urls[1].clone(), "live".to_owned())]
+            );
+            let source = MeetingSource::get(&pool, "live").await.unwrap().unwrap();
+            assert_eq!(source.recording_url.as_deref(), Some(urls[0].as_str()));
         }
 
         #[tokio::test]

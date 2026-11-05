@@ -13,6 +13,9 @@ use crate::database::repositories::{
 
 #[derive(Debug, PartialEq)]
 pub enum RecordingTarget {
+    /// A live meeting already holds this file or another part of the recording.
+    /// The file needs no import and the meeting nothing more.
+    Held(String),
     /// The live recording of this meeting. The file needs no import.
     Live(String),
     /// Import it as its own meeting. `overlapping` names live recordings that
@@ -21,12 +24,19 @@ pub enum RecordingTarget {
 }
 
 /// Decide from the database as it is now, so a recording earlier in the same
-/// scan can claim a meeting. `created` is SharePoint's creation time.
+/// scan can claim a meeting and leave its other parts held. `created` is
+/// SharePoint's creation time.
 pub async fn find_recording_target(
     pool: &SqlitePool,
     file_url: &str,
     created: &str,
 ) -> Result<RecordingTarget, sqlx::Error> {
+    if let Some(meeting_id) = MeetingSource::live_recording_keys(pool)
+        .await?
+        .remove(&MeetingSource::live_key(file_url))
+    {
+        return Ok(RecordingTarget::Held(meeting_id));
+    }
     let Some(facts) = RecordingFacts::from_file(file_url, created) else {
         return Ok(RecordingTarget::New { overlapping: Vec::new() });
     };
@@ -279,6 +289,20 @@ mod tests {
                 .unwrap(),
             RecordingTarget::New { overlapping: vec![] }
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_or_another_part_on_a_live_meeting_is_held_whatever_the_time_says() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync").await;
+        attach_recording(&pool, "live", FILE).await.unwrap();
+        for file in [FILE, PART_TWO] {
+            assert_eq!(
+                find_recording_target(&pool, file, "not a time").await.unwrap(),
+                RecordingTarget::Held("live".to_owned()),
+                "{file}"
+            );
+        }
     }
 
     #[tokio::test]
