@@ -23,6 +23,7 @@ interface RecapSyncReport {
   skipped: number;
   notReady: number;
   failed: { title: string; error: string }[];
+  possibleDuplicates: string[];
   meetingsFolder: string;
 }
 
@@ -53,7 +54,11 @@ export function describeSyncReport(report: RecapSyncReport): string {
   ];
   if (report.notReady > 0) parts.push(`${report.notReady} not ready yet`);
   if (report.failed.length > 0) parts.push(`${report.failed.length} failed`);
-  return `${report.scanned} scanned: ${parts.join(', ')}.`;
+  const counts = `${report.scanned} scanned: ${parts.join(', ')}.`;
+  if (report.possibleDuplicates.length === 0) return counts;
+  const [first, ...others] = report.possibleDuplicates;
+  const named = others.length > 0 ? `"${first}" and ${others.length} more` : `"${first}"`;
+  return `${counts} ${named} may duplicate a live recording: saved separately because nothing confirmed the match.`;
 }
 
 /** Sync Teams recaps into Meetily and the vault. Lives inside the Obsidian settings block. */
@@ -107,6 +112,8 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
         toast.warning('Teams recap sync finished with failures', {
           description: `${description} First failure: ${report.failed[0].title}: ${report.failed[0].error}`,
         });
+      } else if (report.possibleDuplicates.length > 0) {
+        toast.warning('Teams recap sync finished, check possible duplicates', { description });
       } else {
         toast.success('Teams recap sync finished', { description });
       }

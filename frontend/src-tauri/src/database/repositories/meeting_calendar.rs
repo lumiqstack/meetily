@@ -1,3 +1,4 @@
+use crate::audio::teams_recap_live_match::LiveWindow;
 use crate::calendar::CalendarEvent;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,32 @@ impl MeetingCalendarRepository {
         .await?;
         Ok(row.and_then(MeetingCalendarRow::into_calendar))
     }
+
+    /// Live recordings a recap may still attach to: those with a calendar
+    /// window and no recording or recap recorded against them yet.
+    pub async fn unclaimed_live_windows(pool: &SqlitePool) -> Result<Vec<LiveWindow>, sqlx::Error> {
+        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.title, m.calendar_start, m.calendar_end, m.calendar_join_url FROM meetings m \
+             LEFT JOIN meeting_sources ms ON ms.meeting_id = m.id \
+             WHERE m.calendar_start IS NOT NULL AND m.calendar_end IS NOT NULL \
+             AND ms.recording_url IS NULL \
+             ORDER BY m.calendar_start, m.id",
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(meeting_id, title, start, end, join_url)| {
+                Some(LiveWindow {
+                    meeting_id,
+                    title,
+                    start: parse_time(Some(&start))?,
+                    end: parse_time(Some(&end))?,
+                    join_url,
+                })
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +186,45 @@ mod tests {
         assert_eq!(stored.attendees, vec!["Ana", "Bo"]);
         assert_eq!(stored.join_url, event().teams_join_url);
         assert_eq!(stored.body.as_deref(), Some("Agenda"));
+    }
+
+    #[tokio::test]
+    async fn unclaimed_windows_are_calendar_matched_meetings_without_a_recording() {
+        let pool = test_pool().await;
+        MeetingCalendarRepository::attach(&pool, "m1", &event()).await.unwrap();
+        for id in ["no-calendar", "claimed", "source-without-url", "bad-time"] {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at) \
+                 VALUES (?, 'T', '2026-11-02T10:00:00Z', '2026-11-02T10:00:00Z')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for id in ["claimed", "source-without-url"] {
+            MeetingCalendarRepository::attach(&pool, id, &event()).await.unwrap();
+        }
+        let source = |url: Option<&str>| {
+            crate::database::repositories::meeting_sources::MeetingSource::for_import("file", "T", url, None, None)
+        };
+        source(Some("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax"))
+            .insert(&pool, "claimed")
+            .await
+            .unwrap();
+        source(None).insert(&pool, "source-without-url").await.unwrap();
+        sqlx::query("UPDATE meetings SET calendar_start = 'garbage', calendar_end = 'garbage' WHERE id = 'bad-time'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let windows = MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap();
+        let ids: Vec<&str> = windows.iter().map(|w| w.meeting_id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "source-without-url"]);
+        assert_eq!(windows[0].title, "Standup");
+        assert_eq!(windows[0].start, event().start);
+        assert_eq!(windows[0].end, event().end);
+        assert_eq!(windows[0].join_url, event().teams_join_url);
     }
 
     #[tokio::test]

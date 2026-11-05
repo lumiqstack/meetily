@@ -88,6 +88,9 @@ pub struct RecapSyncReport {
     pub skipped: usize,
     pub not_ready: usize,
     pub failed: Vec<RecapSyncFailure>,
+    /// Titles of recaps imported as their own meeting although a live
+    /// recording overlaps them in time without being confirmed as the same.
+    pub possible_duplicates: Vec<String>,
     pub meetings_folder: String,
 }
 
@@ -101,7 +104,7 @@ struct SyncProgress<'a> {
 
 #[derive(Debug, PartialEq)]
 enum Outcome {
-    New,
+    New { possible_duplicate: bool },
     Updated,
     Skipped,
     NotReady,
@@ -237,6 +240,7 @@ async fn import_candidate<R: Runtime>(
         candidate.title.clone(),
         source_url,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
+        candidate.started_at.as_deref(),
         &markdown,
     )
     .await
@@ -257,10 +261,39 @@ async fn import_candidate<R: Runtime>(
     }) {
         warn!("[recap-sync] could not record recap import: {e}");
     }
-    if seen_before.is_some() {
+    written_outcome(seen_before.is_some(), &persisted)
+}
+
+/// How a written recap counts: "updated" when it replaced something, whether an
+/// earlier copy of itself or the meeting's own summary.
+fn written_outcome(
+    seen_before: bool,
+    persisted: &crate::summary::commands::ImportedRecapFromLinkResponse,
+) -> Outcome {
+    if seen_before || persisted.replaced_summary {
         Outcome::Updated
     } else {
-        Outcome::New
+        Outcome::New { possible_duplicate: persisted.possible_duplicate }
+    }
+}
+
+impl RecapSyncReport {
+    fn tally(&mut self, title: &str, outcome: Outcome) {
+        match outcome {
+            Outcome::New { possible_duplicate } => {
+                self.new += 1;
+                if possible_duplicate {
+                    self.possible_duplicates.push(title.to_owned());
+                }
+            }
+            Outcome::Updated => self.updated += 1,
+            Outcome::Skipped => self.skipped += 1,
+            Outcome::NotReady => self.not_ready += 1,
+            Outcome::Failed(error) => {
+                warn!("[recap-sync] {title}: {error}");
+                self.failed.push(RecapSyncFailure { title: title.to_owned(), error });
+            }
+        }
     }
 }
 
@@ -300,16 +333,8 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
             PROGRESS_EVENT,
             SyncProgress { done, total, current_title: &candidate.title },
         );
-        match import_candidate(app, pool, &state.imported, candidate).await {
-            Outcome::New => report.new += 1,
-            Outcome::Updated => report.updated += 1,
-            Outcome::Skipped => report.skipped += 1,
-            Outcome::NotReady => report.not_ready += 1,
-            Outcome::Failed(error) => {
-                warn!("[recap-sync] {}: {error}", candidate.title);
-                report.failed.push(RecapSyncFailure { title: candidate.title.clone(), error });
-            }
-        }
+        let outcome = import_candidate(app, pool, &state.imported, candidate).await;
+        report.tally(&candidate.title, outcome);
     }
     let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
 
@@ -459,6 +484,42 @@ mod tests {
         assert!(is_not_ready("Teams did not show an AI summary for this link. Sign in if prompted."));
         assert!(!is_not_ready("WebView2 is unavailable: boom"));
         assert!(!is_not_ready("Teams stayed on its app-choice page."));
+    }
+
+    fn written(replaced_summary: bool, possible_duplicate: bool) -> crate::summary::commands::ImportedRecapFromLinkResponse {
+        crate::summary::commands::ImportedRecapFromLinkResponse {
+            meeting_id: "m1".into(),
+            title: "T".into(),
+            obsidian_file_path: "V/Meetings/T.md".into(),
+            attached: replaced_summary,
+            replaced_summary,
+            possible_duplicate,
+        }
+    }
+
+    #[test]
+    fn a_written_recap_counts_as_updated_when_it_replaced_something() {
+        // A brand new meeting, flagged or not.
+        assert_eq!(written_outcome(false, &written(false, false)), Outcome::New { possible_duplicate: false });
+        assert_eq!(written_outcome(false, &written(false, true)), Outcome::New { possible_duplicate: true });
+        // An earlier copy of this recap, or a live recording's own summary.
+        assert_eq!(written_outcome(true, &written(false, false)), Outcome::Updated);
+        assert_eq!(written_outcome(false, &written(true, false)), Outcome::Updated);
+    }
+
+    #[test]
+    fn the_report_counts_every_outcome_and_names_possible_duplicates() {
+        let mut report = RecapSyncReport::default();
+        report.tally("A", Outcome::New { possible_duplicate: false });
+        report.tally("B", Outcome::New { possible_duplicate: true });
+        report.tally("C", Outcome::Updated);
+        report.tally("D", Outcome::Skipped);
+        report.tally("E", Outcome::NotReady);
+        report.tally("F", Outcome::Failed("boom".into()));
+        assert_eq!((report.new, report.updated, report.skipped, report.not_ready), (2, 1, 1, 1));
+        assert_eq!(report.possible_duplicates, vec!["B".to_string()]);
+        assert_eq!(report.failed[0].title, "F");
+        assert_eq!(report.failed[0].error, "boom");
     }
 
     #[test]

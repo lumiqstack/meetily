@@ -484,13 +484,18 @@ export function ImportAudioDialog({
             title: string;
             obsidianFilePath: string;
             attached: boolean;
+            possibleDuplicate: boolean;
           }>('api_import_copilot_recap_from_link', { title: title.trim(), sourceUrl: linkUrl.trim() });
           await refetchMeetings();
           onComplete?.();
           onOpenChange(false);
           toast.success(
             result.attached ? `Copilot recap attached to "${result.title}"` : 'Copilot recap imported',
-            { description: `Saved to Meetily and Obsidian: ${result.obsidianFilePath}` }
+            {
+              description: result.possibleDuplicate
+                ? `It overlaps a live recording, but nothing confirmed they are the same meeting, so it was saved separately: ${result.obsidianFilePath}`
+                : `Saved to Meetily and Obsidian: ${result.obsidianFilePath}`,
+            }
           );
           router.push(`/meeting-details?id=${result.meetingId}`);
         } catch (e) {

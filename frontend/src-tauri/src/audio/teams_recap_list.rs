@@ -33,6 +33,8 @@ pub const SCRIPT_OVERRIDE_ENV: &str = "MEETILY_RECAP_LIST_SCRIPT";
 pub const MEET_APP_URL: &str = "https://teams.microsoft.com/v2/";
 /// More rows than any 30-day window of meetings; stops a runaway scroll.
 pub const MAX_ROWS: usize = 500;
+/// The title of a listed row that showed none.
+pub const UNTITLED_ROW_TITLE: &str = "Teams meeting";
 const LIST_SCRIPT: &str = include_str!("teams_recap_list.js");
 
 /// What one listing produced. `error` is set when the page never showed a
@@ -119,7 +121,7 @@ pub(crate) fn collect(rows: &[ListedRow]) -> (Vec<RecapCandidate>, usize) {
         let title = row.title.trim();
         candidates.push(RecapCandidate {
             recap_url: url.to_owned(),
-            title: if title.is_empty() { "Teams meeting".to_owned() } else { title.to_owned() },
+            title: if title.is_empty() { UNTITLED_ROW_TITLE.to_owned() } else { title.to_owned() },
             started_at: row.started_at.clone().filter(|value| !value.trim().is_empty()),
         });
     }

@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { describeSyncReport } from '../../src/components/TeamsRecapSyncSettings';
 
-const base = { scanned: 0, new: 0, updated: 0, skipped: 0, notReady: 0, failed: [], meetingsFolder: 'V/Meetings' };
+const base = {
+  scanned: 0, new: 0, updated: 0, skipped: 0, notReady: 0, failed: [], possibleDuplicates: [], meetingsFolder: 'V/Meetings',
+};
 
 describe('describeSyncReport', () => {
   test('says so when the window listed nothing', () => {
@@ -18,5 +20,14 @@ describe('describeSyncReport', () => {
         failed: [{ title: 'Standup', error: 'boom' }],
       })
     ).toBe('3 scanned: 0 new, 0 updated, 1 unchanged, 1 not ready yet, 1 failed.');
+  });
+
+  test('names a recap that may duplicate a live recording', () => {
+    expect(describeSyncReport({ ...base, scanned: 2, new: 2, possibleDuplicates: ['Vendor call'] })).toBe(
+      '2 scanned: 2 new, 0 updated, 0 unchanged. "Vendor call" may duplicate a live recording: saved separately because nothing confirmed the match.'
+    );
+    expect(describeSyncReport({ ...base, scanned: 3, new: 3, possibleDuplicates: ['Vendor call', 'Standup', 'Review'] })).toBe(
+      '3 scanned: 3 new, 0 updated, 0 unchanged. "Vendor call" and 2 more may duplicate a live recording: saved separately because nothing confirmed the match.'
+    );
   });
 });
