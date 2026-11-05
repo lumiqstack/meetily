@@ -28,13 +28,8 @@ pub fn meeting_identity_key(link: &str) -> String {
     let Ok(url) = Url::parse(link) else {
         return link.to_lowercase();
     };
-    if url.path() == "/l/meetingrecap" {
-        let file_url = url
-            .query_pairs()
-            .find(|(key, _)| key == "fileUrl")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| !value.trim().is_empty());
-        return match file_url.as_deref().and_then(|value| Url::parse(value.trim()).ok()) {
+    if is_recap_url(&url) {
+        return match recap_file_url(&url) {
             Some(file) => file_identity(&file),
             None => format!(
                 "{}{}?{}",
@@ -45,6 +40,56 @@ pub fn meeting_identity_key(link: &str) -> String {
         };
     }
     file_identity(&url)
+}
+
+fn is_recap_url(url: &Url) -> bool {
+    url.path() == "/l/meetingrecap"
+}
+
+fn recap_file_url(url: &Url) -> Option<Url> {
+    let (_, file_url) = url.query_pairs().find(|(key, _)| key == "fileUrl")?;
+    Url::parse(file_url.trim()).ok()
+}
+
+/// What a stored `recording_url` or an incoming link says about the recording
+/// behind it. A live meeting's row holds one link, and which recaps and files
+/// may still attach depends on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// A recording or transcript file, directly or through its player page.
+    File,
+    /// A recap link whose `fileUrl` names the file.
+    RecapOfFile,
+    /// A recap link that names no file, such as one built from a thread id.
+    RecapWithoutFile,
+}
+
+pub fn link_kind(link: &str) -> LinkKind {
+    match Url::parse(link.trim()) {
+        Ok(url) if is_recap_url(&url) => {
+            if recap_file_url(&url).is_some() {
+                LinkKind::RecapOfFile
+            } else {
+                LinkKind::RecapWithoutFile
+            }
+        }
+        _ => LinkKind::File,
+    }
+}
+
+/// [`meeting_identity_key`] with the part of a long recording removed. Teams
+/// cuts a recording at 4 hours into `…-Meeting Recording.mp4` and
+/// `…-Meeting Recording 2.mp4`, and a recap may name any part, so parts share
+/// this key. Any other key comes back unchanged.
+pub fn whole_recording_key(identity_key: &str) -> &str {
+    ["-meeting recording", "-meeting transcript"]
+        .into_iter()
+        .find_map(|marker| {
+            let (stem, tail) = identity_key.rsplit_once(marker)?;
+            let part = tail.split('.').next()?.trim();
+            part.bytes().all(|byte| byte.is_ascii_digit()).then_some(stem)
+        })
+        .unwrap_or(identity_key)
 }
 
 fn file_identity(url: &Url) -> String {
@@ -69,6 +114,11 @@ mod navigation;
 pub struct TeamsRecap {
     pub markdown: String,
 }
+
+/// An unattended extraction found no AI summary in time. The recap sync reads
+/// this as "not ready", so keep the phrase `is_not_ready` looks for.
+pub(crate) const UNATTENDED_NO_SUMMARY: &str =
+    "Teams did not show an AI summary for this link within a minute.";
 
 pub fn validate_recap_url(input: &str) -> Result<Url> {
     if input.len() > 8_192 {
@@ -96,7 +146,7 @@ pub fn validate_recap_url(input: &str) -> Result<Url> {
 }
 
 #[cfg(target_os = "windows")]
-mod windows {
+pub(crate) mod windows {
     use super::*;
     use ::windows::core::{Interface, PWSTR};
     use serde::Deserialize;
@@ -109,9 +159,11 @@ mod windows {
         LaunchingExternalUriSchemeEventHandler,
     };
 
-    const SILENT_WAIT: Duration = Duration::from_secs(25);
-    const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
-    const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+    pub(crate) const SILENT_WAIT: Duration = Duration::from_secs(25);
+    /// All an unattended extraction gets, since nobody can help it along.
+    const UNATTENDED_WAIT: Duration = Duration::from_secs(60);
+    pub(crate) const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
+    pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
     // Teams renders this view asynchronously. Choose the AI summary tab by
     // role/name, then read only its notes and task rows. A layout change
@@ -128,7 +180,7 @@ mod windows {
         tasks: Vec<String>,
     }
 
-    async fn block_desktop_handoff<R: Runtime>(window: &WebviewWindow<R>) -> Result<()> {
+    pub(crate) async fn block_desktop_handoff<R: Runtime>(window: &WebviewWindow<R>) -> Result<()> {
         let (sender, receiver) = oneshot::channel::<Result<(), String>>();
         window
             .with_webview(move |webview| {
@@ -168,7 +220,7 @@ mod windows {
             .map_err(|e| anyhow!("Could not block Teams desktop-app handoff: {e}"))
     }
 
-    async fn execute_script<R: Runtime>(window: &WebviewWindow<R>, script: &str) -> Result<String> {
+    pub(crate) async fn execute_script<R: Runtime>(window: &WebviewWindow<R>, script: &str) -> Result<String> {
         let (sender, receiver) = oneshot::channel::<Result<String, String>>();
         let script = script.to_owned();
         window
@@ -242,6 +294,7 @@ mod windows {
         source_url: &Url,
         navigation: &mut navigation::Navigation,
         started: tokio::time::Instant,
+        interactive: bool,
     ) -> Result<Option<TeamsRecap>> {
         let mut launcher_since = None;
         let mut tasks_since = None;
@@ -273,8 +326,10 @@ mod windows {
                             log::info!(
                                 "Teams recap: retrying original link after sign-in restored a chat"
                             );
-                            window.set_title("Teams recap — reopening requested meeting")?;
-                            window.show()?;
+                            if interactive {
+                                window.set_title("Teams recap — reopening requested meeting")?;
+                                window.show()?;
+                            }
                             window.navigate(source_url.clone())?;
                         }
                         navigation::Action::ReportWrongPage => {
@@ -318,7 +373,13 @@ mod windows {
         Ok(None)
     }
 
-    pub async fn extract<R: Runtime>(app: &AppHandle<R>, url: &Url) -> Result<TeamsRecap> {
+    /// `interactive` shows the window when the hidden phase finds nothing, so
+    /// the user can sign in. Without it the window stays hidden throughout.
+    pub async fn extract<R: Runtime>(
+        app: &AppHandle<R>,
+        url: &Url,
+        interactive: bool,
+    ) -> Result<TeamsRecap> {
         // The same lock and profile protect the existing SharePoint cookie
         // flow from a competing Teams window destroying its auth webview.
         let _auth_flow = super::super::sharepoint::AUTH_FLOW_LOCK.lock().await;
@@ -336,13 +397,19 @@ mod windows {
             window.navigate(url.clone())?;
             let started = tokio::time::Instant::now();
             let mut navigation = navigation::Navigation::default();
-            if let Some(recap) = poll(&window, started + SILENT_WAIT, url, &mut navigation, started).await? {
+            let hidden_wait = if interactive { SILENT_WAIT } else { UNATTENDED_WAIT };
+            if let Some(recap) =
+                poll(&window, started + hidden_wait, url, &mut navigation, started, interactive).await?
+            {
                 return Ok(recap);
+            }
+            if !interactive {
+                return Err(anyhow!(UNATTENDED_NO_SUMMARY));
             }
             window.set_title("Teams recap — sign in and open the requested AI summary")?;
             window.show()?;
             window.set_focus()?;
-            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, started)
+            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, started, true)
                 .await?
                 .ok_or_else(|| anyhow!(
                     "Teams did not show an AI summary for this link. Sign in if prompted, then check that the recap's AI summary tab is available."
@@ -354,18 +421,36 @@ mod windows {
     }
 }
 
+/// Read one recap the user asked for: the window appears if Teams needs them.
 pub async fn extract_teams_recap<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     source_url: &str,
 ) -> Result<TeamsRecap> {
+    extract(app, source_url, true).await
+}
+
+/// Read one recap of many, with nobody watching: no window, and at most a
+/// minute before it fails with [`UNATTENDED_NO_SUMMARY`].
+pub async fn extract_teams_recap_unattended<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    source_url: &str,
+) -> Result<TeamsRecap> {
+    extract(app, source_url, false).await
+}
+
+async fn extract<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    source_url: &str,
+    interactive: bool,
+) -> Result<TeamsRecap> {
     let url = validate_recap_url(source_url)?;
     #[cfg(target_os = "windows")]
     {
-        windows::extract(app, &url).await
+        windows::extract(app, &url, interactive).await
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, url);
+        let _ = (app, url, interactive);
         Err(anyhow!(
             "Automatic Teams recap extraction requires Meetily on Windows with WebView2."
         ))
@@ -416,5 +501,47 @@ mod tests {
         assert_eq!(meeting_identity_key(a), meeting_identity_key(&format!(" {a} ")));
         assert_ne!(meeting_identity_key(a), meeting_identity_key(b));
         assert_eq!(meeting_identity_key("not a url"), "not a url");
+    }
+
+    #[test]
+    fn a_link_says_whether_it_is_a_file_or_a_recap_and_whether_that_names_one() {
+        let file = "https://c-my.sharepoint.com/personal/j/Documents/Recordings/S-20261102_100000-Meeting%20Recording.mp4";
+        assert_eq!(link_kind(file), LinkKind::File);
+        assert_eq!(
+            link_kind("https://c-my.sharepoint.com/personal/j/_layouts/15/stream.aspx?id=%2Fa%2FS.mp4"),
+            LinkKind::File
+        );
+        assert_eq!(
+            link_kind("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fc.sharepoint.com%2FS.mp4%3Fweb%3D1"),
+            LinkKind::RecapOfFile
+        );
+        assert_eq!(link_kind("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax"), LinkKind::RecapWithoutFile);
+        assert_eq!(
+            link_kind("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl="),
+            LinkKind::RecapWithoutFile
+        );
+    }
+
+    #[test]
+    fn the_parts_of_a_long_recording_share_one_whole_recording_key() {
+        let whole = |link: &str| whole_recording_key(&meeting_identity_key(link)).to_owned();
+        let dir = "https://c-my.sharepoint.com/personal/j/Documents/Recordings";
+        let first = whole(&format!("{dir}/Workshop-20261016_150059-Meeting%20Recording.mp4"));
+        assert_eq!(first, "c-my.sharepoint.com/personal/j/documents/recordings/workshop-20261016_150059");
+        assert_eq!(whole(&format!("{dir}/Workshop-20261016_150059-Meeting%20Recording%202.mp4")), first);
+        assert_eq!(whole(&format!("{dir}/Workshop-20261016_150059-Meeting%20Transcript.mp4")), first);
+        let recap = "https://teams.microsoft.com/l/meetingrecap?fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fpersonal%2Fj%2FDocuments%2FRecordings%2FWorkshop-20261016_150059-Meeting%20Recording%202.mp4%3Fweb%3D1";
+        assert_eq!(whole(recap), first);
+
+        assert_ne!(whole(&format!("{dir}/Workshop-20261017_150059-Meeting%20Recording.mp4")), first);
+        // Not the Teams form: the key stays whole.
+        for key in ["h/a/meeting recording.mp4", "h/a/x-meeting recording notes.mp4", "teams.microsoft.com/l/meetingrecap?threadid=1"] {
+            assert_eq!(whole_recording_key(key), key);
+        }
+        // The title may hold the words too; the last occurrence decides.
+        assert_eq!(
+            whole_recording_key("h/a/review-meeting recording rules-20261016_150059-meeting transcript.mp4"),
+            "h/a/review-meeting recording rules-20261016_150059"
+        );
     }
 }

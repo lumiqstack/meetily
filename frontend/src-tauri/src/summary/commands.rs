@@ -1,5 +1,10 @@
+use crate::audio::teams_recap::{link_kind, LinkKind};
+use crate::audio::teams_recap_live_match::{match_live_meeting, thread_id_from_url, LiveMatch, RecapFacts};
+use crate::database::models::MeetingModel;
 use crate::database::repositories::{
     meeting::MeetingsRepository,
+    meeting_calendar::MeetingCalendarRepository,
+    meeting_sources::{MeetingSource, LIVE_RECORDING_SOURCE},
     summary::SummaryProcessesRepository, transcript_chunk::TranscriptChunksRepository,
 };
 use crate::state::AppState;
@@ -69,9 +74,15 @@ pub struct ImportedRecapFromLinkResponse {
     pub meeting_id: String,
     pub title: String,
     pub obsidian_file_path: String,
-    /// The recap joined a meeting Meetily already had (from its recording
-    /// or an earlier import of the same link) instead of creating one.
+    /// The recap joined a meeting Meetily already had (from its recording,
+    /// its live recording, or an earlier import of the same link) instead of
+    /// creating one.
     pub attached: bool,
+    /// That meeting already had a summary, which the recap replaced.
+    pub replaced_summary: bool,
+    /// The recap stayed its own meeting, but live recordings overlap it in
+    /// time without being confirmed as the same meeting.
+    pub possible_duplicate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,7 +194,7 @@ async fn save_extracted_copilot_recap(
     .await
     .map_err(|e| format!("Failed to import Copilot recap: {e}"))?;
 
-    let mut meeting_source = crate::database::repositories::meeting_sources::MeetingSource::for_import(
+    let mut meeting_source = MeetingSource::for_import(
         "copilot-recap",
         title,
         source_url.as_deref(),
@@ -237,6 +248,7 @@ pub async fn api_import_copilot_recap_from_link<R: Runtime>(
         title,
         source_url,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
+        None,
         &recap_markdown,
     )
     .await
@@ -262,63 +274,169 @@ pub(crate) fn recap_markdown_with_source(markdown: &str, source_url: &str) -> St
     format!("{}\n[Open original Teams recap](<{}>)", markdown.trim(), source_url)
 }
 
+/// Which meeting an extracted recap belongs to.
+#[derive(Debug)]
+enum RecapTarget {
+    /// The meeting holding this recording, or an earlier copy of this recap.
+    Known(MeetingModel),
+    /// A meeting Meetily recorded live, matched by its calendar window.
+    Live(MeetingModel),
+    /// No meeting yet. `overlapping` names live recordings that fit in time
+    /// but could not be confirmed as this meeting.
+    New { overlapping: Vec<String> },
+}
+
+async fn load_meeting(pool: &sqlx::SqlitePool, meeting_id: &str) -> Result<Option<MeetingModel>, String> {
+    MeetingsRepository::get_meeting_metadata(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to load meeting {meeting_id}: {e}"))
+}
+
+/// Whether the meeting's calendar event names a Teams thread other than the
+/// recap's. A meeting holding this recap's file can only be that wrong through
+/// a recording matched on its title, which has no thread id to compare.
+async fn thread_contradicts(pool: &sqlx::SqlitePool, meeting_id: &str, facts: &RecapFacts) -> Result<bool, String> {
+    let Some(ours) = facts.thread_id.as_deref() else {
+        return Ok(false);
+    };
+    let calendar = MeetingCalendarRepository::get(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to read the calendar event of meeting {meeting_id}: {e}"))?;
+    Ok(calendar
+        .and_then(|calendar| calendar.join_url)
+        .as_deref()
+        .and_then(thread_id_from_url)
+        .is_some_and(|theirs| theirs != ours))
+}
+
+/// Identity first, because it is exact; then the live recording rule (see
+/// docs/TEAMS_RECAP_SYNC_SPEC.md, "Matching a recap to a live recording").
+async fn find_recap_target(
+    pool: &sqlx::SqlitePool,
+    source_url: &str,
+    facts: &RecapFacts,
+) -> Result<RecapTarget, String> {
+    let identity = crate::audio::teams_recap::meeting_identity_key(source_url);
+    while let Some(meeting_id) = MeetingSource::find_meeting_by_identity(pool, &identity)
+        .await
+        .map_err(|e| format!("Failed to check for an existing meeting: {e}"))?
+    {
+        if !thread_contradicts(pool, &meeting_id, facts).await? {
+            match load_meeting(pool, &meeting_id).await? {
+                Some(meeting) => return Ok(RecapTarget::Known(meeting)),
+                None => break,
+            }
+        }
+        // The removal also ends this loop: the same row cannot be found twice.
+        log_warn!("Live meeting {meeting_id} gives up a recording attached by its title: its recap names another thread");
+        MeetingSource::remove(pool, &meeting_id)
+            .await
+            .map_err(|e| format!("Failed to release the recording from meeting {meeting_id}: {e}"))?;
+    }
+    let windows = match link_kind(source_url) {
+        LinkKind::RecapWithoutFile => MeetingCalendarRepository::live_windows_for_recap_without_file(pool).await,
+        LinkKind::File | LinkKind::RecapOfFile => MeetingCalendarRepository::unclaimed_live_windows(pool).await,
+    }
+    .map_err(|e| format!("Failed to check for a live recording of this meeting: {e}"))?;
+    match match_live_meeting(facts, &windows) {
+        LiveMatch::None => Ok(RecapTarget::New { overlapping: Vec::new() }),
+        LiveMatch::Ambiguous(overlapping) => Ok(RecapTarget::New { overlapping }),
+        LiveMatch::Attach(meeting_id) => Ok(match load_meeting(pool, &meeting_id).await? {
+            Some(meeting) => RecapTarget::Live(meeting),
+            None => RecapTarget::New { overlapping: Vec::new() },
+        }),
+    }
+}
+
+/// Put the recap's key on the live recording it is about to attach to, so the
+/// next import of this recap finds the meeting by identity and no other recap
+/// can claim it. Done before the summary is replaced: without the key, a second
+/// recording's recap could overwrite this one.
+async fn claim_live_meeting(
+    pool: &sqlx::SqlitePool,
+    meeting: &MeetingModel,
+    source_url: &str,
+    recorded_at: Option<&str>,
+) -> Result<(), String> {
+    let mut source = MeetingSource::for_import(LIVE_RECORDING_SOURCE, &meeting.title, Some(source_url), None, None);
+    if recorded_at.is_some() {
+        source.recorded_at = recorded_at.map(str::to_owned);
+    }
+    source
+        .insert(pool, &meeting.id)
+        .await
+        .map_err(|e| format!("Failed to link the recap to live meeting {}: {e}", meeting.id))
+}
+
 /// Store an extracted recap and write its vault note. The recap joins the
-/// meeting Meetily already holds for the same recording (or an earlier
-/// import of the same link) when there is one; otherwise it becomes a new
-/// transcript-free meeting. Shared by the link import and the recap sync.
+/// meeting Meetily already holds for the same recording, an earlier import of
+/// the same link, or a live recording of the same meeting; otherwise it
+/// becomes a new transcript-free meeting. `listed_start` is the start time the
+/// Meet app row showed, when the recap came from the list. Shared by the link
+/// import and the recap sync.
 pub(crate) async fn persist_recap_from_link<R: Runtime>(
     app: &AppHandle<R>,
     pool: &sqlx::SqlitePool,
     title: String,
     source_url: &str,
     recorded_at: Option<&str>,
+    listed_start: Option<&str>,
     recap_markdown: &str,
 ) -> Result<ImportedRecapFromLinkResponse, String> {
-    let identity = crate::audio::teams_recap::meeting_identity_key(source_url);
-    let existing = crate::database::repositories::meeting_sources::MeetingSource::find_meeting_by_identity(
-        pool, &identity,
-    )
-    .await
-    .map_err(|e| format!("Failed to check for an existing meeting: {e}"))?;
-    let existing = match existing {
-        Some(meeting_id) => MeetingsRepository::get_meeting_metadata(pool, &meeting_id)
-            .await
-            .map_err(|e| format!("Failed to load meeting {meeting_id}: {e}"))?,
-        None => None,
-    };
+    let facts = RecapFacts::from_link(source_url, &title, recorded_at, listed_start);
+    let target = find_recap_target(pool, source_url, &facts).await?;
 
-    let Some(meeting) = existing else {
-        let imported = save_extracted_copilot_recap(
-            pool,
-            title,
-            recap_markdown.to_string(),
-            Some(source_url.to_string()),
-            recorded_at.map(str::to_owned),
-        )
-        .await?;
-        crate::api::emit_meetings_changed(app, &imported.meeting_id);
-        let exported = crate::obsidian::export_copilot_recap_note(
-            app,
-            &imported.meeting_id,
-            &imported.title,
-            &imported.created_at,
-            recap_markdown,
-            recorded_at,
-        )
-        .await
-        .map_err(|e| format!(
-            "The recap was saved in Meetily as meeting {}, but the Obsidian export failed: {e}",
-            imported.meeting_id
-        ))?;
-        return Ok(ImportedRecapFromLinkResponse {
-            meeting_id: imported.meeting_id,
-            title: imported.title,
-            obsidian_file_path: exported.file_path,
-            attached: false,
-        });
+    let (meeting, live) = match target {
+        RecapTarget::Known(meeting) => (meeting, false),
+        RecapTarget::Live(meeting) => (meeting, true),
+        RecapTarget::New { overlapping } => {
+            let imported = save_extracted_copilot_recap(
+                pool,
+                title,
+                recap_markdown.to_string(),
+                Some(source_url.to_string()),
+                recorded_at.map(str::to_owned),
+            )
+            .await?;
+            if !overlapping.is_empty() {
+                log_warn!(
+                    "Recap meeting {} may duplicate live meetings {:?}: they fit its time, but nothing confirmed one",
+                    imported.meeting_id, overlapping
+                );
+            }
+            crate::api::emit_meetings_changed(app, &imported.meeting_id);
+            let exported = crate::obsidian::export_copilot_recap_note(
+                app,
+                &imported.meeting_id,
+                &imported.title,
+                &imported.created_at,
+                recap_markdown,
+                recorded_at,
+            )
+            .await
+            .map_err(|e| format!(
+                "The recap was saved in Meetily as meeting {}, but the Obsidian export failed: {e}",
+                imported.meeting_id
+            ))?;
+            return Ok(ImportedRecapFromLinkResponse {
+                meeting_id: imported.meeting_id,
+                title: imported.title,
+                obsidian_file_path: exported.file_path,
+                attached: false,
+                replaced_summary: false,
+                possible_duplicate: !overlapping.is_empty(),
+            });
+        }
     };
 
     let summary = imported_recap_summary(recap_markdown, Some(source_url), recorded_at)?;
+    let replaced_summary = SummaryProcessesRepository::get_summary_data(pool, &meeting.id)
+        .await
+        .map_err(|e| format!("Failed to read the summary of meeting {}: {e}", meeting.id))?
+        .is_some_and(|row| row.result.is_some());
+    if live {
+        claim_live_meeting(pool, &meeting, source_url, recorded_at).await?;
+    }
     let attached = SummaryProcessesRepository::attach_imported_summary(pool, &meeting.id, &summary)
         .await
         .map_err(|e| format!("Failed to attach the recap to meeting {}: {e}", meeting.id))?;
@@ -358,6 +476,8 @@ pub(crate) async fn persist_recap_from_link<R: Runtime>(
         title: meeting.title,
         obsidian_file_path: exported.file_path,
         attached: true,
+        replaced_summary,
+        possible_duplicate: false,
     })
 }
 
@@ -1010,6 +1130,251 @@ mod tests {
         }));
         assert_eq!(redacted["markdown"], "Visible\n\nTail");
         assert_eq!(redacted["reasoning_stripped"], true);
+    }
+}
+
+#[cfg(test)]
+mod recap_target_tests {
+    use super::*;
+    use crate::calendar::types::{CalendarEvent, SourceKind};
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    const JOIN: &str = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_AAA%40thread.v2/0";
+    const RECAP: &str = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting_AAA%40thread.v2&fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fpersonal%2Fj%2FDocuments%2FRecordings%2FWeekly%20sync-20261103_100200-Meeting%20Recording.mp4";
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrations apply");
+        pool
+    }
+
+    async fn insert_meeting(pool: &sqlx::SqlitePool, id: &str, title: &str) {
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at) \
+             VALUES (?, ?, '2026-11-03T16:30:00Z', '2026-11-03T16:30:00Z')",
+        )
+        .bind(id)
+        .bind(title)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A meeting recorded live against a 10:00 to 10:30 UTC calendar event.
+    async fn live_meeting(pool: &sqlx::SqlitePool, id: &str, title: &str, join: Option<&str>) {
+        insert_meeting(pool, id, title).await;
+        let event = CalendarEvent {
+            id: format!("event-{id}"),
+            source: SourceKind::OutlookCom,
+            title: title.to_owned(),
+            start: Utc.with_ymd_and_hms(2026, 11, 3, 10, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 11, 3, 10, 30, 0).unwrap(),
+            organizer: None,
+            attendees: vec![],
+            location: None,
+            body: None,
+            teams_join_url: join.map(str::to_owned),
+            is_recurring_instance: false,
+        };
+        MeetingCalendarRepository::attach(pool, id, &event).await.unwrap();
+    }
+
+    /// What the recap at 10:02 UTC says about itself, independent of the
+    /// machine's zone: the sync loop's listed start, not the file stamp.
+    fn facts(title: &str) -> RecapFacts {
+        RecapFacts::from_link(RECAP, title, None, Some("2026-11-03T10:02:00.000Z"))
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_live_recording_is_the_target_then_a_known_meeting() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        SummaryProcessesRepository::create_or_reset_process(&pool, "live", Utc::now()).await.unwrap();
+        SummaryProcessesRepository::update_meeting_summary(&pool, "live", &json!({"markdown": "- from Meetily"}))
+            .await
+            .unwrap();
+
+        let RecapTarget::Live(meeting) = find_recap_target(&pool, RECAP, &facts("Weekly sync")).await.unwrap() else {
+            panic!("expected the live recording");
+        };
+        assert_eq!(meeting.id, "live");
+
+        // What the attach path does to it.
+        let recap = imported_recap_summary("- recap", Some(RECAP), Some("2026-11-03T04:02:00")).unwrap();
+        claim_live_meeting(&pool, &meeting, RECAP, Some("2026-11-03T04:02:00")).await.unwrap();
+        assert!(SummaryProcessesRepository::attach_imported_summary(&pool, "live", &recap).await.unwrap());
+
+        let source = MeetingSource::get(&pool, "live").await.unwrap().unwrap();
+        assert_eq!(source.import_source, LIVE_RECORDING_SOURCE);
+        assert_eq!(source.recorded_at.as_deref(), Some("2026-11-03T04:02:00"));
+        let stored = load_meeting(&pool, "live").await.unwrap().unwrap();
+        assert_eq!(stored.title, "Weekly sync");
+        let summary = SummaryProcessesRepository::get_summary_data(&pool, "live").await.unwrap().unwrap();
+        assert!(summary.result.unwrap().contains("- recap"));
+        assert!(summary.result_backup.unwrap().contains("from Meetily"));
+
+        // The next import of this recap is an identity hit, whatever the clock
+        // or the window says, and no other recap can claim this meeting.
+        let no_clock = RecapFacts::from_link(RECAP, "Weekly sync", None, None);
+        let RecapTarget::Known(again) = find_recap_target(&pool, RECAP, &no_clock).await.unwrap() else {
+            panic!("expected an identity hit");
+        };
+        assert_eq!(again.id, "live");
+        assert!(MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap().is_empty());
+        let other = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting_AAA%40thread.v2&fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fpart2.mp4";
+        let part_two = RecapFacts::from_link(other, "Weekly sync", None, Some("2026-11-03T10:20:00.000Z"));
+        assert!(matches!(
+            find_recap_target(&pool, other, &part_two).await.unwrap(),
+            RecapTarget::New { overlapping } if overlapping.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn identity_wins_over_a_live_recording_that_also_fits() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        insert_meeting(&pool, "imported", "Weekly sync").await;
+        MeetingSource::for_import("sharepoint", "Weekly sync", Some(RECAP), None, None)
+            .insert(&pool, "imported")
+            .await
+            .unwrap();
+
+        let RecapTarget::Known(meeting) = find_recap_target(&pool, RECAP, &facts("Weekly sync")).await.unwrap() else {
+            panic!("expected the imported meeting");
+        };
+        assert_eq!(meeting.id, "imported");
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_overlap_stays_a_new_meeting_and_names_the_candidate() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Budget review", None).await;
+
+        let RecapTarget::New { overlapping } = find_recap_target(&pool, RECAP, &facts("Weekly sync")).await.unwrap() else {
+            panic!("expected a new meeting");
+        };
+        assert_eq!(overlapping, vec!["live".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_meeting_with_no_calendar_match_and_a_recap_outside_every_window_are_new() {
+        let pool = test_pool().await;
+        insert_meeting(&pool, "no-calendar", "Weekly sync").await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        let later = RecapFacts::from_link(RECAP, "Weekly sync", None, Some("2026-11-04T10:02:00.000Z"));
+
+        let RecapTarget::New { overlapping } = find_recap_target(&pool, RECAP, &later).await.unwrap() else {
+            panic!("expected a new meeting");
+        };
+        assert!(overlapping.is_empty());
+    }
+
+    /// Attached by the recording rule, which had only the title to go on.
+    fn file_of_recap() -> &'static str {
+        "https://c-my.sharepoint.com/personal/j/Documents/Recordings/Weekly%20sync-20261103_100200-Meeting%20Recording.mp4"
+    }
+
+    fn recap_of_file(thread: &str) -> String {
+        format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId={}&fileUrl={}",
+            thread,
+            url::form_urlencoded::byte_serialize(file_of_recap().as_bytes()).collect::<String>()
+        )
+    }
+
+    fn recap_facts(link: &str) -> RecapFacts {
+        RecapFacts::from_link(link, "Weekly sync", None, Some("2026-11-03T10:02:00.000Z"))
+    }
+
+    async fn attach_recording_to(pool: &sqlx::SqlitePool, id: &str) {
+        crate::audio::sharepoint_live_match::attach_recording(pool, id, file_of_recap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recap_of_an_attached_recording_is_a_known_meeting() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        attach_recording_to(&pool, "live").await;
+
+        let link = recap_of_file("19%3Ameeting_AAA%40thread.v2");
+        let RecapTarget::Known(meeting) = find_recap_target(&pool, &link, &recap_facts(&link)).await.unwrap() else {
+            panic!("expected an identity hit");
+        };
+        assert_eq!(meeting.id, "live");
+        assert_eq!(
+            MeetingSource::get(&pool, "live").await.unwrap().unwrap().recording_url.as_deref(),
+            Some(file_of_recap()),
+            "the row keeps the file: attaching to a known meeting does not claim it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recap_from_another_thread_takes_the_recording_back_from_a_wrong_match() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        attach_recording_to(&pool, "live").await;
+
+        let link = recap_of_file("19%3Ameeting_OTHER%40thread.v2");
+        let RecapTarget::New { overlapping } = find_recap_target(&pool, &link, &recap_facts(&link)).await.unwrap() else {
+            panic!("the live meeting is another meeting");
+        };
+        assert!(overlapping.is_empty(), "a differing thread is certain, so nothing to report");
+        assert_eq!(MeetingSource::get(&pool, "live").await.unwrap(), None);
+        // The meeting is open to its own recap again.
+        assert_eq!(MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_known_thread_on_only_one_side_does_not_take_the_recording_back() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "meet-link", "Weekly sync", Some("https://teams.microsoft.com/meet/123?p=abc")).await;
+        attach_recording_to(&pool, "meet-link").await;
+
+        let link = recap_of_file("19%3Ameeting_OTHER%40thread.v2");
+        let RecapTarget::Known(meeting) = find_recap_target(&pool, &link, &recap_facts(&link)).await.unwrap() else {
+            panic!("nothing contradicts the match");
+        };
+        assert_eq!(meeting.id, "meet-link");
+    }
+
+    #[tokio::test]
+    async fn a_recap_naming_no_file_can_attach_to_a_meeting_holding_a_recording() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        attach_recording_to(&pool, "live").await;
+
+        let without_file = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting_AAA%40thread.v2";
+        let RecapTarget::Live(meeting) = find_recap_target(&pool, without_file, &recap_facts(without_file)).await.unwrap()
+        else {
+            panic!("nothing ties this recap to another recording");
+        };
+        assert_eq!(meeting.id, "live");
+
+        // A recap naming another file is the recap of another recording.
+        let other_file = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting_AAA%40thread.v2&fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fother-20261103_101500-Meeting%20Recording.mp4";
+        assert!(matches!(
+            find_recap_target(&pool, other_file, &recap_facts(other_file)).await.unwrap(),
+            RecapTarget::New { overlapping } if overlapping.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_generated_title_does_not_stop_a_recap_from_confirming_by_the_subject() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some("https://teams.microsoft.com/meet/123?p=abc")).await;
+        sqlx::query("UPDATE meetings SET title = 'Generated heading' WHERE id = 'live'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let RecapTarget::Live(meeting) = find_recap_target(&pool, RECAP, &facts("Weekly sync")).await.unwrap() else {
+            panic!("expected the live recording");
+        };
+        assert_eq!(meeting.id, "live");
     }
 }
 

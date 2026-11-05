@@ -4,10 +4,9 @@
 //! recap never creates a second meeting or a second note, and a content hash
 //! per key turns an unchanged recap into a skip instead of a rewrite.
 //!
-//! The list itself comes from [`list_recaps`]. Until the Meet app scanner
-//! exists it returns nothing, so a sync reports zero scanned rather than
-//! inventing work; everything downstream of the list is complete and tested.
-//! See docs/TEAMS_RECAP_SYNC_SPEC.md.
+//! The list itself comes from `teams_recap_list`, which reads the Meet app's
+//! recap tab in a hidden WebView2 window. Rows it lists without a recap link
+//! count as not ready. See docs/TEAMS_RECAP_SYNC_SPEC.md.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -89,6 +88,9 @@ pub struct RecapSyncReport {
     pub skipped: usize,
     pub not_ready: usize,
     pub failed: Vec<RecapSyncFailure>,
+    /// Titles of recaps imported as their own meeting although a live
+    /// recording overlaps them in time without being confirmed as the same.
+    pub possible_duplicates: Vec<String>,
     pub meetings_folder: String,
 }
 
@@ -102,7 +104,7 @@ struct SyncProgress<'a> {
 
 #[derive(Debug, PartialEq)]
 enum Outcome {
-    New,
+    New { possible_duplicate: bool },
     Updated,
     Skipped,
     NotReady,
@@ -180,7 +182,7 @@ fn is_not_ready(error: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Scanner (stub until the Meet app script lands)
+// Listing
 // ---------------------------------------------------------------------------
 
 /// The Meet app can only be read through the Windows WebView2 profile.
@@ -188,21 +190,16 @@ pub const fn sync_available() -> bool {
     cfg!(target_os = "windows")
 }
 
-/// Every meeting row the Meet app lists from `since` onwards, newest first.
-/// Rows without a recap link are not returned; the Meet app scanner reports
-/// them as not ready when it exists.
+/// The Meet app's rows for the window, or the error the listing hit.
 async fn list_recaps<R: Runtime>(
     app: &AppHandle<R>,
     since: DateTime<Utc>,
-) -> Result<Vec<RecapCandidate>> {
-    let _ = (app, since);
-    if !sync_available() {
-        return Err(anyhow!(
-            "Teams recap sync requires Meetily on Windows with WebView2."
-        ));
+) -> Result<super::teams_recap_list::RecapListing> {
+    let listing = super::teams_recap_list::list_recaps(app, since, false).await?;
+    if let Some(error) = &listing.error {
+        return Err(anyhow!("{error}"));
     }
-    info!("[recap-sync] Meet app scanner not implemented; nothing listed");
-    Ok(Vec::new())
+    Ok(listing)
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +222,9 @@ async fn import_candidate<R: Runtime>(
     let key = crate::audio::teams_recap::meeting_identity_key(source_url);
     let recording = crate::audio::teams_recap::recording_metadata(&validated);
 
-    let recap = match crate::audio::teams_recap::extract_teams_recap(app, source_url).await {
+    // The listing just proved sign-in, so no recap gets a window of its own: a
+    // list with ten unfinished recaps must not cost ten five-minute waits.
+    let recap = match crate::audio::teams_recap::extract_teams_recap_unattended(app, source_url).await {
         Ok(recap) => recap,
         Err(e) if is_not_ready(&e.to_string()) => return Outcome::NotReady,
         Err(e) => return Outcome::Failed(e.to_string()),
@@ -243,6 +242,7 @@ async fn import_candidate<R: Runtime>(
         candidate.title.clone(),
         source_url,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
+        candidate.started_at.as_deref(),
         &markdown,
     )
     .await
@@ -263,10 +263,46 @@ async fn import_candidate<R: Runtime>(
     }) {
         warn!("[recap-sync] could not record recap import: {e}");
     }
-    if seen_before.is_some() {
+    written_outcome(seen_before.is_some(), &persisted)
+}
+
+/// Whether the scan window may move on. A sync that read no recap learned
+/// nothing, and may have misread the list, so moving on could lose the rest of
+/// the first sync's backfill for good.
+fn read_any_recap(report: &RecapSyncReport) -> bool {
+    report.new + report.updated + report.skipped > 0
+}
+
+/// How a written recap counts: "updated" when it replaced something, whether an
+/// earlier copy of itself or the meeting's own summary.
+fn written_outcome(
+    seen_before: bool,
+    persisted: &crate::summary::commands::ImportedRecapFromLinkResponse,
+) -> Outcome {
+    if seen_before || persisted.replaced_summary {
         Outcome::Updated
     } else {
-        Outcome::New
+        Outcome::New { possible_duplicate: persisted.possible_duplicate }
+    }
+}
+
+impl RecapSyncReport {
+    fn tally(&mut self, title: &str, outcome: Outcome) {
+        match outcome {
+            Outcome::New { possible_duplicate } => {
+                self.new += 1;
+                if possible_duplicate {
+                    self.possible_duplicates.push(title.to_owned());
+                }
+            }
+            Outcome::Updated => self.updated += 1,
+            Outcome::Skipped => self.skipped += 1,
+            Outcome::NotReady => self.not_ready += 1,
+            Outcome::Failed(error) => {
+                warn!("[recap-sync] {title}: {error}");
+                self.failed.push(RecapSyncFailure { title: title.to_owned(), error });
+            }
+        }
     }
 }
 
@@ -286,17 +322,19 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let state = load_state(app);
     let since = scan_window_start(&state, started_at);
     info!("[recap-sync] listing recaps since {}", since.to_rfc3339());
-    let candidates = list_recaps(app, since).await.map_err(|e| e.to_string())?;
+    let listing = list_recaps(app, since).await.map_err(|e| e.to_string())?;
 
     let app_state = app.state::<crate::state::AppState>();
     let pool = app_state.db_manager.pool();
     let mut report = RecapSyncReport {
-        scanned: candidates.len(),
+        scanned: listing.candidates.len() + listing.rows_without_link,
+        // A listed meeting with no recap link yet is retried next sync.
+        not_ready: listing.rows_without_link,
         meetings_folder,
         ..Default::default()
     };
     // Oldest first so a sync interrupted midway leaves a contiguous prefix.
-    let mut ordered = candidates;
+    let mut ordered = listing.candidates;
     ordered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     let total = ordered.len();
     for (done, candidate) in ordered.iter().enumerate() {
@@ -304,20 +342,14 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
             PROGRESS_EVENT,
             SyncProgress { done, total, current_title: &candidate.title },
         );
-        match import_candidate(app, pool, &state.imported, candidate).await {
-            Outcome::New => report.new += 1,
-            Outcome::Updated => report.updated += 1,
-            Outcome::Skipped => report.skipped += 1,
-            Outcome::NotReady => report.not_ready += 1,
-            Outcome::Failed(error) => {
-                warn!("[recap-sync] {}: {error}", candidate.title);
-                report.failed.push(RecapSyncFailure { title: candidate.title.clone(), error });
-            }
-        }
+        let outcome = import_candidate(app, pool, &state.imported, candidate).await;
+        report.tally(&candidate.title, outcome);
     }
     let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
 
-    if let Err(e) = update_state(app, |state| state.last_sync_date = Some(started_at.to_rfc3339())) {
+    if !read_any_recap(&report) {
+        info!("[recap-sync] no recap was read, so the scan window stays where it was");
+    } else if let Err(e) = update_state(app, |state| state.last_sync_date = Some(started_at.to_rfc3339())) {
         warn!("[recap-sync] could not persist last sync date: {e}");
     }
     info!(
@@ -366,10 +398,50 @@ pub async fn set_teams_recap_sync_prefs_command<R: Runtime>(
 #[tauri::command]
 pub async fn teams_recap_list_debug_command<R: Runtime>(
     app: AppHandle<R>,
-) -> Result<Vec<RecapCandidate>, String> {
+) -> Result<RecapListDebug, String> {
+    let Ok(_running) = SYNC_LOCK.try_lock() else {
+        return Err("A Teams recap sync is already running.".into());
+    };
     let state = load_state(&app);
     let since = scan_window_start(&state, Utc::now());
-    list_recaps(&app, since).await.map_err(|e| e.to_string())
+    let listing = super::teams_recap_list::list_recaps(&app, since, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    let probe_file = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve app data directory: {e}"))?
+        .join(PROBE_FILE);
+    let json = serde_json::to_string_pretty(&listing).map_err(|e| e.to_string())?;
+    std::fs::write(&probe_file, json)
+        .map_err(|e| format!("Could not write {}: {e}", probe_file.display()))?;
+    info!(
+        "[recap-sync] list check: {} recaps, {} rows without a link, probe saved",
+        listing.candidates.len(),
+        listing.rows_without_link
+    );
+    Ok(RecapListDebug {
+        candidates: listing.candidates,
+        rows_without_link: listing.rows_without_link,
+        page_url: listing.page_url,
+        error: listing.error,
+        probe_file: probe_file.to_string_lossy().to_string(),
+    })
+}
+
+/// Written next to the app's data by the list check, for reading the Meet
+/// app's layout on the machine that ran it. It holds meeting titles and page
+/// text, so it stays local.
+const PROBE_FILE: &str = "teams_recap_list_probe.json";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapListDebug {
+    pub candidates: Vec<RecapCandidate>,
+    pub rows_without_link: usize,
+    pub page_url: Option<String>,
+    pub error: Option<String>,
+    pub probe_file: String,
 }
 
 #[cfg(test)]
@@ -423,6 +495,59 @@ mod tests {
         assert!(is_not_ready("Teams did not show an AI summary for this link. Sign in if prompted."));
         assert!(!is_not_ready("WebView2 is unavailable: boom"));
         assert!(!is_not_ready("Teams stayed on its app-choice page."));
+        assert!(is_not_ready(crate::audio::teams_recap::UNATTENDED_NO_SUMMARY));
+    }
+
+    #[test]
+    fn the_scan_window_moves_only_when_a_recap_was_read() {
+        let mut report = RecapSyncReport { scanned: 40, not_ready: 40, ..Default::default() };
+        assert!(!read_any_recap(&report), "rows without a link prove nothing about the list");
+        report.failed.push(RecapSyncFailure { title: "T".into(), error: "boom".into() });
+        assert!(!read_any_recap(&report));
+        assert!(!read_any_recap(&RecapSyncReport::default()));
+        for read in [
+            RecapSyncReport { new: 1, ..Default::default() },
+            RecapSyncReport { updated: 1, ..Default::default() },
+            RecapSyncReport { skipped: 1, ..Default::default() },
+        ] {
+            assert!(read_any_recap(&read));
+        }
+    }
+
+    fn written(replaced_summary: bool, possible_duplicate: bool) -> crate::summary::commands::ImportedRecapFromLinkResponse {
+        crate::summary::commands::ImportedRecapFromLinkResponse {
+            meeting_id: "m1".into(),
+            title: "T".into(),
+            obsidian_file_path: "V/Meetings/T.md".into(),
+            attached: replaced_summary,
+            replaced_summary,
+            possible_duplicate,
+        }
+    }
+
+    #[test]
+    fn a_written_recap_counts_as_updated_when_it_replaced_something() {
+        // A brand new meeting, flagged or not.
+        assert_eq!(written_outcome(false, &written(false, false)), Outcome::New { possible_duplicate: false });
+        assert_eq!(written_outcome(false, &written(false, true)), Outcome::New { possible_duplicate: true });
+        // An earlier copy of this recap, or a live recording's own summary.
+        assert_eq!(written_outcome(true, &written(false, false)), Outcome::Updated);
+        assert_eq!(written_outcome(false, &written(true, false)), Outcome::Updated);
+    }
+
+    #[test]
+    fn the_report_counts_every_outcome_and_names_possible_duplicates() {
+        let mut report = RecapSyncReport::default();
+        report.tally("A", Outcome::New { possible_duplicate: false });
+        report.tally("B", Outcome::New { possible_duplicate: true });
+        report.tally("C", Outcome::Updated);
+        report.tally("D", Outcome::Skipped);
+        report.tally("E", Outcome::NotReady);
+        report.tally("F", Outcome::Failed("boom".into()));
+        assert_eq!((report.new, report.updated, report.skipped, report.not_ready), (2, 1, 1, 1));
+        assert_eq!(report.possible_duplicates, vec!["B".to_string()]);
+        assert_eq!(report.failed[0].title, "F");
+        assert_eq!(report.failed[0].error, "boom");
     }
 
     #[test]

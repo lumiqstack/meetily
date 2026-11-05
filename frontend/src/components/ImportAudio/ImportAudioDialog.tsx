@@ -49,7 +49,7 @@ import { recapTitleFromFileUrl } from '@/lib/teams-recap-title';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import { getSharedImportQueue } from '@/lib/import-queue';
 import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
-import { oldestMeetingFirst } from '@/lib/sharepoint-order';
+import { oldestMeetingFirst, startsSelected } from '@/lib/sharepoint-order';
 
 /** Matches the Rust BatchCandidate returned by the batch-selection commands. */
 interface BatchCandidate {
@@ -73,6 +73,8 @@ interface SharePointScanItem {
   already_imported: boolean;
   /** "mine" (own OneDrive Recordings folder) or "shared" (found via search). */
   source: 'mine' | 'shared';
+  /** The meeting recorded live that holds this file, or that it would attach to. */
+  live_meeting_id: string | null;
 }
 
 interface SharePointSyncState {
@@ -359,10 +361,7 @@ export function ImportAudioDialog({
         { hubUrl: spHubUrl.trim(), sinceIso: `${spSinceDate}T00:00:00Z` }
       );
       setSpItems(result.recordings);
-      // Preselect everything not yet imported.
-      setSpSelected(
-        new Set(result.recordings.filter((r) => !r.already_imported).map((r) => r.file_url))
-      );
+      setSpSelected(new Set(result.recordings.filter(startsSelected).map((r) => r.file_url)));
       if (result.recordings.length === 0) {
         toast.info('No recordings found since that date');
       }
@@ -484,13 +483,18 @@ export function ImportAudioDialog({
             title: string;
             obsidianFilePath: string;
             attached: boolean;
+            possibleDuplicate: boolean;
           }>('api_import_copilot_recap_from_link', { title: title.trim(), sourceUrl: linkUrl.trim() });
           await refetchMeetings();
           onComplete?.();
           onOpenChange(false);
           toast.success(
             result.attached ? `Copilot recap attached to "${result.title}"` : 'Copilot recap imported',
-            { description: `Saved to Meetily and Obsidian: ${result.obsidianFilePath}` }
+            {
+              description: result.possibleDuplicate
+                ? `It overlaps a live recording, but nothing confirmed they are the same meeting, so it was saved separately: ${result.obsidianFilePath}`
+                : `Saved to Meetily and Obsidian: ${result.obsidianFilePath}`,
+            }
           );
           router.push(`/meeting-details?id=${result.meetingId}`);
         } catch (e) {
@@ -976,10 +980,19 @@ export function ImportAudioDialog({
                                 Shared
                               </span>
                             )}
-                            {rec.already_imported && (
-                              <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wide text-green-700 bg-green-100 rounded px-1.5 py-0.5">
-                                Imported
+                            {rec.live_meeting_id !== null ? (
+                              <span
+                                title="Meetily recorded this meeting live, so this file is not imported. Tick it to import it as its own meeting."
+                                className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wide text-purple-700 bg-purple-100 rounded px-1.5 py-0.5"
+                              >
+                                Recorded live
                               </span>
+                            ) : (
+                              rec.already_imported && (
+                                <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wide text-green-700 bg-green-100 rounded px-1.5 py-0.5">
+                                  Imported
+                                </span>
+                              )
                             )}
                             <span className="text-xs text-gray-400 flex-shrink-0">
                               {rec.created ? rec.created.slice(0, 10) : ''}

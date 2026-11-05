@@ -23,7 +23,17 @@ interface RecapSyncReport {
   skipped: number;
   notReady: number;
   failed: { title: string; error: string }[];
+  possibleDuplicates: string[];
   meetingsFolder: string;
+}
+
+/** Mirrors `RecapListDebug` in src-tauri/src/audio/teams_recap_sync.rs. */
+interface RecapListDebug {
+  candidates: { recapUrl: string; title: string; startedAt: string | null }[];
+  rowsWithoutLink: number;
+  pageUrl: string | null;
+  error: string | null;
+  probeFile: string;
 }
 
 interface SyncProgress {
@@ -44,7 +54,11 @@ export function describeSyncReport(report: RecapSyncReport): string {
   ];
   if (report.notReady > 0) parts.push(`${report.notReady} not ready yet`);
   if (report.failed.length > 0) parts.push(`${report.failed.length} failed`);
-  return `${report.scanned} scanned: ${parts.join(', ')}.`;
+  const counts = `${report.scanned} scanned: ${parts.join(', ')}.`;
+  if (report.possibleDuplicates.length === 0) return counts;
+  const [first, ...others] = report.possibleDuplicates;
+  const named = others.length > 0 ? `"${first}" and ${others.length} more` : `"${first}"`;
+  return `${counts} ${named} may duplicate a live recording: saved separately because nothing confirmed the match.`;
 }
 
 /** Sync Teams recaps into Meetily and the vault. Lives inside the Obsidian settings block. */
@@ -53,6 +67,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
   const [state, setState] = useState<TeamsRecapSyncStateView | null>(null);
   const [sinceDate, setSinceDate] = useState("");
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isChecking, setIsChecking] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
 
   const loadState = async () => {
@@ -76,6 +91,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
   }, []);
 
   const available = (state?.available ?? platform === 'windows') && vaultConfigured;
+  const busy = isSyncing || isChecking;
 
   const handleSinceDateBlur = async () => {
     if (sinceDate === (state?.sinceDate ?? "")) return;
@@ -98,6 +114,8 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
         toast.warning('Teams recap sync finished with failures', {
           description: `${description} First failure: ${report.failed[0].title}: ${report.failed[0].error}`,
         });
+      } else if (report.possibleDuplicates.length > 0) {
+        toast.warning('Teams recap sync finished, check possible duplicates', { description });
       } else {
         toast.success('Teams recap sync finished', { description });
       }
@@ -107,6 +125,23 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
     } finally {
       setIsSyncing(false);
       setProgress(null);
+    }
+  };
+
+  const handleCheckList = async () => {
+    setIsChecking(true);
+    try {
+      const result = await invoke<RecapListDebug>('teams_recap_list_debug_command');
+      const description = `${result.candidates.length} with a recap link, ${result.rowsWithoutLink} without. Details saved to ${result.probeFile}`;
+      if (result.error) {
+        toast.warning('Recap list not read', { description: `${result.error} ${description}` });
+      } else {
+        toast.success('Recap list read', { description });
+      }
+    } catch (error) {
+      toast.error('Recap list check failed', { description: String(error) });
+    } finally {
+      setIsChecking(false);
     }
   };
 
@@ -136,11 +171,19 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
       <div className="flex items-center gap-3">
         <button
           onClick={handleSync}
-          disabled={!available || isSyncing}
+          disabled={!available || busy}
           className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-60"
         >
           <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
           {isSyncing ? 'Syncing...' : 'Sync Teams recaps'}
+        </button>
+        <button
+          onClick={handleCheckList}
+          disabled={!available || busy}
+          title="Reads the recap list without importing anything and saves what the page showed next to Meetily's data"
+          className="px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-60"
+        >
+          {isChecking ? 'Checking...' : 'Check recap list'}
         </button>
         {isSyncing && progress && progress.total > 0 && (
           <span className="text-xs text-gray-600">

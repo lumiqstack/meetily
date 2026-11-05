@@ -262,6 +262,10 @@ ALTER TABLE meetings ADD COLUMN calendar_join_url TEXT;
 ALTER TABLE meetings ADD COLUMN calendar_body TEXT;
 ```
 
+`20261105000000_add_meeting_calendar_title.sql` later added `calendar_title`, the
+event's subject, because generating a summary replaces `meetings.title`. Teams
+recaps and recordings are compared with it. See `docs/TEAMS_RECAP_SYNC_SPEC.md`.
+
 Filled when a recording starts from a prompt that carried a match. The
 The frontend starts recordings without a meeting argument and names
 them at save time, so the match travels the same way: the prompt stashes the
