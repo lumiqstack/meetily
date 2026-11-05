@@ -1285,12 +1285,22 @@ async fn create_meeting_with_transcripts(
     tx.commit()
         .await
         .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+    drop(conn);
 
     info!(
         "Created meeting '{}' with {} transcripts",
         meeting_id,
         segments.len()
     );
+
+    // The user may have chosen to import a file that was attached to a live
+    // meeting. It belongs to this meeting now, so a later recap follows it here.
+    // The meeting is committed, so this cannot fail the import.
+    if let Some(url) = source.recording_url.as_deref() {
+        if let Err(e) = crate::database::repositories::meeting_sources::MeetingSource::release_from_live_meetings(pool, url).await {
+            warn!("Could not release an imported recording from its live meeting: {}", e);
+        }
+    }
 
     Ok(meeting_id)
 }
@@ -2320,6 +2330,44 @@ mod tests {
                 .unwrap();
         assert_eq!(stored, created_at);
         assert_eq!(MeetingSource::get(&pool, &meeting_id).await.unwrap(), Some(source));
+    }
+
+    #[tokio::test]
+    async fn importing_a_file_a_live_meeting_holds_takes_it_from_that_meeting() {
+        use crate::database::repositories::meeting_sources::{MeetingSource, LIVE_RECORDING_SOURCE};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO meetings (id, title, created_at, updated_at) \
+             VALUES ('live', 'Generated heading', '2026-07-21T15:00:00Z', '2026-07-21T15:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let url = "https://contoso-my.sharepoint.com/personal/j/Documents/Recordings/Weekly%20sync-20260721_100221-Meeting%20Recording.mp4";
+        MeetingSource::for_import(LIVE_RECORDING_SOURCE, "", Some(url), None, None)
+            .insert(&pool, "live")
+            .await
+            .unwrap();
+
+        // The user ticked it in the dialog: the import creates its own meeting.
+        let source = MeetingSource::for_import("sharepoint", "Weekly sync", Some(url), None, Some(60.0));
+        let meeting_id = create_meeting_with_transcripts(&pool, "Weekly sync", &[], "/tmp/f".into(), chrono::Utc::now(), &source)
+            .await
+            .unwrap();
+
+        assert_eq!(MeetingSource::get(&pool, "live").await.unwrap(), None);
+        assert!(MeetingSource::live_recording_keys(&pool).await.unwrap().is_empty());
+        let key = crate::audio::teams_recap::meeting_identity_key(url);
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap(),
+            Some(meeting_id),
+            "a later recap of the file follows the new meeting"
+        );
     }
 
     #[test]

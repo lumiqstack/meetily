@@ -28,13 +28,8 @@ pub fn meeting_identity_key(link: &str) -> String {
     let Ok(url) = Url::parse(link) else {
         return link.to_lowercase();
     };
-    if url.path() == "/l/meetingrecap" {
-        let file_url = url
-            .query_pairs()
-            .find(|(key, _)| key == "fileUrl")
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| !value.trim().is_empty());
-        return match file_url.as_deref().and_then(|value| Url::parse(value.trim()).ok()) {
+    if is_recap_url(&url) {
+        return match recap_file_url(&url) {
             Some(file) => file_identity(&file),
             None => format!(
                 "{}{}?{}",
@@ -45,6 +40,56 @@ pub fn meeting_identity_key(link: &str) -> String {
         };
     }
     file_identity(&url)
+}
+
+fn is_recap_url(url: &Url) -> bool {
+    url.path() == "/l/meetingrecap"
+}
+
+fn recap_file_url(url: &Url) -> Option<Url> {
+    let (_, file_url) = url.query_pairs().find(|(key, _)| key == "fileUrl")?;
+    Url::parse(file_url.trim()).ok()
+}
+
+/// What a stored `recording_url` or an incoming link says about the recording
+/// behind it. A live meeting's row holds one link, and which recaps and files
+/// may still attach depends on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// A recording or transcript file, directly or through its player page.
+    File,
+    /// A recap link whose `fileUrl` names the file.
+    RecapOfFile,
+    /// A recap link that names no file, such as one built from a thread id.
+    RecapWithoutFile,
+}
+
+pub fn link_kind(link: &str) -> LinkKind {
+    match Url::parse(link.trim()) {
+        Ok(url) if is_recap_url(&url) => {
+            if recap_file_url(&url).is_some() {
+                LinkKind::RecapOfFile
+            } else {
+                LinkKind::RecapWithoutFile
+            }
+        }
+        _ => LinkKind::File,
+    }
+}
+
+/// [`meeting_identity_key`] with the part of a long recording removed. Teams
+/// cuts a recording at 4 hours into `…-Meeting Recording.mp4` and
+/// `…-Meeting Recording 2.mp4`, and a recap may name any part, so parts share
+/// this key. Any other key comes back unchanged.
+pub fn whole_recording_key(identity_key: &str) -> &str {
+    ["-meeting recording", "-meeting transcript"]
+        .into_iter()
+        .find_map(|marker| {
+            let (stem, tail) = identity_key.rsplit_once(marker)?;
+            let part = tail.split('.').next()?.trim();
+            part.bytes().all(|byte| byte.is_ascii_digit()).then_some(stem)
+        })
+        .unwrap_or(identity_key)
 }
 
 fn file_identity(url: &Url) -> String {
@@ -416,5 +461,47 @@ mod tests {
         assert_eq!(meeting_identity_key(a), meeting_identity_key(&format!(" {a} ")));
         assert_ne!(meeting_identity_key(a), meeting_identity_key(b));
         assert_eq!(meeting_identity_key("not a url"), "not a url");
+    }
+
+    #[test]
+    fn a_link_says_whether_it_is_a_file_or_a_recap_and_whether_that_names_one() {
+        let file = "https://c-my.sharepoint.com/personal/j/Documents/Recordings/S-20261102_100000-Meeting%20Recording.mp4";
+        assert_eq!(link_kind(file), LinkKind::File);
+        assert_eq!(
+            link_kind("https://c-my.sharepoint.com/personal/j/_layouts/15/stream.aspx?id=%2Fa%2FS.mp4"),
+            LinkKind::File
+        );
+        assert_eq!(
+            link_kind("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fc.sharepoint.com%2FS.mp4%3Fweb%3D1"),
+            LinkKind::RecapOfFile
+        );
+        assert_eq!(link_kind("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax"), LinkKind::RecapWithoutFile);
+        assert_eq!(
+            link_kind("https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl="),
+            LinkKind::RecapWithoutFile
+        );
+    }
+
+    #[test]
+    fn the_parts_of_a_long_recording_share_one_whole_recording_key() {
+        let whole = |link: &str| whole_recording_key(&meeting_identity_key(link)).to_owned();
+        let dir = "https://c-my.sharepoint.com/personal/j/Documents/Recordings";
+        let first = whole(&format!("{dir}/Workshop-20261016_150059-Meeting%20Recording.mp4"));
+        assert_eq!(first, "c-my.sharepoint.com/personal/j/documents/recordings/workshop-20261016_150059");
+        assert_eq!(whole(&format!("{dir}/Workshop-20261016_150059-Meeting%20Recording%202.mp4")), first);
+        assert_eq!(whole(&format!("{dir}/Workshop-20261016_150059-Meeting%20Transcript.mp4")), first);
+        let recap = "https://teams.microsoft.com/l/meetingrecap?fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fpersonal%2Fj%2FDocuments%2FRecordings%2FWorkshop-20261016_150059-Meeting%20Recording%202.mp4%3Fweb%3D1";
+        assert_eq!(whole(recap), first);
+
+        assert_ne!(whole(&format!("{dir}/Workshop-20261017_150059-Meeting%20Recording.mp4")), first);
+        // Not the Teams form: the key stays whole.
+        for key in ["h/a/meeting recording.mp4", "h/a/x-meeting recording notes.mp4", "teams.microsoft.com/l/meetingrecap?threadid=1"] {
+            assert_eq!(whole_recording_key(key), key);
+        }
+        // The title may hold the words too; the last occurrence decides.
+        assert_eq!(
+            whole_recording_key("h/a/review-meeting recording rules-20261016_150059-meeting transcript.mp4"),
+            "h/a/review-meeting recording rules-20261016_150059"
+        );
     }
 }

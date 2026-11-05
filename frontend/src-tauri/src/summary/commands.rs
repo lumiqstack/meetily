@@ -1,4 +1,5 @@
-use crate::audio::teams_recap_live_match::{match_live_meeting, LiveMatch, RecapFacts};
+use crate::audio::teams_recap::{link_kind, LinkKind};
+use crate::audio::teams_recap_live_match::{match_live_meeting, thread_id_from_url, LiveMatch, RecapFacts};
 use crate::database::models::MeetingModel;
 use crate::database::repositories::{
     meeting::MeetingsRepository,
@@ -291,6 +292,23 @@ async fn load_meeting(pool: &sqlx::SqlitePool, meeting_id: &str) -> Result<Optio
         .map_err(|e| format!("Failed to load meeting {meeting_id}: {e}"))
 }
 
+/// Whether the meeting's calendar event names a Teams thread other than the
+/// recap's. A meeting holding this recap's file can only be that wrong through
+/// a recording matched on its title, which has no thread id to compare.
+async fn thread_contradicts(pool: &sqlx::SqlitePool, meeting_id: &str, facts: &RecapFacts) -> Result<bool, String> {
+    let Some(ours) = facts.thread_id.as_deref() else {
+        return Ok(false);
+    };
+    let calendar = MeetingCalendarRepository::get(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to read the calendar event of meeting {meeting_id}: {e}"))?;
+    Ok(calendar
+        .and_then(|calendar| calendar.join_url)
+        .as_deref()
+        .and_then(thread_id_from_url)
+        .is_some_and(|theirs| theirs != ours))
+}
+
 /// Identity first, because it is exact; then the live recording rule (see
 /// docs/TEAMS_RECAP_SYNC_SPEC.md, "Matching a recap to a live recording").
 async fn find_recap_target(
@@ -299,17 +317,27 @@ async fn find_recap_target(
     facts: &RecapFacts,
 ) -> Result<RecapTarget, String> {
     let identity = crate::audio::teams_recap::meeting_identity_key(source_url);
-    let known = MeetingSource::find_meeting_by_identity(pool, &identity)
+    while let Some(meeting_id) = MeetingSource::find_meeting_by_identity(pool, &identity)
         .await
-        .map_err(|e| format!("Failed to check for an existing meeting: {e}"))?;
-    if let Some(meeting_id) = known {
-        if let Some(meeting) = load_meeting(pool, &meeting_id).await? {
-            return Ok(RecapTarget::Known(meeting));
+        .map_err(|e| format!("Failed to check for an existing meeting: {e}"))?
+    {
+        if !thread_contradicts(pool, &meeting_id, facts).await? {
+            match load_meeting(pool, &meeting_id).await? {
+                Some(meeting) => return Ok(RecapTarget::Known(meeting)),
+                None => break,
+            }
         }
+        // The removal also ends this loop: the same row cannot be found twice.
+        log_warn!("Live meeting {meeting_id} gives up a recording attached by its title: its recap names another thread");
+        MeetingSource::remove(pool, &meeting_id)
+            .await
+            .map_err(|e| format!("Failed to release the recording from meeting {meeting_id}: {e}"))?;
     }
-    let windows = MeetingCalendarRepository::unclaimed_live_windows(pool)
-        .await
-        .map_err(|e| format!("Failed to check for a live recording of this meeting: {e}"))?;
+    let windows = match link_kind(source_url) {
+        LinkKind::RecapWithoutFile => MeetingCalendarRepository::live_windows_for_recap_without_file(pool).await,
+        LinkKind::File | LinkKind::RecapOfFile => MeetingCalendarRepository::unclaimed_live_windows(pool).await,
+    }
+    .map_err(|e| format!("Failed to check for a live recording of this meeting: {e}"))?;
     match match_live_meeting(facts, &windows) {
         LiveMatch::None => Ok(RecapTarget::New { overlapping: Vec::new() }),
         LiveMatch::Ambiguous(overlapping) => Ok(RecapTarget::New { overlapping }),
@@ -1244,6 +1272,109 @@ mod recap_target_tests {
             panic!("expected a new meeting");
         };
         assert!(overlapping.is_empty());
+    }
+
+    /// Attached by the recording rule, which had only the title to go on.
+    fn file_of_recap() -> &'static str {
+        "https://c-my.sharepoint.com/personal/j/Documents/Recordings/Weekly%20sync-20261103_100200-Meeting%20Recording.mp4"
+    }
+
+    fn recap_of_file(thread: &str) -> String {
+        format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId={}&fileUrl={}",
+            thread,
+            url::form_urlencoded::byte_serialize(file_of_recap().as_bytes()).collect::<String>()
+        )
+    }
+
+    fn recap_facts(link: &str) -> RecapFacts {
+        RecapFacts::from_link(link, "Weekly sync", None, Some("2026-11-03T10:02:00.000Z"))
+    }
+
+    async fn attach_recording_to(pool: &sqlx::SqlitePool, id: &str) {
+        crate::audio::sharepoint_live_match::attach_recording(pool, id, file_of_recap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recap_of_an_attached_recording_is_a_known_meeting() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        attach_recording_to(&pool, "live").await;
+
+        let link = recap_of_file("19%3Ameeting_AAA%40thread.v2");
+        let RecapTarget::Known(meeting) = find_recap_target(&pool, &link, &recap_facts(&link)).await.unwrap() else {
+            panic!("expected an identity hit");
+        };
+        assert_eq!(meeting.id, "live");
+        assert_eq!(
+            MeetingSource::get(&pool, "live").await.unwrap().unwrap().recording_url.as_deref(),
+            Some(file_of_recap()),
+            "the row keeps the file: attaching to a known meeting does not claim it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recap_from_another_thread_takes_the_recording_back_from_a_wrong_match() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        attach_recording_to(&pool, "live").await;
+
+        let link = recap_of_file("19%3Ameeting_OTHER%40thread.v2");
+        let RecapTarget::New { overlapping } = find_recap_target(&pool, &link, &recap_facts(&link)).await.unwrap() else {
+            panic!("the live meeting is another meeting");
+        };
+        assert!(overlapping.is_empty(), "a differing thread is certain, so nothing to report");
+        assert_eq!(MeetingSource::get(&pool, "live").await.unwrap(), None);
+        // The meeting is open to its own recap again.
+        assert_eq!(MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_known_thread_on_only_one_side_does_not_take_the_recording_back() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "meet-link", "Weekly sync", Some("https://teams.microsoft.com/meet/123?p=abc")).await;
+        attach_recording_to(&pool, "meet-link").await;
+
+        let link = recap_of_file("19%3Ameeting_OTHER%40thread.v2");
+        let RecapTarget::Known(meeting) = find_recap_target(&pool, &link, &recap_facts(&link)).await.unwrap() else {
+            panic!("nothing contradicts the match");
+        };
+        assert_eq!(meeting.id, "meet-link");
+    }
+
+    #[tokio::test]
+    async fn a_recap_naming_no_file_can_attach_to_a_meeting_holding_a_recording() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some(JOIN)).await;
+        attach_recording_to(&pool, "live").await;
+
+        let without_file = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting_AAA%40thread.v2";
+        let RecapTarget::Live(meeting) = find_recap_target(&pool, without_file, &recap_facts(without_file)).await.unwrap()
+        else {
+            panic!("nothing ties this recap to another recording");
+        };
+        assert_eq!(meeting.id, "live");
+
+        // A recap naming another file is the recap of another recording.
+        let other_file = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ameeting_AAA%40thread.v2&fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fother-20261103_101500-Meeting%20Recording.mp4";
+        assert!(matches!(
+            find_recap_target(&pool, other_file, &recap_facts(other_file)).await.unwrap(),
+            RecapTarget::New { overlapping } if overlapping.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_generated_title_does_not_stop_a_recap_from_confirming_by_the_subject() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Weekly sync", Some("https://teams.microsoft.com/meet/123?p=abc")).await;
+        sqlx::query("UPDATE meetings SET title = 'Generated heading' WHERE id = 'live'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let RecapTarget::Live(meeting) = find_recap_target(&pool, RECAP, &facts("Weekly sync")).await.unwrap() else {
+            panic!("expected the live recording");
+        };
+        assert_eq!(meeting.id, "live");
     }
 }
 

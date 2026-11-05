@@ -1,3 +1,4 @@
+use crate::audio::teams_recap::{link_kind, LinkKind};
 use crate::audio::teams_recap_live_match::LiveWindow;
 use crate::calendar::CalendarEvent;
 use chrono::{DateTime, Utc};
@@ -76,12 +77,13 @@ impl MeetingCalendarRepository {
             .unwrap_or_else(|| "outlook_com".to_string());
         let attendees = serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".to_string());
         sqlx::query(
-            "UPDATE meetings SET calendar_source = ?, calendar_event_id = ?, calendar_start = ?, \
+            "UPDATE meetings SET calendar_source = ?, calendar_event_id = ?, calendar_title = ?, calendar_start = ?, \
              calendar_end = ?, calendar_organizer = ?, calendar_attendees = ?, calendar_join_url = ?, \
              calendar_body = ? WHERE id = ?",
         )
         .bind(source)
         .bind(&event.id)
+        .bind(&event.title)
         .bind(event.start.to_rfc3339())
         .bind(event.end.to_rfc3339())
         .bind(&event.organizer)
@@ -106,21 +108,43 @@ impl MeetingCalendarRepository {
         Ok(row.and_then(MeetingCalendarRow::into_calendar))
     }
 
-    /// Live recordings a recap may still attach to: those with a calendar
-    /// window and no recording or recap recorded against them yet.
+    /// Live recordings a recap naming its file may still attach to: those with
+    /// a calendar window and no recording or recap recorded against them yet.
     pub async fn unclaimed_live_windows(pool: &SqlitePool) -> Result<Vec<LiveWindow>, sqlx::Error> {
-        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT m.id, m.title, m.calendar_start, m.calendar_end, m.calendar_join_url FROM meetings m \
+        Self::live_windows(pool, |held| held.is_none()).await
+    }
+
+    /// Live recordings a recap naming no file may attach to: a meeting holding
+    /// only a recording is still open, since nothing ties the recap to another
+    /// recording.
+    pub async fn live_windows_for_recap_without_file(pool: &SqlitePool) -> Result<Vec<LiveWindow>, sqlx::Error> {
+        Self::live_windows(pool, |held| matches!(held, None | Some(LinkKind::File))).await
+    }
+
+    /// Live recordings a file found on SharePoint may attach to: those holding
+    /// no file yet.
+    pub async fn live_windows_for_recording(pool: &SqlitePool) -> Result<Vec<LiveWindow>, sqlx::Error> {
+        Self::live_windows(pool, |held| matches!(held, None | Some(LinkKind::RecapWithoutFile))).await
+    }
+
+    /// `open` is given what the meeting's `recording_url` holds, if anything.
+    async fn live_windows(
+        pool: &SqlitePool,
+        open: impl Fn(Option<LinkKind>) -> bool,
+    ) -> Result<Vec<LiveWindow>, sqlx::Error> {
+        let rows: Vec<(String, String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, COALESCE(NULLIF(TRIM(m.calendar_title), ''), m.title), m.calendar_start, m.calendar_end, \
+             m.calendar_join_url, ms.recording_url FROM meetings m \
              LEFT JOIN meeting_sources ms ON ms.meeting_id = m.id \
              WHERE m.calendar_start IS NOT NULL AND m.calendar_end IS NOT NULL \
-             AND ms.recording_url IS NULL \
              ORDER BY m.calendar_start, m.id",
         )
         .fetch_all(pool)
         .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|(meeting_id, title, start, end, join_url)| {
+            .filter(|(.., held)| open(held.as_deref().map(link_kind)))
+            .filter_map(|(meeting_id, title, start, end, join_url, _)| {
                 Some(LiveWindow {
                     meeting_id,
                     title,
@@ -225,6 +249,69 @@ mod tests {
         assert_eq!(windows[0].start, event().start);
         assert_eq!(windows[0].end, event().end);
         assert_eq!(windows[0].join_url, event().teams_join_url);
+    }
+
+    #[tokio::test]
+    async fn a_window_keeps_the_event_subject_after_the_title_changes() {
+        let pool = test_pool().await;
+        MeetingCalendarRepository::attach(&pool, "m1", &event()).await.unwrap();
+        // What generating a summary does to the meeting.
+        sqlx::query("UPDATE meetings SET title = 'Generated heading' WHERE id = 'm1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let windows = MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap();
+        assert_eq!(windows[0].title, "Standup");
+
+        // A meeting saved before the subject was stored has only its own title.
+        for blank in ["NULL", "'  '"] {
+            sqlx::query(&format!("UPDATE meetings SET calendar_title = {blank} WHERE id = 'm1'"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let windows = MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap();
+            assert_eq!(windows[0].title, "Generated heading");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_arrival_sees_the_meetings_that_can_still_take_it() {
+        let pool = test_pool().await;
+        const FILE: &str = "https://c-my.sharepoint.com/personal/j/Documents/Recordings/S-20261102_100000-Meeting%20Recording.mp4";
+        const RECAP_OF_FILE: &str = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fc-my.sharepoint.com%2Fa%2FS-20261102_100000-Meeting%20Recording.mp4";
+        const RECAP_WITHOUT_FILE: &str = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax";
+        let held = [
+            ("holds-file", Some(FILE)),
+            ("holds-recap-of-file", Some(RECAP_OF_FILE)),
+            ("holds-recap-without-file", Some(RECAP_WITHOUT_FILE)),
+        ];
+        for (id, url) in held {
+            sqlx::query(
+                "INSERT INTO meetings (id, title, created_at, updated_at) \
+                 VALUES (?, 'T', '2026-11-02T10:00:00Z', '2026-11-02T10:00:00Z')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            MeetingCalendarRepository::attach(&pool, id, &event()).await.unwrap();
+            crate::database::repositories::meeting_sources::MeetingSource::for_import("live-recording", "T", url, None, None)
+                .insert(&pool, id)
+                .await
+                .unwrap();
+        }
+        MeetingCalendarRepository::attach(&pool, "m1", &event()).await.unwrap();
+
+        let ids = |windows: Vec<LiveWindow>| windows.into_iter().map(|w| w.meeting_id).collect::<Vec<_>>();
+        assert_eq!(ids(MeetingCalendarRepository::unclaimed_live_windows(&pool).await.unwrap()), vec!["m1"]);
+        assert_eq!(
+            ids(MeetingCalendarRepository::live_windows_for_recap_without_file(&pool).await.unwrap()),
+            vec!["holds-file", "m1"]
+        );
+        assert_eq!(
+            ids(MeetingCalendarRepository::live_windows_for_recording(&pool).await.unwrap()),
+            vec!["holds-recap-without-file", "m1"]
+        );
     }
 
     #[tokio::test]
