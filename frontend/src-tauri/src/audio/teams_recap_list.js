@@ -316,7 +316,9 @@
         }
         if (when && (!oldest || when < oldest)) oldest = when;
       }
-      const items = state.order.filter(item => !item.startedAt || new Date(item.startedAt) >= SINCE);
+      const inWindow = state.order.filter(item => !item.startedAt || new Date(item.startedAt) >= SINCE);
+      // Probe results only go to the local file, never to an import.
+      const items = PROBE ? redact(inWindow) : inWindow;
       const reachedSince = oldest !== null && oldest < SINCE;
       const finish = () => ({ status: 'done', items, href: location.href, probe: probe() });
       if (reachedSince || state.order.length >= MAX_ROWS) return finish();
