@@ -215,6 +215,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recording_from_a_spanish_teams_links_like_an_english_one() {
+        let pool = test_pool().await;
+        live_meeting(&pool, "live", "Revisión semanal").await;
+        // As search and the recap's Share button write the file, then as the
+        // OneDrive listing does.
+        let encoded = "https://c-my.sharepoint.com/personal/j/Documents/Recordings/Revisi%C3%B3n%20semanal-20261103_100200-Grabaci%C3%B3n%20de%20la%20reuni%C3%B3n.mp4";
+        let listed = "https://c-my.sharepoint.com/personal/j/Documents/Recordings/Revisión%20semanal-20261103_100200-Grabación%20de%20la%20reunión.mp4";
+
+        assert_eq!(
+            find_recording_target(&pool, encoded, CREATED).await.unwrap(),
+            RecordingTarget::Live("live".to_owned())
+        );
+        attach_recording(&pool, "live", encoded).await.unwrap();
+        let source = MeetingSource::get(&pool, "live").await.unwrap().unwrap();
+        assert_eq!(source.recorded_at.as_deref(), Some("2026-11-03T10:02:00"));
+        assert_eq!(
+            source.recording_file.as_deref(),
+            Some("Revisión semanal-20261103_100200-Grabación de la reunión.mp4")
+        );
+
+        assert_eq!(rescan(&pool, &[], listed).await, (true, Some("live".to_owned())));
+        let recap = format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl={}",
+            url::form_urlencoded::byte_serialize(format!("{encoded}?web=1").as_bytes()).collect::<String>()
+        );
+        let key = crate::audio::teams_recap::meeting_identity_key(&recap);
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap().as_deref(),
+            Some("live")
+        );
+    }
+
+    #[tokio::test]
     async fn an_ambiguous_recording_is_new_and_names_the_candidates() {
         let pool = test_pool().await;
 

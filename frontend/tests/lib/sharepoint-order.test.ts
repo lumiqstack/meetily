@@ -33,6 +33,12 @@ describe('oldestMeetingFirst', () => {
     expect(oldestMeetingFirst([late, early])).toEqual([early, late]);
   });
 
+  test('reads the stamp a Spanish Teams writes', () => {
+    const early = rec('Planificación-20260901_090000-Grabación de la reunión.mp4', '2026-09-20T10:00:00Z');
+    const late = rec('Review-20260910_090000-Meeting Recording.mp4', '2026-09-10T10:00:00Z');
+    expect(oldestMeetingFirst([late, early])).toEqual([early, late]);
+  });
+
   test('falls back to the creation time and puts unknown dates last without mutating input', () => {
     const scan = [
       rec('audio.mp4', ''),

@@ -1141,7 +1141,7 @@ pub async fn sharepoint_enumerate_recordings_debug_command<R: Runtime>(
             ("filetype:mp4", 10),          // modern property, same intent
             ("filetype:docx", 3),          // control: property queries work at all?
             ("FileExtension:docx", 3),     // control: is FileExtension itself dead?
-            ("\"Meeting Recording\"", 10), // free text present in every recording name
+            ("\"Meeting Recording\"", 10), // free text in every English Teams recording name
             ("AMER AI Community", 10),     // free text for the known shared recording
         ] {
             search_probes.push(probe_search_get(&client, &root_host, &header, kql, limit).await);
@@ -1695,6 +1695,43 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn both_sources_list_a_spanish_teams_recording_once_dated_by_its_stamp() {
+        use chrono::TimeZone;
+        let name = "Revisión semanal-20261105_133311-Grabación de la reunión.mp4";
+        let created = "2026-11-05T19:40:00Z";
+        let own = parse_onedrive_files(
+            &serde_json::json!({"value": [{
+                "Name": name,
+                "ServerRelativeUrl": format!("/personal/u/Documents/Recordings/{name}"),
+                "TimeCreated": created,
+                "Length": 1
+            }]}),
+            "t-my.sharepoint.com",
+        );
+        let shared = parse_search_results(&serde_json::json!({
+            "PrimaryQueryResult": {"RelevantResults": {"Table": {"Rows": [{"Cells": [
+                {"Key": "Title", "Value": "Revisión semanal"},
+                {"Key": "DefaultEncodingURL", "Value": "https://t-my.sharepoint.com/personal/u/Documents/Recordings/Revisi%C3%B3n%20semanal-20261105_133311-Grabaci%C3%B3n%20de%20la%20reuni%C3%B3n.mp4"},
+                {"Key": "Created", "Value": created}
+            ]}]}}}
+        }));
+        let stamp = chrono::Local
+            .with_ymd_and_hms(2026, 11, 5, 13, 33, 11)
+            .earliest()
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for rec in own.iter().chain(&shared) {
+            let title = meeting_title_for(&rec.name);
+            let dated = crate::audio::import::resolve_meeting_date(&title, Some(&rec.file_url), Some(&rec.created));
+            assert_eq!(dated, stamp, "{}", rec.file_url);
+        }
+
+        let merged = merge_scan_results(own, shared, &[], &[], &HashMap::new());
+        assert_eq!(merged.len(), 1, "the listing and search name one file");
+        assert_eq!(merged[0].source, "mine");
     }
 
     #[test]
