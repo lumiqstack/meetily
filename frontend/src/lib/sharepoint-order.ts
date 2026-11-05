@@ -1,5 +1,10 @@
-/** Teams' recording stamp in a file name: `…-20260721_100221-Meeting Recording`. */
-const TEAMS_STAMP = /-(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})-Meeting (?:Recording|Transcript)/i;
+/**
+ * Teams' recording stamp in a file name: `…-20260721_100221-Meeting Recording`,
+ * or `…-Grabación de la reunión` from a Spanish Teams. The suffixes are those of
+ * `SUFFIXES` in `src-tauri/src/audio/teams_recap_metadata.rs`.
+ */
+const TEAMS_STAMP =
+  /-(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})-(?:Meeting Recording|Meeting Transcript|Grabación de la reunión)/i;
 
 /**
  * Sort key for when a recorded meeting took place, matching the backend's

@@ -80,12 +80,13 @@ pub fn link_kind(link: &str) -> LinkKind {
 /// [`meeting_identity_key`] with the part of a long recording removed. Teams
 /// cuts a recording at 4 hours into `…-Meeting Recording.mp4` and
 /// `…-Meeting Recording 2.mp4`, and a recap may name any part, so parts share
-/// this key. Any other key comes back unchanged.
+/// this key. Every suffix in [`metadata::SUFFIXES`] counts, whatever the
+/// language. Any other key comes back unchanged.
 pub fn whole_recording_key(identity_key: &str) -> &str {
-    ["-meeting recording", "-meeting transcript"]
+    metadata::SUFFIXES
         .into_iter()
-        .find_map(|marker| {
-            let (stem, tail) = identity_key.rsplit_once(marker)?;
+        .find_map(|suffix| {
+            let (stem, tail) = identity_key.rsplit_once(suffix)?;
             let part = tail.split('.').next()?.trim();
             part.bytes().all(|byte| byte.is_ascii_digit()).then_some(stem)
         })
@@ -543,5 +544,30 @@ mod tests {
             whole_recording_key("h/a/review-meeting recording rules-20261016_150059-meeting transcript.mp4"),
             "h/a/review-meeting recording rules-20261016_150059"
         );
+    }
+
+    #[test]
+    fn a_spanish_recording_keys_and_dates_like_an_english_one() {
+        let dir = "https://c-my.sharepoint.com/personal/j/Documents/Recordings";
+        // As SharePoint lists the path, and as the recap's Share button encodes it.
+        let raw = format!("{dir}/Revisión semanal-20261105_133311-Grabación de la reunión.mp4");
+        let encoded = format!(
+            "{dir}/Revisi%C3%B3n%20semanal-20261105_133311-Grabaci%C3%B3n%20de%20la%20reuni%C3%B3n.mp4"
+        );
+        let recap = format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl={}",
+            url::form_urlencoded::byte_serialize(format!("{encoded}?web=1").as_bytes()).collect::<String>()
+        );
+        let key = meeting_identity_key(&raw);
+        assert_eq!(meeting_identity_key(&encoded), key);
+        assert_eq!(meeting_identity_key(&recap), key);
+        assert_eq!(
+            whole_recording_key(&key),
+            "c-my.sharepoint.com/personal/j/documents/recordings/revisión semanal-20261105_133311"
+        );
+
+        let read = recording_metadata(&Url::parse(&recap).unwrap()).unwrap();
+        assert_eq!(read.title, "Revisión semanal");
+        assert_eq!(read.recorded_at, "2026-11-05T13:33:11");
     }
 }

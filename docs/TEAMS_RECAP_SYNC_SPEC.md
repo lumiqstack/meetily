@@ -119,6 +119,10 @@ lookup therefore looks for the file itself first and then for any other part of
 the same recording, meaning the same folder, title and stamp. The sync store
 keeps its exact keys.
 
+The words after the stamp are localized: a Spanish Teams writes
+`…-Grabación de la reunión.mp4`. `SUFFIXES` in `teams_recap_metadata.rs` lists
+the forms Meetily knows, and both the stamp reader and this lookup use it.
+
 ### Matching a recap to a live recording
 
 A meeting Meetily recorded live has no file URL, so the identity lookup cannot
@@ -248,8 +252,9 @@ with the summary's first heading, usually before the file appears. So the rule
 is stricter than the recap rule, and compares with the event's subject:
 
 - *Only Teams recordings qualify.* The file name must read
-  `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-Meeting Recording|Transcript[ <part>].<ext>`.
-  Other videos the search finds never match.
+  `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-<suffix>[ <part>].<ext>`, with a suffix of
+  `Meeting Recording`, `Meeting Transcript`, or `Grabación de la reunión` from a
+  Spanish Teams. Other videos the search finds never match.
 - *When it happened.* The rule tries up to three times in order, each only if the
   earlier ones fit no live recording. First a stamp marked `UTC`, then SharePoint's
   `created`, which is an instant, then an unmarked stamp read in this machine's
@@ -517,13 +522,14 @@ probe file described above, on that machine only.
   double-booked slot and a restarted recording stay ambiguous; back-to-back
   meetings go to the closer one; a second import is an identity hit; the
   replaced summary lands in `result_backup`.
-- Unit, for the recording rule: file name forms, including `UTC` stamps and part
-  numbers; the order of times; only an exact or long truncated title attaches; a
-  tie and an unconfirmed fit stay ambiguous; a meeting without a transcript is not
-  attached to; attaching writes the row and leaves the meeting alone; a re-scan
-  sees the file as held through the row and through the ledger; the order live,
-  recap, recording; a part of a held recording; a recap naming no file on either
-  side of a recording; a contradicting thread takes the key back; a manual import
+- Unit, for the recording rule: file name forms, including `UTC` stamps, part
+  numbers and the Spanish suffix, raw and percent-encoded; the order of times;
+  only an exact or long truncated title attaches; a tie and an unconfirmed fit
+  stay ambiguous; a meeting without a transcript is not attached to; attaching
+  writes the row and leaves the meeting alone; a re-scan sees the file as held
+  through the row and through the ledger; the order live, recap, recording; a
+  part of a held recording; a recap naming no file on either side of a
+  recording; a contradicting thread takes the key back; a manual import
   releases the key.
 - Unit, `#[cfg(not(windows))]`-guarded where `mock_app` is used: the loop over a
   fake extractor returning ready, not ready and error in sequence.
@@ -545,6 +551,10 @@ probe file described above, on that machine only.
   recorded live at that wrong hour. The probe's rows show a stamp beside the time
   the Meet app displays, which will settle it. Real file names already show one
   other form, `…-20261009_180000UTC-Meeting Recording.mp4`.
+- How a Spanish Teams names a transcript-only file and the parts after the
+  first. Neither has been seen. Until one is, a Spanish transcript file gives no
+  stamp and keys on its own path, and a later part counts as a part only if it
+  ends in a space and a number, as in English.
 - What SharePoint's `created` means for a recording. The code comments call it
   the recording's end. In the one real case that can be read back it equals the
   file's UTC stamp, so it may be the start. The recording rule works with either
