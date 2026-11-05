@@ -92,8 +92,10 @@ pub(crate) fn script_template() -> Result<String> {
 fn script_template_from(path: &std::path::Path) -> Result<String> {
     let script = std::fs::read_to_string(path)
         .with_context(|| format!("{SCRIPT_OVERRIDE_ENV} names an unreadable file"))?;
-    if !script.contains("%SINCE%") {
-        return Err(anyhow!("{SCRIPT_OVERRIDE_ENV} file has no %SINCE% placeholder"));
+    for placeholder in ["%SINCE%", "%PROBE%"] {
+        if !script.contains(placeholder) {
+            return Err(anyhow!("{SCRIPT_OVERRIDE_ENV} file has no {placeholder} placeholder"));
+        }
     }
     log::warn!("[recap-list] using the recap list script override from {SCRIPT_OVERRIDE_ENV}");
     Ok(script)
@@ -353,6 +355,9 @@ mod tests {
         let bad = dir.path().join("bad.js");
         std::fs::write(&bad, "(() => ({status:'done'}))()").unwrap();
         assert!(script_template_from(&bad).unwrap_err().to_string().contains("%SINCE%"));
+        let no_probe = dir.path().join("no_probe.js");
+        std::fs::write(&no_probe, "(() => ({status:'done', since:'%SINCE%'}))()").unwrap();
+        assert!(script_template_from(&no_probe).unwrap_err().to_string().contains("%PROBE%"));
         let good = dir.path().join("good.js");
         std::fs::write(&good, "(() => ({status:'done', since:'%SINCE%', probe:%PROBE%}))()").unwrap();
         assert!(script_template_from(&good).unwrap().contains("%PROBE%"));

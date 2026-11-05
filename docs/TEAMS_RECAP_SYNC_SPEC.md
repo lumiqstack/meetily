@@ -129,21 +129,26 @@ does not recognise, never with a partial list presented as complete.
 How the layout is learned (`teams_recap_list.rs`, `teams_recap_list.js`):
 
 - The window opens the Teams web shell (`https://teams.microsoft.com/v2/`),
-  since no direct URL for the Meet app's recap tab is documented. The script
-  clicks, once each, a rail button named Meet or Recap and a tab named Recap
-  or similar; after the silent phase the window is shown so the user can
-  navigate by hand, and the script reads the list wherever it appears.
+  since no direct URL for the Meet app's recap tab is documented. Before any
+  row counts, the script clicks, once each, a rail button named Meet or Recap
+  (opening the "more apps" flyout if the rail has none) and a tab named Recap
+  or similar, because the shell may open on Chat or Activity, whose rows carry
+  dates too. After the silent phase the window is shown so the user can
+  navigate by hand, and the script reads the list wherever it appears,
+  including inside a same-origin frame.
 - A row is any list item, row or article with a date it can parse or a recap
   link it can find. The link comes from an `href`, from a recap URL embedded
   in the row's markup, or, failing both, is built from a `19:meeting_…@thread.v2`
   id in the row's markup. Rows with no link count as not ready.
 - In probe mode (the "Check recap list" button) the script also returns a
   compact description of the page: rail and tab names, headings, list
-  containers, the first rows with their lines, parsed date, link and
-  attributes, every `data-tid`, recap-looking hrefs and thread ids in the
-  page. The debug command writes it to `teams_recap_list_probe.json` in the
-  app data folder. It contains meeting titles and page text, so it stays on
-  that machine unless the user shares it.
+  containers, frames, the first rows with their lines, parsed date, link,
+  attributes and id-looking React props, every `data-tid`, recap-looking hrefs
+  and thread ids in the page. If no row holds a link, the probe opens one past
+  row (the row itself, never a button inside it) and records what that showed.
+  Token query values are redacted. The debug command writes the probe to
+  `teams_recap_list_probe.json` in the app data folder. It contains meeting
+  titles and page text, so it stays on that machine unless the user shares it.
 - `MEETILY_RECAP_LIST_SCRIPT=<file>` replaces the bundled script with that
   file, so selectors can be tuned on Windows without a rebuild. The file must
   keep the `%SINCE%` and `%PROBE%` placeholders.
@@ -228,7 +233,8 @@ Same boundary as the recap link import. The script reads the rendered DOM
 only; no Tauri IPC is exposed to the Teams page; recap text is never written to
 a URL, clipboard, log or external service. Logs record keys, counts and error
 messages, not recap content. The since date and keys in the store are the only
-persisted additions.
+persisted additions of a sync; the "Check recap list" button also writes the
+probe file described above, on that machine only.
 
 ## Out of scope
 

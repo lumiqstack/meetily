@@ -179,7 +179,7 @@ fn is_not_ready(error: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Scanner (stub until the Meet app script lands)
+// Listing
 // ---------------------------------------------------------------------------
 
 /// The Meet app can only be read through the Windows WebView2 profile.
@@ -187,9 +187,6 @@ pub const fn sync_available() -> bool {
     cfg!(target_os = "windows")
 }
 
-/// Every meeting row the Meet app lists from `since` onwards, newest first.
-/// Rows without a recap link are not returned; the Meet app scanner reports
-/// them as not ready when it exists.
 /// The Meet app's rows for the window, or the error the listing hit.
 async fn list_recaps<R: Runtime>(
     app: &AppHandle<R>,
