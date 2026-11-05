@@ -96,7 +96,7 @@ pub fn validate_recap_url(input: &str) -> Result<Url> {
 }
 
 #[cfg(target_os = "windows")]
-mod windows {
+pub(crate) mod windows {
     use super::*;
     use ::windows::core::{Interface, PWSTR};
     use serde::Deserialize;
@@ -109,9 +109,9 @@ mod windows {
         LaunchingExternalUriSchemeEventHandler,
     };
 
-    const SILENT_WAIT: Duration = Duration::from_secs(25);
-    const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
-    const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+    pub(crate) const SILENT_WAIT: Duration = Duration::from_secs(25);
+    pub(crate) const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
+    pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
     // Teams renders this view asynchronously. Choose the AI summary tab by
     // role/name, then read only its notes and task rows. A layout change
@@ -128,7 +128,7 @@ mod windows {
         tasks: Vec<String>,
     }
 
-    async fn block_desktop_handoff<R: Runtime>(window: &WebviewWindow<R>) -> Result<()> {
+    pub(crate) async fn block_desktop_handoff<R: Runtime>(window: &WebviewWindow<R>) -> Result<()> {
         let (sender, receiver) = oneshot::channel::<Result<(), String>>();
         window
             .with_webview(move |webview| {
@@ -168,7 +168,7 @@ mod windows {
             .map_err(|e| anyhow!("Could not block Teams desktop-app handoff: {e}"))
     }
 
-    async fn execute_script<R: Runtime>(window: &WebviewWindow<R>, script: &str) -> Result<String> {
+    pub(crate) async fn execute_script<R: Runtime>(window: &WebviewWindow<R>, script: &str) -> Result<String> {
         let (sender, receiver) = oneshot::channel::<Result<String, String>>();
         let script = script.to_owned();
         window

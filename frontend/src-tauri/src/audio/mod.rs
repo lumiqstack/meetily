@@ -72,6 +72,7 @@ pub mod ytdlp;
 pub mod sharepoint;
 pub mod teams_recap;
 pub mod sharepoint_sync;
+pub mod teams_recap_list;
 pub mod teams_recap_sync;
 pub mod url_import;
 pub mod vtt;

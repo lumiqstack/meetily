@@ -4,10 +4,9 @@
 //! recap never creates a second meeting or a second note, and a content hash
 //! per key turns an unchanged recap into a skip instead of a rewrite.
 //!
-//! The list itself comes from [`list_recaps`]. Until the Meet app scanner
-//! exists it returns nothing, so a sync reports zero scanned rather than
-//! inventing work; everything downstream of the list is complete and tested.
-//! See docs/TEAMS_RECAP_SYNC_SPEC.md.
+//! The list itself comes from `teams_recap_list`, which reads the Meet app's
+//! recap tab in a hidden WebView2 window. Rows it lists without a recap link
+//! count as not ready. See docs/TEAMS_RECAP_SYNC_SPEC.md.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -180,7 +179,7 @@ fn is_not_ready(error: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Scanner (stub until the Meet app script lands)
+// Listing
 // ---------------------------------------------------------------------------
 
 /// The Meet app can only be read through the Windows WebView2 profile.
@@ -188,21 +187,16 @@ pub const fn sync_available() -> bool {
     cfg!(target_os = "windows")
 }
 
-/// Every meeting row the Meet app lists from `since` onwards, newest first.
-/// Rows without a recap link are not returned; the Meet app scanner reports
-/// them as not ready when it exists.
+/// The Meet app's rows for the window, or the error the listing hit.
 async fn list_recaps<R: Runtime>(
     app: &AppHandle<R>,
     since: DateTime<Utc>,
-) -> Result<Vec<RecapCandidate>> {
-    let _ = (app, since);
-    if !sync_available() {
-        return Err(anyhow!(
-            "Teams recap sync requires Meetily on Windows with WebView2."
-        ));
+) -> Result<super::teams_recap_list::RecapListing> {
+    let listing = super::teams_recap_list::list_recaps(app, since, false).await?;
+    if let Some(error) = &listing.error {
+        return Err(anyhow!("{error}"));
     }
-    info!("[recap-sync] Meet app scanner not implemented; nothing listed");
-    Ok(Vec::new())
+    Ok(listing)
 }
 
 // ---------------------------------------------------------------------------
@@ -286,17 +280,19 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let state = load_state(app);
     let since = scan_window_start(&state, started_at);
     info!("[recap-sync] listing recaps since {}", since.to_rfc3339());
-    let candidates = list_recaps(app, since).await.map_err(|e| e.to_string())?;
+    let listing = list_recaps(app, since).await.map_err(|e| e.to_string())?;
 
     let app_state = app.state::<crate::state::AppState>();
     let pool = app_state.db_manager.pool();
     let mut report = RecapSyncReport {
-        scanned: candidates.len(),
+        scanned: listing.candidates.len() + listing.rows_without_link,
+        // A listed meeting with no recap link yet is retried next sync.
+        not_ready: listing.rows_without_link,
         meetings_folder,
         ..Default::default()
     };
     // Oldest first so a sync interrupted midway leaves a contiguous prefix.
-    let mut ordered = candidates;
+    let mut ordered = listing.candidates;
     ordered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     let total = ordered.len();
     for (done, candidate) in ordered.iter().enumerate() {
@@ -366,10 +362,50 @@ pub async fn set_teams_recap_sync_prefs_command<R: Runtime>(
 #[tauri::command]
 pub async fn teams_recap_list_debug_command<R: Runtime>(
     app: AppHandle<R>,
-) -> Result<Vec<RecapCandidate>, String> {
+) -> Result<RecapListDebug, String> {
+    let Ok(_running) = SYNC_LOCK.try_lock() else {
+        return Err("A Teams recap sync is already running.".into());
+    };
     let state = load_state(&app);
     let since = scan_window_start(&state, Utc::now());
-    list_recaps(&app, since).await.map_err(|e| e.to_string())
+    let listing = super::teams_recap_list::list_recaps(&app, since, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    let probe_file = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve app data directory: {e}"))?
+        .join(PROBE_FILE);
+    let json = serde_json::to_string_pretty(&listing).map_err(|e| e.to_string())?;
+    std::fs::write(&probe_file, json)
+        .map_err(|e| format!("Could not write {}: {e}", probe_file.display()))?;
+    info!(
+        "[recap-sync] list check: {} recaps, {} rows without a link, probe saved",
+        listing.candidates.len(),
+        listing.rows_without_link
+    );
+    Ok(RecapListDebug {
+        candidates: listing.candidates,
+        rows_without_link: listing.rows_without_link,
+        page_url: listing.page_url,
+        error: listing.error,
+        probe_file: probe_file.to_string_lossy().to_string(),
+    })
+}
+
+/// Written next to the app's data by the list check, for reading the Meet
+/// app's layout on the machine that ran it. It holds meeting titles and page
+/// text, so it stays local.
+const PROBE_FILE: &str = "teams_recap_list_probe.json";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapListDebug {
+    pub candidates: Vec<RecapCandidate>,
+    pub rows_without_link: usize,
+    pub page_url: Option<String>,
+    pub error: Option<String>,
+    pub probe_file: String,
 }
 
 #[cfg(test)]

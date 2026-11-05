@@ -26,6 +26,15 @@ interface RecapSyncReport {
   meetingsFolder: string;
 }
 
+/** Mirrors `RecapListDebug` in src-tauri/src/audio/teams_recap_sync.rs. */
+interface RecapListDebug {
+  candidates: { recapUrl: string; title: string; startedAt: string | null }[];
+  rowsWithoutLink: number;
+  pageUrl: string | null;
+  error: string | null;
+  probeFile: string;
+}
+
 interface SyncProgress {
   done: number;
   total: number;
@@ -110,6 +119,23 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
     }
   };
 
+  const handleCheckList = async () => {
+    setIsSyncing(true);
+    try {
+      const result = await invoke<RecapListDebug>('teams_recap_list_debug_command');
+      const description = `${result.candidates.length} with a recap link, ${result.rowsWithoutLink} without. Details saved to ${result.probeFile}`;
+      if (result.error) {
+        toast.warning('Recap list not read', { description: `${result.error} ${description}` });
+      } else {
+        toast.success('Recap list read', { description });
+      }
+    } catch (error) {
+      toast.error('Recap list check failed', { description: String(error) });
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const lastSync = state?.lastSyncDate ? new Date(state.lastSyncDate).toLocaleString() : 'never';
 
   return (
@@ -141,6 +167,14 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
         >
           <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
           {isSyncing ? 'Syncing...' : 'Sync Teams recaps'}
+        </button>
+        <button
+          onClick={handleCheckList}
+          disabled={!available || isSyncing}
+          title="Reads the recap list without importing anything and saves what the page showed next to Meetily's data"
+          className="px-3 py-2 text-sm border border-gray-300 rounded-md hover:bg-gray-100 transition-colors disabled:opacity-60"
+        >
+          Check recap list
         </button>
         {isSyncing && progress && progress.total > 0 && (
           <span className="text-xs text-gray-600">
