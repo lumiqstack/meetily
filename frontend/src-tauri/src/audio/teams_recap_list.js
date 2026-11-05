@@ -1,129 +1,42 @@
 (() => {
       // Rendered by teams_recap_list.rs: %SINCE% is an RFC 3339 instant and
-      // %PROBE% a boolean. The script reads the Meet app's recap list and
-      // never exposes Tauri IPC or sends page text anywhere.
+      // %PROBE% a boolean. The script reads the meeting list of the Teams
+      // Recap app ("Meeting Recaps" on the app bar) and never exposes Tauri
+      // IPC or sends page text anywhere.
       const SINCE = new Date('%SINCE%');
       const PROBE = %PROBE%;
       const MAX_ROWS = 600;
       // Let the shell render, and a click take effect, before reading rows.
       const SETTLE_MS = 6000;
+      // An open Recap app showing no rows and no loading placeholders for
+      // this long has nothing to list.
+      const EMPTY_MS = 20000;
+      // The list is complete once it has neither grown nor scrolled for this
+      // long: older rows load in pages as the list scrolls.
+      const IDLE_MS = 8000;
       const host = location.hostname.toLowerCase();
       if (!['teams.microsoft.com', 'teams.cloud.microsoft',
             'teams.microsoft.com.mcas.ms', 'teams.cloud.microsoft.mcas.ms'].includes(host)) {
         return { status: 'waiting', href: location.href };
       }
+      const ROW = '[data-tid="podcast-meeting-item"]';
       const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
       const label = el => (el.getAttribute('aria-label') || text(el)).trim();
       const visible = el => el.getClientRects().length > 0;
-      const state = window.__meetilyRecapList ||= {
-        clicks: {}, clicked: {}, seen: {}, order: [], idle: 0, lastCount: -1, firstSeen: Date.now(), lastClick: 0,
-        errors: [], net: [], stages: null, snapSig: null, pendingSig: null, pendingSince: 0, lastProbeAt: 0
-      };
       const session = {
         get: key => { try { return sessionStorage.getItem(key); } catch (e) { return null; } },
-        set: (key, value) => { try { sessionStorage.setItem(key, value); } catch (e) { /* quota or blocked */ } }
-      };
-      const STAGES_KEY = 'meetilyRecapStages';
-      state.stages ||= JSON.parse(session.get(STAGES_KEY) || '[]');
-
-      // ---- probe only: note the page's recap and meeting calls, so the report
-      // shows where the list's data comes from. Key names and short values
-      // only; nothing leaves the page except through the local probe file. ----
-      const SECRET_KEY = /token|auth|secret|password|cookie|session|credential|signature|^sig$|^key$/i;
-      const shapeOf = root => {
-        const out = [];
-        const walk = (value, path, depth) => {
-          if (out.length >= 60) return;
-          if (Array.isArray(value)) {
-            out.push(path + ' [' + value.length + ']');
-            value.slice(0, 2).forEach((item, i) => walk(item, path + '[' + i + ']', depth + 1));
-          } else if (value && typeof value === 'object') {
-            if (depth < 7) for (const name of Object.keys(value).slice(0, 40)) walk(value[name], path + '.' + name, depth + 1);
-          } else if (SECRET_KEY.test(path.slice(path.lastIndexOf('.') + 1))) {
-            out.push(path + ' <hidden>');
-          } else if (typeof value === 'string') {
-            const prose = /\s/.test(value) && value.length > 70;
-            out.push(path + ' = ' + (prose ? '<text ' + value.length + ' chars>' : value.slice(0, 300)));
-          } else {
-            out.push(path + ' = ' + value);
-          }
-        };
-        walk(root, '$', 0);
-        return out;
-      };
-      const urlKey = url => { try { const u = new URL(url, location.href); return u.origin + u.pathname; } catch (e) { return null; } };
-      const netWanted = url => {
-        const key = urlKey(url);
-        return !!key && /recap|meeting|calendar|substrate|stream|intelligent|transcript|graphql|sharepoint/i.test(key) &&
-          !/telemetry|browser\.events|beacon|collect|trouter|presence|\.(js|css|png|svg|woff2?|map)$/i.test(key);
-      };
-      const noteCall = (url, status, body) => {
-        const key = urlKey(url);
-        if (!key || state.net.length >= 30 || state.net.filter(call => call.u === key).length >= 2) return;
-        let json = null;
-        try { json = JSON.parse(body); } catch (e) { /* not JSON */ }
-        state.net.push({ u: key.slice(0, 200), s: status, n: (body || '').length, shape: json ? shapeOf(json) : undefined });
-      };
-      if (PROBE && !state.hooked) {
-        state.hooked = true;
-        try { performance.setResourceTimingBufferSize(3000); } catch (e) { /* older engine */ }
-        const realFetch = window.fetch;
-        window.fetch = function (...args) {
-          const pending = realFetch.apply(this, args);
-          try {
-            const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || String(args[0]);
-            if (netWanted(url)) {
-              pending.then(res => res.clone().text().then(body => noteCall(url, res.status, body))).catch(() => {});
-            }
-          } catch (e) { /* never disturb the page */ }
-          return pending;
-        };
-        const realOpen = XMLHttpRequest.prototype.open;
-        const realSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-          this.__meetilyUrl = url;
-          return realOpen.call(this, method, url, ...rest);
-        };
-        XMLHttpRequest.prototype.send = function (...args) {
-          try {
-            if (netWanted(this.__meetilyUrl)) {
-              this.addEventListener('load', () => {
-                try {
-                  const body = this.responseType === '' || this.responseType === 'text' ? this.responseText
-                    : this.responseType === 'json' ? JSON.stringify(this.response) : '';
-                  noteCall(this.__meetilyUrl, this.status, body);
-                } catch (e) { /* never disturb the page */ }
-              });
-            }
-          } catch (e) { /* never disturb the page */ }
-          return realSend.apply(this, args);
-        };
-      }
-
-      // The page and any same-origin frame an app renders in. A cross-origin
-      // frame is out of reach from here; the probe reports it.
-      const documents = () => {
-        const found = [document];
-        for (const frame of document.querySelectorAll('iframe')) {
-          try { if (frame.contentDocument?.body) found.push(frame.contentDocument); } catch (e) { /* cross-origin */ }
+        set: (key, value) => {
+          try { sessionStorage.setItem(key, value); return sessionStorage.getItem(key) === value; } catch (e) { return false; }
         }
-        return found;
       };
-      const all = selector => documents().flatMap(doc => [...doc.querySelectorAll(selector)]);
-      const recapHref = /https?:\/\/[^"'\s<>]*\/l\/meetingrecap\?[^"'\s<>]*/i;
-      const threadId = /19:meeting_[A-Za-z0-9+/=_-]+@thread\.v2/i;
-      const months = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?';
-      const clock = '\\d{1,2}:\\d{2}(?:\\s?[ap]\\.?m\\.?)?';
-      const dateLine = new RegExp(
-        '(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\\s+)?(' +
-        months + '\\s+\\d{1,2}(?:,?\\s+\\d{4})?|\\d{1,2}\\s+' + months + '(?:\\s+\\d{4})?|' +
-        '\\d{1,2}/\\d{1,2}/\\d{2,4})(?:[,\\s]+(?:at\\s+)?(' + clock + '))?', 'i');
-      const relativeLine = new RegExp('^(today|yesterday)\\b(?:[,\\s]+(?:at\\s+)?(' + clock + '))?', 'i');
-      const lines = el => (el.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+      const state = window.__meetilyRecapList ||= {
+        clicks: {}, seen: {}, order: [], details: [], shapes: {}, errors: [], oldest: null,
+        firstSeen: Date.now(), lastClick: 0, emptySince: 0, idleSince: 0, lastCount: -1, lastProbeAt: 0
+      };
+      const noteError = (where, e) => { if (state.errors.length < 20) state.errors.push(where + ': ' + e.message); };
 
       // ---- app-choice page, same handling as the recap import ----
-      const choices = all('a,button,[role="button"]');
-      const webChoice = choices.find(el =>
+      const webChoice = [...document.querySelectorAll('a,button,[role="button"]')].find(el =>
         /^(continue (on|in) (this|the) browser|use the web app( instead)?|open (in|on) (the )?web( app)?|continue in browser)$/i
           .test(text(el) || el.getAttribute('aria-label') || ''));
       if (webChoice) {
@@ -131,470 +44,441 @@
         return { status: 'opening_web', href: location.href };
       }
 
-      // ---- what a meeting row looks like ----
-      const parseWhen = row => {
-        const stamp = row.querySelector('time[datetime]');
-        if (stamp) {
-          const when = new Date(stamp.getAttribute('datetime'));
-          if (!isNaN(when)) return when;
-        }
-        for (const line of lines(row)) {
-          const rel = line.match(relativeLine);
-          if (rel) {
-            const day = new Date();
-            if (/yesterday/i.test(rel[1])) day.setDate(day.getDate() - 1);
-            if (rel[2]) {
-              const at = new Date(day.toDateString() + ' ' + rel[2].replace(/\./g, ''));
-              if (!isNaN(at)) return at;
-            }
-            day.setHours(0, 0, 0, 0);
-            return day;
-          }
-          const m = line.match(dateLine);
-          if (m) {
-            let value = m[1];
-            if (!/\d{4}/.test(value)) value += ' ' + new Date().getFullYear();
-            if (m[2]) value += ' ' + m[2].replace(/\./g, '');
-            const when = new Date(value);
-            if (!isNaN(when)) {
-              // A list without years that reaches into "next month" is last year's.
-              if (when.getTime() > Date.now() + 86400000) when.setFullYear(when.getFullYear() - 1);
-              return when;
-            }
-          }
+      // ---- what a row holds: the meeting object its React component gets
+      // as a prop, which carries every field of a recap sharing link ----
+      const fiberOf = el => {
+        const key = Object.keys(el).find(name => name.startsWith('__reactFiber$'));
+        return key ? el[key] : null;
+      };
+      // The props of the nearest component at or above `el` that pass `wanted`.
+      const propsAbove = (el, wanted) => {
+        for (let fiber = fiberOf(el), level = 0; fiber && level < 12; level++, fiber = fiber.return) {
+          const props = fiber.memoizedProps;
+          if (props && typeof props === 'object' && wanted(props)) return props;
         }
         return null;
       };
-      const linkOf = row => {
-        const anchor = [...row.querySelectorAll('a[href]')].map(a => a.href).find(h => recapHref.test(h));
-        if (anchor) return { url: anchor, kind: 'href' };
-        const html = row.outerHTML.replace(/&amp;/g, '&');
-        const embedded = html.match(recapHref);
-        if (embedded) return { url: embedded[0], kind: 'embedded' };
-        const thread = html.match(threadId);
-        if (thread) {
-          return {
-            url: 'https://teams.microsoft.com/l/meetingrecap?threadId=' + encodeURIComponent(thread[0]),
-            kind: 'thread'
-          };
+      const meetingOf = row => propsAbove(row, props => {
+        const meeting = props.meeting;
+        return !!meeting && typeof meeting === 'object' && !!(meeting.threadId || meeting.iCalUid);
+      })?.meeting || null;
+      const str = value => typeof value === 'string' ? value.trim() : '';
+      const listOf = value => Array.isArray(value) ? value.filter(entry => entry && typeof entry === 'object') : [];
+      const instant = value => {
+        const when = value ? new Date(value) : null;
+        return when && !isNaN(when) ? when : null;
+      };
+      // Outlook's GlobalObjectId: bytes 16-19 hold an occurrence's original
+      // date, and are zero for a series and for a single meeting.
+      const GLOBAL_ID = /^040000008200E00074C5B7101A82E008[0-9A-F]{8,}$/i;
+      const isOccurrence = ical => GLOBAL_ID.test(ical) && !/^0{8}$/.test(ical.slice(32, 40));
+      const seriesOf = ical => ical.slice(0, 32) + '00000000' + ical.slice(40);
+      const itemInApiUrl = url => (str(url).match(/\/items\/([^/?#]+)/) || [])[1] || '';
+      // The recording file as a sharing link writes it: non-ASCII letters
+      // percent-encoded and Office's "?web=1".
+      const fileLink = url => {
+        try {
+          const file = new URL(url);
+          file.search = 'web=1';
+          file.hash = '';
+          return file.href;
+        } catch (e) {
+          return '';
         }
-        return null;
       };
-      const titleOf = row => {
-        const heading = row.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"],strong,b,[data-tid*="title" i],[class*="title" i]');
-        const value = heading ? text(heading) : '';
-        if (value && !dateLine.test(value) && !relativeLine.test(value)) return value.slice(0, 200);
-        const first = lines(row).find(line => !dateLine.test(line) && !relativeLine.test(line) && line.length > 2);
-        return (first || '').slice(0, 200);
+      const tenantOf = meeting => str(meeting.tenantId) || str(meeting.organizerTenantId) ||
+        listOf(meeting.meetingFiles).map(file => str(file.organizerTenantId)).find(Boolean) || '';
+      // A recap sharing link built from the row, with the same keys and order
+      // the recap's Share button uses. A recording's row names its file, so
+      // the link keys on that file like a pasted link does. A
+      // transcript-only row has only the transcript's drive item.
+      const recapOf = meeting => {
+        const transcripts = listOf(meeting.transcripts);
+        const recordings = listOf(meeting.recordings);
+        const files = transcripts.concat(recordings);
+        const recommended = meeting.recommendationData && typeof meeting.recommendationData === 'object'
+          ? meeting.recommendationData : {};
+        const file = str(recommended.url);
+        const ical = str(meeting.iCalUid);
+        const recurring = isOccurrence(ical);
+        const first = read => files.map(read).find(Boolean) || '';
+        const params = [
+          ['driveId', str(recommended.driveId) || first(entry => str(entry.driveId))],
+          ['driveItemId', str(recommended.driveItemId) || first(entry => str(entry.driveItemId) || itemInApiUrl(entry.url))],
+          ['sitePath', file],
+          ['fileUrl', file ? fileLink(file) : ''],
+          ['iCalUid', ical],
+          ['masterICalUid', recurring ? seriesOf(ical) : ''],
+          ['threadId', str(meeting.threadId) || str(meeting.skypeTeamsProperties?.conversationId)],
+          ['organizerId', str(meeting.organizerId)],
+          ['tenantId', tenantOf(meeting)],
+          ['callId', first(entry => str(entry.callId))],
+          ['threadType', 'meeting'],
+          ['meetingType', recurring ? 'Recurring' : 'Scheduled'],
+          ['subType', 'RecapSharingLink_RecapCore'],
+          ['recapType', transcripts.length ? (recordings.length ? 'RecordingAndTranscript' : 'ODSPTranscript') : '']
+        ].filter(([, value]) => value);
+        const has = name => params.some(([key]) => key === name);
+        if (!has('threadId') && !has('iCalUid')) return null;
+        // When it was recorded, not the calendar slot: a recurring row can
+        // show the series' next slot beside an earlier occurrence's recap.
+        const starts = files.map(entry => instant(entry.startDateTime)).filter(Boolean);
+        return {
+          recapUrl: 'https://teams.microsoft.com/l/meetingrecap?' +
+            params.map(([key, value]) => key + '=' + encodeURIComponent(value)).join('&'),
+          linkKind: file ? 'file' : has('driveItemId') ? 'item' : 'thread',
+          recordedAt: starts.length ? new Date(Math.min(...starts)) : null,
+          detail: { recurring, transcripts: transcripts.length, recordings: recordings.length, tenant: has('tenantId') }
+        };
       };
-      const outsideLists = el => !!el.closest('nav,[role="navigation"],[role="tablist"],[role="menu"],[role="menubar"],[role="toolbar"]');
-      const looksLikeRow = el => {
-        if (!visible(el) || outsideLists(el)) return false;
-        const value = text(el);
-        if (value.length < 3 || value.length > 700) return false;
-        return parseWhen(el) !== null || linkOf(el) !== null;
-      };
-      const findRows = () => {
-        const found = all('[role="row"],[role="listitem"],[role="treeitem"],[role="option"],li,article,a[href*="meetingrecap"]')
-          .filter(looksLikeRow);
-        // A row may nest list items: keep the outermost element only.
-        return found.filter(el => !found.some(parent => parent !== el && parent.contains(el)));
+      const readRow = row => {
+        const meeting = meetingOf(row);
+        const title = (str(meeting?.subject) ||
+          row.querySelector('input[type="checkbox"][aria-label]')?.getAttribute('aria-label') || '').trim().slice(0, 200);
+        const scheduled = instant(meeting?.start) || instant(row.querySelector('time[datetime]')?.getAttribute('datetime'));
+        const recap = meeting ? recapOf(meeting) : null;
+        const startedAt = recap?.recordedAt || scheduled;
+        return {
+          meeting,
+          scheduled,
+          item: {
+            recapUrl: recap ? recap.recapUrl : null,
+            linkKind: recap ? recap.linkKind : null,
+            title,
+            startedAt: startedAt ? startedAt.toISOString() : null
+          },
+          detail: { scheduled: scheduled ? scheduled.toISOString() : null, props: !!meeting, ...(recap?.detail || {}) }
+        };
       };
 
-      // ---- probe for learning the layout; only returned when asked ----
-      const idAttrs = root => {
-        const found = [];
-        for (const el of [root, ...root.querySelectorAll('*')]) {
-          for (const attr of el.attributes) {
-            if (/19:|meetingrecap|recap|thread|callid|organizer|fileurl|icaluid/i.test(attr.value) ||
-                /^data-/.test(attr.name) && attr.name !== 'data-tid') {
-              found.push(el.tagName.toLowerCase() + '@' + attr.name + '=' + attr.value.slice(0, 160));
-              if (found.length >= 25) return found;
-            }
-          }
-        }
-        return found;
-      };
-      // Data a row keeps in its React props rather than its markup: id-looking
-      // strings only, with their key path. Bounded, because props reach the
-      // whole component tree.
-      const fiberIds = root => {
-        const key = Object.keys(root).find(k => k.startsWith('__reactFiber$'));
-        if (!key) return [];
-        const wantedValue = /19:[a-z0-9_-]+|meetingrecap|sharepoint\.com|040000008200e00074c5b7101a82e008/i;
-        const wantedKey = /thread|callid|icaluid|organizer|fileurl|driveid|driveitem|sitepath|starttime|endtime|startdate|subject|meetingid|recapurl|deeplink|weburl/i;
-        const skip = new Set(['children', '_owner', '_store', 'ref', 'style', 'className', 'return', 'stateNode', 'queue', 'baseQueue', 'deps', 'data-tid']);
-        const found = [];
-        const seen = new WeakSet();
-        let budget = 8000;
-        const walk = (value, path, depth) => {
-          if (budget-- <= 0 || found.length >= 40) return;
-          const last = path.slice(path.lastIndexOf('.') + 1);
-          if (typeof value === 'string') {
-            if (!SECRET_KEY.test(last) && (wantedValue.test(value) || wantedKey.test(last))) found.push(path + '=' + value.slice(0, 400));
-            return;
-          }
-          if (typeof value === 'number') {
-            if (wantedKey.test(last)) found.push(path + '=' + value);
-            return;
-          }
-          if (value instanceof Date) {
-            if (!isNaN(value)) found.push(path + '=' + value.toISOString());
-            return;
-          }
-          if (!value || typeof value !== 'object' || value === window || value.nodeType || depth > 6 || seen.has(value)) return;
-          seen.add(value);
-          for (const name of Object.keys(value).slice(0, 60)) {
-            if (!skip.has(name) && !name.startsWith('__react')) walk(value[name], path + '.' + name, depth + 1);
-          }
-        };
-        let fiber = root[key];
-        for (let level = 0; fiber && level < 10; level++, fiber = fiber.return) {
-          walk(fiber.memoizedProps, 'p' + level, 0);
-          walk(fiber.memoizedState, 's' + level, 0);
-        }
-        return found;
-      };
-      const frames = () => [...document.querySelectorAll('iframe')].map(frame => {
-        const rect = frame.getBoundingClientRect();
-        let sameOrigin = false;
-        try { sameOrigin = !!frame.contentDocument; } catch (e) { /* cross-origin */ }
-        const raw = frame.getAttribute('src') || '';
-        let src;
-        try { if (raw) { const url = new URL(raw, location.href); src = url.origin + url.pathname; } } catch (e) { /* no src */ }
-        return { src, srcdoc: frame.hasAttribute('srcdoc') || undefined, name: frame.name || undefined,
-                 title: frame.title || undefined, sandbox: frame.getAttribute('sandbox') ?? undefined,
-                 w: Math.round(rect.width), h: Math.round(rect.height), sameOrigin };
-      });
+      // ---- probe only: a record for tuning, written to a local file ----
+      const VIEWS_KEY = 'meetilyRecapViews';
+      const TESTS_KEY = 'meetilyRecapTests';
+      const SECRET_KEY = /token|auth|secret|password|cookie|session|credential|signature|^sig$|^key$/i;
       // Tokens never leave the page, even into the local probe file.
       const redact = value => JSON.parse(JSON.stringify(value)
         .replace(/(tempauth|access_token|token|sig|code)(=|%3D)[^&%"'\s\\]+/gi, '$1$2REDACTED')
         .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '<jwt>'));
-
-      // ---- probe: what each view of the page looks like. The open recap's
-      // own content (notes, transcript, speakers) is never described. ----
-      const OPAQUE = '[data-tid="meeting-recap-main-panel"]';
-      const RAIL = '[data-tid="app-bar-wrapper"],[data-tid="app-layout-area--nav"]';
-      const inRail = el => !!el.closest(RAIL);
-      const fuiOf = el => (typeof el.className === 'string' ? el.className.split(/\s+/).filter(c => c.startsWith('fui-')) : []).join('.');
-      const ownText = el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue).join(' ').replace(/\s+/g, ' ').trim();
-      const STATE_ATTRS = ['aria-selected', 'aria-current', 'aria-pressed', 'aria-expanded', 'aria-checked', 'aria-level', 'aria-posinset', 'aria-setsize', 'tabindex'];
-      const shortName = el => {
-        const parts = [el.tagName.toLowerCase()];
-        const role = el.getAttribute('role');
-        if (role) parts.push('[' + role + ']');
-        const tid = el.getAttribute('data-tid');
-        if (tid) parts.push('{' + tid.slice(0, 60) + '}');
-        const fui = fuiOf(el);
-        if (fui) parts.push('.' + fui);
-        return parts.join(' ');
-      };
-      const describe = el => {
-        const parts = [shortName(el)];
-        for (const name of STATE_ATTRS) {
-          const value = el.getAttribute(name);
-          if (value !== null) parts.push(name.replace('aria-', '') + '=' + value);
-        }
-        const aria = el.getAttribute('aria-label');
-        if (aria) parts.push('label="' + aria.slice(0, 90) + '"');
-        const own = ownText(el);
-        if (own) parts.push('"' + own.slice(0, 70) + '"');
-        if (el.tagName === 'A' && el.getAttribute('href')) {
-          const key = urlKey(el.getAttribute('href'));
-          if (key) parts.push('href=' + key.slice(0, 80));
-        }
-        return parts.join(' ');
-      };
-      const pathOf = el => {
-        const chain = [];
-        for (let node = el; node && node !== document.body && chain.length < 8; node = node.parentElement) chain.push(shortName(node));
-        return chain;
-      };
-      const worthALine = el => el.getAttribute('role') || el.getAttribute('data-tid') || el.getAttribute('aria-label') ||
-        el.hasAttribute('tabindex') || ownText(el) || fuiOf(el) || /^(A|BUTTON|INPUT|LI|UL|OL|H[1-6]|TIME|IFRAME|TABLE|TR)$/.test(el.tagName);
-      const outline = (root, limit) => {
+      // Key paths of a meeting object. Values only for id, type, time and
+      // file fields; never prose, names or summaries.
+      const SHOW_VALUE = /^(id|.*Ids?|.*ICalUid|iCalUid|type|subType|.*Type|start|end|.*DateTime|.*Time|url|webUrl|location|fileUrl|sitePath|fileName|name|is[A-Z].*|has[A-Z].*|state|status)$/;
+      const shapeOf = root => {
         const out = [];
-        let dropped = 0;
-        const walk = (el, depth) => {
-          if (/^(script|style|svg|path|link|meta)$/i.test(el.tagName) || getComputedStyle(el).display === 'none') return;
-          const pad = ' '.repeat(Math.min(depth, 24));
-          if (el.matches(OPAQUE)) {
-            out.push(pad + shortName(el) + ' (not described: ' + el.getElementsByTagName('*').length + ' elements)');
-            return;
+        const seen = new WeakSet();
+        const walk = (value, path, depth) => {
+          if (out.length >= 160) return;
+          const key = path.slice(path.lastIndexOf('.') + 1).replace(/\[\d+\]$/, '');
+          if (Array.isArray(value)) {
+            out.push(path + ' [' + value.length + ']');
+            if (value.length && depth < 4) walk(value[0], path + '[0]', depth + 1);
+          } else if (value && typeof value === 'object') {
+            if (seen.has(value) || value.nodeType || value === window) return;
+            seen.add(value);
+            if (depth >= 4) {
+              out.push(path + ' {' + Object.keys(value).length + ' keys}');
+              return;
+            }
+            for (const name of Object.keys(value).slice(0, 60)) walk(value[name], path + '.' + name, depth + 1);
+          } else if (typeof value === 'string') {
+            const plain = !/\s/.test(value) || /^https?:/i.test(value) || /\.(mp4|vtt|docx?|pptx?|xlsx?|loop)$/i.test(value);
+            const shown = SHOW_VALUE.test(key) && !SECRET_KEY.test(key) && plain && value.length <= 600;
+            out.push(path + (shown ? ' = ' + value : ' <string ' + value.length + '>'));
+          } else if (typeof value === 'number' || typeof value === 'boolean') {
+            out.push(path + ' = ' + value);
+          } else if (value !== undefined) {
+            out.push(path + ' <' + (value === null ? 'null' : typeof value) + '>');
           }
-          const shown = worthALine(el);
-          if (shown) {
-            if (out.length < limit) out.push(pad + describe(el));
-            else dropped++;
-          }
-          for (const child of el.children) walk(child, shown ? depth + 1 : depth);
         };
-        walk(root, 0);
-        return dropped ? out.concat('... ' + dropped + ' more') : out;
+        walk(root, '$', 0);
+        return out;
       };
-      const dateish = value => value.length <= 300 && (dateLine.test(value) || relativeLine.test(value) ||
-        /^(tomorrow|this week|last week|last month|earlier|older|(mon|tues?|wed(nes)?|thu(rs)?|fri|sat(ur)?|sun)(day)?)\b/i.test(value) ||
-        new RegExp('\\b' + clock).test(value));
-      const dateHits = () => {
-        const found = [];
-        for (const el of document.body.querySelectorAll('*')) {
-          if (found.length >= 200) break;
-          if (/^(SCRIPT|STYLE)$/.test(el.tagName) || el.closest(OPAQUE) || inRail(el)) continue;
-          const own = ownText(el);
-          if (el.tagName === 'TIME' || (own && dateish(own)) || dateish(el.getAttribute('aria-label') || '')) found.push(el);
+      const parsed = raw => { try { return JSON.parse(raw || 'null'); } catch (e) { return null; } };
+      const views = PROBE ? parsed(session.get(VIEWS_KEY)) || [] : [];
+      // Whether the page paints while the window is hidden: older rows load
+      // on scroll, which may need painting.
+      if (PROBE && !state.counting) {
+        state.counting = true;
+        state.frames = 0;
+        const tick = () => { state.frames += 1; requestAnimationFrame(tick); };
+        requestAnimationFrame(tick);
+      }
+      // One line per change of view, kept across Teams' own reloads.
+      const noteView = status => {
+        if (!PROBE) return;
+        const view = {
+          status,
+          path: location.pathname,
+          title: document.title.replace(/^\(\d+\)\s*/, '').slice(0, 120),
+          visibility: document.visibilityState,
+          app: !!document.querySelector('[data-tid="recaps-app-feedback-button"]'),
+          rows: document.querySelectorAll(ROW).length,
+          skeletons: document.querySelectorAll('[data-tid="app-layout-area--main"] .fui-SkeletonItem').length,
+          recap: !!document.querySelector('[data-tid="recap-share-button"]')
+        };
+        const last = views[views.length - 1];
+        if (last && Object.keys(view).every(key => last[key] === view[key])) return;
+        views.push({ at: new Date().toISOString(), loadMs: Math.round(performance.now()), frames: state.frames, ...view });
+        if (views.length > 40) views.splice(4, 1);
+        session.set(VIEWS_KEY, JSON.stringify(views));
+      };
+      const listReport = () => ({
+        clicks: state.clicks,
+        errors: state.errors,
+        rows: state.order.length,
+        rowsWithoutProps: state.details.filter(detail => !detail.props).length,
+        firstRowsMs: state.firstRowsMs,
+        listMs: state.listMs,
+        frames: state.frames,
+        scrolls: state.scrolls,
+        pane: state.pane,
+        details: state.details.slice(0, 80),
+        shapes: state.shapes
+      });
+      const report = saved => redact({
+        try: 3,
+        href: location.href,
+        since: SINCE.toISOString(),
+        list: saved ? saved.list : listReport(),
+        tests: saved ? saved.tests : undefined,
+        views
+      });
+      // The app keeps the last report it got, so a report every few seconds
+      // is enough.
+      const probe = (saved, force) => {
+        if (!PROBE || (!force && Date.now() - state.lastProbeAt < 5000)) return undefined;
+        state.lastProbeAt = Date.now();
+        return report(saved);
+      };
+      const reply = (status, extra, saved) => {
+        try { noteView(status); } catch (e) { noteError('view', e); }
+        return { status, href: location.href, ...(extra || {}), probe: probe(saved, status === 'done') };
+      };
+
+      // ---- probe only: open a built link the way the recap import will, and
+      // compare what the recap's Share button holds with what the row gave ----
+      const fileKey = url => {
+        try {
+          const file = new URL(url);
+          return file.host.toLowerCase() + decodeURIComponent(file.pathname).toLowerCase();
+        } catch (e) {
+          return '';
         }
-        return found;
       };
-      // Rows without assuming their markup: climb from each date until a
-      // parent holds three or more children that each hold a date.
-      const rowGuesses = hits => {
-        const lists = new Map();
-        const checked = new Set();
-        for (const hit of hits.slice(0, 120)) {
-          let node = hit;
-          for (let up = 0; up < 14 && node.parentElement; up++, node = node.parentElement) {
-            const parent = node.parentElement;
-            if (checked.has(parent)) break;
-            checked.add(parent);
-            const holding = [...parent.children].filter(child => hits.some(other => child.contains(other)));
-            if (holding.length >= 3) {
-              lists.set(parent, holding);
-              break;
+      const SHARE_FIELDS = ['fileUrl', 'sitePath', 'driveId', 'driveItemId', 'iCalUid', 'masterICalUid', 'threadId',
+        'organizerId', 'tenantId', 'organizerTenantId', 'callId', 'threadType', 'meetingType', 'subType', 'recapType',
+        'meetingStartTime', 'meetingEndTime'];
+      const shareProps = () => {
+        const button = document.querySelector('[data-tid="recap-share-button"]');
+        const props = button && propsAbove(button, value => 'fileUrl' in value || 'sitePath' in value || 'driveItemId' in value);
+        if (!props) return null;
+        const picked = { keys: Object.keys(props).filter(key => key !== 'children').slice(0, 80) };
+        for (const name of SHARE_FIELDS) {
+          const value = props[name];
+          if (typeof value === 'string' || typeof value === 'number') picked[name] = String(value).slice(0, 600);
+        }
+        return picked;
+      };
+      const pickTests = items => ['item', 'file']
+        .map(kind => items.find(item => item.linkKind === kind))
+        .filter(Boolean)
+        .map(item => {
+          const query = new URL(item.recapUrl).searchParams;
+          const expect = { fileKey: fileKey(query.get('fileUrl') || '') };
+          for (const name of ['callId', 'driveItemId', 'iCalUid', 'threadId']) expect[name] = query.get(name) || '';
+          return { title: item.title, kind: item.linkKind, query: item.recapUrl.split('?')[1], expect };
+        });
+      const saveTests = saved => session.set(TESTS_KEY, JSON.stringify(saved));
+      const runTests = saved => {
+        const test = saved.tests[saved.index];
+        if (!test) {
+          if (saved.phase !== 'finished') {
+            saved.phase = 'finished';
+            saveTests(saved);
+          }
+          return reply('done', { items: saved.items }, saved);
+        }
+        if (!test.navigatedAt) {
+          test.navigatedAt = Date.now();
+          saveTests(saved);
+          location.href = location.origin + '/l/meetingrecap?' + test.query;
+          return reply('navigating', {}, saved);
+        }
+        const elapsed = Date.now() - test.navigatedAt;
+        const share = shareProps();
+        if (share && !test.shareMs) {
+          test.shareMs = elapsed;
+          saveTests(saved);
+        }
+        // The button can render before its recap's ids arrive.
+        const complete = share && (share.callId || share.driveItemId || elapsed - test.shareMs > 15000);
+        if (complete || elapsed > 75000) {
+          test.ms = elapsed;
+          test.share = share;
+          if (share) {
+            test.matches = { fileUrl: !!test.expect.fileKey && fileKey(share.fileUrl || '') === test.expect.fileKey };
+            for (const name of ['callId', 'driveItemId', 'iCalUid', 'threadId']) {
+              test.matches[name] = (share[name] || '').toLowerCase() === test.expect[name].toLowerCase();
             }
           }
+          test.landed = {
+            title: document.title.replace(/^\(\d+\)\s*/, '').slice(0, 120),
+            path: location.pathname,
+            seen: ['intelligent-recap-header', 'recap-share-button', 'meeting-recap-main-panel', 'podcast-meeting-item',
+              'recaps-app-feedback-button'].filter(tid => document.querySelector('[data-tid="' + tid + '"]'))
+          };
+          saved.index += 1;
+          saveTests(saved);
         }
-        return [...lists.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 3).map(([list, kids]) => ({
-          list: describe(list),
-          path: pathOf(list),
-          count: kids.length,
-          listProps: fiberIds(list).slice(0, 12),
-          rows: kids.slice(0, 8).map(row => ({
-            el: describe(row),
-            lines: lines(row).slice(0, 8),
-            attrs: idAttrs(row),
-            props: fiberIds(row)
-          }))
-        }));
+        return reply('navigating', {}, saved);
       };
-      const counts = values => {
-        const tally = {};
-        for (const value of values) if (value) tally[value] = (tally[value] || 0) + 1;
-        return tally;
-      };
-      const snapshot = () => {
-        const section = (name, read) => {
-          try { return read(); } catch (e) { state.errors.push(name + ': ' + e.message); return undefined; }
-        };
-        const pick = (selector, limit) => all(selector).filter(visible).filter(el => !inRail(el) && !el.closest(OPAQUE)).slice(0, limit).map(describe);
-        const hits = section('dates', dateHits) || [];
-        const areaTids = ['app-layout-area--mid-nav', 'app-layout-area--sub-nav', 'app-layout-area--header', 'app-layout-area--start', 'app-layout-area--main'];
-        return {
-          at: new Date().toISOString(),
-          sinceLoadMs: Math.round(performance.now()),
-          visibility: document.visibilityState,
-          title: document.title,
-          href: location.href,
-          rail: section('rail', () => {
-            const rail = [...document.querySelectorAll('[data-tid="app-bar-wrapper"] button,[data-tid="app-bar-wrapper"] [role="button"]')];
-            const raw = el => [...el.attributes].filter(a => a.name !== 'class' && a.name !== 'style').map(a => a.name + '=' + a.value.slice(0, 60));
-            return {
-              marked: rail.filter(el => STATE_ATTRS.slice(0, 4).some(name => el.getAttribute(name) !== null)).slice(0, 20).map(describe),
-              recaps: rail.filter(el => /recap/i.test(label(el))).map(raw),
-              chat: rail.filter(el => /^chat/i.test(label(el))).slice(0, 1).map(raw)
-            };
-          }),
-          frames: section('frames', frames),
-          areas: section('areas', () => [...document.querySelectorAll('[data-tid^="app-layout-area--"]')].map(el => {
-            const rect = el.getBoundingClientRect();
-            return el.getAttribute('data-tid').replace('app-layout-area--', '') + ' ' + Math.round(rect.width) + 'x' + Math.round(rect.height) +
-              ' els=' + el.getElementsByTagName('*').length;
-          })),
-          outline: section('outline', () => Object.fromEntries(areaTids.map(tid => {
-            const root = document.querySelector('[data-tid="' + tid + '"]');
-            return [tid.replace('app-layout-area--', ''), root ? outline(root, 140) : null];
-          }))),
-          roles: section('roles', () => counts([...document.querySelectorAll('[role]')].map(el => el.getAttribute('role')))),
-          components: section('components', () => counts([...document.querySelectorAll('[class*="fui-"]')].map(fuiOf))),
-          lists: section('lists', () => pick('[role="grid"],[role="list"],[role="listbox"],[role="tree"],[role="table"],ul,ol', 20)),
-          headings: section('headings', () => pick('h1,h2,h3,h4,[role="heading"]', 30)),
-          tabs: section('tabs', () => pick('[role="tab"]', 30)),
-          selected: section('selected', () => pick('[aria-selected="true"],[aria-current]', 12).concat(
-            all('[aria-selected="true"],[aria-current]').filter(el => !inRail(el) && !el.closest(OPAQUE)).slice(0, 3).map(el => pathOf(el).join(' < ')))),
-          controls: section('controls', () => pick('button,[role="button"],[role="link"],a,[role="checkbox"],[role="combobox"],[role="search"],input', 60)),
-          dates: hits.slice(0, 30).map(el => ({ text: (ownText(el) || el.getAttribute('aria-label') || '').slice(0, 120), path: pathOf(el) })),
-          rowGuesses: section('rowGuesses', () => rowGuesses(hits)),
-          listRowsFound: section('listRows', () => findRows().length),
-          panel: section('panel', () => Object.fromEntries(
-            ['entity-header', 'intelligent-recap-header', 'Meeting-Recap-recording-container', 'recap-share-button', 'recap-open-in-stream-button', 'meeting-recap-main-panel']
-              .map(tid => { const el = document.querySelector('[data-tid="' + tid + '"]'); return [tid, el ? fiberIds(el).slice(0, 25) : null]; }))),
-          ids: section('ids', () => {
-            const html = documents().map(doc => doc.body.innerHTML).join('\n');
-            return {
-              threads: [...new Set(html.match(new RegExp(threadId.source, 'gi')) || [])].slice(0, 10),
-              recapLinks: [...new Set(html.replace(/&amp;/g, '&').match(new RegExp(recapHref.source, 'gi')) || [])].slice(0, 10)
-            };
-          }),
-          tids: section('tids', () => [...new Set([...document.querySelectorAll('[data-tid]')].map(el => el.getAttribute('data-tid')))]
-            .filter(tid => !/-\d+(-empty)?$/.test(tid)).slice(0, 150))
-        };
-      };
-      // A new view is recorded once it has held still for a moment, whoever
-      // caused it, so a list the user passes through by hand is not lost.
-      const STAGE_STABLE_MS = 3000;
-      const MAX_STAGES = 10;
-      const signature = () => {
-        const size = tid => document.querySelector('[data-tid="' + tid + '"]')?.getElementsByTagName('*').length || 0;
-        const recapOpen = !!document.querySelector(OPAQUE);
-        return [document.title.replace(/^\(\d+\)\s*/, ''), recapOpen,
-          Math.round(size('app-layout-area--mid-nav') / 25), Math.round(size('app-layout-area--sub-nav') / 25),
-          Math.round(size('app-layout-area--start') / 25), recapOpen ? 0 : Math.round(size('app-layout-area--main') / 100),
-          document.querySelectorAll('iframe').length].join('|');
-      };
-      const watch = () => {
-        const sig = signature();
-        if (sig === state.snapSig) { state.pendingSig = null; return; }
-        if (sig !== state.pendingSig) { state.pendingSig = sig; state.pendingSince = Date.now(); return; }
-        if (Date.now() - state.pendingSince < STAGE_STABLE_MS) return;
-        state.snapSig = sig;
-        state.pendingSig = null;
-        // Keep the first views and the latest ones.
-        if (state.stages.length >= MAX_STAGES) state.stages.splice(2, 1);
-        state.stages.push(snapshot());
-        state.lastProbeAt = 0;
-        session.set(STAGES_KEY, JSON.stringify(state.stages));
-      };
-      const resources = () => {
-        const seen = new Map();
-        for (const entry of performance.getEntriesByType('resource')) {
-          const key = urlKey(entry.name);
-          if (key && netWanted(entry.name) && !/\.json$/i.test(key)) seen.set(key, (seen.get(key) || 0) + 1);
-        }
-        return [...seen].slice(-60).map(([url, times]) => times + ' ' + url.slice(0, 200));
-      };
-      // Reporting every poll would slow an already busy page, and the app
-      // keeps the last report it got.
-      const probe = () => {
-        if (!PROBE || Date.now() - state.lastProbeAt < 10000) return undefined;
-        state.lastProbeAt = Date.now();
-        return redact({
-          try: 2,
-          href: location.href,
-          title: document.title,
-          since: SINCE.toISOString(),
-          clicks: state.clicks,
-          clicked: state.clicked,
-          errors: state.errors.slice(0, 20),
-          net: state.net,
-          resources: resources(),
-          stages: state.stages
-        });
-      };
+      const pending = PROBE ? parsed(session.get(TESTS_KEY)) : null;
+      if (pending) return runTests(pending);
 
-      const navigating = () => ({ status: 'navigating', href: location.href, probe: probe() });
-      const clickNow = (key, el) => {
-        state.clicks[key] = new Date().toISOString();
-        if (PROBE) state.clicked[key] = describe(el);
-        state.lastClick = Date.now();
-        el.click();
-        return navigating();
-      };
-      const settled = () => Date.now() - Math.max(state.firstSeen, state.lastClick) >= SETTLE_MS;
-
-      if (PROBE) {
-        try { watch(); } catch (e) { state.errors.push('watch: ' + e.message); }
-      }
-
-      // ---- steer to the recap app, once per step, before any row counts: the
-      // shell may open on Chat or Activity, whose rows carry dates too. The
-      // app is the first-party Recap app, named "Recap" or "Meeting Recaps"
-      // depending on the tenant, so its id is tried before its name. In a
-      // probe the opening view is recorded first. ----
+      // ---- steer to the Recap app once. The shell may open on Chat or
+      // Activity, and the app may be pinned or behind "more apps"; its id is
+      // tried before its name. ----
       const RECAP_APP_ID = '981bbfd0-5eb8-4393-8158-bfff69d2d6b5';
-      const buttons = () => all('[role="tab"],[role="button"],[role="menuitem"],[role="menuitemradio"],[role="option"],button,a').filter(visible);
+      const RAIL = '[data-tid="app-bar-wrapper"],[data-tid="app-layout-area--nav"]';
+      const inRail = el => !!el.closest(RAIL);
+      const buttons = () => [...document.querySelectorAll('[role="tab"],[role="button"],[role="menuitem"],[role="option"],button,a')]
+        .filter(visible);
       const named = (el, pattern) => pattern.test(label(el)) || pattern.test(text(el));
       const isSelected = el => el.getAttribute('aria-selected') === 'true' ||
         el.getAttribute('aria-current') === 'page' || el.getAttribute('aria-pressed') === 'true';
-      const railName = /^(meet|recaps?|meeting recaps?)(?:\s*[,(].*)?$/i;
-      const tabName = /^(recaps?|meeting recaps?|past|past meetings|recent)(?:\s*[,(].*)?$/i;
+      const appName = /^(recaps?|meeting recaps?)(?:\s*[,(].*)?$/i;
       const moreApps = /^(view more apps|more added apps|more apps)(?:\s*[,(].*)?$/i;
-      const openingRecorded = !PROBE || state.stages.length > 0 || Date.now() - state.firstSeen > 20000;
-      if (!state.clicks.railApp && openingRecorded) {
+      const clickNow = (key, el) => {
+        state.clicks[key] = new Date().toISOString();
+        state.lastClick = Date.now();
+        el.click();
+        return reply('navigating');
+      };
+      const settled = () => Date.now() - Math.max(state.firstSeen, state.lastClick) >= SETTLE_MS;
+      if (!state.clicks.app) {
         const byId = document.querySelector('[data-tid="' + RECAP_APP_ID + '"]');
-        const rail = byId && visible(byId) ? byId : buttons().find(el => inRail(el) && named(el, railName)) || buttons().find(el => named(el, railName));
-        if (rail && isSelected(rail)) {
-          state.clicks.railApp = 'already selected';
-        } else if (rail) {
-          return clickNow('railApp', rail);
-        } else if (!state.clicks.moreApps) {
-          const more = buttons().find(el => named(el, moreApps));
-          if (more) return clickNow('moreApps', more);
+        const app = byId && visible(byId) ? byId
+          : buttons().find(el => inRail(el) && named(el, appName)) ||
+            (state.clicks.moreApps ? buttons().find(el => !inRail(el) && named(el, appName)) : null);
+        if (app && isSelected(app)) {
+          state.clicks.app = 'already open';
+        } else if (app) {
+          return clickNow('app', app);
+        } else {
+          if (!state.clicks.moreApps && Date.now() - state.firstSeen > 15000) {
+            const more = buttons().find(el => inRail(el) && named(el, moreApps));
+            if (more) return clickNow('moreApps', more);
+          }
+          return reply('navigating');
         }
       }
-      if (state.clicks.railApp && !state.clicks.recapTab && Date.now() - state.lastClick >= SETTLE_MS) {
-        // Never the rail button again: it carries the same name as the tab.
-        const tab = buttons().find(el => !inRail(el) && named(el, tabName) && !isSelected(el));
-        if (tab) return clickNow('recapTab', tab);
+      if (!settled()) return reply('navigating');
+      // The app opens on Home, its list; "Audio recaps" is the other tab.
+      if (!state.clicks.home) {
+        const home = buttons().find(el => el.getAttribute('role') === 'tab' && !inRail(el) && named(el, /^home$/i));
+        if (home && !isSelected(home)) return clickNow('home', home);
+        if (home) state.clicks.home = 'already open';
       }
-      if (!settled()) return navigating();
 
-      // A probe only watches: it leaves the window to the user, who closes it
-      // when done, and reads no rows.
-      if (PROBE) return { status: 'waiting', href: location.href, probe: probe() };
-
-      const rows = findRows();
+      const finishList = items => {
+        state.listMs ||= Math.round(performance.now());
+        if (PROBE && !state.testsQueued) {
+          state.testsQueued = true;
+          const saved = { phase: 'running', index: 0, items, list: listReport(), tests: pickTests(items) };
+          if (saved.tests.length && saveTests(saved)) return reply('page', { items, more: true }, saved);
+        }
+        return reply('done', { items });
+      };
+      const rows = [...document.querySelectorAll(ROW)].filter(visible);
       if (!rows.length) {
-        const page = text(document.body).slice(0, 1200);
-        if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(page)) {
-          return { status: 'launcher', href: location.href, probe: probe() };
+        // A recap left open from an earlier visit hides the list.
+        const back = !state.clicks.back && buttons().find(el => !inRail(el) && named(el, /^(go|back) to (meeting )?recaps?$/i));
+        if (back) return clickNow('back', back);
+        const home = document.querySelector('[data-tid="recaps-app-feedback-button"]');
+        const loading = document.querySelector('[data-tid="app-layout-area--main"] .fui-SkeletonItem');
+        if (home && !loading) {
+          state.emptySince ||= Date.now();
+          if (Date.now() - state.emptySince >= EMPTY_MS) return finishList([]);
+        } else {
+          state.emptySince = 0;
         }
-        return { status: 'waiting', href: location.href, probe: probe() };
+        if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(text(document.body).slice(0, 1200))) {
+          return reply('launcher');
+        }
+        return reply('waiting');
       }
+      state.emptySince = 0;
+      state.firstRowsMs ||= Math.round(performance.now());
 
-      // ---- collect rows, oldest date seen decides when to stop ----
-      let oldest = null;
+      // ---- collect rows; the list runs newest first by calendar slot, so
+      // the oldest slot seen decides when to stop ----
       for (const row of rows) {
-        const link = linkOf(row);
-        const when = parseWhen(row);
-        const title = titleOf(row);
-        const key = link ? link.url : title + '|' + (when ? when.toISOString() : '');
+        let read;
+        try {
+          read = readRow(row);
+        } catch (e) {
+          noteError('row', e);
+          continue;
+        }
+        const { item, meeting, scheduled, detail } = read;
+        const key = item.recapUrl || item.title + '|' + item.startedAt;
         if (!state.seen[key]) {
           state.seen[key] = true;
-          state.order.push({
-            recapUrl: link ? link.url : null,
-            linkKind: link ? link.kind : null,
-            title,
-            startedAt: when ? when.toISOString() : null
-          });
+          state.order.push(item);
+          if (PROBE) {
+            state.details.push({ title: item.title, kind: item.linkKind, startedAt: item.startedAt, ...detail });
+            if (meeting && item.linkKind && !state.shapes[item.linkKind]) {
+              try { state.shapes[item.linkKind] = shapeOf(meeting); } catch (e) { noteError('shape', e); }
+            }
+          }
         }
-        if (when && (!oldest || when < oldest)) oldest = when;
+        const slot = scheduled || instant(item.startedAt);
+        if (slot && (!state.oldest || slot < state.oldest)) state.oldest = slot;
       }
       const items = state.order.filter(item => !item.startedAt || new Date(item.startedAt) >= SINCE);
-      const reachedSince = oldest !== null && oldest < SINCE;
-      const finish = () => ({ status: 'done', items, href: location.href, probe: probe() });
-      if (reachedSince || state.order.length >= MAX_ROWS) return finish();
+      if ((state.oldest && state.oldest < SINCE) || state.order.length >= MAX_ROWS) return finishList(items);
 
-      // Scroll the list's own pane (not the page) to reveal older rows.
+      // Open groups the list starts collapsed ("Last week", ...).
+      const accordion = rows[0].closest('.fui-Accordion');
+      const group = accordion && [...accordion.querySelectorAll('.fui-AccordionHeader__button[aria-expanded="false"]')]
+        .filter(visible).find(el => !state.clicks['group ' + text(el).slice(0, 40)]);
+      if (group) {
+        state.clicks['group ' + text(group).slice(0, 40)] = new Date().toISOString();
+        group.click();
+        state.idleSince = 0;
+        return reply('page', { items, more: true });
+      }
+
+      // Scroll the list's own pane (not the page) to load older rows.
       const lastRow = rows[rows.length - 1];
       let pane = lastRow.parentElement;
-      while (pane && pane !== lastRow.ownerDocument.body) {
-        if (pane.scrollHeight > pane.clientHeight + 20 &&
-            /auto|scroll/.test(getComputedStyle(pane).overflowY)) break;
+      while (pane && pane !== document.body) {
+        if (pane.scrollHeight > pane.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(pane).overflowY)) break;
         pane = pane.parentElement;
       }
-      if (!pane || pane === lastRow.ownerDocument.body) pane = lastRow.ownerDocument.scrollingElement;
+      if (!pane || pane === document.body) pane = document.scrollingElement;
       const before = pane.scrollTop;
       pane.scrollTop += Math.max(300, pane.clientHeight * 0.8);
       const moved = pane.scrollTop > before;
+      if (PROBE) {
+        state.scrolls = (state.scrolls || 0) + (moved ? 1 : 0);
+        state.pane = [pane.tagName.toLowerCase(), pane.getAttribute('data-tid') || '',
+          (typeof pane.className === 'string' ? pane.className.split(/\s+/).filter(c => c.startsWith('fui-')).join('.') : ''),
+          pane.scrollTop + '/' + pane.scrollHeight + '/' + pane.clientHeight].join(' ');
+      }
       const grew = state.order.length !== state.lastCount;
       state.lastCount = state.order.length;
-      state.idle = moved || grew ? 0 : state.idle + 1;
-      const loadMore = all('button,[role="button"]')
-        .filter(visible).find(el => /^(load more|show more|see more|more)$/i.test(label(el)));
-      if (!moved && !grew && loadMore && !state.clicks['loadMore' + state.order.length]) {
-        state.clicks['loadMore' + state.order.length] = new Date().toISOString();
-        loadMore.click();
-        state.idle = 0;
+      if (moved || grew) {
+        state.idleSince = 0;
+      } else {
+        state.idleSince ||= Date.now();
+        const loadMore = buttons().find(el => !el.closest(ROW) && !inRail(el) &&
+          /^(load|show|see) more( meetings| recaps)?$/i.test(label(el)));
+        if (loadMore && !state.clicks['more ' + state.order.length]) {
+          state.clicks['more ' + state.order.length] = new Date().toISOString();
+          loadMore.click();
+          state.idleSince = 0;
+        }
       }
-      if (state.idle >= 3) return finish();
-      return { status: 'page', items, more: true, href: location.href, probe: probe() };
+      if (state.idleSince && Date.now() - state.idleSince >= IDLE_MS) return finishList(items);
+      return reply('page', { items, more: true });
     })()
