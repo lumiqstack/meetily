@@ -1,6 +1,18 @@
 import { describe, expect, test } from 'bun:test';
 
-import { oldestMeetingFirst } from '../../src/lib/sharepoint-order';
+import { oldestMeetingFirst, startsSelected } from '../../src/lib/sharepoint-order';
+
+describe('startsSelected', () => {
+  test('ticks only a recording Meetily has in no form', () => {
+    expect(startsSelected({ already_imported: false, live_meeting_id: null })).toBe(true);
+    expect(startsSelected({ already_imported: true, live_meeting_id: null })).toBe(false);
+  });
+
+  test('leaves a recording of a live meeting unticked, attached or not', () => {
+    expect(startsSelected({ already_imported: false, live_meeting_id: 'meeting-1' })).toBe(false);
+    expect(startsSelected({ already_imported: true, live_meeting_id: 'meeting-1' })).toBe(false);
+  });
+});
 
 const rec = (name: string, created: string) => ({ name, created });
 

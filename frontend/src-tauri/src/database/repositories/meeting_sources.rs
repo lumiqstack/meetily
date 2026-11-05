@@ -1,9 +1,11 @@
+use crate::audio::teams_recap::{meeting_identity_key, whole_recording_key};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Sqlite, SqlitePool};
+use std::collections::HashMap;
 
 /// `import_source` of a meeting Meetily recorded live and later matched to its
-/// Teams recap. The row carries the recap's link so the next import of that
-/// recap finds this meeting by identity.
+/// Teams recap or recording. The row carries the recap's link or the file's URL,
+/// so the next import of either finds this meeting by identity.
 pub const LIVE_RECORDING_SOURCE: &str = "live-recording";
 
 /// Where an imported meeting came from. Written once when the import
@@ -11,7 +13,7 @@ pub const LIVE_RECORDING_SOURCE: &str = "live-recording";
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct MeetingSource {
     /// `sharepoint`, `url`, `teams-transcript`, `copilot-recap` or `file`, or
-    /// [`LIVE_RECORDING_SOURCE`] for a live recording a recap attached to.
+    /// [`LIVE_RECORDING_SOURCE`] for a live recording a recap or file attached to.
     pub import_source: String,
     pub recording_url: Option<String>,
     pub recording_file: Option<String>,
@@ -73,8 +75,9 @@ impl MeetingSource {
     /// The meeting imported from the same recording as `key` (see
     /// [`crate::audio::teams_recap::meeting_identity_key`]), so a recap can
     /// attach to the meeting that already holds the recording or an earlier
-    /// copy of the recap. The oldest matching meeting wins. Stored URLs are
-    /// raw, so the comparison runs in Rust over the rows that have one.
+    /// copy of the recap. The file itself wins, then any other part of the same
+    /// long recording; within each, the oldest meeting. Stored URLs are raw, so
+    /// the comparison runs in Rust over the rows that have one.
     pub async fn find_meeting_by_identity(
         pool: &SqlitePool,
         key: &str,
@@ -87,10 +90,62 @@ impl MeetingSource {
         )
         .fetch_all(pool)
         .await?;
-        Ok(rows
+        let keyed: Vec<(String, String)> = rows
             .into_iter()
-            .find(|(_, url)| crate::audio::teams_recap::meeting_identity_key(url) == key)
-            .map(|(meeting_id, _)| meeting_id))
+            .map(|(meeting_id, url)| (meeting_id, meeting_identity_key(&url)))
+            .collect();
+        let whole = whole_recording_key(key);
+        Ok(keyed
+            .iter()
+            .find(|(_, stored)| stored == key)
+            .or_else(|| keyed.iter().find(|(_, stored)| whole_recording_key(stored) == whole))
+            .map(|(meeting_id, _)| meeting_id.clone()))
+    }
+
+    /// Whole-recording keys held by live meetings, each with its meeting, for
+    /// looking up [`Self::live_key`]. The live transcript covers every part of a
+    /// recording, so a file whose key is here need not be downloaded.
+    pub async fn live_recording_keys(pool: &SqlitePool) -> Result<HashMap<String, String>, sqlx::Error> {
+        Ok(Self::live_recording_links(pool)
+            .await?
+            .into_iter()
+            .map(|(meeting_id, url)| (Self::live_key(&url), meeting_id))
+            .collect())
+    }
+
+    /// The key a link goes by in [`Self::live_recording_keys`].
+    pub fn live_key(link: &str) -> String {
+        whole_recording_key(&meeting_identity_key(link)).to_owned()
+    }
+
+    async fn live_recording_links(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT meeting_id, recording_url FROM meeting_sources \
+             WHERE import_source = ? AND recording_url IS NOT NULL",
+        )
+        .bind(LIVE_RECORDING_SOURCE)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// The file was imported as its own meeting after all, so any live meeting
+    /// it was attached to gives it up and a later recap follows the new meeting.
+    pub async fn release_from_live_meetings(pool: &SqlitePool, file_url: &str) -> Result<(), sqlx::Error> {
+        let key = meeting_identity_key(file_url);
+        for (meeting_id, url) in Self::live_recording_links(pool).await? {
+            if meeting_identity_key(&url) == key {
+                Self::remove(pool, &meeting_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn remove(pool: &SqlitePool, meeting_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM meeting_sources WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn get(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Self>, sqlx::Error> {
@@ -267,5 +322,66 @@ mod tests {
             MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap().as_deref(),
             Some("m-old")
         );
+    }
+
+    const PART_ONE: &str = "https://h-my.sharepoint.com/personal/j/Documents/Recordings/Workshop-20261016_150059-Meeting%20Recording.mp4";
+    const PART_TWO: &str = "https://h-my.sharepoint.com/personal/j/Documents/Recordings/Workshop-20261016_150059-Meeting%20Recording%202.mp4";
+    const RECAP_OF_PART_TWO: &str = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fh-my.sharepoint.com%2Fpersonal%2Fj%2FDocuments%2FRecordings%2FWorkshop-20261016_150059-Meeting%20Recording%202.mp4%3Fweb%3D1";
+
+    #[tokio::test]
+    async fn a_recap_of_any_part_finds_the_meeting_holding_another_part() {
+        let pool = test_pool().await;
+        insert_meeting(&pool, "m-part-one", "2026-10-16T15:00:00Z", "sharepoint", Some(PART_ONE)).await;
+
+        let key = crate::audio::teams_recap::meeting_identity_key(RECAP_OF_PART_TWO);
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap().as_deref(),
+            Some("m-part-one")
+        );
+
+        // A meeting holding the very file wins over an older one holding another part.
+        insert_meeting(&pool, "m-part-two", "2026-10-16T19:00:00Z", "sharepoint", Some(PART_TWO)).await;
+        assert_eq!(
+            MeetingSource::find_meeting_by_identity(&pool, &key).await.unwrap().as_deref(),
+            Some("m-part-two")
+        );
+
+        // A different stamp is a different recording.
+        let other = "https://h-my.sharepoint.com/personal/j/Documents/Recordings/Workshop-20261017_150059-Meeting%20Recording.mp4";
+        let other_key = crate::audio::teams_recap::meeting_identity_key(other);
+        assert_eq!(MeetingSource::find_meeting_by_identity(&pool, &other_key).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn live_keys_cover_both_links_on_a_live_meeting_and_nothing_else() {
+        let pool = test_pool().await;
+        let recap_only = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Ax&fileUrl=https%3A%2F%2Fh.sharepoint.com%2Fa%2FRecapOnly-20261016_150059-Meeting%20Recording.mp4";
+        let imported = "https://h.sharepoint.com/a/Imported-20261016_150059-Meeting%20Recording.mp4";
+        insert_meeting(&pool, "live-file", "2026-10-16T15:00:00Z", LIVE_RECORDING_SOURCE, Some(PART_ONE)).await;
+        insert_meeting(&pool, "live-no-link", "2026-10-16T15:00:00Z", LIVE_RECORDING_SOURCE, None).await;
+        insert_meeting(&pool, "recap-only", "2026-10-16T15:00:00Z", "copilot-recap", Some(recap_only)).await;
+        insert_meeting(&pool, "imported", "2026-10-16T15:00:00Z", "sharepoint", Some(imported)).await;
+
+        let keys = MeetingSource::live_recording_keys(&pool).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        let key = MeetingSource::live_key;
+        assert_eq!(keys.get(&key(PART_TWO)).map(String::as_str), Some("live-file"));
+        assert_eq!(keys.get(&key(RECAP_OF_PART_TWO)).map(String::as_str), Some("live-file"));
+        assert!(!keys.contains_key(&key(recap_only)));
+        assert!(!keys.contains_key(&key(imported)));
+    }
+
+    #[tokio::test]
+    async fn an_imported_file_is_released_only_from_the_live_meeting_holding_exactly_it() {
+        let pool = test_pool().await;
+        insert_meeting(&pool, "live-part-one", "2026-10-16T15:00:00Z", LIVE_RECORDING_SOURCE, Some(PART_ONE)).await;
+        insert_meeting(&pool, "imported-part-one", "2026-10-16T15:00:00Z", "sharepoint", Some(PART_ONE)).await;
+
+        MeetingSource::release_from_live_meetings(&pool, PART_TWO).await.unwrap();
+        assert!(MeetingSource::get(&pool, "live-part-one").await.unwrap().is_some());
+
+        MeetingSource::release_from_live_meetings(&pool, PART_ONE).await.unwrap();
+        assert_eq!(MeetingSource::get(&pool, "live-part-one").await.unwrap(), None);
+        assert!(MeetingSource::get(&pool, "imported-part-one").await.unwrap().is_some());
     }
 }

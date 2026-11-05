@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-04. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI) and 3 (Meet app scanner with its probe mode) merged; the selectors are still being learned on the Windows machine. Step 4 (QA checklist, `docs/TEAMS_RECAP_SYNC_QA.md`) and step 5 (matching a recap to a live recording) merged, neither yet exercised on Windows.
+Status: 2026-11-05. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI) and 3 (Meet app scanner with its probe mode) merged; the selectors are still being learned on the Windows machine. Step 4 (QA checklist, `docs/TEAMS_RECAP_SYNC_QA.md`) and step 5 (matching a recap to a live recording) merged, neither yet exercised on Windows. Step 6 (matching a recording to a live recording) is in review.
 
 ## Goal
 
@@ -25,6 +25,7 @@ code.
 | Backfill | A since date in settings, default 30 days before the first sync. Each later sync starts from the last confirmed sync date minus an overlap window. |
 | Existing meeting from the recording | Attach the recap to that meeting. One meeting, one note. Match on the recording file URL. |
 | Existing meeting recorded live | Attach the recap when the meeting's calendar window fits the recap's time and its thread id or title confirms it. When that is ambiguous, import the recap separately and report it. See "Matching a recap to a live recording". |
+| Recording of a meeting recorded live | Link the file to the live meeting without downloading or transcribing it. The live transcript stays, and Teams' own transcript of that meeting is never imported. An ambiguous match imports the recording as its own meeting. See "Matching a recording to a live recording". |
 | Recap changed in Teams | Overwrite the vault note. Tags survive (they come from the meeting record); other edits made in Obsidian do not. |
 | Recap not ready or absent | Leave the meeting unmarked so the next sync retries. Count it as "not ready" in the report. |
 | Reporting | One toast with counts: new, updated, skipped, not ready, failed, and how many may duplicate a live recording. A link opens the vault Meetings folder. |
@@ -45,7 +46,7 @@ code.
   enumeration command, and a results toast.
 - `meeting_sources` records, per meeting, where it came from: `import_source`
   (`sharepoint`, `url`, `teams-transcript`, `copilot-recap`, `file`, and
-  `live-recording` once a recap attaches to a live meeting),
+  `live-recording` once a recap or a recording attaches to a live meeting),
   `recording_url`, `recording_file`, `recorded_at`. Recording imports store the
   direct file URL with any token query stripped.
 - The recap link's `fileUrl` query parameter names the recording or transcript
@@ -62,6 +63,8 @@ code.
    its recap become two meetings.
 5. A meeting Meetily recorded live and the same meeting imported from its recap
    become two meetings, because a live recording has no file URL to key on.
+6. A meeting Meetily recorded live and the same meeting's recording arriving
+   through SharePoint become two meetings, for the same reason.
 
 ## Architecture
 
@@ -110,17 +113,25 @@ canonical `recording_url`. A hit in either means "existing meeting". With no
 hit, the rule in the next section decides whether a live recording is that
 meeting.
 
+Teams cuts a long recording at 4 hours into `…-Meeting Recording.mp4` and
+`…-Meeting Recording 2.mp4`, and a recap may name any part. The `meeting_sources`
+lookup therefore looks for the file itself first and then for any other part of
+the same recording, meaning the same folder, title and stamp. The sync store
+keeps its exact keys.
+
 ### Matching a recap to a live recording
 
 A meeting Meetily recorded live has no file URL, so the identity lookup cannot
 find it and its recap becomes a second meeting. Live recordings started from
 the calendar prompt do store the event they matched: `calendar_event_id`,
-`calendar_start`, `calendar_end` and `calendar_join_url` on the meeting row.
-This rule uses them, in both the link import and the sync loop.
+`calendar_title`, `calendar_start`, `calendar_end` and `calendar_join_url` on
+the meeting row. This rule uses them, in both the link import and the sync loop.
 
 The rule runs only when the identity lookup finds nothing. Identity stays first
 because it is exact, and the rule writes the recap's key onto the meeting it
-attaches to, so every later import of that recap goes straight there.
+attaches to, so every later import of that recap goes straight there. The one
+exception is a key that a recording attach put on the meeting, which is only as
+good as the title it matched on: see "Matching a recording to a live recording".
 
 **When the recap happened.** A recap can carry two times. They are tried in
 this order, and the second only if the first fits no live recording:
@@ -134,7 +145,10 @@ A recap with neither, such as a pasted link without `fileUrl`, is not matched.
 
 **Candidates.** Meetings with `calendar_start` and `calendar_end` and no
 `recording_url` in `meeting_sources`. A live meeting that already holds another
-recap is out, so the recap of a second recording cannot overwrite the first.
+recap is out, so the recap of a second recording cannot overwrite the first. A
+live meeting that holds only a recording stays a candidate for a recap whose
+link names no file, because nothing says that recap belongs to another
+recording.
 
 **The window.** A candidate fits when one of the recap's times lies inside
 `calendar_start - 15 min` to `calendar_end + 15 min`. Its distance is zero
@@ -152,10 +166,13 @@ a fitting candidate also needs evidence that it is the same meeting:
 - *Title*, for candidates where either side has no thread id, as with a
   `/meet/<code>` join link or an Outlook event with no join link. The recap's
   title (the row's or the pasted one) and the title in its file name are each
-  compared with the meeting's title, on lowercase letters and digits only,
+  compared with the event's subject, on lowercase letters and digits only,
   because Teams drops punctuation from file names. They agree exactly when
   equal, and weakly when one is a prefix of the other of at least 8 characters,
-  because long titles get truncated and users add to them.
+  because long titles get truncated and users add to them. The subject is
+  `calendar_title`. A meeting saved before that column existed falls back to its
+  own title, which generating a summary replaces with the summary's first
+  heading, so such a meeting usually stops agreeing once it is summarized.
 
 **Deciding.** Stronger evidence is considered first: thread id, then an exact
 title, then a prefix. A closer slot never outranks better evidence, so "Weekly
@@ -204,9 +221,118 @@ Three additions:
   meeting. So does a meeting Meetily recorded before calendar matching existed.
 - Meetings already duplicated before this rule landed stay two: the identity
   lookup finds the recap's own meeting first.
-- A recording imported through SharePoint after a live recording still creates
-  its own meeting. The rule's matcher is reusable for it, but what to do with
-  the second transcript is a separate decision.
+
+### Matching a recording to a live recording
+
+Nothing ties the file URL of a recording found by the SharePoint scan to a meeting
+Meetily recorded live, so Meetily downloads it, transcribes it and saves a second
+meeting. This rule stops that in the automatic scan and marks the candidates in
+the import dialog. A pasted link is an explicit request to import that file, so it
+imports as before.
+
+**What attaching means.** Meetily does not download or transcribe the file. The
+live meeting keeps its title, date, tags, transcript and summary, and gets a
+`meeting_sources` row with `import_source` `live-recording`, the file's URL and
+its stamp. A stamp marked `UTC` stays out of that row, because `recorded_at` means
+local time. The SharePoint ledger lists the file as imported, and a recap of the
+same file then attaches by identity. The cost is that Meetily never imports Teams'
+own transcript of that meeting, and that a wrong match leaves a recording
+unimported. Attaching does not rewrite the note, because nothing it shows has
+changed. Its front matter picks up the source at the next export.
+
+**A recording has less evidence than a recap.** It has no thread id in any field
+Meetily reads, so nothing can veto a meeting in the same slot, and tenant-wide
+search can surface other people's recordings. Comparing with the meeting's own
+title would not work either, because generating a summary replaces that title
+with the summary's first heading, usually before the file appears. So the rule
+is stricter than the recap rule, and compares with the event's subject:
+
+- *Only Teams recordings qualify.* The file name must read
+  `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-Meeting Recording|Transcript[ <part>].<ext>`.
+  Other videos the search finds never match.
+- *When it happened.* The rule tries up to three times in order, each only if the
+  earlier ones fit no live recording. First a stamp marked `UTC`, then SharePoint's
+  `created`, which is an instant, then an unmarked stamp read in this machine's
+  zone. The instant comes before the unmarked stamp because most recordings are in
+  colleagues' OneDrives, stamped in their zones.
+- *The window.* The same 15 minute tolerance as the recap rule.
+- *Title.* The file name's title must equal `calendar_title`, on lowercase letters
+  and digits only. One exception: a file title of at least 100 letters and digits
+  may be the start of the subject, because Teams cuts titles at about 160
+  characters. Shorter prefixes do not count, so "Weekly sync" cannot take "Weekly
+  sync with vendors".
+
+**Deciding.** The same table as the recap rule, with title as the only evidence.
+One closest confirmed candidate attaches. A tie, or candidates that fit but are
+not confirmed, is ambiguous. Nothing fitting means a new meeting. An ambiguous
+recording imports as its own meeting, exactly as before, and the log names the
+candidate meeting ids. There is no toast because the scan runs in the background.
+
+**Candidates.** Meetings with `calendar_start` and `calendar_end` that hold no file
+yet: no `recording_url`, or a recap link that names no file. A candidate that
+wins the match but has no transcript does not attach, because the recording may
+be the only record of what was said. It imports as its own meeting.
+
+**Already held.** A file counts as imported when a `live-recording` row holds it
+or another part of it, whether the URL there came from this rule or from a
+recap link's `fileUrl`. That covers the order live, recap, recording, and the second
+part of a long meeting. The live transcript covers every part, so no part is
+downloaded. Other import sources stay as they were: a recording imported through
+SharePoint does not stop its second part from importing, because that part's audio
+is not in the meeting.
+
+| The live meeting holds | A recording | A recap naming a file | A recap naming no file |
+| --- | --- | --- | --- |
+| Nothing | Candidate | Candidate | Candidate |
+| A recording | Same recording: held. Otherwise its own meeting. | Same recording: identity. Otherwise its own meeting. | Candidate |
+| A recap naming a file | Same recording: held. Otherwise its own meeting. | Same recording: identity. Otherwise its own meeting. | Its own meeting |
+| A recap naming no file | Candidate. The row keeps the recap link and only the ledger records the file. | Its own meeting | Same link: identity. Otherwise its own meeting. |
+
+A meeting has room for one URL. When a recap naming no file attaches to a meeting
+holding a recording, the recap link replaces the file's URL and the ledger keeps
+the file imported.
+
+**In the automatic scan.** The scan takes recordings oldest first and decides again
+for each one, so a recording earlier in the same scan can claim a meeting, and
+another part of that recording then counts as held. Attaching does not use one of
+the scan's import slots. It counts as a success for the watermark, so the watermark
+passes it. A held file goes into the ledger too, so deleting that meeting later
+does not bring the recording back. While a recording is in progress the scan
+imports nothing, whichever transcription provider is set, because the meeting being
+recorded has no row to match until it is saved.
+
+**In the import dialog.** The scan reports the live meeting for each file a
+`live-recording` row holds and each file the rule would attach. Those files show
+`Recorded live` and start unticked. Leaving one unticked writes nothing. A later
+automatic scan attaches it while the file is still inside the scan window, and
+otherwise its recap can still attach by the recap rule.
+
+**Undoing a wrong match.** Ticking such a file imports it as its own meeting. When
+that import lands, any `live-recording` row holding exactly that file gives it up,
+so a later recap of the file follows the new meeting.
+
+**A recap can still refuse.** A recap that finds its file on a live meeting compares
+threads before attaching. If its thread id and the one in `calendar_join_url` are
+both known and differ, the recording rule attached that file to the wrong meeting.
+The live meeting gives up the key and keeps its summary, and the recap rule
+continues as if identity had found nothing. The recording itself stays unimported
+until the user ticks it in the dialog. Without this, one wrong title match could replace the
+meeting's summary, which is the mistake the recap rule exists to prevent.
+
+**What this rule does not cover.**
+
+- A live meeting with no calendar match has no window, so its recording stays a
+  second meeting.
+- Two different meetings with the same subject in one slot cannot be told apart.
+  The wrong one attaches, and a recap only catches it when both thread ids are
+  known.
+- A meeting saved before `calendar_title` existed falls back to its own title, which
+  usually stops agreeing once it is summarized. Its recording stays a second meeting.
+- A second recording in one call, with a different stamp, stays its own meeting, as
+  with the recap rule.
+- A recording that arrives after a recap-only meeting (`copilot-recap`) still creates
+  a second meeting. That meeting has no transcript, so dropping the recording would
+  lose it, and moving its transcript across is a separate change.
 
 ### RecapListScanner
 
@@ -330,19 +456,22 @@ link import gives.
 
 ## Database
 
-No schema change. `meeting_sources` already has the columns. Sync state lives
-in the JSON store like the SharePoint sync state.
+One column is added: `meetings.calendar_title`, the subject of the event a
+recording was matched to, written beside the other calendar columns. Generating
+a summary overwrites `meetings.title`, so nothing else keeps the subject. There
+is no backfill. `meeting_sources` already has its columns. Sync state lives in the
+JSON store like the SharePoint sync state.
 
 One query is added to `meeting_sources`: find a meeting id by canonical
 `recording_url`. Because stored URLs are raw, the comparison decodes and
 lowercases both sides in Rust over the candidate set of rows with a non-null
 `recording_url`, which is small.
 
-One query is added to `meetings`: the live recordings a recap may still attach
-to, meaning those with `calendar_start` and `calendar_end` and no
-`recording_url` in `meeting_sources`. The window comparison runs in Rust.
-`attach_imported_summary` now keeps a replaced summary in `result_backup` unless
-that summary is itself a recap.
+One query is added to `meetings`: the live recordings a recap or recording may
+still attach to, meaning those with `calendar_start` and `calendar_end`, filtered
+in Rust by what their `meeting_sources` row holds. The window comparison runs in
+Rust too. `attach_imported_summary` now keeps a replaced summary in `result_backup`
+unless that summary is itself a recap.
 
 ## Privacy
 
@@ -375,6 +504,7 @@ probe file described above, on that machine only.
 4. QA doc, `docs/TEAMS_RECAP_SYNC_QA.md`, mirroring
    `TEAMS_MEETING_DETECTION_QA.md`.
 5. Matching a recap to a live recording, in the link import and the sync loop.
+6. Matching a recording to a live recording, in the SharePoint scan.
 
 ## Testing
 
@@ -387,6 +517,14 @@ probe file described above, on that machine only.
   double-booked slot and a restarted recording stay ambiguous; back-to-back
   meetings go to the closer one; a second import is an identity hit; the
   replaced summary lands in `result_backup`.
+- Unit, for the recording rule: file name forms, including `UTC` stamps and part
+  numbers; the order of times; only an exact or long truncated title attaches; a
+  tie and an unconfirmed fit stay ambiguous; a meeting without a transcript is not
+  attached to; attaching writes the row and leaves the meeting alone; a re-scan
+  sees the file as held through the row and through the ledger; the order live,
+  recap, recording; a part of a held recording; a recap naming no file on either
+  side of a recording; a contradicting thread takes the key back; a manual import
+  releases the key.
 - Unit, `#[cfg(not(windows))]`-guarded where `mock_app` is used: the loop over a
   fake extractor returning ready, not ready and error in sequence.
 - Manual on Windows: the checklist in `docs/TEAMS_RECAP_SYNC_QA.md`.
@@ -405,7 +543,13 @@ probe file described above, on that machine only.
   and costs a second meeting. On a pasted link, with no row time to try first, it
   can reach a wrong attach only if a meeting sharing the thread or title was
   recorded live at that wrong hour. The probe's rows show a stamp beside the time
-  the Meet app displays, which will settle it.
+  the Meet app displays, which will settle it. Real file names already show one
+  other form, `…-20261009_180000UTC-Meeting Recording.mp4`.
+- What SharePoint's `created` means for a recording. The code comments call it
+  the recording's end. In the one real case that can be read back it equals the
+  file's UTC stamp, so it may be the start. The recording rule works with either
+  as long as the file appears close to the meeting, but a value at the end can
+  land in the next slot when two meetings with the same subject run back to back.
 - How many rows the Meet app keeps. Microsoft's admin documentation for the
   Meeting Recaps app says it shows recaps from the previous 30 days, which
   matches the default backfill; to be confirmed on the real list. If it is

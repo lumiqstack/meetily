@@ -26,7 +26,9 @@ use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_store::StoreExt;
 use std::time::Duration;
 
+use super::sharepoint_live_match::{find_recording_target, RecordingTarget};
 use super::url_import::STALL_TIMEOUT;
+use crate::database::repositories::meeting_sources::MeetingSource;
 
 /// One recording found on SharePoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1298,6 +1300,10 @@ pub struct SharePointScanItem {
     /// recordings surfaced via tenant-wide search (other people's OneDrives,
     /// team sites).
     pub source: String,
+    /// The meeting Meetily recorded live that holds this file, or that the file
+    /// would attach to. See "Matching a recording to a live recording" in
+    /// docs/TEAMS_RECAP_SYNC_SPEC.md.
+    pub live_meeting_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1308,12 +1314,17 @@ pub struct SharePointScanResult {
 }
 
 /// Merge own-folder and search results into one annotated, newest-first list.
-/// Split out from the command for testability.
+/// `live_keys` is [`MeetingSource::live_recording_keys`]: a file a live meeting
+/// holds counts as imported, whether it got there through this feature or
+/// through a recap naming it. Split out from the command for testability.
+///
+/// [`MeetingSource::live_recording_keys`]: crate::database::repositories::meeting_sources::MeetingSource::live_recording_keys
 pub(crate) fn merge_scan_results(
     own: Vec<SharePointRecording>,
     shared: Vec<SharePointRecording>,
     imported_urls: &[String],
     meeting_titles: &[String],
+    live_keys: &HashMap<String, String>,
 ) -> Vec<SharePointScanItem> {
     let imported: std::collections::HashSet<String> =
         imported_urls.iter().map(|u| file_url_key(u)).collect();
@@ -1332,12 +1343,15 @@ pub(crate) fn merge_scan_results(
         if !seen.insert(file_url_key(&recording.file_url)) {
             continue; // own-folder hit already covers this file
         }
-        let already_imported = imported.contains(&file_url_key(&recording.file_url))
+        let live_meeting_id = live_keys.get(&MeetingSource::live_key(&recording.file_url)).cloned();
+        let already_imported = live_meeting_id.is_some()
+            || imported.contains(&file_url_key(&recording.file_url))
             || titles.contains(&title_stem(&recording.name));
         items.push(SharePointScanItem {
             already_imported,
             source: source.to_string(),
             recording,
+            live_meeting_id,
         });
     }
     items.sort_by(|a, b| b.recording.created.cmp(&a.recording.created));
@@ -1347,9 +1361,10 @@ pub(crate) fn merge_scan_results(
 /// Enumerate recordings newer than `since_iso` from both sources — the user's
 /// own OneDrive Recordings folder and tenant-wide search (recordings shared
 /// with them) — deduped by file URL and annotated with whether each is
-/// already in Meetily (imported through this feature, or an existing meeting
-/// carries the title the import would create). Either source may fail without
-/// failing the scan, as long as the other succeeds.
+/// already in Meetily (imported through this feature, held by a live meeting, or
+/// an existing meeting carries the title the import would create) and which live
+/// meeting it belongs to. Either source may fail without failing the scan, as
+/// long as the other succeeds.
 #[tauri::command]
 pub async fn sharepoint_scan_recordings_command<R: Runtime>(
     app: AppHandle<R>,
@@ -1446,9 +1461,11 @@ pub async fn scan_recordings<R: Runtime>(
 
     // Existing meeting titles, for the "skip the ones I already have" rule.
     // Best-effort: a DB hiccup only disables title-based dedupe.
-    let meeting_titles: Vec<String> = match app.try_state::<crate::state::AppState>() {
-        Some(state) => sqlx::query_scalar::<_, String>("SELECT title FROM meetings")
-            .fetch_all(state.db_manager.pool())
+    let state = app.try_state::<crate::state::AppState>();
+    let pool = state.as_ref().map(|state| state.db_manager.pool());
+    let meeting_titles: Vec<String> = match pool {
+        Some(pool) => sqlx::query_scalar::<_, String>("SELECT title FROM meetings")
+            .fetch_all(pool)
             .await
             .unwrap_or_else(|e| {
                 warn!("[sp-scan] Could not read meeting titles for dedupe: {e}");
@@ -1456,11 +1473,33 @@ pub async fn scan_recordings<R: Runtime>(
             }),
         None => Vec::new(),
     };
+    // Best-effort too: this only annotates the list. The pipeline decides again
+    // before it acts, and a failure there is retried rather than imported.
+    let live_keys = match pool {
+        Some(pool) => MeetingSource::live_recording_keys(pool).await.unwrap_or_else(|e| {
+            warn!("[sp-scan] Could not read the files live meetings hold: {e}");
+            HashMap::new()
+        }),
+        None => HashMap::new(),
+    };
     let imported_urls: Vec<String> = load_sync_state(&app).imported.into_keys().collect();
+
+    let mut recordings = merge_scan_results(own, shared, &imported_urls, &meeting_titles, &live_keys);
+    if let Some(pool) = pool {
+        for item in recordings.iter_mut().filter(|item| !item.already_imported) {
+            match find_recording_target(pool, &item.recording.file_url, &item.recording.created).await {
+                Ok(RecordingTarget::Held(meeting_id) | RecordingTarget::Live(meeting_id)) => {
+                    item.live_meeting_id = Some(meeting_id)
+                }
+                Ok(RecordingTarget::New { .. }) => {}
+                Err(e) => warn!("[sp-scan] Could not match a recording to a live meeting: {e}"),
+            }
+        }
+    }
 
     Ok(SharePointScanResult {
         strategy: strategies.join("+"),
-        recordings: merge_scan_results(own, shared, &imported_urls, &meeting_titles),
+        recordings,
     })
 }
 
@@ -2061,7 +2100,7 @@ mod tests {
         ];
         let titles = vec!["already meeting".to_string()];
 
-        let items = merge_scan_results(own, shared, &imported, &titles);
+        let items = merge_scan_results(own, shared, &imported, &titles, &HashMap::new());
         assert_eq!(items.len(), 4);
         // Newest first.
         assert_eq!(items[0].recording.name, "Theirs.mp4");
@@ -2076,6 +2115,7 @@ mod tests {
         // Imported map matches across percent-encoding.
         assert_eq!(items[3].recording.name, "Old Sync.mp4");
         assert!(items[3].already_imported);
+        assert!(items.iter().all(|item| item.live_meeting_id.is_none()));
     }
 
     #[test]

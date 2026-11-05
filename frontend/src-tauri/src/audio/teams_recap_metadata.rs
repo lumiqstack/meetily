@@ -43,7 +43,19 @@ pub fn valid_recorded_at(value: &str) -> bool {
     p[0] > 0 && p[2] > 0 && p[2] <= days && p[3] < 24 && p[4] < 60 && p[5] < 60
 }
 
-pub fn from_filename(filename: &str) -> Option<RecordingMetadata> {
+/// What a Teams file name says, including a stamp marked as UTC, which
+/// [`from_filename`] refuses because `recorded_at` means local time.
+#[derive(Debug, PartialEq)]
+pub struct StampedName {
+    pub title: String,
+    /// The stamp as `2026-07-21T10:02:21`, with no offset.
+    pub stamp: String,
+    pub is_utc: bool,
+}
+
+/// `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-Meeting Recording|Transcript[ <part>].<ext>`.
+/// Teams cuts a recording at 4 hours and numbers the parts after the first.
+pub fn read_stamped_name(filename: &str) -> Option<StampedName> {
     let decoded_spaces = filename.replace("%20", " ");
     let mut name = decoded_spaces.as_str();
     for extension in [".mp4", ".vtt"] {
@@ -52,12 +64,24 @@ pub fn from_filename(filename: &str) -> Option<RecordingMetadata> {
             break;
         }
     }
+    if let Some((before_part, part)) = name.rsplit_once(' ') {
+        if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
+            name = before_part;
+        }
+    }
     let lower = name.to_ascii_lowercase();
     let suffix = ["-meeting recording", "-meeting transcript"]
         .into_iter()
         .find(|suffix| lower.ends_with(suffix))?;
     let (title, stamp) = name[..name.len() - suffix.len()].rsplit_once('-')?;
-    if stamp.len() != 15 || !stamp.is_ascii() || stamp.as_bytes()[8] != b'_' {
+    if !stamp.is_ascii() {
+        return None;
+    }
+    let (stamp, is_utc) = match stamp.len() {
+        18 if stamp[15..].eq_ignore_ascii_case("utc") => (&stamp[..15], true),
+        _ => (stamp, false),
+    };
+    if stamp.len() != 15 || stamp.as_bytes()[8] != b'_' {
         return None;
     }
     let recorded_at = format!(
@@ -72,9 +96,18 @@ pub fn from_filename(filename: &str) -> Option<RecordingMetadata> {
     if title.trim().is_empty() || !valid_recorded_at(&recorded_at) {
         return None;
     }
-    Some(RecordingMetadata {
+    Some(StampedName {
         title: title.trim().to_owned(),
-        recorded_at,
+        stamp: recorded_at,
+        is_utc,
+    })
+}
+
+pub fn from_filename(filename: &str) -> Option<RecordingMetadata> {
+    let name = read_stamped_name(filename).filter(|name| !name.is_utc)?;
+    Some(RecordingMetadata {
+        title: name.title,
+        recorded_at: name.stamp,
     })
 }
 
@@ -99,5 +132,32 @@ mod tests {
         assert!(!valid_recorded_at("2026-09-24T25:00:00"));
         assert!(from_filename("Ordinary title.mp4").is_none());
         assert!(from_filename("Review-20260230_140734-Meeting Recording.mp4").is_none());
+    }
+    #[test]
+    fn a_later_part_of_a_long_recording_reads_like_the_first() {
+        let parsed = from_filename("Workshop 2-20261016_150059-Meeting Recording 2.mp4").unwrap();
+        assert_eq!(parsed.title, "Workshop 2");
+        assert_eq!(parsed.recorded_at, "2026-10-16T15:00:59");
+        assert!(from_filename("Workshop 2.mp4").is_none());
+    }
+    #[test]
+    fn a_stamp_marked_utc_is_never_presented_as_local_time() {
+        let name = "Kickoff-20261009_180000UTC-Meeting Recording.mp4";
+        assert!(from_filename(name).is_none());
+        let read = read_stamped_name(name).unwrap();
+        assert_eq!(read.title, "Kickoff");
+        assert_eq!(read.stamp, "2026-10-09T18:00:00");
+        assert!(read.is_utc);
+        assert!(!read_stamped_name("Kickoff-20261009_180000-Meeting Recording.mp4").unwrap().is_utc);
+    }
+    #[test]
+    fn a_stamp_with_other_text_or_characters_is_not_a_stamp() {
+        for name in [
+            "Kickoff-20261009_180000PST-Meeting Recording.mp4",
+            "Kickoff-2026100_180000é-Meeting Recording.mp4",
+            "-20261009_180000-Meeting Recording.mp4",
+        ] {
+            assert_eq!(read_stamped_name(name), None, "{name}");
+        }
     }
 }

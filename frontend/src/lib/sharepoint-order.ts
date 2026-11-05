@@ -20,3 +20,12 @@ function meetingTime(rec: { name: string; created: string }): number {
 export function oldestMeetingFirst<T extends { name: string; created: string }>(recordings: T[]): T[] {
   return [...recordings].sort((a, b) => meetingTime(a) - meetingTime(b));
 }
+
+/**
+ * Whether the import dialog ticks a scanned recording for the user. A file Meetily
+ * already has stays unticked, and so does one of a meeting it recorded live:
+ * importing that would make a second meeting, so it takes a deliberate tick.
+ */
+export function startsSelected(rec: { already_imported: boolean; live_meeting_id: string | null }): boolean {
+  return !rec.already_imported && rec.live_meeting_id === null;
+}

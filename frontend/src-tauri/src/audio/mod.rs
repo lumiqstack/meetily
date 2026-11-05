@@ -71,6 +71,7 @@ pub mod import;
 pub mod ytdlp;
 pub mod sharepoint;
 pub mod teams_recap;
+pub mod sharepoint_live_match;
 pub mod sharepoint_sync;
 pub mod teams_recap_list;
 pub mod teams_recap_live_match;
