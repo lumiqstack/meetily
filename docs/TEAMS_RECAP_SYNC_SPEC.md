@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-02. Steps 1 (identity and dedupe in the link import) and 2 (sync state, commands, settings UI) merged. Step 3 (Meet app scanner) in review: the script and its probe mode are written, the selectors are still being learned on the Windows machine. Step 4 pending.
+Status: 2026-11-04. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI) and 3 (Meet app scanner with its probe mode) merged; the selectors are still being learned on the Windows machine. Step 4 (QA checklist) is `docs/TEAMS_RECAP_SYNC_QA.md`.
 
 ## Goal
 
@@ -255,7 +255,8 @@ probe file described above, on that machine only.
 3. The Meet app scanner script, learned on the Windows machine through the
    Stash handoff: first the debug command until it lists the week's meetings
    correctly, then the real sync.
-4. QA doc in `docs/`, mirroring `TEAMS_MEETING_DETECTION_QA.md`.
+4. QA doc, `docs/TEAMS_RECAP_SYNC_QA.md`, mirroring
+   `TEAMS_MEETING_DETECTION_QA.md`.
 
 ## Testing
 
@@ -264,11 +265,7 @@ probe file described above, on that machine only.
   overlap window arithmetic; the attach path keeps title, tags and transcript.
 - Unit, `#[cfg(not(windows))]`-guarded where `mock_app` is used: the loop over a
   fake extractor returning ready, not ready and error in sequence.
-- Manual on Windows: fresh vault, since date 14 days back, run sync, confirm
-  one note per meeting, run again, confirm all "skipped", edit a recap in
-  Teams, run again, confirm one "updated" and the note overwritten with tags
-  intact, import the same meeting's recording through SharePoint sync before a
-  recap sync and confirm the recap attaches to it.
+- Manual on Windows: the checklist in `docs/TEAMS_RECAP_SYNC_QA.md`.
 
 ## Open questions
 
