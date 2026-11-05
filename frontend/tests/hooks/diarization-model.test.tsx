@@ -23,7 +23,7 @@ mock.module('@tauri-apps/api/event', () => ({
 }));
 
 type Report = { status: string; size_mb: number; path: string; percent?: number };
-let statusReport: Report = { status: 'missing', size_mb: 402, path: '/models/x.onnx' };
+let statusReport: Report = { status: 'missing', size_mb: 107, path: '/models/x.onnx' };
 let downloadOutcome: () => Promise<Report> = async () => statusReport;
 const invokeCalls: string[] = [];
 mock.module('@tauri-apps/api/core', () => ({
@@ -55,7 +55,7 @@ const emit = async (name: string, payload: unknown) => {
 beforeEach(() => {
   registrations.length = 0;
   invokeCalls.length = 0;
-  statusReport = { status: 'missing', size_mb: 402, path: '/models/x.onnx' };
+  statusReport = { status: 'missing', size_mb: 107, path: '/models/x.onnx' };
   downloadOutcome = async () => statusReport;
   latest = undefined;
 });
@@ -80,7 +80,7 @@ describe('useDiarizationModel', () => {
   test('follows progress events during a download and becomes available on completion', async () => {
     let finish: (() => void) | undefined;
     downloadOutcome = () => new Promise(resolve => {
-      finish = () => resolve({ status: 'available', size_mb: 402, path: '/models/x.onnx' });
+      finish = () => resolve({ status: 'available', size_mb: 107, path: '/models/x.onnx' });
     });
     await act(async () => {
       create(<Probe active />);

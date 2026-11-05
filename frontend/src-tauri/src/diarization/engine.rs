@@ -21,14 +21,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const MODEL_NAME: &str = "nemotron-3-diarization";
-pub const MODEL_FILE: &str = "nemotron3_diar_v3.onnx";
-pub const MODEL_BYTES: u64 = 402_167_515;
-pub const MODEL_SIZE_MB: u32 = 402;
-/// The parakeet-rs export of NVIDIA's checkpoint (OpenMDW-1.1), re-hosted on a Meetily
-/// release because corporate networks that block Hugging Face usually allow GitHub. The
-/// release notes name the pinned source revision and the file's SHA-256:
+pub const MODEL_FILE: &str = "nemotron3_step.int8.onnx";
+pub const MODEL_BYTES: u64 = 107_243_199;
+pub const MODEL_SIZE_MB: u32 = 107;
+/// s0undy's int8 build of beshkenadze's opset-17 export of NVIDIA's checkpoint (all
+/// OpenMDW-1.1), re-hosted on a Meetily release because corporate networks that block
+/// Hugging Face usually allow GitHub. Opset 17 matters: the ONNX Runtime 1.22 the Windows
+/// build ships refuses the opset-23 parakeet-rs export. The release notes name the source
+/// revisions and the file's SHA-256:
 /// https://github.com/lumiqstack/meetily/releases/tag/model-nemotron-3-diarization-v3
-pub const MODEL_URL: &str = "https://github.com/lumiqstack/meetily/releases/download/model-nemotron-3-diarization-v3/nemotron3_diar_v3.onnx";
+pub const MODEL_URL: &str = "https://github.com/lumiqstack/meetily/releases/download/model-nemotron-3-diarization-v3/nemotron3_step.int8.onnx";
 
 /// Two spans of the same speaker closer than this are one utterance split by a window edge.
 const MERGE_GAP_MS: f64 = 1.0;
@@ -85,12 +87,48 @@ fn model_status_at(path: &Path) -> ModelStatus {
     }
 }
 
+/// Remove files in the model folder that are not the current model or its download in
+/// progress: an earlier Meetily build downloaded a different export there, and 400 MB of
+/// unusable file should not linger on the user's disk.
+fn sweep_stale_files() {
+    let Ok(entries) = std::fs::read_dir(model_dir()) else {
+        return;
+    };
+    let part_name = format!("{MODEL_FILE}.part");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == MODEL_FILE || name.to_string_lossy() == part_name {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => log::info!("Removed stale speaker model file {}", entry.path().display()),
+                Err(e) => log::warn!("Could not remove stale file {}: {e}", entry.path().display()),
+            }
+        }
+    }
+}
+
 pub fn model_report() -> ModelReport {
+    sweep_stale_files();
     ModelReport {
         status: model_status(),
         size_mb: MODEL_SIZE_MB,
-        path: model_path().display().to_string(),
+        path: display_path(&model_path()),
     }
+}
+
+/// The path as the user knows it: with the models root resolved through any junction or
+/// symlink (on Windows the app data folder is often a junction onto another drive), and
+/// without the `\\?\` prefix canonicalization adds there.
+fn display_path(path: &Path) -> String {
+    let root = crate::storage::models_dir();
+    let resolved = match (std::fs::canonicalize(&root), path.strip_prefix(&root)) {
+        (Ok(real_root), Ok(rest)) => real_root.join(rest),
+        _ => path.to_path_buf(),
+    };
+    let text = resolved.display().to_string();
+    text.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(text)
 }
 
 pub fn is_model_available() -> bool {
@@ -285,8 +323,58 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["status"], "downloading");
         assert_eq!(json["percent"], 42);
-        assert_eq!(json["size_mb"], 402);
+        assert_eq!(json["size_mb"], 107);
         let json = serde_json::to_value(ModelStatus::Available).unwrap();
         assert_eq!(json["status"], "available");
+    }
+}
+
+#[cfg(test)]
+mod load_probe {
+    /// Diarizes the 16 kHz mono 16-bit PCM WAV named by `DIAR_WAV_PATH` with the model
+    /// named by `DIAR_MODEL_PATH` and prints the spans, for checking a real export by hand.
+    #[test]
+    #[ignore]
+    fn diarize_real_wav() {
+        let model = std::path::PathBuf::from(std::env::var("DIAR_MODEL_PATH").expect("DIAR_MODEL_PATH"));
+        let wav = std::fs::read(std::env::var("DIAR_WAV_PATH").expect("DIAR_WAV_PATH")).expect("read wav");
+        // Minimal RIFF walk: find the "data" chunk, assume what ffmpeg wrote (s16le mono 16 kHz).
+        let mut pos = 12;
+        let samples: Vec<f32> = loop {
+            let id = &wav[pos..pos + 4];
+            let len = u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
+            if id == b"data" {
+                break wav[pos + 8..pos + 8 + len]
+                    .chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .collect();
+            }
+            pos += 8 + len + (len & 1);
+        };
+        let started = std::time::Instant::now();
+        let spans = super::diarize_blocking(&model, &samples, |_| true).unwrap_or_else(|e| panic!("{e:#}"));
+        println!("DIARIZED {:.1}s of audio in {:.1}s", samples.len() as f64 / 16000.0, started.elapsed().as_secs_f64());
+        for s in &spans {
+            println!("SPAN speaker {} {:>7.2}s - {:>7.2}s", s.speaker, s.start_ms / 1000.0, s.end_ms / 1000.0);
+        }
+    }
+
+    /// Loads a real model file named by `DIAR_MODEL_PATH`, so a load failure seen on
+    /// another machine can be reproduced here with the same ort version.
+    #[test]
+    #[ignore]
+    fn load_real_model() {
+        let path = std::path::PathBuf::from(std::env::var("DIAR_MODEL_PATH").expect("DIAR_MODEL_PATH"));
+        match super::build_session(&path) {
+            Ok(session) => {
+                let s = session;
+                let sf = super::super::sortformer::Sortformer::from_session(s, Default::default());
+                match sf {
+                    Ok(_) => println!("LOAD_OK"),
+                    Err(e) => panic!("sortformer init failed: {e:#}"),
+                }
+            }
+            Err(e) => panic!("session load failed: {e:#}"),
+        }
     }
 }

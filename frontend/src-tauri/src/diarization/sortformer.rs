@@ -12,13 +12,20 @@
 //! - Speakers are tracked at 80 ms frames (which drive the cache) and predicted at 10 ms
 //!   frames (what this module returns). Up to eight speakers, IDs ordered by first
 //!   appearance in the recording.
-//! - The exported graph has dynamic time axes, so the streaming window is a runtime
-//!   setting. Meetily runs the model after a meeting, so it uses NVIDIA's offline preset:
-//!   a 30.4 s window, which gives the best accuracy.
+//! - Two export flavours are accepted. parakeet-rs's has dynamic time axes and names its
+//!   outputs `preds_diar` / `preds_hires` / `chunk_pre_encode_embs`; beshkenadze's
+//!   (https://huggingface.co/beshkenadze/nemotron-3-diarization-onnx, the one Meetily
+//!   ships, opset 17 so it loads on ONNX Runtime 1.22) fixes every axis to the offline
+//!   preset and names them `preds` / `preds_hr` / `chunk_embs`. For a fixed graph the
+//!   state is zero-padded to the declared length and the real length passed alongside,
+//!   which is NeMo's `async_pad_to_max` computation.
+//! - Meetily runs the model after a meeting, so it uses NVIDIA's offline preset: a 30.4 s
+//!   window, which gives the best accuracy.
 
 use anyhow::{anyhow, Context, Result};
 use ndarray::{s, Array1, Array2, Array3, Axis};
 use ort::session::Session;
+use ort::value::ValueType;
 use ort::value::TensorRef;
 use realfft::RealFftPlanner;
 use std::collections::HashMap;
@@ -43,6 +50,17 @@ const UPSAMPLE_FACTOR: usize = 8; // model frames -> output frames
 const EMB_DIM: usize = 512;
 pub const NUM_SPEAKERS: usize = 8;
 const FRAME_DURATION: f32 = 0.08;
+
+/// The checkpoint's learned silence embedding (512 little-endian f32), used for unused
+/// speaker-cache slots. Exports without it in their metadata fall back to this copy, taken
+/// from beshkenadze's export of the same checkpoint.
+const SIL_EMB_BYTES: &[u8] = include_bytes!("nemotron3_learnable_sil_emb.f32");
+
+/// Output names of the two accepted exports: (80 ms preds, 10 ms preds, chunk embeddings).
+const OUTPUT_NAMES: [[&str; 3]; 2] = [
+    ["preds_diar", "preds_hires", "chunk_pre_encode_embs"],
+    ["preds", "preds_hr", "chunk_embs"],
+];
 
 // Speaker-cache compression parameters (from NeMo)
 const SPKCACHE_SIL_FRAMES_PER_SPK: usize = 1;
@@ -111,8 +129,15 @@ pub struct Sortformer {
     spkcache_len: usize,
     right_context: usize,
     spkcache_update_period: usize,
-    /// Learned embedding for silence / unused cache slots (from ONNX metadata).
+    /// Learned embedding for silence / unused cache slots.
     sil_emb: Array1<f32>,
+    /// Output names of this export, see [`OUTPUT_NAMES`].
+    outputs: [&'static str; 3],
+    /// Declared lengths of the `chunk`, `spkcache` and `fifo` inputs when the graph fixes
+    /// them; `None` for a dynamic axis.
+    fixed_chunk: Option<usize>,
+    fixed_spkcache: Option<usize>,
+    fixed_fifo: Option<usize>,
     // Streaming state, kept exactly as NeMo does.
     spkcache: Array3<f32>,               // (1, 0..spkcache_len, EMB_DIM)
     spkcache_preds: Option<Array3<f32>>, // (1, 0..spkcache_len, NUM_SPEAKERS), 80 ms
@@ -128,12 +153,27 @@ impl Sortformer {
     /// Wrap an already-built session. The caller chooses execution providers and threads.
     pub fn from_session(session: Session, config: DiarizationConfig) -> Result<Self> {
         let has_output = |name: &str| session.outputs.iter().any(|o| o.name == name);
-        if !has_output("preds_diar") || !has_output("preds_hires") {
-            return Err(anyhow!(
-                "this ONNX has no preds_diar/preds_hires outputs; it is not a Nemotron-3 \
-                 Diarization export"
-            ));
-        }
+        let outputs = OUTPUT_NAMES
+            .into_iter()
+            .find(|names| names.iter().all(|n| has_output(n)))
+            .ok_or_else(|| {
+                anyhow!(
+                    "this ONNX has none of the expected output sets {OUTPUT_NAMES:?}; it is \
+                     not a Nemotron-3 Diarization step export"
+                )
+            })?;
+        let fixed_len = |input: &str| -> Option<usize> {
+            session.inputs.iter().find(|i| i.name == input).and_then(|i| match &i.input_type {
+                ValueType::Tensor { shape, .. } => {
+                    let dims: &[i64] = shape;
+                    dims.get(1).copied().filter(|d| *d > 0).map(|d| d as usize)
+                }
+                _ => None,
+            })
+        };
+        let fixed_chunk = fixed_len("chunk");
+        let fixed_spkcache = fixed_len("spkcache");
+        let fixed_fifo = fixed_len("fifo");
 
         let metadata: HashMap<String, String> = match session.metadata() {
             Ok(meta) => meta
@@ -161,9 +201,13 @@ impl Sortformer {
             .filter(|v| v.len() == EMB_DIM)
             .map(Array1::from_vec)
             .unwrap_or_else(|| {
-                log::warn!("Sortformer ONNX carries no learnable_sil_emb metadata; using zeros");
-                Array1::zeros(EMB_DIM)
+                Array1::from_iter(
+                    SIL_EMB_BYTES
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                )
             });
+        debug_assert_eq!(sil_emb.len(), EMB_DIM);
 
         let mut instance = Self {
             session,
@@ -174,6 +218,10 @@ impl Sortformer {
             right_context: get("right_context", RIGHT_CONTEXT),
             spkcache_update_period: get("spkcache_update_period", SPKCACHE_UPDATE_PERIOD),
             sil_emb,
+            outputs,
+            fixed_chunk,
+            fixed_spkcache,
+            fixed_fifo,
             spkcache: Array3::zeros((1, 0, EMB_DIM)),
             spkcache_preds: None,
             fifo: Array3::zeros((1, 0, EMB_DIM)),
@@ -182,6 +230,21 @@ impl Sortformer {
             elapsed_samples: 0,
             mel_basis: create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE).mapv(to_bf16),
         };
+        if let Some(fixed) = instance.fixed_chunk {
+            let window = (instance.chunk_len + instance.right_context) * SUBSAMPLING;
+            if fixed != window {
+                return Err(anyhow!(
+                    "the graph fixes `chunk` to {fixed} mel frames but the streaming preset \
+                     needs {window}; the export was made for a different preset"
+                ));
+            }
+        }
+        if let Some(fixed) = instance.fixed_spkcache {
+            instance.spkcache_len = fixed;
+        }
+        if let Some(fixed) = instance.fixed_fifo {
+            instance.fifo_len = fixed;
+        }
         if instance.spkcache_len == 0 || instance.spkcache_len % NUM_SPEAKERS != 0 {
             return Err(anyhow!(
                 "spkcache_len ({}) must be a positive multiple of {NUM_SPEAKERS}",
@@ -227,7 +290,7 @@ impl Sortformer {
             let features = self.extract_mel_features(window)?;
             // STFT with center padding yields feed_size + 1 frames; keep exactly feed_size.
             let chunk_feat = features.slice(s![.., ..feed_size, ..]).to_owned();
-            let chunk_preds = self.streaming_update(&chunk_feat, feed_size)?;
+            let chunk_preds = self.streaming_update(&chunk_feat, feed_size, false)?;
 
             let sample_offset = self.elapsed_samples as u64;
             let mut segments =
@@ -255,7 +318,7 @@ impl Sortformer {
         let features = self.extract_mel_features(&remaining)?;
         let current_len = features.shape()[1].min(feed_size);
         let chunk_feat = Self::pad_chunk(features.slice(s![.., ..current_len, ..]));
-        let chunk_preds = self.streaming_update(&chunk_feat, current_len)?;
+        let chunk_preds = self.streaming_update(&chunk_feat, current_len, true)?;
 
         let sample_offset = self.elapsed_samples as u64;
         let mut segments = Self::post_process(&self.config, &chunk_preds, remaining.len() as u64);
@@ -326,8 +389,15 @@ impl Sortformer {
     }
 
     /// NeMo's `streaming_update`: one model call, then FIFO and speaker-cache bookkeeping.
-    /// Returns the chunk's 10 ms predictions.
-    fn streaming_update(&mut self, chunk_feat: &Array3<f32>, current_len: usize) -> Result<Array2<f32>> {
+    /// Returns the chunk's 10 ms predictions. In a full window the trailing right-context
+    /// frames only served as lookahead and belong to the next window; in the final chunk
+    /// (`is_last`) nothing follows, so every valid frame is kept.
+    fn streaming_update(
+        &mut self,
+        chunk_feat: &Array3<f32>,
+        current_len: usize,
+        is_last: bool,
+    ) -> Result<Array2<f32>> {
         let spkcache_len = self.spkcache.shape()[1];
         let fifo_len = self.fifo.shape()[1];
 
@@ -335,26 +405,38 @@ impl Sortformer {
         let spkcache_lengths = Array1::from_vec(vec![spkcache_len as i64]);
         let fifo_lengths = Array1::from_vec(vec![fifo_len as i64]);
 
+        // A fixed-shape graph takes every state tensor at its declared length, zero-padded,
+        // with the live length alongside. Inside, the model packs the live cache, live FIFO
+        // and chunk back to back and pads the total, so the outputs sit at the live offsets
+        // (checked: reading them at the padded offsets drops all but the last 6 s of the
+        // first window).
+        let chunk_in = pad_axis1(chunk_feat, self.fixed_chunk.unwrap_or(chunk_feat.shape()[1]));
+        let spkcache_in = pad_axis1(&self.spkcache, self.fixed_spkcache.unwrap_or(spkcache_len));
+        let fifo_in = pad_axis1(&self.fifo, self.fixed_fifo.unwrap_or(fifo_len));
+
         let (preds_diar, preds_hires, new_embs) = {
             let inputs = ort::inputs![
-                "chunk" => TensorRef::from_array_view(chunk_feat.view())?,
+                "chunk" => TensorRef::from_array_view(chunk_in.view())?,
                 "chunk_lengths" => TensorRef::from_array_view(chunk_lengths.view())?,
-                "spkcache" => TensorRef::from_array_view(self.spkcache.view())?,
+                "spkcache" => TensorRef::from_array_view(spkcache_in.view())?,
                 "spkcache_lengths" => TensorRef::from_array_view(spkcache_lengths.view())?,
-                "fifo" => TensorRef::from_array_view(self.fifo.view())?,
+                "fifo" => TensorRef::from_array_view(fifo_in.view())?,
                 "fifo_lengths" => TensorRef::from_array_view(fifo_lengths.view())?,
             ];
             let outputs = self.session.run(inputs).context("Sortformer inference failed")?;
             (
-                extract_3d_f32(&outputs, "preds_diar")?,
-                extract_3d_f32(&outputs, "preds_hires")?,
-                extract_3d_f32(&outputs, "chunk_pre_encode_embs")?,
+                extract_3d_f32(&outputs, self.outputs[0])?,
+                extract_3d_f32(&outputs, self.outputs[1])?,
+                extract_3d_f32(&outputs, self.outputs[2])?,
             )
         };
 
-        // Keep chunk_len frames: the right-context frames only served as lookahead.
         let valid_frames = current_len.div_ceil(SUBSAMPLING);
-        let keep = self.chunk_len.min(valid_frames);
+        let keep = if is_last {
+            valid_frames.min(self.chunk_len + self.right_context)
+        } else {
+            self.chunk_len.min(valid_frames)
+        };
 
         let fifo_preds = if fifo_len > 0 {
             preds_diar
@@ -363,12 +445,13 @@ impl Sortformer {
         } else {
             Array2::zeros((0, NUM_SPEAKERS))
         };
+        let chunk_start = spkcache_len + fifo_len;
         let chunk_preds = preds_diar
-            .slice(s![0, spkcache_len + fifo_len..spkcache_len + fifo_len + keep, ..])
+            .slice(s![0, chunk_start..chunk_start + keep, ..])
             .to_owned();
         let chunk_embs = new_embs.slice(s![0, ..keep, ..]).to_owned();
 
-        let hires_start = (spkcache_len + fifo_len) * UPSAMPLE_FACTOR;
+        let hires_start = chunk_start * UPSAMPLE_FACTOR;
         let chunk_preds_hires = preds_hires
             .slice(s![0, hires_start..hires_start + keep * UPSAMPLE_FACTOR, ..])
             .to_owned();
@@ -646,6 +729,17 @@ impl Sortformer {
         let log_mel = mel.mapv(|x| (x + LOG_ZERO_GUARD).ln());
         Ok(log_mel.t().as_standard_layout().into_owned().insert_axis(Axis(0)))
     }
+}
+
+/// Zero-pad `a` along axis 1 up to `len` frames; returns it unchanged when already that long.
+fn pad_axis1(a: &Array3<f32>, len: usize) -> Array3<f32> {
+    let current = a.shape()[1];
+    if current >= len {
+        return a.clone();
+    }
+    let mut padded = Array3::zeros((a.shape()[0], len, a.shape()[2]));
+    padded.slice_mut(s![.., ..current, ..]).assign(a);
+    padded
 }
 
 fn extract_3d_f32(outputs: &ort::session::SessionOutputs<'_>, name: &str) -> Result<Array3<f32>> {

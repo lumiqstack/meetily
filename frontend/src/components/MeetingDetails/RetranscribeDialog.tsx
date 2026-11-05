@@ -410,7 +410,7 @@ export function RetranscribeDialog({
                 </div>
               ) : speakerModel.isAvailable ? (
                 <p className="text-xs text-muted-foreground">
-                  Speaker model installed (NVIDIA Nemotron-3 Diarization, {speakerModel.report?.size_mb ?? 402} MB).
+                  Speaker model installed (NVIDIA Nemotron-3 Diarization, {speakerModel.report?.size_mb ?? 107} MB).
                 </p>
               ) : (
                 <div className="space-y-1">
@@ -427,7 +427,7 @@ export function RetranscribeDialog({
                       onClick={speakerModel.download}
                       disabled={speakerModel.report === null}
                     >
-                      Download speaker model ({speakerModel.report?.size_mb ?? 402} MB)
+                      Download speaker model ({speakerModel.report?.size_mb ?? 107} MB)
                     </Button>
                     <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={speakerModel.openFolder}>
                       Open model folder

@@ -188,7 +188,9 @@ async fn start_retranscription_with_guard<R: Runtime>(
                 "retranscription-error",
                 RetranscriptionError {
                     meeting_id: meeting_id.clone(),
-                    error: e.to_string(),
+                    // `{:#}` keeps the whole cause chain; `to_string()` would drop
+                    // everything below the outermost context.
+                    error: format!("{e:#}"),
                 },
             );
         }
