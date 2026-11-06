@@ -1,18 +1,19 @@
-//! List the meetings the Teams Meet app shows under its recap tab, so the
-//! recap sync knows which recaps exist without the user pasting links.
+//! List the meetings the Teams Recap app ("Meeting Recaps" on the Teams app
+//! bar) shows on its Home tab, so the recap sync knows which recaps exist
+//! without the user pasting links.
 //!
 //! The list is read from the same persisted WebView2 profile the recap import
-//! uses, by a page script (`teams_recap_list.js`) that only reads the rendered
-//! DOM. The script returns the rows it has seen so far on every poll and
-//! `done` once it has scrolled past the scan window; this module keeps the
+//! uses, by a page script (`teams_recap_list.js`) that reads each row's
+//! meeting from the props React gives the row and builds the recap sharing
+//! link from it. The script returns the rows it has seen so far on every poll
+//! and `done` once it has scrolled past the scan window; this module keeps the
 //! last snapshot, dedupes rows by meeting identity and counts rows without a
-//! recap link as "not ready". A probe mode returns a compact description of
-//! the page for learning the Meet app's layout; the debug command writes it
-//! to a local file, never to a log.
+//! recap link as "not ready". A probe mode adds the listing's counts and
+//! timings; the debug command writes it to a local file, never to a log.
 //!
-//! While the layout is being learned, `MEETILY_RECAP_LIST_SCRIPT` names a file
-//! whose contents replace the bundled script, so selectors can be tuned on
-//! the Windows machine without a rebuild.
+//! If Teams changes its layout, `MEETILY_RECAP_LIST_SCRIPT` names a file whose
+//! contents replace the bundled script, so the script can be tuned on the
+//! Windows machine without a rebuild.
 
 // Only the Windows driver calls the script helpers; the rest of the module
 // stays compiled everywhere so its tests run on every platform.
@@ -27,10 +28,11 @@ use super::teams_recap::meeting_identity_key;
 use super::teams_recap_sync::RecapCandidate;
 
 pub const SCRIPT_OVERRIDE_ENV: &str = "MEETILY_RECAP_LIST_SCRIPT";
-/// The Teams web shell; the script steers from here to the Meet app's recap
-/// tab by button names, and the user can do the same by hand in the
-/// interactive phase.
-pub const MEET_APP_URL: &str = "https://teams.microsoft.com/v2/";
+/// The Teams web shell, on the domain Teams now serves it from: starting on
+/// teams.microsoft.com costs about 40 seconds on the redirect page. The script
+/// steers from here to the Recap app by its app id or name, and the user can
+/// do the same by hand in the interactive phase.
+pub const TEAMS_WEB_URL: &str = "https://teams.cloud.microsoft/v2/";
 /// More rows than any 30-day window of meetings; stops a runaway scroll.
 pub const MAX_ROWS: usize = 500;
 /// The title of a listed row that showed none.
@@ -220,7 +222,7 @@ mod windows {
         probe: bool,
     ) -> Result<RecapListing> {
         let script = render_script(&script_template()?, since, probe);
-        let url = Url::parse(MEET_APP_URL).expect("constant URL");
+        let url = Url::parse(TEAMS_WEB_URL).expect("constant URL");
         // Same lock and profile as the SharePoint and recap flows, so two
         // hidden Teams windows never fight over the one profile.
         let _auth_flow = crate::audio::sharepoint::AUTH_FLOW_LOCK.lock().await;
@@ -241,14 +243,15 @@ mod windows {
             if poll(&window, &script, started + SILENT_WAIT, &mut listing).await? {
                 return Ok(());
             }
-            window.set_title("Teams recaps — sign in and open the Meet app's Recap list")?;
+            log::info!("[recap-list] showing the window: the list was not read while it was hidden");
+            window.set_title("Teams recaps — sign in, then open Meeting Recaps")?;
             window.show()?;
             window.set_focus()?;
             if poll(&window, &script, tokio::time::Instant::now() + INTERACTIVE_WAIT, &mut listing).await? {
                 return Ok(());
             }
             Err(anyhow!(
-                "Teams did not show the Meet app's recap list. Sign in if prompted, open the Meet app and its Recap tab in the Meetily window, then retry."
+                "Teams did not show the Meeting Recaps list. Sign in if prompted, open Meeting Recaps from the Teams app bar in the Meetily window, then retry."
             ))
         }
         .await;
@@ -260,7 +263,7 @@ mod windows {
     }
 }
 
-/// Read the Meet app's recap list for meetings since `since`. On Windows the
+/// Read the Recap app's list for meetings since `since`. On Windows the
 /// listing's `error` reports a page that never showed the list; elsewhere
 /// this is an error outright.
 pub async fn list_recaps<R: tauri::Runtime>(
@@ -327,6 +330,28 @@ mod tests {
         assert_eq!(candidates[0].recap_url, link);
         assert_eq!(candidates[1].title, "Teams meeting");
         assert_eq!(candidates[1].started_at, None);
+    }
+
+    #[test]
+    fn a_meetings_transcript_row_and_recording_row_become_one_candidate() {
+        // The Recap app can list a meeting twice, once for its transcript and
+        // once for its recording. Both rows name the same file, so the links
+        // the script builds differ only in the fields each row knows.
+        let file = "https%3A%2F%2Fcontoso-my.sharepoint.com%2Fpersonal%2Fjdoe%2FDocuments%2FRecordings%2FSync-20261105_133311-Meeting%2520Recording.mp4%3Fweb%3D1";
+        let transcript_row = format!(
+            "https://teams.cloud.microsoft/l/meetingrecap?fileUrl={file}&callId=call-a&recapType=ODSPTranscript"
+        );
+        let recording_row = format!(
+            "https://teams.cloud.microsoft/l/meetingrecap?fileUrl={file}&callId=call-b&tenantId=t-1&recapType=RecordingAndTranscript"
+        );
+        let rows = vec![
+            row(Some(&transcript_row), "Sync", Some("2026-11-05T19:33:55.000Z")),
+            row(Some(&recording_row), "Sync", Some("2026-11-05T19:34:23.170Z")),
+        ];
+        let (candidates, without_link) = collect(&rows);
+        assert_eq!((candidates.len(), without_link), (1, 0));
+        assert_eq!(candidates[0].recap_url, transcript_row);
+        assert_eq!(candidates[0].started_at.as_deref(), Some("2026-11-05T19:33:55.000Z"));
     }
 
     #[test]

@@ -151,7 +151,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
     <div className="mt-3 pt-3 border-t border-gray-200 flex flex-col gap-2">
       <div className="text-sm font-medium">Teams recaps</div>
       <div className="text-xs text-gray-600">
-        Reads the recap list in the Teams Meet app and saves every Copilot recap to Meetily and the
+        Reads Meeting Recaps in Teams and saves every Copilot recap to Meetily and the
         vault, attaching each to the meeting that already holds its recording. Last sync: {lastSync}
         {state && state.knownRecaps > 0 ? ` · ${state.knownRecaps} recaps known` : ''}.
       </div>

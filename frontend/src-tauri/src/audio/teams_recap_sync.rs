@@ -1,11 +1,11 @@
-//! Pull every Copilot recap the Teams Meet app lists into Meetily and the
+//! Pull every Copilot recap the Teams Recap app lists into Meetily and the
 //! Obsidian vault, one button press at a time. Each recap is keyed on the
 //! recording it belongs to (see `teams_recap::meeting_identity_key`), so a
 //! recap never creates a second meeting or a second note, and a content hash
 //! per key turns an unchanged recap into a skip instead of a rewrite.
 //!
-//! The list itself comes from `teams_recap_list`, which reads the Meet app's
-//! recap tab in a hidden WebView2 window. Rows it lists without a recap link
+//! The list itself comes from `teams_recap_list`, which reads the Recap app's
+//! ("Meeting Recaps") Home list in a hidden WebView2 window. Rows it lists without a recap link
 //! count as not ready. See docs/TEAMS_RECAP_SYNC_SPEC.md.
 
 use anyhow::{anyhow, Context, Result};
@@ -58,11 +58,11 @@ pub struct TeamsRecapSyncStateView {
     pub since_date: Option<String>,
     pub last_sync_date: Option<String>,
     pub known_recaps: usize,
-    /// The Meet app can be read on this platform.
+    /// The Recap app can be read on this platform.
     pub available: bool,
 }
 
-/// One meeting row the Meet app lists.
+/// One meeting row the Recap app lists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecapCandidate {
@@ -185,12 +185,12 @@ fn is_not_ready(error: &str) -> bool {
 // Listing
 // ---------------------------------------------------------------------------
 
-/// The Meet app can only be read through the Windows WebView2 profile.
+/// The Recap app can only be read through the Windows WebView2 profile.
 pub const fn sync_available() -> bool {
     cfg!(target_os = "windows")
 }
 
-/// The Meet app's rows for the window, or the error the listing hit.
+/// The Recap app's rows for the window, or the error the listing hit.
 async fn list_recaps<R: Runtime>(
     app: &AppHandle<R>,
     since: DateTime<Utc>,
@@ -393,8 +393,8 @@ pub async fn set_teams_recap_sync_prefs_command<R: Runtime>(
     update_state(&app, |state| state.since_date = since_date).map_err(|e| e.to_string())
 }
 
-/// The raw candidate list, without importing anything. For learning the
-/// Meet app layout and for the QA doc.
+/// The raw candidate list, without importing anything. For checking the
+/// listing against Teams and for the QA doc.
 #[tauri::command]
 pub async fn teams_recap_list_debug_command<R: Runtime>(
     app: AppHandle<R>,
