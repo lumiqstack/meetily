@@ -132,12 +132,13 @@ const home = () => {
       btn.closest('.fui-AccordionItem').querySelector('.fui-AccordionPanel').innerHTML = listHtml(btn.textContent);
       wire();
     };
-    // Older rows arrive in a later page once the list is scrolled to its end.
+    // Older rows arrive in a later page once the list is scrolled to its end;
+    // in the "stalled" mode that page never comes.
     let earlier = false;
     clearInterval(window.pager);
     window.pager = setInterval(() => {
       const sc = document.getElementById('scroller');
-      if (sc && !earlier && sc.scrollTop > 0 && sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 60) {
+      if (sc && !earlier && mode !== 'stalled' && sc.scrollTop > 0 && sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 60) {
         earlier = true;
         setTimeout(() => {
           main.querySelector('.fui-Accordion').insertAdjacentHTML('beforeend', groupHtml('Earlier', true) + (mode === 'oldgroups' ? groupHtml('September', false) : ''));
@@ -282,6 +283,18 @@ test('closes a recap left open with its back button', async () => {
   const { result, clicks } = await list('open');
   assert.equal(clicks.back, 1);
   assert.equal(result.items.length, 7);
+});
+
+test('says why it stopped and the oldest slot it reached, probe or not', async () => {
+  const { result } = await list();
+  assert.equal(result.stop, 'since');
+  assert.equal(result.oldest, '2026-10-27T17:00:00.000Z');
+  // Older rows that never load: the list ends inside the window and says so.
+  const { result: stalled } = await list('stalled');
+  assert.equal(stalled.stop, 'idle');
+  assert.equal(stalled.oldest, '2026-10-29T17:00:00.000Z');
+  const { result: empty } = await list('empty');
+  assert.deepEqual([empty.stop, empty.oldest], ['empty', null]);
 });
 
 test('an empty Recap app finishes with no items', async () => {

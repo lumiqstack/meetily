@@ -19,6 +19,7 @@ use tauri_plugin_store::StoreExt;
 
 const SYNC_STORE_FILE: &str = "teams_recap_sync.json";
 const SYNC_STORE_KEY: &str = "state";
+const LAST_LISTING_KEY: &str = "lastListing";
 /// How far back the first sync reaches when the user has not chosen a date.
 const DEFAULT_BACKFILL_DAYS: i64 = 30;
 /// A recap appears hours after a meeting and Teams may finish generating one
@@ -60,6 +61,95 @@ pub struct TeamsRecapSyncStateView {
     pub known_recaps: usize,
     /// The Recap app can be read on this platform.
     pub available: bool,
+    /// The line beside the buttons, once the list has been read.
+    pub last_listing: Option<LastListingView>,
+}
+
+/// The list as the last check or sync read it. Stored apart from
+/// [`TeamsRecapSyncState`]: reading the list never moves the scan window or
+/// changes the known recaps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastListing {
+    /// RFC 3339, when the list was read.
+    pub read_at: String,
+    /// RFC 3339 start of the scan window it was read for.
+    pub window_start: String,
+    /// Recaps listed with a link.
+    pub listed: usize,
+    /// Identity keys of the listed recaps whose link is valid, to count the
+    /// synced ones.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default)]
+    pub rows_without_link: usize,
+    /// Why the list was not read, when it was not.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The oldest slot the list reached, when it stopped before the window
+    /// start with rows possibly left unread.
+    #[serde(default)]
+    pub ended_early_at: Option<String>,
+}
+
+impl LastListing {
+    fn from_listing(
+        read_at: DateTime<Utc>,
+        window_start: DateTime<Utc>,
+        listing: &super::teams_recap_list::RecapListing,
+    ) -> Self {
+        // The same key the sync records an import under.
+        let keys = listing
+            .candidates
+            .iter()
+            .filter_map(|candidate| crate::audio::teams_recap::validate_recap_url(&candidate.recap_url).ok())
+            .map(|url| crate::audio::teams_recap::meeting_identity_key(url.as_str()))
+            .collect();
+        Self {
+            read_at: read_at.to_rfc3339(),
+            window_start: window_start.to_rfc3339(),
+            listed: listing.candidates.len(),
+            keys,
+            rows_without_link: listing.rows_without_link,
+            error: listing.error.clone(),
+            ended_early_at: listing
+                .end
+                .filter(|end| end.may_be_short())
+                .and(listing.oldest_row.clone()),
+        }
+    }
+
+    /// Counted against the recaps synced so far, so a sync after the check
+    /// moves its recaps from pending to synced.
+    fn view(&self, imported: &HashMap<String, ImportedRecap>) -> LastListingView {
+        let synced = self.keys.iter().filter(|key| imported.contains_key(*key)).count();
+        LastListingView {
+            read_at: self.read_at.clone(),
+            window_start: self.window_start.clone(),
+            listed: self.listed,
+            synced,
+            pending: self.listed.saturating_sub(synced),
+            not_ready: self.rows_without_link,
+            error: self.error.clone(),
+            ended_early_at: self.ended_early_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastListingView {
+    pub read_at: String,
+    pub window_start: String,
+    pub listed: usize,
+    /// Listed recaps a sync has already saved.
+    pub synced: usize,
+    /// Listed recaps the next sync would save.
+    pub pending: usize,
+    /// Listed meetings without a recap link yet.
+    pub not_ready: usize,
+    pub error: Option<String>,
+    pub ended_early_at: Option<String>,
 }
 
 /// One meeting row the Recap app lists.
@@ -148,6 +238,34 @@ fn update_state<R: Runtime>(
         .map_err(|e| anyhow!("Could not persist the recap sync store: {e}"))
 }
 
+fn load_last_listing<R: Runtime>(app: &AppHandle<R>) -> Option<LastListing> {
+    let store = app.store(SYNC_STORE_FILE).ok()?;
+    store
+        .get(LAST_LISTING_KEY)
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Keep what the list showed for the line beside the buttons. A failure costs
+/// only that line, so it is logged instead of failing the check or sync.
+fn record_listing<R: Runtime>(app: &AppHandle<R>, last: &LastListing) {
+    let saved = (|| -> Result<()> {
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = app
+            .store(SYNC_STORE_FILE)
+            .map_err(|e| anyhow!("Could not open the recap sync store: {e}"))?;
+        store.set(
+            LAST_LISTING_KEY,
+            serde_json::to_value(last).context("Could not serialize the list result")?,
+        );
+        store
+            .save()
+            .map_err(|e| anyhow!("Could not persist the recap sync store: {e}"))
+    })();
+    if let Err(e) = saved {
+        warn!("[recap-sync] could not record the list result: {e}");
+    }
+}
+
 fn parse_since_date(value: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
         .map_err(|_| anyhow!("Enter the since date as YYYY-MM-DD."))
@@ -188,18 +306,6 @@ fn is_not_ready(error: &str) -> bool {
 /// The Recap app can only be read through the Windows WebView2 profile.
 pub const fn sync_available() -> bool {
     cfg!(target_os = "windows")
-}
-
-/// The Recap app's rows for the window, or the error the listing hit.
-async fn list_recaps<R: Runtime>(
-    app: &AppHandle<R>,
-    since: DateTime<Utc>,
-) -> Result<super::teams_recap_list::RecapListing> {
-    let listing = super::teams_recap_list::list_recaps(app, since, false).await?;
-    if let Some(error) = &listing.error {
-        return Err(anyhow!("{error}"));
-    }
-    Ok(listing)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +428,13 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let state = load_state(app);
     let since = scan_window_start(&state, started_at);
     info!("[recap-sync] listing recaps since {}", since.to_rfc3339());
-    let listing = list_recaps(app, since).await.map_err(|e| e.to_string())?;
+    let listing = super::teams_recap_list::list_recaps(app, since, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    record_listing(app, &LastListing::from_listing(Utc::now(), since, &listing));
+    if let Some(error) = &listing.error {
+        return Err(error.clone());
+    }
 
     let app_state = app.state::<crate::state::AppState>();
     let pool = app_state.db_manager.pool();
@@ -373,11 +485,13 @@ pub async fn get_teams_recap_sync_state_command<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<TeamsRecapSyncStateView, String> {
     let state = load_state(&app);
+    let last_listing = load_last_listing(&app).map(|last| last.view(&state.imported));
     Ok(TeamsRecapSyncStateView {
         since_date: state.since_date,
         last_sync_date: state.last_sync_date,
         known_recaps: state.imported.len(),
         available: sync_available(),
+        last_listing,
     })
 }
 
@@ -394,7 +508,8 @@ pub async fn set_teams_recap_sync_prefs_command<R: Runtime>(
 }
 
 /// The raw candidate list, without importing anything. For checking the
-/// listing against Teams and for the QA doc.
+/// listing against Teams and for the QA doc. Like a sync, it records what the
+/// list showed for the line beside the buttons.
 #[tauri::command]
 pub async fn teams_recap_list_debug_command<R: Runtime>(
     app: AppHandle<R>,
@@ -407,6 +522,7 @@ pub async fn teams_recap_list_debug_command<R: Runtime>(
     let listing = super::teams_recap_list::list_recaps(&app, since, true)
         .await
         .map_err(|e| e.to_string())?;
+    record_listing(&app, &LastListing::from_listing(Utc::now(), since, &listing));
     let probe_file = app
         .path()
         .app_data_dir()
@@ -548,6 +664,101 @@ mod tests {
         assert_eq!(report.possible_duplicates, vec!["B".to_string()]);
         assert_eq!(report.failed[0].title, "F");
         assert_eq!(report.failed[0].error, "boom");
+    }
+
+    fn recap_link(file: &str) -> String {
+        format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Aa&fileUrl=https%3A%2F%2Fcontoso-my.sharepoint.com%2Fpersonal%2Fjdoe%2FDocuments%2FRecordings%2F{file}-Meeting%20Recording.mp4"
+        )
+    }
+
+    /// The key the sync records an import under.
+    fn synced_key(link: &str) -> String {
+        crate::audio::teams_recap::meeting_identity_key(
+            crate::audio::teams_recap::validate_recap_url(link).unwrap().as_str(),
+        )
+    }
+
+    fn listing_of(links: &[String]) -> crate::audio::teams_recap_list::RecapListing {
+        crate::audio::teams_recap_list::RecapListing {
+            candidates: links
+                .iter()
+                .map(|link| RecapCandidate { recap_url: link.clone(), title: "T".into(), started_at: None })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_last_listing_counts_its_recaps_against_the_synced_ones() {
+        let links = [recap_link("Standup-20261103_090000"), recap_link("Review-20261104_090000"), recap_link("Sync-20261105_090000")];
+        let mut listing = listing_of(&links);
+        listing.rows_without_link = 2;
+        let last = LastListing::from_listing(at("2026-11-06T18:40:20Z"), at("2026-10-29T01:16:21Z"), &listing);
+        let mut imported = HashMap::new();
+        imported.insert(synced_key(&links[0]), ImportedRecap::default());
+        let view = last.view(&imported);
+        assert_eq!((view.listed, view.synced, view.pending, view.not_ready), (3, 1, 2, 2));
+        assert_eq!((view.read_at.as_str(), view.window_start.as_str()), ("2026-11-06T18:40:20+00:00", "2026-10-29T01:16:21+00:00"));
+        assert_eq!((view.error, view.ended_early_at), (None, None));
+
+        // A sync after the check moves its recaps from pending to synced.
+        imported.insert(synced_key(&links[2]), ImportedRecap::default());
+        let view = last.view(&imported);
+        assert_eq!((view.synced, view.pending), (2, 1));
+    }
+
+    #[test]
+    fn a_listed_link_that_fails_validation_stays_pending() {
+        let link = "https://example.com/l/meetingrecap?threadId=1".to_string();
+        let last = LastListing::from_listing(at("2026-11-06T18:40:20Z"), at("2026-10-29T00:00:00Z"), &listing_of(&[link.clone()]));
+        assert!(last.keys.is_empty());
+        let mut imported = HashMap::new();
+        imported.insert(crate::audio::teams_recap::meeting_identity_key(&link), ImportedRecap::default());
+        let view = last.view(&imported);
+        assert_eq!((view.listed, view.synced, view.pending), (1, 0, 1));
+    }
+
+    #[test]
+    fn a_list_that_stopped_before_the_window_start_says_how_far_back_it_got() {
+        use crate::audio::teams_recap_list::ListEnd;
+        let oldest = "2026-11-05T15:00:00.000Z";
+        for (end, expected) in [
+            (Some(ListEnd::Idle), Some(oldest)),
+            (Some(ListEnd::Cap), Some(oldest)),
+            (Some(ListEnd::Since), None),
+            (Some(ListEnd::Empty), None),
+            (None, None),
+        ] {
+            let mut listing = listing_of(&[recap_link("Sync-20261105_090000")]);
+            listing.end = end;
+            listing.oldest_row = Some(oldest.into());
+            let last = LastListing::from_listing(at("2026-11-06T17:04:15Z"), at("2026-10-29T01:16:21Z"), &listing);
+            assert_eq!(last.ended_early_at.as_deref(), expected, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_was_not_read_keeps_the_reason() {
+        let mut listing = listing_of(&[]);
+        listing.error = Some("Teams did not show the Meeting Recaps list.".into());
+        let view = LastListing::from_listing(at("2026-11-06T17:04:15Z"), at("2026-10-29T01:16:21Z"), &listing)
+            .view(&HashMap::new());
+        assert_eq!(view.error.as_deref(), Some("Teams did not show the Meeting Recaps list."));
+        assert_eq!((view.listed, view.synced, view.pending), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_last_listing_round_trips_through_json() {
+        let last = LastListing::from_listing(
+            at("2026-11-06T18:40:20Z"),
+            at("2026-10-29T01:16:21Z"),
+            &listing_of(&[recap_link("Sync-20261105_090000")]),
+        );
+        let json = serde_json::to_value(&last).unwrap();
+        assert_eq!(json["readAt"], "2026-11-06T18:40:20+00:00");
+        assert_eq!(json["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(serde_json::from_value::<LastListing>(json).unwrap(), last);
     }
 
     #[test]

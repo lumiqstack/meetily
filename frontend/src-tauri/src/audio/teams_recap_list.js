@@ -223,7 +223,10 @@
       const finishList = (items, why) => {
         state.stop ||= why;
         state.listMs ||= Math.round(performance.now());
-        return reply('done', { items });
+        // Why it stopped and the oldest calendar slot it reached go with
+        // every listing, probe or not: a list that stopped before the since
+        // date may be missing older rows.
+        return reply('done', { items, stop: state.stop, oldest: state.oldest ? state.oldest.toISOString() : null });
       };
       const rows = [...document.querySelectorAll(ROW)].filter(visible);
       if (!rows.length) {

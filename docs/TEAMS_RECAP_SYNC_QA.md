@@ -19,12 +19,15 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 ## List Check
 
 - `Check recap list` imports nothing: no new meeting, no new note, last sync date unchanged, known recap count unchanged.
-- The toast reports how many rows have a recap link, how many do not, and where the probe file was saved.
+- No toast. The line beside the buttons reads `Checked at <time>: N recaps, N already synced, N pending.`, with `N without a recap yet` added when rows have no link. It is still there after Settings is closed and reopened and after a restart, and it names the day once the date has changed.
+- After `Sync Teams recaps`, the line shows the sync's own listing and the synced recaps count as already synced.
+- A list that stopped before the scan window's start adds `The list stopped at <day>, before <day>, so it may be missing older recaps. Check again.`
+- With a sync running, `Check recap list` shows `Check failed: A Teams recap sync is already running.` on the line.
 - The counts match the Home list for the scan window, including rows in collapsed groups and rows further down that only load on scrolling. A meeting listed twice, once for its transcript and once for its recording, counts once.
 - The Teams window stays hidden when the session is still signed in, and closes itself when the list has been read.
 - Signed out: the window appears titled `Teams recaps — sign in, then open Meeting Recaps`. After signing in, the list is read and the window closes.
 - The Teams desktop app does not open at any point.
-- Closing the window early reports that it was closed before the list was read, and writes nothing to the sync state.
+- Closing the window early puts `the list was not read. The Teams window was closed before the recap list was read.` on the line, and changes nothing else: last sync date and known recap count stay as they were.
 - A page with no recognisable list ends in `Teams did not show the Meeting Recaps list`, never in a short list reported as complete.
 - `teams_recap_list_probe.json` appears in the app data folder. It holds the candidates (titles, times and recap links, whose file paths name the OneDrive each file sits in) and the listing's counts and timings, and no token, summary or transcript.
 
