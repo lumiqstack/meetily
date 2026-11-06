@@ -1,47 +1,37 @@
 (() => {
       // Rendered by teams_recap_list.rs: %SINCE% is an RFC 3339 instant and
-      // %PROBE% a boolean. The script reads the Meet app's recap list and
-      // never exposes Tauri IPC or sends page text anywhere.
+      // %PROBE% a boolean. The script reads the meeting list of the Teams
+      // Recap app ("Meeting Recaps" on the app bar) and never exposes Tauri
+      // IPC or sends page text anywhere.
       const SINCE = new Date('%SINCE%');
       const PROBE = %PROBE%;
-      const MAX_ROWS = 600;
+      // The same cap as MAX_ROWS in teams_recap_list.rs.
+      const MAX_ROWS = 500;
       // Let the shell render, and a click take effect, before reading rows.
       const SETTLE_MS = 6000;
+      // An open Recap app showing no rows and no loading placeholders for
+      // this long has nothing to list.
+      const EMPTY_MS = 20000;
+      // The list is complete once it has neither grown nor scrolled for this
+      // long: older rows load in pages as the list scrolls.
+      const IDLE_MS = 8000;
       const host = location.hostname.toLowerCase();
       if (!['teams.microsoft.com', 'teams.cloud.microsoft',
             'teams.microsoft.com.mcas.ms', 'teams.cloud.microsoft.mcas.ms'].includes(host)) {
         return { status: 'waiting', href: location.href };
       }
+      const ROW = '[data-tid="podcast-meeting-item"]';
       const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
       const label = el => (el.getAttribute('aria-label') || text(el)).trim();
       const visible = el => el.getClientRects().length > 0;
       const state = window.__meetilyRecapList ||= {
-        clicks: {}, seen: {}, order: [], idle: 0, lastCount: -1, firstSeen: Date.now(), lastClick: 0
+        clicks: {}, opened: {}, seen: {}, order: [], kinds: {}, withoutProps: 0, errors: [], oldest: null, stop: '',
+        firstSeen: Date.now(), lastClick: 0, emptySince: 0, idleSince: 0, lastCount: -1
       };
-      // The page and any same-origin frame an app renders in. A cross-origin
-      // frame is out of reach from here; the probe reports it.
-      const documents = () => {
-        const found = [document];
-        for (const frame of document.querySelectorAll('iframe')) {
-          try { if (frame.contentDocument?.body) found.push(frame.contentDocument); } catch (e) { /* cross-origin */ }
-        }
-        return found;
-      };
-      const all = selector => documents().flatMap(doc => [...doc.querySelectorAll(selector)]);
-      const recapHref = /https?:\/\/[^"'\s<>]*\/l\/meetingrecap\?[^"'\s<>]*/i;
-      const threadId = /19:meeting_[A-Za-z0-9+/=_-]+@thread\.v2/i;
-      const months = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?';
-      const clock = '\\d{1,2}:\\d{2}(?:\\s?[ap]\\.?m\\.?)?';
-      const dateLine = new RegExp(
-        '(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\\s+)?(' +
-        months + '\\s+\\d{1,2}(?:,?\\s+\\d{4})?|\\d{1,2}\\s+' + months + '(?:\\s+\\d{4})?|' +
-        '\\d{1,2}/\\d{1,2}/\\d{2,4})(?:[,\\s]+(?:at\\s+)?(' + clock + '))?', 'i');
-      const relativeLine = new RegExp('^(today|yesterday)\\b(?:[,\\s]+(?:at\\s+)?(' + clock + '))?', 'i');
-      const lines = el => (el.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+      const noteError = (where, e) => { if (state.errors.length < 20) state.errors.push(where + ': ' + e.message); };
 
       // ---- app-choice page, same handling as the recap import ----
-      const choices = all('a,button,[role="button"]');
-      const webChoice = choices.find(el =>
+      const webChoice = [...document.querySelectorAll('a,button,[role="button"]')].find(el =>
         /^(continue (on|in) (this|the) browser|use the web app( instead)?|open (in|on) (the )?web( app)?|continue in browser)$/i
           .test(text(el) || el.getAttribute('aria-label') || ''));
       if (webChoice) {
@@ -49,302 +39,292 @@
         return { status: 'opening_web', href: location.href };
       }
 
-      // ---- what a meeting row looks like ----
-      const parseWhen = row => {
-        const stamp = row.querySelector('time[datetime]');
-        if (stamp) {
-          const when = new Date(stamp.getAttribute('datetime'));
-          if (!isNaN(when)) return when;
-        }
-        for (const line of lines(row)) {
-          const rel = line.match(relativeLine);
-          if (rel) {
-            const day = new Date();
-            if (/yesterday/i.test(rel[1])) day.setDate(day.getDate() - 1);
-            if (rel[2]) {
-              const at = new Date(day.toDateString() + ' ' + rel[2].replace(/\./g, ''));
-              if (!isNaN(at)) return at;
-            }
-            day.setHours(0, 0, 0, 0);
-            return day;
-          }
-          const m = line.match(dateLine);
-          if (m) {
-            let value = m[1];
-            if (!/\d{4}/.test(value)) value += ' ' + new Date().getFullYear();
-            if (m[2]) value += ' ' + m[2].replace(/\./g, '');
-            const when = new Date(value);
-            if (!isNaN(when)) {
-              // A list without years that reaches into "next month" is last year's.
-              if (when.getTime() > Date.now() + 86400000) when.setFullYear(when.getFullYear() - 1);
-              return when;
-            }
-          }
+      // ---- what a row holds: the meeting object its React component gets
+      // as a prop, which carries every field of a recap sharing link ----
+      const fiberOf = el => {
+        const key = Object.keys(el).find(name => name.startsWith('__reactFiber$'));
+        return key ? el[key] : null;
+      };
+      // The props of the nearest component at or above `el` that pass `wanted`.
+      const propsAbove = (el, wanted) => {
+        for (let fiber = fiberOf(el), level = 0; fiber && level < 12; level++, fiber = fiber.return) {
+          const props = fiber.memoizedProps;
+          if (props && typeof props === 'object' && wanted(props)) return props;
         }
         return null;
       };
-      const linkOf = row => {
-        const anchor = [...row.querySelectorAll('a[href]')].map(a => a.href).find(h => recapHref.test(h));
-        if (anchor) return { url: anchor, kind: 'href' };
-        const html = row.outerHTML.replace(/&amp;/g, '&');
-        const embedded = html.match(recapHref);
-        if (embedded) return { url: embedded[0], kind: 'embedded' };
-        const thread = html.match(threadId);
-        if (thread) {
-          return {
-            url: 'https://teams.microsoft.com/l/meetingrecap?threadId=' + encodeURIComponent(thread[0]),
-            kind: 'thread'
-          };
+      const meetingOf = row => propsAbove(row, props => {
+        const meeting = props.meeting;
+        return !!meeting && typeof meeting === 'object' && !!(meeting.threadId || meeting.iCalUid);
+      })?.meeting || null;
+      const str = value => typeof value === 'string' ? value.trim() : '';
+      const listOf = value => Array.isArray(value) ? value.filter(entry => entry && typeof entry === 'object') : [];
+      const instant = value => {
+        const when = value ? new Date(value) : null;
+        return when && !isNaN(when) ? when : null;
+      };
+      // Outlook's GlobalObjectId: bytes 16-19 hold an occurrence's original
+      // date, and are zero for a series and for a single meeting.
+      const GLOBAL_ID = /^040000008200E00074C5B7101A82E008[0-9A-F]{8,}$/i;
+      const isOccurrence = ical => GLOBAL_ID.test(ical) && !/^0{8}$/.test(ical.slice(32, 40));
+      const seriesOf = ical => ical.slice(0, 32) + '00000000' + ical.slice(40);
+      const itemInApiUrl = url => (str(url).match(/\/items\/([^/?#]+)/) || [])[1] || '';
+      // The recording file as a sharing link writes it: non-ASCII letters
+      // percent-encoded and Office's "?web=1".
+      const fileLink = url => {
+        try {
+          const file = new URL(url);
+          file.search = 'web=1';
+          file.hash = '';
+          return file.href;
+        } catch (e) {
+          return '';
         }
-        return null;
       };
-      const titleOf = row => {
-        const heading = row.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"],strong,b,[data-tid*="title" i],[class*="title" i]');
-        const value = heading ? text(heading) : '';
-        if (value && !dateLine.test(value) && !relativeLine.test(value)) return value.slice(0, 200);
-        const first = lines(row).find(line => !dateLine.test(line) && !relativeLine.test(line) && line.length > 2);
-        return (first || '').slice(0, 200);
-      };
-      const outsideLists = el => !!el.closest('nav,[role="navigation"],[role="tablist"],[role="menu"],[role="menubar"],[role="toolbar"]');
-      const looksLikeRow = el => {
-        if (!visible(el) || outsideLists(el)) return false;
-        const value = text(el);
-        if (value.length < 3 || value.length > 700) return false;
-        return parseWhen(el) !== null || linkOf(el) !== null;
-      };
-      let rows = all('[role="row"],[role="listitem"],li,article,a[href*="meetingrecap"]')
-        .filter(looksLikeRow);
-      // A row may nest list items: keep the outermost element only.
-      rows = rows.filter(el => !rows.some(parent => parent !== el && parent.contains(el)));
-
-      // ---- probe for learning the layout; only returned when asked ----
-      const brief = el => {
-        const className = typeof el.className === 'string' ? el.className : '';
+      const tenantOf = meeting => str(meeting.tenantId) || str(meeting.organizerTenantId) ||
+        listOf(meeting.meetingFiles).map(file => str(file.organizerTenantId)).find(Boolean) || '';
+      // A recap sharing link built from the row, with the same keys and order
+      // the recap's Share button uses. Every row seen so far names its
+      // recording file (`recommendationData.url`, even for a meeting whose
+      // row lists no recording), so the link keys on that file like a pasted
+      // link does. The link uses this page's own host: the recap import
+      // opens it in a fresh window, and a teams.microsoft.com link first
+      // spends about 40 seconds on the redirect to teams.cloud.microsoft.
+      const recapOf = meeting => {
+        const transcripts = listOf(meeting.transcripts);
+        const recordings = listOf(meeting.recordings);
+        const files = transcripts.concat(recordings);
+        const recommended = meeting.recommendationData && typeof meeting.recommendationData === 'object'
+          ? meeting.recommendationData : {};
+        const file = str(recommended.url);
+        const ical = str(meeting.iCalUid);
+        const recurring = isOccurrence(ical);
+        const first = read => files.map(read).find(Boolean) || '';
+        const params = [
+          ['driveId', str(recommended.driveId) || first(entry => str(entry.driveId))],
+          ['driveItemId', str(recommended.driveItemId) || first(entry => str(entry.driveItemId) || itemInApiUrl(entry.url))],
+          ['sitePath', file],
+          ['fileUrl', file ? fileLink(file) : ''],
+          ['iCalUid', ical],
+          ['masterICalUid', recurring ? seriesOf(ical) : ''],
+          ['threadId', str(meeting.threadId) || str(meeting.skypeTeamsProperties?.conversationId)],
+          ['organizerId', str(meeting.organizerId)],
+          ['tenantId', tenantOf(meeting)],
+          ['callId', first(entry => str(entry.callId))],
+          ['threadType', 'meeting'],
+          ['meetingType', recurring ? 'Recurring' : 'Scheduled'],
+          ['subType', 'RecapSharingLink_RecapCore'],
+          ['recapType', transcripts.length ? (recordings.length ? 'RecordingAndTranscript' : 'ODSPTranscript') : '']
+        ].filter(([, value]) => value);
+        const has = name => params.some(([key]) => key === name);
+        if (!has('threadId') && !has('iCalUid')) return null;
+        // When it was recorded, not the calendar slot: a recurring row can
+        // show the series' next slot beside an earlier occurrence's recap.
+        const starts = files.map(entry => instant(entry.startDateTime)).filter(Boolean);
         return {
-          tag: el.tagName.toLowerCase(),
-          role: el.getAttribute('role') || undefined,
-          tid: el.getAttribute('data-tid') || undefined,
-          id: el.id || undefined,
-          cls: className ? className.slice(0, 100) : undefined,
-          label: (el.getAttribute('aria-label') || '').slice(0, 100) || undefined,
-          text: text(el).slice(0, 140) || undefined
+          recapUrl: location.origin + '/l/meetingrecap?' +
+            params.map(([key, value]) => key + '=' + encodeURIComponent(value)).join('&'),
+          linkKind: file ? 'file' : has('driveItemId') ? 'item' : 'thread',
+          recordedAt: starts.length ? new Date(Math.min(...starts)) : null
         };
       };
-      const idAttrs = root => {
-        const found = [];
-        for (const el of [root, ...root.querySelectorAll('*')]) {
-          for (const attr of el.attributes) {
-            if (/19:|meetingrecap|recap|thread|callid|organizer|fileurl|icaluid/i.test(attr.value) ||
-                /^data-/.test(attr.name) && attr.name !== 'data-tid') {
-              found.push(el.tagName.toLowerCase() + '@' + attr.name + '=' + attr.value.slice(0, 160));
-              if (found.length >= 25) return found;
-            }
-          }
-        }
-        return found;
-      };
-      // Data a row keeps in its React props rather than its markup: id-looking
-      // strings only, with their key path. Bounded, because props reach the
-      // whole component tree.
-      const fiberIds = root => {
-        const key = Object.keys(root).find(k => k.startsWith('__reactFiber$'));
-        if (!key) return [];
-        const wanted = /19:|meetingrecap|fileurl|sharepoint|thread|callid|icaluid|organizer|recap/i;
-        const skip = new Set(['children', '_owner', '_store', 'ref', 'style', 'className', 'return', 'stateNode']);
-        const found = [];
-        const seen = new WeakSet();
-        let budget = 3000;
-        const walk = (value, path, depth) => {
-          if (budget-- <= 0 || found.length >= 25) return;
-          if (typeof value === 'string') {
-            if (wanted.test(value) || wanted.test(path)) found.push(path + '=' + value.slice(0, 300));
-            return;
-          }
-          if (!value || typeof value !== 'object' || depth > 5 || seen.has(value)) return;
-          seen.add(value);
-          for (const name of Object.keys(value).slice(0, 60)) {
-            if (!skip.has(name)) walk(value[name], path + '.' + name, depth + 1);
+      const readRow = row => {
+        const meeting = meetingOf(row);
+        const title = (str(meeting?.subject) ||
+          row.querySelector('input[type="checkbox"][aria-label]')?.getAttribute('aria-label') || '').trim().slice(0, 200);
+        const scheduled = instant(meeting?.start) || instant(row.querySelector('time[datetime]')?.getAttribute('datetime'));
+        const recap = meeting ? recapOf(meeting) : null;
+        const startedAt = recap?.recordedAt || scheduled;
+        return {
+          meeting,
+          scheduled,
+          item: {
+            recapUrl: recap ? recap.recapUrl : null,
+            linkKind: recap ? recap.linkKind : null,
+            title,
+            startedAt: startedAt ? startedAt.toISOString() : null
           }
         };
-        let fiber = root[key];
-        for (let level = 0; fiber && level < 8; level++, fiber = fiber.return) {
-          walk(fiber.memoizedProps, 'p' + level, 0);
-        }
-        return found;
-      };
-      const frames = () => [...document.querySelectorAll('iframe')].map(frame => {
-        const rect = frame.getBoundingClientRect();
-        let sameOrigin = false;
-        try { sameOrigin = !!frame.contentDocument; } catch (e) { /* cross-origin */ }
-        let src = '';
-        try { const url = new URL(frame.src, location.href); src = url.origin + url.pathname; } catch (e) { /* no src */ }
-        return { src, name: frame.name || undefined, title: frame.title || undefined,
-                 w: Math.round(rect.width), h: Math.round(rect.height), sameOrigin };
-      });
-      // Tokens never leave the page, even into the local probe file.
-      const redact = value => JSON.parse(JSON.stringify(value)
-        .replace(/(tempauth|access_token|token|sig|code)(=|%3D)[^&%"'\s\\]+/gi, '$1$2REDACTED'));
-      const OPENED_KEY = 'meetilyRecapRowOpened';
-      const CAPTURE_KEY = 'meetilyRecapRowCapture';
-      const session = {
-        get: key => { try { return sessionStorage.getItem(key); } catch (e) { return state.clicks[key] ?? null; } },
-        set: (key, value) => { try { sessionStorage.setItem(key, value); } catch (e) { state.clicks[key] = value; } }
-      };
-      const probe = () => {
-        if (!PROBE) return undefined;
-        const pick = (selector, limit) => all(selector).filter(visible).slice(0, limit).map(brief);
-        const bodyHtml = documents().map(doc => doc.body.innerHTML).join('\n');
-        return redact({
-          href: location.href,
-          title: document.title,
-          since: SINCE.toISOString(),
-          frames: frames(),
-          rails: pick('[role="tab"],[role="button"][aria-label],nav a,nav button,[data-tid*="app-bar" i] button', 80),
-          headings: pick('h1,h2,h3,[role="heading"]', 40),
-          lists: pick('[role="grid"],[role="list"],[role="table"],ul,ol', 20),
-          rowsFound: rows.length,
-          rowSamples: rows.slice(0, 12).map(row => ({
-            ...brief(row),
-            lines: lines(row).slice(0, 8),
-            when: parseWhen(row)?.toISOString() || null,
-            link: linkOf(row),
-            title: titleOf(row),
-            attrs: idAttrs(row),
-            props: fiberIds(row)
-          })),
-          tids: [...new Set(all('[data-tid]').map(el => el.getAttribute('data-tid')))].slice(0, 250),
-          hrefs: [...new Set(all('a[href]').map(a => a.href)
-            .filter(h => /meetingrecap|thread|meet|recap/i.test(h)))].slice(0, 40),
-          threads: [...new Set(bodyHtml.match(new RegExp(threadId.source, 'gi')) || [])].slice(0, 20),
-          recapLinksInHtml: [...new Set(bodyHtml.replace(/&amp;/g, '&').match(new RegExp(recapHref.source, 'gi')) || [])].slice(0, 20),
-          bodyText: text(document.body).slice(0, 2000),
-          clicks: state.clicks,
-          afterRowOpened: JSON.parse(session.get(CAPTURE_KEY) || 'null')
-        });
       };
 
-      const navigating = () => ({ status: 'navigating', href: location.href, probe: probe() });
+      // ---- probe only: counts and timings of this listing, written to a
+      // local file by the debug command. No titles, links or row data. ----
+      // Whether the page paints while the window is still hidden: older rows
+      // load on scroll, which may need painting.
+      if (PROBE && !state.counting) {
+        state.counting = true;
+        state.frames = 0;
+        const tick = () => { state.frames += 1; requestAnimationFrame(tick); };
+        requestAnimationFrame(tick);
+      }
+      const report = () => ({
+        href: location.origin + location.pathname,
+        since: SINCE.toISOString(),
+        clicks: state.clicks,
+        errors: state.errors,
+        rows: state.order.length,
+        kinds: state.kinds,
+        rowsWithoutProps: state.withoutProps,
+        stop: state.stop || null,
+        firstRowsMs: state.firstRowsMs,
+        listMs: state.listMs,
+        frames: state.frames,
+        scrolls: state.scrolls,
+        pane: state.pane
+      });
+      const reply = (status, extra) =>
+        ({ status, href: location.href, ...(extra || {}), probe: PROBE ? report() : undefined });
+
+      // ---- steer to the Recap app once. The shell may open on Chat or
+      // Activity, and the app may be pinned or behind "more apps"; its id is
+      // tried before its name. ----
+      const RECAP_APP_ID = '981bbfd0-5eb8-4393-8158-bfff69d2d6b5';
+      const RAIL = '[data-tid="app-bar-wrapper"],[data-tid="app-layout-area--nav"]';
+      const inRail = el => !!el.closest(RAIL);
+      const buttons = () => [...document.querySelectorAll('[role="tab"],[role="button"],[role="menuitem"],[role="option"],button,a')]
+        .filter(visible);
+      const named = (el, pattern) => pattern.test(label(el)) || pattern.test(text(el));
+      const isSelected = el => el.getAttribute('aria-selected') === 'true' ||
+        el.getAttribute('aria-current') === 'page' || el.getAttribute('aria-pressed') === 'true';
+      const appName = /^(recaps?|meeting recaps?)(?:\s*[,(].*)?$/i;
+      const moreApps = /^(view more apps|more added apps|more apps)(?:\s*[,(].*)?$/i;
       const clickNow = (key, el) => {
         state.clicks[key] = new Date().toISOString();
         state.lastClick = Date.now();
         el.click();
-        return navigating();
+        return reply('navigating');
       };
       const settled = () => Date.now() - Math.max(state.firstSeen, state.lastClick) >= SETTLE_MS;
-
-      // ---- probe only: a row was opened on an earlier poll. Record what that
-      // showed, then go back to the list. Kept in sessionStorage because
-      // opening a row may be a full page load, which resets `state`. ----
-      if (PROBE && session.get(OPENED_KEY) && !session.get(CAPTURE_KEY)) {
-        if (!settled()) return navigating();
-        const bodyHtml = documents().map(doc => doc.body.innerHTML).join('\n');
-        session.set(CAPTURE_KEY, JSON.stringify(redact({
-          href: location.href,
-          title: document.title,
-          frames: frames(),
-          headings: all('h1,h2,h3,[role="heading"]').filter(visible).slice(0, 20).map(brief),
-          tabs: all('[role="tab"]').filter(visible).slice(0, 20).map(brief),
-          threads: [...new Set(bodyHtml.match(new RegExp(threadId.source, 'gi')) || [])].slice(0, 5),
-          recapLinksInHtml: [...new Set(bodyHtml.replace(/&amp;/g, '&').match(new RegExp(recapHref.source, 'gi')) || [])].slice(0, 5)
-        })));
-        state.lastClick = Date.now();
-        history.back();
-        return navigating();
-      }
-
-      // ---- steer to the Meet app's recap list, once per step, before any
-      // row counts: the shell may open on Chat or Activity, whose rows carry
-      // dates too ----
-      const buttons = () => all('[role="tab"],[role="button"],[role="menuitem"],[role="menuitemradio"],[role="option"],button,a').filter(visible);
-      const named = (el, pattern) => pattern.test(label(el)) || pattern.test(text(el));
-      const isSelected = el => el.getAttribute('aria-selected') === 'true' ||
-        el.getAttribute('aria-current') === 'page' || el.getAttribute('aria-pressed') === 'true';
-      const railName = /^(meet|recaps?|meeting recaps?)(?:\s*[,(].*)?$/i;
-      const tabName = /^(recaps?|meeting recaps?|past|past meetings|recent)(?:\s*[,(].*)?$/i;
-      const moreApps = /^(view more apps|more added apps|more apps)(?:\s*[,(].*)?$/i;
-      if (!state.clicks.railApp) {
-        const rail = buttons().find(el => named(el, railName));
-        if (rail && isSelected(rail)) {
-          state.clicks.railApp = 'already selected';
-        } else if (rail) {
-          return clickNow('railApp', rail);
-        } else if (!state.clicks.moreApps) {
-          const more = buttons().find(el => named(el, moreApps));
-          if (more) return clickNow('moreApps', more);
+      if (!state.clicks.app) {
+        const byId = document.querySelector('[data-tid="' + RECAP_APP_ID + '"]');
+        const app = byId && visible(byId) ? byId
+          : buttons().find(el => inRail(el) && named(el, appName)) ||
+            (state.clicks.moreApps ? buttons().find(el => !inRail(el) && named(el, appName)) : null);
+        if (app && isSelected(app)) {
+          state.clicks.app = 'already open';
+        } else if (app) {
+          return clickNow('app', app);
+        } else {
+          if (!state.clicks.moreApps && Date.now() - state.firstSeen > 15000) {
+            const more = buttons().find(el => inRail(el) && named(el, moreApps));
+            if (more) return clickNow('moreApps', more);
+          }
+          return reply('navigating');
         }
       }
-      if (state.clicks.railApp && !state.clicks.recapTab && Date.now() - state.lastClick >= SETTLE_MS) {
-        const tab = buttons().find(el => named(el, tabName) && !isSelected(el));
-        if (tab) return clickNow('recapTab', tab);
+      if (!settled()) return reply('navigating');
+      // The app opens on Home, its list; "Audio recaps" is the other tab.
+      if (!state.clicks.home) {
+        const home = buttons().find(el => el.getAttribute('role') === 'tab' && !inRail(el) && named(el, /^home$/i));
+        if (home && !isSelected(home)) return clickNow('home', home);
+        if (home) state.clicks.home = 'already open';
       }
-      if (!settled()) return navigating();
 
+      const finishList = (items, why) => {
+        state.stop ||= why;
+        state.listMs ||= Math.round(performance.now());
+        return reply('done', { items });
+      };
+      const rows = [...document.querySelectorAll(ROW)].filter(visible);
       if (!rows.length) {
-        const page = text(document.body).slice(0, 1200);
-        if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(page)) {
-          return { status: 'launcher', href: location.href, probe: probe() };
+        // A recap left open from an earlier visit hides the list.
+        const back = !state.clicks.back && buttons().find(el => !inRail(el) && named(el, /^(go|back) to (meeting )?recaps?$/i));
+        if (back) return clickNow('back', back);
+        const home = document.querySelector('[data-tid="recaps-app-feedback-button"]');
+        const loading = document.querySelector('[data-tid="app-layout-area--main"] .fui-SkeletonItem');
+        if (home && !loading) {
+          state.emptySince ||= Date.now();
+          if (Date.now() - state.emptySince >= EMPTY_MS) return finishList([], 'empty');
+        } else {
+          state.emptySince = 0;
         }
-        return { status: 'waiting', href: location.href, probe: probe() };
-      }
-
-      // ---- probe only: rows without a link, so learn what opening one does.
-      // The row itself, never a button inside it, and only a past meeting:
-      // an upcoming row may hold Join. ----
-      if (PROBE && !rows.some(row => linkOf(row)) && !session.get(OPENED_KEY)) {
-        const past = rows.find(row => { const when = parseWhen(row); return when && when < new Date(); });
-        if (past) {
-          session.set(OPENED_KEY, '1');
-          return clickNow('rowOpened', past);
+        if (/open (your|the) teams app|join (on|in) (the )?teams app|use the web app/i.test(text(document.body).slice(0, 1200))) {
+          return reply('launcher');
         }
+        return reply('waiting');
       }
+      state.emptySince = 0;
+      state.firstRowsMs ||= Math.round(performance.now());
 
-      // ---- collect rows, oldest date seen decides when to stop ----
-      let oldest = null;
+      // ---- collect rows; the list runs newest first by calendar slot, so
+      // the oldest slot seen decides when to stop. A meeting can have two
+      // rows, one for its transcript and one for its recording: both name
+      // the same file, and teams_recap_list.rs keeps the first. ----
+      let pastWindow = null;
       for (const row of rows) {
-        const link = linkOf(row);
-        const when = parseWhen(row);
-        const title = titleOf(row);
-        const key = link ? link.url : title + '|' + (when ? when.toISOString() : '');
+        let read;
+        try {
+          read = readRow(row);
+        } catch (e) {
+          noteError('row', e);
+          continue;
+        }
+        const { item, meeting, scheduled } = read;
+        const key = item.recapUrl || item.title + '|' + item.startedAt;
         if (!state.seen[key]) {
           state.seen[key] = true;
-          state.order.push({
-            recapUrl: link ? link.url : null,
-            linkKind: link ? link.kind : null,
-            title,
-            startedAt: when ? when.toISOString() : null
-          });
+          state.order.push(item);
+          const kind = item.linkKind || 'none';
+          state.kinds[kind] = (state.kinds[kind] || 0) + 1;
+          if (!meeting) state.withoutProps += 1;
         }
-        if (when && (!oldest || when < oldest)) oldest = when;
+        const slot = scheduled || instant(item.startedAt);
+        if (slot && (!state.oldest || slot < state.oldest)) state.oldest = slot;
+        if (slot && slot < SINCE) pastWindow ||= row;
       }
-      const inWindow = state.order.filter(item => !item.startedAt || new Date(item.startedAt) >= SINCE);
-      // Probe results only go to the local file, never to an import.
-      const items = PROBE ? redact(inWindow) : inWindow;
-      const reachedSince = oldest !== null && oldest < SINCE;
-      const finish = () => ({ status: 'done', items, href: location.href, probe: probe() });
-      if (reachedSince || state.order.length >= MAX_ROWS) return finish();
+      const items = state.order.filter(item => !item.startedAt || new Date(item.startedAt) >= SINCE);
+      const pastEnd = !!state.oldest && state.oldest < SINCE;
 
-      // Scroll the list's own pane (not the page) to reveal older rows.
+      // Open groups the list shows collapsed ("Last week", ...). A re-render
+      // can collapse a group again, so each may be opened a few times. Once
+      // the list has reached rows from before the window, only a group above
+      // the first of them can still hold rows inside it.
+      const accordion = rows[0].closest('.fui-Accordion');
+      const collapsed = accordion ? [...accordion.querySelectorAll('.fui-AccordionHeader__button[aria-expanded="false"]')]
+        .filter(el => visible(el) && (state.opened[text(el).slice(0, 40)] || 0) < 3) : [];
+      const group = pastEnd
+        ? collapsed.find(el => pastWindow && (el.compareDocumentPosition(pastWindow) & Node.DOCUMENT_POSITION_FOLLOWING))
+        : collapsed[0];
+      if (group) {
+        const name = text(group).slice(0, 40);
+        state.opened[name] = (state.opened[name] || 0) + 1;
+        state.clicks['group ' + name] = new Date().toISOString();
+        group.click();
+        state.idleSince = 0;
+        return reply('page', { items, more: true });
+      }
+      if (pastEnd) return finishList(items, 'since');
+      if (state.order.length >= MAX_ROWS) return finishList(items, 'cap');
+
+      // Scroll the list's own pane (not the page) to load older rows.
       const lastRow = rows[rows.length - 1];
       let pane = lastRow.parentElement;
-      while (pane && pane !== lastRow.ownerDocument.body) {
-        if (pane.scrollHeight > pane.clientHeight + 20 &&
-            /auto|scroll/.test(getComputedStyle(pane).overflowY)) break;
+      while (pane && pane !== document.body) {
+        if (pane.scrollHeight > pane.clientHeight + 20 && /auto|scroll/.test(getComputedStyle(pane).overflowY)) break;
         pane = pane.parentElement;
       }
-      if (!pane || pane === lastRow.ownerDocument.body) pane = lastRow.ownerDocument.scrollingElement;
+      if (!pane || pane === document.body) pane = document.scrollingElement;
       const before = pane.scrollTop;
       pane.scrollTop += Math.max(300, pane.clientHeight * 0.8);
       const moved = pane.scrollTop > before;
+      if (PROBE) {
+        state.scrolls = (state.scrolls || 0) + (moved ? 1 : 0);
+        state.pane = pane.scrollTop + '/' + pane.scrollHeight + '/' + pane.clientHeight;
+      }
       const grew = state.order.length !== state.lastCount;
       state.lastCount = state.order.length;
-      state.idle = moved || grew ? 0 : state.idle + 1;
-      const loadMore = all('button,[role="button"]')
-        .filter(visible).find(el => /^(load more|show more|see more|more)$/i.test(label(el)));
-      if (!moved && !grew && loadMore && !state.clicks['loadMore' + state.order.length]) {
-        state.clicks['loadMore' + state.order.length] = new Date().toISOString();
-        loadMore.click();
-        state.idle = 0;
+      if (moved || grew) {
+        state.idleSince = 0;
+      } else {
+        state.idleSince ||= Date.now();
+        const loadMore = buttons().find(el => !el.closest(ROW) && !inRail(el) &&
+          /^(load|show|see) more( meetings| recaps)?$/i.test(label(el)));
+        if (loadMore && !state.clicks['more ' + state.order.length]) {
+          state.clicks['more ' + state.order.length] = new Date().toISOString();
+          loadMore.click();
+          state.idleSince = 0;
+        }
       }
-      if (state.idle >= 3) return finish();
-      return { status: 'page', items, more: true, href: location.href, probe: probe() };
+      if (state.idleSince && Date.now() - state.idleSince >= IDLE_MS) return finishList(items, 'idle');
+      return reply('page', { items, more: true });
     })()
