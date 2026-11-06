@@ -24,6 +24,9 @@
        preserving that file's first "path header" line. No transcript text,
        credentials or authenticated URLs are written.
 
+  Temporary files from cargo, the native build scripts and the Rust tests go
+  to target\tmp, on the checkout's drive, instead of %TEMP%.
+
   Machine-specific paths are parameters on purpose; this file is public.
 
 .EXAMPLE
@@ -170,6 +173,13 @@ function Write-Report {
 
 try {
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    # Scratch stays on the checkout's drive rather than the system drive: cargo,
+    # the native build scripts and the Rust tests write temporary files to TEMP.
+    $scratch = Join-Path $targetDir 'tmp'
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    $env:TEMP = $scratch
+    $env:TMP = $scratch
+    $facts['Temp folder'] = $scratch
     Start-Transcript -LiteralPath $buildLog -Force | Out-Null
     $transcribing = $true
     Write-Host "Meetily Vulkan build started $($startedAt.ToString('o'))"
