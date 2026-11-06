@@ -21,6 +21,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - `Check recap list` imports nothing: no new meeting, no new note, last sync date unchanged, known recap count unchanged.
 - The toast reports how many rows have a recap link, how many do not, and where the probe file was saved.
 - The counts match the Home list for the scan window, including rows in collapsed groups and rows further down that only load on scrolling. A meeting listed twice, once for its transcript and once for its recording, counts once.
+- Quit Meetily, start it again and press `Check recap list` within a minute: the counts match a check made a few minutes later. The log may show `[recap-list] state: reloading` once, when the list showed only its newest rows at first.
 - The Teams window stays hidden when the session is still signed in, and closes itself when the list has been read.
 - Signed out: the window appears titled `Teams recaps — sign in, then open Meeting Recaps`. After signing in, the list is read and the window closes.
 - The Teams desktop app does not open at any point.

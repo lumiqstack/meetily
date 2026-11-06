@@ -12,9 +12,13 @@
       // An open Recap app showing no rows and no loading placeholders for
       // this long has nothing to list.
       const EMPTY_MS = 20000;
-      // The list is complete once it has neither grown nor scrolled for this
-      // long: older rows load in pages as the list scrolls.
-      const IDLE_MS = 8000;
+      // The list is complete once it has neither grown nor scrolled deeper for
+      // this long: older rows load in pages as the list scrolls.
+      const IDLE_MS = 12000;
+      // While it waits, the list is scrolled back up a screen this often, so
+      // the next scroll brings its end into view again and a request for
+      // older rows that went nowhere is made again.
+      const NUDGE_MS = 3000;
       const host = location.hostname.toLowerCase();
       if (!['teams.microsoft.com', 'teams.cloud.microsoft',
             'teams.microsoft.com.mcas.ms', 'teams.cloud.microsoft.mcas.ms'].includes(host)) {
@@ -26,7 +30,8 @@
       const visible = el => el.getClientRects().length > 0;
       const state = window.__meetilyRecapList ||= {
         clicks: {}, opened: {}, seen: {}, order: [], kinds: {}, withoutProps: 0, errors: [], oldest: null, stop: '',
-        firstSeen: Date.now(), lastClick: 0, emptySince: 0, idleSince: 0, lastCount: -1
+        firstSeen: Date.now(), lastClick: 0, emptySince: 0, idleSince: 0, lastCount: -1,
+        paneEl: null, deepest: 0, scrolls: 0, nudges: 0, nudgedAt: 0, grows: [], reloading: false
       };
       const noteError = (where, e) => { if (state.errors.length < 20) state.errors.push(where + ': ' + e.message); };
 
@@ -147,6 +152,36 @@
         };
       };
 
+      // ---- one reload when the list stops before the since date. On the
+      // first listing after Meetily started, the Recap app showed its first
+      // page of rows and never loaded older ones, while a page loaded later
+      // in the same session listed the whole window. The mark lives in this
+      // window's sessionStorage, and every listing opens a new window. It
+      // holds the first pass's counts, for the probe. ----
+      const RELOAD_KEY = 'meetilyRecapListReload';
+      const firstPass = () => {
+        try {
+          return JSON.parse(sessionStorage.getItem(RELOAD_KEY) || 'null');
+        } catch (e) {
+          return null;
+        }
+      };
+      const reloadOnce = () => {
+        try {
+          if (sessionStorage.getItem(RELOAD_KEY) !== null) return false;
+          sessionStorage.setItem(RELOAD_KEY, JSON.stringify({
+            rows: state.order.length, scrolls: state.scrolls, nudges: state.nudges, grows: state.grows,
+            pane: state.pane || null, firstRowsMs: state.firstRowsMs, reloadMs: Math.round(performance.now())
+          }));
+        } catch (e) {
+          noteError('reload', e);
+          return false;
+        }
+        state.reloading = true;
+        setTimeout(() => location.reload(), 50);
+        return true;
+      };
+
       // ---- probe only: counts and timings of this listing, written to a
       // local file by the debug command. No titles, links or row data. ----
       // Whether the page paints while the window is still hidden: older rows
@@ -170,10 +205,15 @@
         listMs: state.listMs,
         frames: state.frames,
         scrolls: state.scrolls,
-        pane: state.pane
+        nudges: state.nudges,
+        // [ms since the page started, rows] each time the list grew.
+        grows: state.grows,
+        pane: state.pane,
+        firstPass: firstPass()
       });
       const reply = (status, extra) =>
         ({ status, href: location.href, ...(extra || {}), probe: PROBE ? report() : undefined });
+      if (state.reloading) return reply('reloading');
 
       // ---- steer to the Recap app once. The shell may open on Chat or
       // Activity, and the app may be pinned or behind "more apps"; its id is
@@ -274,6 +314,11 @@
       }
       const items = state.order.filter(item => !item.startedAt || new Date(item.startedAt) >= SINCE);
       const pastEnd = !!state.oldest && state.oldest < SINCE;
+      const grew = state.order.length !== state.lastCount;
+      if (grew && state.lastCount >= 0 && state.grows.length < 40) {
+        state.grows.push([Math.round(performance.now()), state.order.length]);
+      }
+      state.lastCount = state.order.length;
 
       // Open groups the list shows collapsed ("Last week", ...). A re-render
       // can collapse a group again, so each may be opened a few times. Once
@@ -304,27 +349,40 @@
         pane = pane.parentElement;
       }
       if (!pane || pane === document.body) pane = document.scrollingElement;
+      if (state.paneEl !== pane) {
+        state.paneEl = pane;
+        state.deepest = 0;
+      }
       const before = pane.scrollTop;
       pane.scrollTop += Math.max(300, pane.clientHeight * 0.8);
       const moved = pane.scrollTop > before;
-      if (PROBE) {
-        state.scrolls = (state.scrolls || 0) + (moved ? 1 : 0);
-        state.pane = pane.scrollTop + '/' + pane.scrollHeight + '/' + pane.clientHeight;
-      }
-      const grew = state.order.length !== state.lastCount;
-      state.lastCount = state.order.length;
-      if (moved || grew) {
+      // Progress is a new row or a scroll deeper than any before. Scrolling
+      // down again after a nudge is neither, so it never resets the wait.
+      const deeper = pane.scrollTop > state.deepest;
+      state.deepest = Math.max(state.deepest, pane.scrollTop);
+      if (deeper) state.scrolls += 1;
+      state.pane = pane.scrollTop + '/' + pane.scrollHeight + '/' + pane.clientHeight;
+      if (grew || deeper) {
         state.idleSince = 0;
+        state.nudgedAt = 0;
       } else {
-        state.idleSince ||= Date.now();
+        const now = Date.now();
+        state.idleSince ||= now;
         const loadMore = buttons().find(el => !el.closest(ROW) && !inRail(el) &&
           /^(load|show|see) more( meetings| recaps)?$/i.test(label(el)));
         if (loadMore && !state.clicks['more ' + state.order.length]) {
           state.clicks['more ' + state.order.length] = new Date().toISOString();
           loadMore.click();
           state.idleSince = 0;
+        } else if (!moved && now - (state.nudgedAt || state.idleSince) >= NUDGE_MS) {
+          pane.scrollTop = Math.max(0, pane.scrollTop - pane.clientHeight);
+          state.nudgedAt = now;
+          state.nudges += 1;
         }
       }
-      if (state.idleSince && Date.now() - state.idleSince >= IDLE_MS) return finishList(items, 'idle');
+      if (state.idleSince && Date.now() - state.idleSince >= IDLE_MS) {
+        if (reloadOnce()) return reply('reloading');
+        return finishList(items, 'idle');
+      }
       return reply('page', { items, more: true });
     })()
