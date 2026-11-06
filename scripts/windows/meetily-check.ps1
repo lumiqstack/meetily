@@ -7,7 +7,10 @@
   -Mode Before  (run before building/launching a new build)
      1. Stops Meetily.
      2. Backs up the data folder's database (+ -wal/-shm) and JSON settings,
-        with SHA-256 hashes.
+        with SHA-256 hashes, into -BackupRoot. By default that is beside the
+        folder the data folder links to, so a data folder moved to another
+        drive keeps its backups on that drive. For a regular data folder it
+        is %USERPROFILE%\meetily-backups.
      3. Reads integrity and applied migration versions from the BACKUP copy.
      4. Compares them with the migrations of -Branch on origin.
      5. Records git branch/status/stash and saves a patch copy of local changes.
@@ -35,7 +38,8 @@ param(
     # Overrides for testing; defaults are the real app locations.
     [string]$DataDir = (Join-Path $env:APPDATA 'com.meetily.ai'),
     [string]$LogFile = (Join-Path $env:LOCALAPPDATA 'com.meetily.ai\logs\meetily.log'),
-    [string]$BackupRoot = (Join-Path $env:USERPROFILE 'meetily-backups'),
+    # Empty means: decided below, from where -DataDir really lives.
+    [string]$BackupRoot,
     # After: only consider log lines from this time on (default: last 24h).
     [datetime]$Since = (Get-Date).AddDays(-1),
     # Testing only: compare against this migrations folder instead of git.
@@ -44,6 +48,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $BackupRoot) {
+    # A data folder that links to another drive (a junction onto D:, say) keeps
+    # its backups beside the folder it links to, not on the system drive.
+    $dataLink = Get-Item -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue
+    $BackupRoot = if ($dataLink -and $dataLink.LinkType -and $dataLink.Target) {
+        $target = (@($dataLink.Target)[0]).TrimEnd('\')
+        if (-not [IO.Path]::IsPathRooted($target)) {
+            $target = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $DataDir) $target))
+        }
+        $parent = Split-Path -Parent $target
+        Join-Path $(if ($parent) { $parent } else { $target }) 'meetily-backups'
+    } else {
+        Join-Path $env:USERPROFILE 'meetily-backups'
+    }
+}
 $lines = [System.Collections.Generic.List[string]]::new()
 function Say([string]$text) { $lines.Add($text); Write-Host $text }
 function Finish([string]$verdict, [string]$reason) {
@@ -64,9 +83,8 @@ integrity = c.execute("PRAGMA integrity_check").fetchone()[0]
 rows = [{"version": str(v), "success": int(s)} for v, s in c.execute("SELECT version, success FROM _sqlx_migrations ORDER BY version")]
 print(json.dumps({"integrity": integrity, "rows": rows}))
 '@
-        $script = Join-Path ([IO.Path]::GetTempPath()) 'meetily-check-read.py'
-        Set-Content -Path $script -Value $code -Encoding utf8
-        $json = & $py.Source $script $path
+        # The code goes in on stdin ("python -"), so no helper file lands in %TEMP%.
+        $json = $code | & $py.Source - $path
         if ($LASTEXITCODE -ne 0) { throw "python could not read $path" }
         return $json | ConvertFrom-Json
     }
