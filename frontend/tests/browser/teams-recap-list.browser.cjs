@@ -25,7 +25,8 @@ const template = readFileSync(join(__dirname, '../../src-tauri/src/audio/teams_r
 // The real waits are seconds long; the fixture renders in milliseconds.
 function render(probe) {
   let script = template.replace(/%SINCE%/g, SINCE).replace(/%PROBE%/g, String(probe));
-  for (const [from, to] of [['SETTLE_MS = 6000', 'SETTLE_MS = 150'], ['EMPTY_MS = 20000', 'EMPTY_MS = 1500'], ['IDLE_MS = 8000', 'IDLE_MS = 1500']]) {
+  for (const [from, to] of [['SETTLE_MS = 6000', 'SETTLE_MS = 150'], ['EMPTY_MS = 20000', 'EMPTY_MS = 1500'],
+    ['IDLE_MS = 12000', 'IDLE_MS = 1500'], ['NUDGE_MS = 3000', 'NUDGE_MS = 300']]) {
     assert.ok(script.includes(from), `the list script no longer declares ${from}; update this suite`);
     script = script.replace(from, to);
   }
@@ -80,6 +81,14 @@ function fixture() {
 const M = ${JSON.stringify(MEETINGS)};
 const mode = new URLSearchParams(location.search).get('mode') || 'list';
 window.clicks = { app: 0, home: 0, group: 0, back: 0, row: 0 };
+// "cold", "stalled" and "nudge" start with This week only; Last week and
+// Earlier come in the page that scrolling to the end loads. "cold" loads it
+// only after the page has been loaded again, as Teams did on its first start;
+// "stalled" never; "nudge" the second time the end comes into view.
+const lazy = ['cold', 'stalled', 'nudge'].includes(mode);
+const firstLoad = !sessionStorage.getItem('fixtureLoaded');
+sessionStorage.setItem('fixtureLoaded', '1');
+const pages = !(mode === 'stalled' || (mode === 'cold' && firstLoad));
 const fiber = (el, props) => {
   const own = { memoizedProps: props, return: null };
   el['__reactFiber$fixture'] = { memoizedProps: { className: 'b' }, return: { memoizedProps: { className: 'a' }, return: own } };
@@ -119,7 +128,9 @@ const home = () => {
   window.render = setTimeout(() => {
     if (audio) { main.innerHTML = '<div>Your audio recaps</div>'; return; }
     if (mode === 'empty') { main.innerHTML = '<h1>Good afternoon</h1><div>No recaps yet</div>'; return; }
-    main.innerHTML = '<div id=scroller><div class="fui-Accordion">' + groupHtml('This week', true) + groupHtml('Last week', false) + '</div></div>';
+    main.innerHTML = lazy
+      ? '<div id=scroller style="height:200px"><div class="fui-Accordion">' + groupHtml('This week', true) + '</div></div>'
+      : '<div id=scroller><div class="fui-Accordion">' + groupHtml('This week', true) + groupHtml('Last week', false) + '</div></div>';
     wire();
     // One handler for every group header, including groups added later.
     main.onclick = event => {
@@ -132,19 +143,22 @@ const home = () => {
       btn.closest('.fui-AccordionItem').querySelector('.fui-AccordionPanel').innerHTML = listHtml(btn.textContent);
       wire();
     };
-    // Older rows arrive in a later page once the list is scrolled to its end;
-    // in the "stalled" mode that page never comes.
-    let earlier = false;
+    // Older rows arrive in a later page once the list is scrolled to its end.
+    let earlier = false, arrivals = 0, wasAtEnd = false;
     clearInterval(window.pager);
     window.pager = setInterval(() => {
       const sc = document.getElementById('scroller');
-      if (sc && !earlier && mode !== 'stalled' && sc.scrollTop > 0 && sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 60) {
-        earlier = true;
-        setTimeout(() => {
-          main.querySelector('.fui-Accordion').insertAdjacentHTML('beforeend', groupHtml('Earlier', true) + (mode === 'oldgroups' ? groupHtml('September', false) : ''));
-          wire();
-        }, 100);
-      }
+      if (!sc || earlier) return;
+      const atEnd = sc.scrollTop > 0 && sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 60;
+      if (atEnd && !wasAtEnd) arrivals += 1;
+      wasAtEnd = atEnd;
+      if (!atEnd || !pages || arrivals < (mode === 'nudge' ? 2 : 1)) return;
+      earlier = true;
+      setTimeout(() => {
+        main.querySelector('.fui-Accordion').insertAdjacentHTML('beforeend', (lazy ? groupHtml('Last week', true) : '') +
+          groupHtml('Earlier', true) + (mode === 'oldgroups' ? groupHtml('September', false) : ''));
+        wire();
+      }, 100);
     }, 30);
   }, 200);
 };
@@ -184,8 +198,16 @@ async function list(mode = 'list', probe = false) {
     const script = render(probe);
     const statuses = [];
     let result;
-    for (let i = 0; i < 300; i++) {
-      result = await page.evaluate(script);
+    for (let i = 0; i < 500; i++) {
+      try {
+        result = await page.evaluate(script);
+      } catch (error) {
+        // A reload ends the page's script context mid-call. Poll again, as
+        // teams_recap_list.rs does when a call fails.
+        if (!/context|navigat/i.test(error.message)) throw error;
+        await page.waitForTimeout(40);
+        continue;
+      }
       if (statuses[statuses.length - 1] !== result.status) statuses.push(result.status);
       if (result.status === 'done') break;
       await page.waitForTimeout(40);
@@ -198,14 +220,47 @@ async function list(mode = 'list', probe = false) {
 }
 const query = item => new URL(item.recapUrl).searchParams;
 
+const WINDOW_TITLES = [
+  'Practice onboarding', 'Kick-Off Sesión', 'Clients Monthly Review', 'Clients Monthly Review', 'No props row', 'Weekly sync', 'Planning',
+];
+const reloads = statuses => statuses.filter(status => status === 'reloading').length;
+
 test('lists the scan window from the rows\' meeting data and stops past it', async () => {
-  const { result, clicks } = await list();
-  assert.deepEqual(result.items.map(item => item.title), [
-    'Practice onboarding', 'Kick-Off Sesión', 'Clients Monthly Review', 'Clients Monthly Review', 'No props row', 'Weekly sync', 'Planning',
-  ]);
+  const { result, clicks, statuses } = await list();
+  assert.deepEqual(result.items.map(item => item.title), WINDOW_TITLES);
   // Opened the app once, the collapsed group once, and never a row's buttons.
   assert.deepEqual(clicks, { app: 1, home: 0, group: 1, back: 0, row: 0 });
   assert.equal(result.items.find(item => item.title === 'No props row').recapUrl, null);
+  assert.equal(reloads(statuses), 0, statuses.join(' > '));
+});
+
+test('reads the list again after one reload when its first load brings no older rows', async () => {
+  const { result, statuses } = await list('cold', true);
+  assert.equal(reloads(statuses), 1, statuses.join(' > '));
+  assert.deepEqual(result.items.map(item => item.title), WINDOW_TITLES);
+  const { probe } = result;
+  assert.equal(probe.stop, 'since');
+  // The first pass had This week's five rows, and scrolled back up while it waited.
+  assert.equal(probe.firstPass.rows, 5, JSON.stringify(probe.firstPass));
+  assert.ok(probe.firstPass.nudges >= 1, JSON.stringify(probe.firstPass));
+  assert.ok(probe.firstPass.reloadMs > probe.firstPass.firstRowsMs, JSON.stringify(probe.firstPass));
+});
+
+test('reloads only once and stops when the list still brings no older rows', async () => {
+  const { result, statuses } = await list('stalled', true);
+  assert.equal(reloads(statuses), 1, statuses.join(' > '));
+  assert.equal(result.probe.stop, 'idle');
+  assert.deepEqual(result.items.map(item => item.title), WINDOW_TITLES.slice(0, 5));
+});
+
+test('scrolls back up and down again when the end of the list brings nothing at first', async () => {
+  const { result, statuses } = await list('nudge', true);
+  assert.equal(reloads(statuses), 0, statuses.join(' > '));
+  assert.deepEqual(result.items.map(item => item.title), WINDOW_TITLES);
+  assert.equal(result.probe.stop, 'since');
+  assert.ok(result.probe.nudges >= 1, JSON.stringify(result.probe));
+  // [ms, rows] when Last week and Earlier arrived.
+  assert.ok(result.probe.grows.some(([, rows]) => rows > 5), JSON.stringify(result.probe.grows));
 });
 
 test('builds a recording\'s link with the Share button\'s keys, keyed on its file', async () => {
@@ -289,10 +344,11 @@ test('says why it stopped and the oldest slot it reached, probe or not', async (
   const { result } = await list();
   assert.equal(result.stop, 'since');
   assert.equal(result.oldest, '2026-10-27T17:00:00.000Z');
-  // Older rows that never load: the list ends inside the window and says so.
+  // Older rows that never load, even after the reload: the list ends inside
+  // the window, at This week's oldest row, and says so.
   const { result: stalled } = await list('stalled');
   assert.equal(stalled.stop, 'idle');
-  assert.equal(stalled.oldest, '2026-10-29T17:00:00.000Z');
+  assert.equal(stalled.oldest, '2026-11-04T16:00:00.000Z');
   const { result: empty } = await list('empty');
   assert.deepEqual([empty.stop, empty.oldest], ['empty', null]);
 });
@@ -311,6 +367,8 @@ test('the probe holds counts and timings, never titles, names, links or meeting 
   assert.equal(probe.stop, 'since');
   assert.equal(probe.since, '2026-10-29T01:16:21.000Z');
   assert.ok(probe.firstRowsMs > 0 && probe.listMs >= probe.firstRowsMs, JSON.stringify(probe));
+  assert.equal(probe.nudges, 0);
+  assert.equal(probe.firstPass, null);
   const text = JSON.stringify(probe);
   for (const leak of ['Kick-Off', 'Planning', 'PERSON', 'SECRET', 'CONFIDENTIAL', 'sharepoint', 'meetingrecap']) {
     assert.ok(!text.includes(leak), `probe leaked ${leak}: ${text}`);

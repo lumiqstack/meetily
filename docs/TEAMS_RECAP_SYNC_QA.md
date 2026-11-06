@@ -24,6 +24,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - A list that stopped before the scan window's start adds `The list stopped at <day>, before <day>, so it may be missing older recaps. Check again.`
 - With a sync running, `Check recap list` shows `Check failed: A Teams recap sync is already running.` on the line.
 - The counts match the Home list for the scan window, including rows in collapsed groups and rows further down that only load on scrolling. A meeting listed twice, once for its transcript and once for its recording, counts once.
+- Quit Meetily, start it again and press `Check recap list` within a minute: the counts match a check made a few minutes later. The log may show `[recap-list] state: reloading` once, when the list showed only its newest rows at first.
 - The Teams window stays hidden when the session is still signed in, and closes itself when the list has been read.
 - Signed out: the window appears titled `Teams recaps — sign in, then open Meeting Recaps`. After signing in, the list is read and the window closes.
 - The Teams desktop app does not open at any point.

@@ -351,12 +351,15 @@ returns one of:
 - `{ status: "page", items: [...], more: true }` with every meeting row read so
   far. An item carries the recap link the script built, the title and the
   start time.
+- `{ status: "reloading" }` once per listing, when the list stopped growing
+  before reaching the since date: the script reloads the page and reads the
+  list again from the top.
 - `{ status: "done", items: [...], stop, oldest }` once a row older than the
-  since date is reached (`stop: "since"`), the list stops growing (`"idle"`),
-  it reaches the row cap (`"cap"`), or it shows no meetings at all
-  (`"empty"`). `oldest` is the oldest calendar slot it reached. `idle` and
-  `cap` end before the since date, so the list may be missing older rows: the
-  line beside the buttons says where it stopped.
+  since date is reached (`stop: "since"`), the list stops growing after that
+  reload (`"idle"`), it reaches the row cap (`"cap"`), or it shows no meetings
+  at all (`"empty"`). `oldest` is the oldest calendar slot it reached. `idle`
+  and `cap` end before the since date, so the list may be missing older rows:
+  the line beside the buttons says where it stopped.
 
 The Rust side keeps the last snapshot, caps it at 500 rows and dedupes items
 by key, first row wins. Rows without a recap link are reported as "not ready"
@@ -380,6 +383,16 @@ The list, as learned on the Windows machine in November 2026
   if a re-render collapses it, up to three times. A recap left open from an
   earlier visit hides the list, so the script presses its "Go to Meeting
   Recaps" button once. It never clicks inside a row.
+- The first listing after Meetily starts can stop at the newest rows. Twice,
+  a check made within a minute of the start showed only the list's first rows
+  (7 and 6 recaps) and never loaded older ones, while checks later in the same
+  session read the whole window (28 and 29).
+  So the list counts as stopped only after 12 seconds with no new row and no
+  deeper scroll. While it waits, the script scrolls back up a screen every 3
+  seconds so the list's end comes into view again. If it still stops before
+  the since date, the script reloads the page once and reads the list again.
+  The mark for that one reload lives in the window's sessionStorage, and every
+  listing opens a new window.
 - A row's markup holds no link. Its React component gets the meeting as a prop
   (`memoizedProps.meeting`, a few fiber levels up), and that object carries
   everything a recap sharing link holds: `subject`, `start` and `end`,

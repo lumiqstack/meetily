@@ -6,11 +6,14 @@
 //! uses, by a page script (`teams_recap_list.js`) that reads each row's
 //! meeting from the props React gives the row and builds the recap sharing
 //! link from it. The script returns the rows it has seen so far on every poll
-//! and `done` once it has scrolled past the scan window; this module keeps the
-//! last snapshot, dedupes rows by meeting identity, counts rows without a
-//! recap link as "not ready", and keeps why the script stopped and the oldest
-//! slot it reached, so a list that stopped short can say so. A probe mode adds the listing's counts and
-//! timings; the debug command writes it to a local file, never to a log.
+//! and `done` once it has scrolled past the scan window. A list that stops
+//! growing before that gets one page reload (`reloading`) and is read again:
+//! the first listing after Meetily starts can show only the newest rows. This
+//! module keeps the last snapshot, dedupes rows by meeting identity, counts
+//! rows without a recap link as "not ready", and keeps why the script stopped
+//! and the oldest slot it reached, so a list that stopped short can say so. A
+//! probe mode adds the listing's counts and timings; the debug command writes
+//! it to a local file, never to a log.
 //!
 //! If Teams changes its layout, `MEETILY_RECAP_LIST_SCRIPT` names a file whose
 //! contents replace the bundled script, so the script can be tuned on the
@@ -241,6 +244,7 @@ mod windows {
                             "navigating" => "navigating",
                             "launcher" => "launcher",
                             "opening_web" => "opening_web",
+                            "reloading" => "reloading",
                             _ => "waiting",
                         };
                         if status != previous_status {
