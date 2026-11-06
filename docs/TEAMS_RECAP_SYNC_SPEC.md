@@ -584,12 +584,12 @@ probe file described above, on that machine only.
   in November 2026, 11 carry a `UTC` stamp equal to the recorded time. Of the 12
   local stamps, 6 are this machine's zone (UTC−6) and 6 are an hour or two later
   (UTC−5 and UTC−4), presumably the zone of whoever recorded. The sync tries the
-  row's exact time first, so this matters where the stamp is the only time: a
-  pasted link, and the recording rule in the SharePoint scan, where a file
-  recorded in another zone reads an hour or two off, usually misses the live
-  meeting's window and costs a second meeting. On a pasted link it can reach a
-  wrong attach only if a meeting sharing the thread or title was recorded live
-  at that wrong hour. Still open: how to tell the recorder's zone from the file.
+  row's exact time first, and the recording rule tries SharePoint's `created`
+  before an unmarked stamp, so this matters where the stamp is the only time: a
+  pasted link, which then reads an hour or two off, usually misses the live
+  meeting's window and costs a second meeting. It can reach a wrong attach only
+  if a meeting sharing the thread or title was recorded live at that wrong hour.
+  Still open: how to tell the recorder's zone from the file.
 - How a Spanish Teams names a transcript-only file and the parts after the
   first. Neither has been seen. Until one is, a Spanish transcript file gives no
   stamp and keys on its own path, and a later part counts as a part only if it
