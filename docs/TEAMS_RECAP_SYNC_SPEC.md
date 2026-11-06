@@ -1,12 +1,12 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-05. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI) and 3 (Meet app scanner with its probe mode) merged; the selectors are still being learned on the Windows machine. Step 4 (QA checklist, `docs/TEAMS_RECAP_SYNC_QA.md`) and step 5 (matching a recap to a live recording) merged, neither yet exercised on Windows. Step 6 (matching a recording to a live recording) is in review.
+Status: 2026-11-06. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"): on the Windows machine its list check found the week's 23 meetings, each with a recap link naming its recording file. No real sync has run yet, so the import half of step 3, the QA checklist (step 4) and the live matching of steps 5 and 6 are not yet exercised on Windows.
 
 ## Goal
 
 Keep the Obsidian vault complete for every Teams meeting that has a Copilot
 recap, without pasting links one at a time. One button in Meetily reads the
-recap list in the Teams Meet app, imports every recap it has not seen, attaches
+meeting list of the Teams Recap app, imports every recap it has not seen, attaches
 recaps to meetings Meetily already holds from their recordings, and writes or
 refreshes one vault note per meeting. No duplicates, no misses, and a count of
 what happened at the end.
@@ -19,7 +19,7 @@ code.
 
 | Question | Decision |
 | --- | --- |
-| Source page | The Meet app in Teams (its list of recent meetings with recaps), read in the persisted WebView2 profile the recap link import already uses. |
+| Source page | The Recap app in Teams ("Meeting Recaps" on the app bar), whose Home tab lists recent meetings with recaps, read in the persisted WebView2 profile the recap link import already uses. |
 | Microsoft Graph | Not used. No Entra app registration, no admin consent. |
 | Trigger | Manual "Sync Teams recaps" button. No schedule in this version. |
 | Backfill | A since date in settings, default 30 days before the first sync. Each later sync starts from the last confirmed sync date minus an overlap window. |
@@ -69,7 +69,7 @@ code.
 ## Architecture
 
 ```
-Settings (since date)          Teams Meet app, hidden WebView2
+Settings (since date)          Teams Recap app, hidden WebView2
         │                                  │
         ▼                                  ▼
 sync_teams_recaps_command ──► RecapListScanner ──► Vec<RecapCandidate>
@@ -140,8 +140,8 @@ good as the title it matched on: see "Matching a recording to a live recording".
 **When the recap happened.** A recap can carry two times. They are tried in
 this order, and the second only if the first fits no live recording:
 
-- In the sync loop, the start time the Meet app row shows, which Teams renders
-  in this user's zone.
+- In the sync loop, the start time the Recap app row gives: when the meeting
+  was recorded, as an exact instant, or else its calendar slot.
 - The stamp in the `fileUrl` file name, which is when the recording started,
   read in this machine's time zone (`teams_recap_metadata.rs`).
 
@@ -346,48 +346,71 @@ poll and timeout machinery as `teams_recap.js`. It is given the since date and
 returns one of:
 
 - `{ status: "waiting" }` while the list renders or sign-in is in progress.
-  The existing `launcher`, `opening_web` and `signed_in_chat` handling applies.
-- `{ status: "page", items: [...], more: bool }` with every meeting row visible
-  so far. An item carries the recap deep link, the title, the start time as
-  shown, and whether the row shows a recap indicator.
-- `{ status: "done" }` once a row older than the since date is reached or the
-  list says there are no more.
+  The existing `launcher` and `opening_web` handling applies.
+- `{ status: "navigating" }` while it steers to the list.
+- `{ status: "page", items: [...], more: true }` with every meeting row read so
+  far. An item carries the recap link the script built, the title and the
+  start time.
+- `{ status: "done", items: [...] }` once a row older than the since date is
+  reached, the list stops growing, or it shows no meetings at all.
 
-The Rust side scrolls the list until `done` or a hard cap of 500 rows, then
-dedupes items by key. Rows without a recap link are reported as "not ready"
+The Rust side keeps the last snapshot, caps it at 500 rows and dedupes items
+by key, first row wins. Rows without a recap link are reported as "not ready"
 and never written to the sync store.
 
-The exact selectors are unknown until the Meet app is inspected on the Windows
-machine. Learning them is the first delivery step and the main risk; the
-script must fail with `waiting` and then a clear timeout error on any layout it
-does not recognise, never with a partial list presented as complete.
+The list, as learned on the Windows machine in November 2026
+(`teams_recap_list.rs`, `teams_recap_list.js`):
 
-How the layout is learned (`teams_recap_list.rs`, `teams_recap_list.js`):
-
-- The window opens the Teams web shell (`https://teams.microsoft.com/v2/`),
-  since no direct URL for the Meet app's recap tab is documented. Before any
-  row counts, the script clicks, once each, a rail button named Meet or Recap
-  (opening the "more apps" flyout if the rail has none) and a tab named Recap
-  or similar, because the shell may open on Chat or Activity, whose rows carry
-  dates too. After the silent phase the window is shown so the user can
-  navigate by hand, and the script reads the list wherever it appears,
-  including inside a same-origin frame.
-- A row is any list item, row or article with a date it can parse or a recap
-  link it can find. The link comes from an `href`, from a recap URL embedded
-  in the row's markup, or, failing both, is built from a `19:meeting_…@thread.v2`
-  id in the row's markup. Rows with no link count as not ready.
-- In probe mode (the "Check recap list" button) the script also returns a
-  compact description of the page: rail and tab names, headings, list
-  containers, frames, the first rows with their lines, parsed date, link,
-  attributes and id-looking React props, every `data-tid`, recap-looking hrefs
-  and thread ids in the page. If no row holds a link, the probe opens one past
-  row (the row itself, never a button inside it) and records what that showed.
-  Token query values are redacted. The debug command writes the probe to
-  `teams_recap_list_probe.json` in the app data folder. It contains meeting
-  titles and page text, so it stays on that machine unless the user shares it.
+- The window opens the Teams web shell at `https://teams.cloud.microsoft/v2/`.
+  Starting at `teams.microsoft.com` costs about 40 seconds on a redirect page
+  (`?ocdiRedirect=index`) before Teams reloads on the new domain.
+- The list lives in the Teams Recap app, "Meeting Recaps" on the app bar (app
+  id `981bbfd0-5eb8-4393-8158-bfff69d2d6b5`). The script clicks it once, by id
+  and then by name, opening "more apps" if the bar has no such button. The app
+  has two tabs, Home and Audio recaps, and the list is Home.
+- Home is an accordion of groups ("This week", "Last week", ...), each a list
+  of `li[data-tid="podcast-meeting-item"]` rows, newest calendar slot first.
+  The script opens collapsed groups, scrolls the list's own pane to load older
+  rows, and stops at the first row whose slot is before the since date. Past
+  that row it opens only a collapsed group above it, and it opens a group again
+  if a re-render collapses it, up to three times. A recap left open from an
+  earlier visit hides the list, so the script presses its "Go to Meeting
+  Recaps" button once. It never clicks inside a row.
+- A row's markup holds no link. Its React component gets the meeting as a prop
+  (`memoizedProps.meeting`, a few fiber levels up), and that object carries
+  everything a recap sharing link holds: `subject`, `start` and `end`,
+  `threadId`, `iCalUid`, `organizerId`, `transcripts[]` (with `callId`,
+  `startDateTime` and the transcript's drive item), `recordings[]`, and
+  `recommendationData` with the recording file's `driveId`, `driveItemId` and
+  path (`url`). The same object holds the AI summary and action items; the
+  script reads neither.
+- The script builds the link the recap's Share button gives: the same keys in
+  the same order, `fileUrl` set to the file's path with Office's `?web=1`, and
+  `masterICalUid` for an occurrence of a series (the GlobalObjectId with its
+  date bytes zeroed). The link uses the page's own host, so the recap import's
+  fresh window should skip the redirect too (see "Open questions"). Every row
+  seen so far names its file, even a meeting whose row lists no recording, so
+  the link keys on the recording like a pasted link. A row without that path
+  would get a link naming the transcript's drive item, which keys on its own
+  query.
+- A row's time is when it was recorded, the earliest transcript or recording
+  start, not the slot it shows: a recurring row can show the series' next slot
+  beside an earlier occurrence's recap.
+- A meeting can have two rows, one for its transcript and one for its
+  recording. Both name the same file, so they collapse to one candidate.
+- In probe mode (the "Check recap list" button) the script also returns the
+  listing's counts and timings: rows read, link kinds, rows without props, why
+  it stopped, the clicks it made, when rows first appeared and when the list was
+  done, and how many frames the page painted. The debug command writes them,
+  with the candidates, to `teams_recap_list_probe.json` in the app data folder.
+  The candidates carry titles and file paths, so the file stays on that machine
+  unless the user shares it.
 - `MEETILY_RECAP_LIST_SCRIPT=<file>` replaces the bundled script with that
-  file, so selectors can be tuned on Windows without a rebuild. The file must
-  keep the `%SINCE%` and `%PROBE%` placeholders.
+  file, so the script can be tuned on Windows without a rebuild if Teams
+  changes its layout. The file must keep the `%SINCE%` and `%PROBE%`
+  placeholders.
+- `frontend/tests/browser/teams-recap-list.browser.cjs` runs the script
+  against a synthetic Recap app; see `frontend/tests/README.md`.
 
 ### Sync loop
 
@@ -503,9 +526,9 @@ probe file described above, on that machine only.
    lookup. Small PR, lands on its own, fixes duplicates today.
 2. Sync store, report type, commands, settings UI, debug command, everything
    wired to a scanner stub that returns an empty list. Mac-testable.
-3. The Meet app scanner script, learned on the Windows machine through the
+3. The Recap app scanner script, learned on the Windows machine through the
    Stash handoff: first the debug command until it lists the week's meetings
-   correctly, then the real sync.
+   correctly (done in November 2026), then the real sync.
 4. QA doc, `docs/TEAMS_RECAP_SYNC_QA.md`, mirroring
    `TEAMS_MEETING_DETECTION_QA.md`.
 5. Matching a recap to a live recording, in the link import and the sync loop.
@@ -533,24 +556,40 @@ probe file described above, on that machine only.
   releases the key.
 - Unit, `#[cfg(not(windows))]`-guarded where `mock_app` is used: the loop over a
   fake extractor returning ready, not ready and error in sequence.
+- Browser fixture: `frontend/tests/browser/teams-recap-list.browser.cjs`
+  checks the list script's links, times, groups, stop rule and probe against a
+  synthetic Recap app.
 - Manual on Windows: the checklist in `docs/TEAMS_RECAP_SYNC_QA.md`.
 
 ## Open questions
 
-- Does the Meet app list show meetings whose recording lives on someone else's
-  OneDrive? If not, recaps for meetings the user did not organise may be
-  missing and the SharePoint scan is the only cross-check.
+- Settled: the Recap app lists meetings whose recording lives in someone
+  else's OneDrive. The week read in November 2026 named files in 16 OneDrives.
+- Whether an unattended import finishes within its minute. Each recap opens in
+  a fresh hidden window, and the list window took about 50 seconds to show Teams
+  when it started on `teams.microsoft.com`, 40 of them on the redirect page. The
+  list now starts on `teams.cloud.microsoft` and builds links on that host,
+  which should spare each import window the redirect; the first real sync will
+  show it. If imports still run out of time, the sync should open each recap in
+  one window that stays open for the whole sync.
+- Whether Teams renders in a hidden window. In November 2026 the list window
+  had already been shown when its rows appeared. The probe's frame count and the
+  `[recap-list] showing the window` log line tell whether the list was read
+  while hidden.
 - Whether `extract_teams_recap` can distinguish "still generating" from "no
   recap for this meeting". If not, both count as "not ready" and retry on every
   sync until the overlap window passes them.
-- Whether the stamp in a recording's file name is always this machine's local
-  time. `teams_recap_metadata.rs` assumes so, but a recording started by someone
-  in another zone may carry theirs. A wrong reading usually misses the window
-  and costs a second meeting. On a pasted link, with no row time to try first, it
-  can reach a wrong attach only if a meeting sharing the thread or title was
-  recorded live at that wrong hour. The probe's rows show a stamp beside the time
-  the Meet app displays, which will settle it. Real file names already show one
-  other form, `…-20261009_180000UTC-Meeting Recording.mp4`.
+- The stamp in a recording's file name is not always this machine's local
+  time, which `teams_recap_metadata.rs` assumes. Of the 23 files the list named
+  in November 2026, 11 carry a `UTC` stamp equal to the recorded time. Of the 12
+  local stamps, 6 are this machine's zone (UTC−6) and 6 are an hour or two later
+  (UTC−5 and UTC−4), presumably the zone of whoever recorded. The sync tries the
+  row's exact time first, so this matters where the stamp is the only time: a
+  pasted link, and the recording rule in the SharePoint scan, where a file
+  recorded in another zone reads an hour or two off, usually misses the live
+  meeting's window and costs a second meeting. On a pasted link it can reach a
+  wrong attach only if a meeting sharing the thread or title was recorded live
+  at that wrong hour. Still open: how to tell the recorder's zone from the file.
 - How a Spanish Teams names a transcript-only file and the parts after the
   first. Neither has been seen. Until one is, a Spanish transcript file gives no
   stamp and keys on its own path, and a later part counts as a part only if it
@@ -560,8 +599,8 @@ probe file described above, on that machine only.
   file's UTC stamp, so it may be the start. The recording rule works with either
   as long as the file appears close to the meeting, but a value at the end can
   land in the next slot when two meetings with the same subject run back to back.
-- How many rows the Meet app keeps. Microsoft's admin documentation for the
+- How many rows the Recap app keeps. Microsoft's admin documentation for the
   Meeting Recaps app says it shows recaps from the previous 30 days, which
-  matches the default backfill; to be confirmed on the real list. If it is
-  so, the since date
-  cannot reach further back and the settings UI should say so.
+  matches the default backfill. The list check stops at the since date, so the
+  end of the list has not been seen. If it is so, the since date cannot reach
+  further back and the settings UI should say so.

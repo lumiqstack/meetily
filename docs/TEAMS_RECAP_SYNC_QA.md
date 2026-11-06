@@ -7,7 +7,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Build and launch as `docs/windows/DATABASE_UPGRADE_CHECK.md` describes.
 - Set an Obsidian vault in Meetily preferences. Use an empty test vault for the first-sync scenarios.
 - Have Copilot recaps for meetings in the last 14 days, including two occurrences of one recurring meeting and, if possible, one meeting whose recap is not ready yet.
-- Note how many meetings with a recap the Meet app shows for the week. The list check below is compared against this number.
+- Note how many meetings Meeting Recaps (the Teams Recap app on the app bar) shows on its Home tab for the week. The list check below is compared against this number.
 - Find `Teams recaps` under `Obsidian Vault` in preferences. It shows the last sync date and the known recap count.
 
 ## Availability
@@ -20,13 +20,13 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 
 - `Check recap list` imports nothing: no new meeting, no new note, last sync date unchanged, known recap count unchanged.
 - The toast reports how many rows have a recap link, how many do not, and where the probe file was saved.
-- The counts match the Meet app's list for the scan window, including rows further down that only load on scrolling.
+- The counts match the Home list for the scan window, including rows in collapsed groups and rows further down that only load on scrolling. A meeting listed twice, once for its transcript and once for its recording, counts once.
 - The Teams window stays hidden when the session is still signed in, and closes itself when the list has been read.
-- Signed out: the window appears titled `Teams recaps — sign in and open the Meet app's Recap list`. After signing in, the list is read and the window closes.
+- Signed out: the window appears titled `Teams recaps — sign in, then open Meeting Recaps`. After signing in, the list is read and the window closes.
 - The Teams desktop app does not open at any point.
 - Closing the window early reports that it was closed before the list was read, and writes nothing to the sync state.
-- A page with no recognisable list ends in `Teams did not show the Meet app's recap list`, never in a short list reported as complete.
-- `teams_recap_list_probe.json` appears in the app data folder, and every token value in it reads `REDACTED`.
+- A page with no recognisable list ends in `Teams did not show the Meeting Recaps list`, never in a short list reported as complete.
+- `teams_recap_list_probe.json` appears in the app data folder. It holds the candidates (titles, times and recap links, whose file paths name the OneDrive each file sits in) and the listing's counts and timings, and no token, summary or transcript.
 
 ## First Sync
 
