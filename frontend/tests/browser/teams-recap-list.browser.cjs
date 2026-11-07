@@ -340,6 +340,19 @@ test('closes a recap left open with its back button', async () => {
   assert.equal(result.items.length, 7);
 });
 
+test('says why it stopped and the oldest slot it reached, probe or not', async () => {
+  const { result } = await list();
+  assert.equal(result.stop, 'since');
+  assert.equal(result.oldest, '2026-10-27T17:00:00.000Z');
+  // Older rows that never load, even after the reload: the list ends inside
+  // the window, at This week's oldest row, and says so.
+  const { result: stalled } = await list('stalled');
+  assert.equal(stalled.stop, 'idle');
+  assert.equal(stalled.oldest, '2026-11-04T16:00:00.000Z');
+  const { result: empty } = await list('empty');
+  assert.deepEqual([empty.stop, empty.oldest], ['empty', null]);
+});
+
 test('an empty Recap app finishes with no items', async () => {
   const { result } = await list('empty');
   assert.deepEqual(result.items, []);

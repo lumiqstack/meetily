@@ -9,10 +9,11 @@
 //! and `done` once it has scrolled past the scan window. A list that stops
 //! growing before that gets one page reload (`reloading`) and is read again:
 //! the first listing after Meetily starts can show only the newest rows. This
-//! module keeps the last snapshot, dedupes rows by meeting identity and counts
-//! rows without a recap link as "not ready". A probe mode adds the listing's
-//! counts and timings; the debug command writes it to a local file, never to a
-//! log.
+//! module keeps the last snapshot, dedupes rows by meeting identity, counts
+//! rows without a recap link as "not ready", and keeps why the script stopped
+//! and the oldest slot it reached, so a list that stopped short can say so. A
+//! probe mode adds the listing's counts and timings; the debug command writes
+//! it to a local file, never to a log.
 //!
 //! If Teams changes its layout, `MEETILY_RECAP_LIST_SCRIPT` names a file whose
 //! contents replace the bundled script, so the script can be tuned on the
@@ -42,6 +43,50 @@ pub const MAX_ROWS: usize = 500;
 pub const UNTITLED_ROW_TITLE: &str = "Teams meeting";
 const LIST_SCRIPT: &str = include_str!("teams_recap_list.js");
 
+/// Why the page script stopped reading the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListEnd {
+    /// It reached a row from before the since date, so the window is complete.
+    Since,
+    /// The Recap app showed no rows at all.
+    Empty,
+    /// The list stopped growing before it reached the since date: either the
+    /// whole list is newer than the window, or older rows never loaded.
+    Idle,
+    /// It reached [`MAX_ROWS`].
+    Cap,
+}
+
+impl ListEnd {
+    /// The script's `stop` value. An unknown one, from an older override
+    /// script, reads as no answer instead of failing the listing.
+    fn from_script(stop: &str) -> Option<Self> {
+        match stop {
+            "since" => Some(Self::Since),
+            "empty" => Some(Self::Empty),
+            "idle" => Some(Self::Idle),
+            "cap" => Some(Self::Cap),
+            _ => None,
+        }
+    }
+
+    /// Whether rows inside the window may be missing: the script stopped
+    /// before it reached the since date while the list still had rows.
+    pub fn may_be_short(self) -> bool {
+        matches!(self, Self::Idle | Self::Cap)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Since => "since",
+            Self::Empty => "empty",
+            Self::Idle => "idle",
+            Self::Cap => "cap",
+        }
+    }
+}
+
 /// What one listing produced. `error` is set when the page never showed a
 /// recognisable list; the probe (when requested) is still kept so the
 /// failure can be diagnosed.
@@ -53,6 +98,10 @@ pub struct RecapListing {
     pub rows_without_link: usize,
     pub page_url: Option<String>,
     pub error: Option<String>,
+    /// Why the script stopped, when it finished and said.
+    pub end: Option<ListEnd>,
+    /// The oldest calendar slot the list reached, RFC 3339.
+    pub oldest_row: Option<String>,
     pub probe: Option<serde_json::Value>,
 }
 
@@ -75,8 +124,33 @@ pub(crate) struct ListProbe {
     pub items: Vec<ListedRow>,
     #[serde(default)]
     pub href: Option<String>,
+    /// On `done`: why the script stopped and the oldest slot it reached.
+    #[serde(default)]
+    pub stop: Option<String>,
+    #[serde(default)]
+    pub oldest: Option<String>,
     #[serde(default)]
     pub probe: Option<serde_json::Value>,
+}
+
+/// Fold one script result into the listing: the rows on `page` and `done`,
+/// and on `done` why the list ended and how far back it got.
+pub(crate) fn apply(listing: &mut RecapListing, probe: ListProbe) {
+    if let Some(href) = probe.href {
+        listing.page_url = Some(href);
+    }
+    if probe.probe.is_some() {
+        listing.probe = probe.probe;
+    }
+    if probe.status == "page" || probe.status == "done" {
+        let (candidates, without_link) = collect(&probe.items);
+        listing.candidates = candidates;
+        listing.rows_without_link = without_link;
+    }
+    if probe.status == "done" {
+        listing.end = probe.stop.as_deref().and_then(ListEnd::from_script);
+        listing.oldest_row = probe.oldest.filter(|at| !at.trim().is_empty());
+    }
 }
 
 /// The script with its two placeholders filled. `since` is generated, never
@@ -144,20 +218,6 @@ mod windows {
         block_desktop_handoff, execute_script, INTERACTIVE_WAIT, POLL_INTERVAL, SILENT_WAIT,
     };
 
-    fn apply(listing: &mut RecapListing, probe: ListProbe) {
-        if let Some(href) = probe.href {
-            listing.page_url = Some(href);
-        }
-        if probe.probe.is_some() {
-            listing.probe = probe.probe;
-        }
-        if probe.status == "page" || probe.status == "done" {
-            let (candidates, without_link) = collect(&probe.items);
-            listing.candidates = candidates;
-            listing.rows_without_link = without_link;
-        }
-    }
-
     /// Poll until the script says `done`. `Ok(true)` when it did, `Ok(false)`
     /// at the deadline; the listing holds whatever was seen either way.
     async fn poll<R: Runtime>(
@@ -195,9 +255,11 @@ mod windows {
                         apply(listing, probe);
                         if done {
                             log::info!(
-                                "[recap-list] listed {} recaps, {} rows without a link",
+                                "[recap-list] listed {} recaps, {} rows without a link, stopped: {}, oldest row: {}",
                                 listing.candidates.len(),
-                                listing.rows_without_link
+                                listing.rows_without_link,
+                                listing.end.map_or("not said", ListEnd::as_str),
+                                listing.oldest_row.as_deref().unwrap_or("none")
                             );
                             return Ok(true);
                         }
@@ -378,6 +440,39 @@ mod tests {
         assert!(done.probe.is_none());
         let waiting: ListProbe = serde_json::from_str(r#"{"status":"waiting"}"#).unwrap();
         assert!(waiting.items.is_empty() && waiting.href.is_none());
+    }
+
+    fn script_result(json: &str) -> ListProbe {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_finished_listing_says_why_it_stopped_and_how_far_back_it_got() {
+        let item = r#"{"recapUrl":"https://teams.microsoft.com/l/meetingrecap?threadId=1","title":"Standup","startedAt":"2026-11-05T15:00:00.000Z"}"#;
+        let mut listing = RecapListing::default();
+        // A page snapshot carries rows but says nothing about the end yet.
+        apply(&mut listing, script_result(&format!(r#"{{"status":"page","items":[{item}],"stop":"idle"}}"#)));
+        assert_eq!((listing.candidates.len(), listing.end, listing.oldest_row.as_deref()), (1, None, None));
+
+        apply(
+            &mut listing,
+            script_result(&format!(r#"{{"status":"done","items":[{item}],"stop":"idle","oldest":"2026-11-05T15:00:00.000Z"}}"#)),
+        );
+        assert_eq!(listing.end, Some(ListEnd::Idle));
+        assert!(listing.end.unwrap().may_be_short());
+        assert_eq!(listing.oldest_row.as_deref(), Some("2026-11-05T15:00:00.000Z"));
+
+        let mut reached = RecapListing::default();
+        apply(&mut reached, script_result(r#"{"status":"done","items":[],"stop":"since","oldest":"2026-10-28T09:00:00.000Z"}"#));
+        assert!(!reached.end.unwrap().may_be_short());
+        assert!(ListEnd::Cap.may_be_short() && !ListEnd::Empty.may_be_short());
+
+        // An override script that predates `stop`, or says something new.
+        let mut older = RecapListing::default();
+        apply(&mut older, script_result(r#"{"status":"done","items":[]}"#));
+        assert_eq!((older.end, older.oldest_row.as_deref()), (None, None));
+        apply(&mut older, script_result(r#"{"status":"done","items":[],"stop":"later","oldest":" "}"#));
+        assert_eq!((older.end, older.oldest_row.as_deref()), (None, None));
     }
 
     #[test]

@@ -354,9 +354,12 @@ returns one of:
 - `{ status: "reloading" }` once per listing, when the list stopped growing
   before reaching the since date: the script reloads the page and reads the
   list again from the top.
-- `{ status: "done", items: [...] }` once a row older than the since date is
-  reached, the list stops growing after that reload, or it shows no meetings
-  at all.
+- `{ status: "done", items: [...], stop, oldest }` once a row older than the
+  since date is reached (`stop: "since"`), the list stops growing after that
+  reload (`"idle"`), it reaches the row cap (`"cap"`), or it shows no meetings
+  at all (`"empty"`). `oldest` is the oldest calendar slot it reached. `idle`
+  and `cap` end before the since date, so the list may be missing older rows:
+  the line beside the buttons says where it stopped.
 
 The Rust side keeps the last snapshot, caps it at 500 rows and dedupes items
 by key, first row wins. Rows without a recap link are reported as "not ready"
@@ -477,7 +480,7 @@ note instead of creating a second meeting. This lands first and on its own.
 | Command | Purpose |
 | --- | --- |
 | `sync_teams_recaps_command` | Run one sync. Returns `RecapSyncReport { new, updated, skipped, not_ready, failed: Vec<{title, error}>, possible_duplicates: Vec<title>, scanned, meetings_folder }`. |
-| `get_teams_recap_sync_state_command` | Since date, last sync date, count of known recaps. |
+| `get_teams_recap_sync_state_command` | Since date, last sync date, count of known recaps, and the last listing: when the list was read, how many recaps it listed, how many of those are already synced and pending, rows without a link, its error, and where it stopped if it stopped before the since date. |
 | `set_teams_recap_sync_prefs_command` | Since date. |
 | `teams_recap_list_debug_command` | Return the raw candidate list without importing. For learning selectors and for the QA doc. |
 
@@ -490,6 +493,14 @@ emission after each write.
 Under the existing Obsidian section in `PreferenceSettings.tsx`:
 
 - "Sync Teams recaps" button with the last sync date beside it.
+- "Check recap list" button. Its result stays on a line beside the buttons
+  instead of a toast, for example `Checked at 12:40 PM: 28 recaps, 3 already
+  synced, 25 pending.` The line shows the last listing, whether a check or a
+  sync read the list. Its counts are taken against the synced recaps each time
+  the panel loads, so a sync moves recaps from pending to synced. It names the
+  day when the list was read on an earlier one, adds rows without a link as
+  "without a recap yet", gives the error when the list was not read, and warns
+  when the list stopped before the since date.
 - Since date picker, default 30 days back, shown until the first sync completes.
 - Disabled on non-Windows with the note "Available on Windows".
 
@@ -521,8 +532,9 @@ Same boundary as the recap link import. The script reads the rendered DOM
 only; no Tauri IPC is exposed to the Teams page; recap text is never written to
 a URL, clipboard, log or external service. Logs record keys, counts and error
 messages, not recap content. The since date and keys in the store are the only
-persisted additions of a sync; the "Check recap list" button also writes the
-probe file described above, on that machine only.
+persisted additions of a sync, with the last listing beside them (`lastListing`:
+times, counts, keys and the listing's error, no titles); the "Check recap list"
+button also writes the probe file described above, on that machine only.
 
 ## Out of scope
 
