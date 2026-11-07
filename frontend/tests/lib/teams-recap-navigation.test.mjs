@@ -30,7 +30,8 @@ test('allows a selected recap time to load its AI summary', () => {
 });
 test('opens AI summary when the recap has loaded', () => {
   const summary = tab('AI summary');
-  assert.equal(probe([summary]).status, 'waiting');
+  // The tab shows the recap is open, so a sync that runs out of time counts it not ready.
+  assert.equal(probe([summary]).status, 'recap_open');
   assert.equal(summary.clicked, true);
 });
 test('handles the corporate proxy Teams host', () => {

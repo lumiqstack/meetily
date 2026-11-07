@@ -116,10 +116,127 @@ pub struct TeamsRecap {
     pub markdown: String,
 }
 
-/// An unattended extraction found no AI summary in time. The recap sync reads
-/// this as "not ready", so keep the phrase `is_not_ready` looks for.
-pub(crate) const UNATTENDED_NO_SUMMARY: &str =
-    "Teams did not show an AI summary for this link within a minute.";
+const WINDOWS_ONLY: &str =
+    "Automatic Teams recap extraction requires Meetily on Windows with WebView2.";
+
+/// Why reading one recap of a sync came back without it.
+#[derive(Debug)]
+pub enum MissedRecap {
+    /// Teams opened the recap but showed no AI summary in time. It may still
+    /// be writing one, so the next sync tries again.
+    NoSummary,
+    /// Teams did not open the recap in time.
+    NotOpened { waited: std::time::Duration },
+    /// The window or the page failed.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for MissedRecap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSummary => f.write_str("Teams opened this recap but showed no AI summary."),
+            Self::NotOpened { waited } => write!(
+                f,
+                "Teams did not open this recap within {} seconds.",
+                waited.as_secs()
+            ),
+            Self::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// How long each recap of a sync may take, and how a read that ran out of
+/// time ends. Kept apart from the window so every platform tests it.
+#[cfg(any(target_os = "windows", test))]
+mod reading {
+    use super::MissedRecap;
+    use std::time::Duration;
+
+    /// The first recap of a sync also waits for Teams to start in its window.
+    /// On 2026-11-06 a start took up to 64 s, and a recap opened 12 s after
+    /// its link in a window where Teams had started.
+    pub(super) const START_WAIT: Duration = Duration::from_secs(180);
+    /// Every later recap opens in a window where Teams has started.
+    pub(super) const UNATTENDED_WAIT: Duration = Duration::from_secs(60);
+
+    pub(super) fn wait_for(earlier_reads: usize) -> Duration {
+        if earlier_reads == 0 {
+            START_WAIT
+        } else {
+            UNATTENDED_WAIT
+        }
+    }
+
+    /// What one read has seen of its recap, from the page script's states.
+    #[derive(Debug, Default)]
+    pub(super) struct Sighting {
+        opened_after: Option<Duration>,
+    }
+
+    impl Sighting {
+        pub(super) fn observe(&mut self, status: &str, elapsed: Duration) {
+            if self.opened_after.is_none()
+                && matches!(status, "recap_open" | "collecting_recap" | "waiting_tasks" | "ready")
+            {
+                self.opened_after = Some(elapsed);
+            }
+        }
+
+        /// How long after its link the recap first showed, if it did.
+        pub(super) fn opened_after(&self) -> Option<Duration> {
+            self.opened_after
+        }
+
+        /// How a read that ran out of time after `waited` ends.
+        pub(super) fn missed(&self, waited: Duration) -> MissedRecap {
+            match self.opened_after {
+                Some(_) => MissedRecap::NoSummary,
+                None => MissedRecap::NotOpened { waited },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn secs(value: u64) -> Duration {
+            Duration::from_secs(value)
+        }
+
+        #[test]
+        fn the_first_recap_also_waits_for_teams_to_start_and_later_ones_get_a_minute() {
+            assert_eq!(wait_for(0), secs(180));
+            assert_eq!(wait_for(1), secs(60));
+            assert_eq!(wait_for(29), secs(60));
+        }
+
+        #[test]
+        fn a_read_that_ran_out_of_time_is_not_ready_only_if_the_recap_opened() {
+            let mut sighting = Sighting::default();
+            for status in ["waiting", "opening_web", "launcher", "signed_in_chat", "waiting"] {
+                sighting.observe(status, secs(30));
+            }
+            assert_eq!(sighting.opened_after(), None);
+            assert!(matches!(sighting.missed(secs(60)), MissedRecap::NotOpened { waited } if waited == secs(60)));
+            assert_eq!(sighting.missed(secs(60)).to_string(), "Teams did not open this recap within 60 seconds.");
+
+            sighting.observe("recap_open", secs(14));
+            sighting.observe("collecting_recap", secs(20));
+            assert_eq!(sighting.opened_after(), Some(secs(14)), "the first sighting counts");
+            assert!(matches!(sighting.missed(secs(60)), MissedRecap::NoSummary));
+        }
+
+        #[test]
+        fn every_state_inside_the_recap_counts_as_open() {
+            for status in ["recap_open", "collecting_recap", "waiting_tasks", "ready"] {
+                let mut sighting = Sighting::default();
+                sighting.observe(status, secs(5));
+                assert_eq!(sighting.opened_after(), Some(secs(5)), "{status}");
+            }
+        }
+    }
+}
 
 pub fn validate_recap_url(input: &str) -> Result<Url> {
     if input.len() > 8_192 {
@@ -161,8 +278,6 @@ pub(crate) mod windows {
     };
 
     pub(crate) const SILENT_WAIT: Duration = Duration::from_secs(25);
-    /// All an unattended extraction gets, since nobody can help it along.
-    const UNATTENDED_WAIT: Duration = Duration::from_secs(60);
     pub(crate) const INTERACTIVE_WAIT: Duration = Duration::from_secs(300);
     pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -294,6 +409,7 @@ pub(crate) mod windows {
         deadline: tokio::time::Instant,
         source_url: &Url,
         navigation: &mut navigation::Navigation,
+        sighting: &mut super::reading::Sighting,
         started: tokio::time::Instant,
         interactive: bool,
     ) -> Result<Option<TeamsRecap>> {
@@ -316,12 +432,14 @@ pub(crate) mod windows {
                         "signed_in_chat" => "signed_in_chat",
                         "waiting_tasks" => "waiting_tasks",
                         "collecting_recap" => "collecting_recap",
+                        "recap_open" => "recap_open",
                         _ => "waiting",
                     };
                     if status != previous_status {
                         log::info!("Teams recap state: {status}");
                         previous_status = status.to_owned();
                     }
+                    sighting.observe(status, started.elapsed());
                     match navigation.observe(status, started.elapsed().as_millis() as u64) {
                         navigation::Action::RetryLink => {
                             log::info!(
@@ -343,7 +461,8 @@ pub(crate) mod windows {
                     }
                     if probe.status == "ready" {
                         log::info!(
-                            "Teams recap extracted: notes={}, tasks={}",
+                            "Teams recap extracted after {} s: notes={}, tasks={}",
+                            started.elapsed().as_secs(),
                             probe.notes.len(),
                             probe.tasks.len()
                         );
@@ -374,16 +493,10 @@ pub(crate) mod windows {
         Ok(None)
     }
 
-    /// `interactive` shows the window when the hidden phase finds nothing, so
-    /// the user can sign in. Without it the window stays hidden throughout.
-    pub async fn extract<R: Runtime>(
-        app: &AppHandle<R>,
-        url: &Url,
-        interactive: bool,
-    ) -> Result<TeamsRecap> {
-        // The same lock and profile protect the existing SharePoint cookie
-        // flow from a competing Teams window destroying its auth webview.
-        let _auth_flow = super::super::sharepoint::AUTH_FLOW_LOCK.lock().await;
+    /// The hidden window every Teams flow here uses, on the shared profile,
+    /// with the desktop app hand-off blocked before any Teams page loads.
+    /// Callers hold `AUTH_FLOW_LOCK` for as long as it is open.
+    async fn open_window<R: Runtime>(app: &AppHandle<R>, url: &Url) -> Result<WebviewWindow<R>> {
         let data_dir = app
             .path()
             .app_data_dir()
@@ -392,25 +505,35 @@ pub(crate) mod windows {
         std::fs::create_dir_all(&data_dir)?;
         let window =
             super::super::sharepoint::create_auth_window_deferred(app, url, &data_dir).await?;
+        if let Err(error) = block_desktop_handoff(&window).await {
+            let _ = window.close();
+            return Err(error);
+        }
+        Ok(window)
+    }
+
+    /// Read the one recap a user asked for. The window appears when the hidden
+    /// phase finds nothing, so the user can sign in.
+    pub async fn extract<R: Runtime>(app: &AppHandle<R>, url: &Url) -> Result<TeamsRecap> {
+        // The same lock and profile protect the existing SharePoint cookie
+        // flow from a competing Teams window destroying its auth webview.
+        let _auth_flow = super::super::sharepoint::AUTH_FLOW_LOCK.lock().await;
+        let window = open_window(app, url).await?;
 
         let result = async {
-            block_desktop_handoff(&window).await?;
             window.navigate(url.clone())?;
             let started = tokio::time::Instant::now();
             let mut navigation = navigation::Navigation::default();
-            let hidden_wait = if interactive { SILENT_WAIT } else { UNATTENDED_WAIT };
+            let mut sighting = super::reading::Sighting::default();
             if let Some(recap) =
-                poll(&window, started + hidden_wait, url, &mut navigation, started, interactive).await?
+                poll(&window, started + SILENT_WAIT, url, &mut navigation, &mut sighting, started, true).await?
             {
                 return Ok(recap);
-            }
-            if !interactive {
-                return Err(anyhow!(UNATTENDED_NO_SUMMARY));
             }
             window.set_title("Teams recap — sign in and open the requested AI summary")?;
             window.show()?;
             window.set_focus()?;
-            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, started, true)
+            poll(&window, tokio::time::Instant::now() + INTERACTIVE_WAIT, url, &mut navigation, &mut sighting, started, true)
                 .await?
                 .ok_or_else(|| anyhow!(
                     "Teams did not show an AI summary for this link. Sign in if prompted, then check that the recap's AI summary tab is available."
@@ -420,41 +543,112 @@ pub(crate) mod windows {
         let _ = window.close();
         result
     }
+
+    /// Reads a sync's recaps one after another in one hidden window, so Teams
+    /// starts once per sync instead of once per recap. Dropping it closes the
+    /// window.
+    pub(crate) struct RecapReader<R: Runtime> {
+        window: WebviewWindow<R>,
+        reads: usize,
+        /// Held while the window is open: every Teams and SharePoint flow
+        /// uses its profile and window label.
+        _auth_flow: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl<R: Runtime> RecapReader<R> {
+        pub(crate) async fn open(app: &AppHandle<R>) -> Result<Self> {
+            let auth_flow = super::super::sharepoint::AUTH_FLOW_LOCK.lock().await;
+            // Names the window only: it opens on about:blank.
+            let teams = Url::parse(crate::audio::teams_recap_list::TEAMS_WEB_URL).expect("constant URL");
+            let window = open_window(app, &teams).await?;
+            Ok(Self { window, reads: 0, _auth_flow: auth_flow })
+        }
+
+        /// Read one recap. Nobody is watching, so the window stays hidden and
+        /// a recap that does not open in time is given up.
+        pub(crate) async fn read(&mut self, url: &Url) -> std::result::Result<TeamsRecap, MissedRecap> {
+            let wait = super::reading::wait_for(self.reads);
+            self.reads += 1;
+            self.leave_page().await.map_err(MissedRecap::Failed)?;
+            self.window
+                .navigate(url.clone())
+                .map_err(|error| MissedRecap::Failed(error.into()))?;
+            let started = tokio::time::Instant::now();
+            let mut navigation = navigation::Navigation::default();
+            let mut sighting = super::reading::Sighting::default();
+            match poll(&self.window, started + wait, url, &mut navigation, &mut sighting, started, false).await {
+                Ok(Some(recap)) => Ok(recap),
+                Ok(None) => {
+                    match sighting.opened_after() {
+                        Some(after) => log::info!(
+                            "Teams recap: open after {} s, but no AI summary within {} s",
+                            after.as_secs(),
+                            wait.as_secs()
+                        ),
+                        None => log::info!("Teams recap: not open within {} s", wait.as_secs()),
+                    }
+                    Err(sighting.missed(wait))
+                }
+                Err(error) => Err(MissedRecap::Failed(error)),
+            }
+        }
+
+        /// Go to an empty page and wait until the previous recap's page is
+        /// gone, so a poll that runs before the next recap loads cannot read
+        /// the previous one in its place.
+        async fn leave_page(&self) -> Result<()> {
+            self.window.navigate(Url::parse("about:blank").expect("constant URL"))?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                if execute_script(&self.window, "location.href").await.ok().as_deref() == Some("\"about:blank\"") {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(anyhow!("The Teams window did not leave the previous recap's page."))
+        }
+    }
+
+    impl<R: Runtime> Drop for RecapReader<R> {
+        fn drop(&mut self) {
+            let _ = self.window.close();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::RecapReader;
+
+/// Elsewhere there is no WebView2 window to read recaps in.
+#[cfg(not(target_os = "windows"))]
+pub(crate) struct RecapReader<R: tauri::Runtime>(std::marker::PhantomData<fn() -> R>);
+
+#[cfg(not(target_os = "windows"))]
+impl<R: tauri::Runtime> RecapReader<R> {
+    pub(crate) async fn open(_app: &tauri::AppHandle<R>) -> Result<Self> {
+        Err(anyhow!(WINDOWS_ONLY))
+    }
+
+    pub(crate) async fn read(&mut self, _url: &Url) -> std::result::Result<TeamsRecap, MissedRecap> {
+        Err(MissedRecap::Failed(anyhow!(WINDOWS_ONLY)))
+    }
 }
 
 /// Read one recap the user asked for: the window appears if Teams needs them.
+/// A sync reads its recaps through [`RecapReader`] instead.
 pub async fn extract_teams_recap<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     source_url: &str,
 ) -> Result<TeamsRecap> {
-    extract(app, source_url, true).await
-}
-
-/// Read one recap of many, with nobody watching: no window, and at most a
-/// minute before it fails with [`UNATTENDED_NO_SUMMARY`].
-pub async fn extract_teams_recap_unattended<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    source_url: &str,
-) -> Result<TeamsRecap> {
-    extract(app, source_url, false).await
-}
-
-async fn extract<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    source_url: &str,
-    interactive: bool,
-) -> Result<TeamsRecap> {
     let url = validate_recap_url(source_url)?;
     #[cfg(target_os = "windows")]
     {
-        windows::extract(app, &url, interactive).await
+        windows::extract(app, &url).await
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, url, interactive);
-        Err(anyhow!(
-            "Automatic Teams recap extraction requires Meetily on Windows with WebView2."
-        ))
+        let _ = (app, url);
+        Err(anyhow!(WINDOWS_ONLY))
     }
 }
 
