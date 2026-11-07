@@ -62,7 +62,8 @@ pub enum LiveMatch {
 
 impl RecapFacts {
     /// `recorded_at` is the stamp from the recording's file name; `listed_start`
-    /// is the RFC 3339 start time the Meet app row showed.
+    /// is the RFC 3339 start the Recap app row gave: when the meeting was
+    /// recorded, or else its calendar slot.
     pub fn from_link(
         link: &str,
         title: &str,

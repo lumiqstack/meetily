@@ -372,7 +372,7 @@ async fn claim_live_meeting(
 /// meeting Meetily already holds for the same recording, an earlier import of
 /// the same link, or a live recording of the same meeting; otherwise it
 /// becomes a new transcript-free meeting. `listed_start` is the start time the
-/// Meet app row showed, when the recap came from the list. Shared by the link
+/// Recap app row gave, when the recap came from the list. Shared by the link
 /// import and the recap sync.
 pub(crate) async fn persist_recap_from_link<R: Runtime>(
     app: &AppHandle<R>,

@@ -495,6 +495,89 @@ mod tests {
         assert_eq!(meeting_identity_key(stream), key);
     }
 
+    /// JavaScript's `encodeURIComponent`, which `teams_recap_list.js` applies
+    /// to every value of the links it builds.
+    fn encode_uri_component(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => (byte as char).to_string(),
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => (byte as char).to_string(),
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    }
+
+    /// A link as `teams_recap_list.js` builds it from a Recap app row whose
+    /// `recommendationData.url` is `file`: the Share button's keys in its
+    /// order, `fileUrl` with Office's `?web=1`, on the list page's host.
+    fn listed_link(host: &str, file: &str) -> String {
+        let occurrence = "040000008200E00074C5B7101A82E00807EA0B05000000000000000000000000000000001000000000112233445566778899AABBCCDDEEFF";
+        let series = format!("{}00000000{}", &occurrence[..32], &occurrence[40..]);
+        let file_url = format!("{file}?web=1");
+        let params = [
+            ("driveId", "b!drive"),
+            ("driveItemId", "01ITEM"),
+            ("sitePath", file),
+            ("fileUrl", file_url.as_str()),
+            ("iCalUid", occurrence),
+            ("masterICalUid", series.as_str()),
+            ("threadId", "19:meeting_abc@thread.v2"),
+            ("organizerId", "org-1"),
+            ("callId", "call-1"),
+            ("threadType", "meeting"),
+            ("meetingType", "Recurring"),
+            ("subType", "RecapSharingLink_RecapCore"),
+            ("recapType", "ODSPTranscript"),
+        ];
+        let query: Vec<String> = params
+            .iter()
+            .map(|(key, value)| format!("{key}={}", encode_uri_component(value)))
+            .collect();
+        format!("https://{host}/l/meetingrecap?{}", query.join("&"))
+    }
+
+    #[test]
+    fn a_link_built_from_a_recap_app_row_keys_and_dates_on_its_recording() {
+        let dir = "https://contoso-my.sharepoint.com/personal/jdoe_contoso_com/Documents/Recordings";
+        // (as the row writes the file, as SharePoint lists it, its title)
+        let files = [
+            (
+                format!("{dir}/Weekly%20sync-20261105_133311-Meeting%20Recording.mp4"),
+                format!("{dir}/Weekly sync-20261105_133311-Meeting Recording.mp4"),
+                "Weekly sync",
+            ),
+            (
+                format!("{dir}/Revisi%C3%B3n%20semanal-20261105_133311-Grabaci%C3%B3n%20de%20la%20reuni%C3%B3n.mp4"),
+                format!("{dir}/Revisión semanal-20261105_133311-Grabación de la reunión.mp4"),
+                "Revisión semanal",
+            ),
+        ];
+        for (row_file, listed_file, title) in &files {
+            for host in ["teams.cloud.microsoft", "teams.microsoft.com"] {
+                let link = listed_link(host, row_file);
+                assert!(validate_recap_url(&link).is_ok(), "{link}");
+                assert_eq!(link_kind(&link), LinkKind::RecapOfFile);
+                assert_eq!(meeting_identity_key(&link), meeting_identity_key(listed_file));
+                assert_eq!(meeting_identity_key(&link), meeting_identity_key(row_file));
+                let metadata = recording_metadata(&Url::parse(&link).unwrap()).expect("the file name's stamp");
+                assert_eq!(metadata.title, *title);
+                assert_eq!(metadata.recorded_at, "2026-11-05T13:33:11");
+            }
+        }
+    }
+
+    #[test]
+    fn a_listed_link_to_a_utc_stamped_file_keys_on_it_without_a_local_time() {
+        // A recording in the user's own OneDrive carries a UTC stamp, which is
+        // not the local time `recorded_at` means; the sync passes the row's
+        // start time instead.
+        let file = "https://contoso-my.sharepoint.com/personal/jdoe_contoso_com/Documents/Recordings/Weekly%20sync-20261105_233029UTC-Meeting%20Recording.mp4";
+        let link = listed_link("teams.cloud.microsoft", file);
+        assert_eq!(meeting_identity_key(&link), meeting_identity_key(file));
+        assert_eq!(recording_metadata(&Url::parse(&link).unwrap()), None);
+    }
+
     #[test]
     fn recap_link_without_file_url_keys_on_itself() {
         let a = "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Aabc&organizerId=1";
