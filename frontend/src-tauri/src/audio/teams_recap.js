@@ -1,8 +1,26 @@
 (() => {
+      // Where a read is waiting, for the log: the page's host and path with
+      // ids masked and no query, whether Teams sees the window, and how many
+      // frames the page has drawn.
+      const frames = window.__meetilyFrames ||= (() => {
+        const counter = { drawn: 0 };
+        const tick = () => { counter.drawn += 1; requestAnimationFrame(tick); };
+        requestAnimationFrame(tick);
+        return counter;
+      })();
+      const waiting = () => ({
+        status: 'waiting',
+        page: (location.host + location.pathname)
+          .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '{id}')
+          .slice(0, 80),
+        visibility: document.visibilityState,
+        focused: document.hasFocus(),
+        frames: frames.drawn
+      });
       const host = location.hostname.toLowerCase();
       if (!['teams.microsoft.com', 'teams.cloud.microsoft',
             'teams.microsoft.com.mcas.ms', 'teams.cloud.microsoft.mcas.ms'].includes(host)) {
-        return { status: 'waiting' };
+        return waiting();
       }
       const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
       const tabs = [...document.querySelectorAll('[role="tab"]')];
@@ -33,7 +51,7 @@
         // AI summary tab appears or when it has none.
         const share = [...document.querySelectorAll('[data-tid="recap-share-button"]')]
           .some(el => el.getClientRects().length > 0);
-        return { status: share ? 'recap_open' : 'waiting' };
+        return share ? { status: 'recap_open' } : waiting();
       }
       // From here the recap is open: 'recap_open' until its notes can be read.
       if (tab.getAttribute('aria-selected') !== 'true') {
