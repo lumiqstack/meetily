@@ -4,11 +4,12 @@
 //! recap never creates a second meeting or a second note, and a content hash
 //! per key turns an unchanged recap into a skip instead of a rewrite.
 //!
-//! The list itself comes from `teams_recap_list`, which reads the Recap app's
-//! ("Meeting Recaps") Home list in a hidden WebView2 window. Rows it lists without a recap link
-//! count as not ready. The listed recaps are then read one after another in
-//! one more hidden window, `teams_recap::RecapReader`, so Teams starts once
-//! per sync. See docs/TEAMS_RECAP_SYNC_SPEC.md.
+//! A sync opens one WebView2 window, `teams_recap::RecapReader`. There it
+//! reads the Recap app's ("Meeting Recaps") Home list through
+//! `teams_recap_list`, which is where Teams may ask the user to pick their
+//! account, and then every listed recap. So Teams starts and signs in once per
+//! sync. Rows listed without a recap link count as not ready. See
+//! docs/TEAMS_RECAP_SYNC_SPEC.md.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -200,6 +201,9 @@ enum Outcome {
     Updated,
     Skipped,
     NotReady,
+    /// Teams did not open the recap in time. The sync tries it once more after
+    /// the others, then counts it failed with this message.
+    NotOpened(String),
     Failed(String),
 }
 
@@ -211,6 +215,7 @@ impl Outcome {
             Outcome::Updated => "updated",
             Outcome::Skipped => "unchanged",
             Outcome::NotReady => "not ready",
+            Outcome::NotOpened(_) => "not open",
             Outcome::Failed(_) => "failed",
         }
     }
@@ -308,11 +313,13 @@ fn content_hash(markdown: &str) -> String {
 }
 
 /// A recap Teams opened without an AI summary may still be in the works, so it
-/// stays unrecorded and the next sync retries it. Any other miss failed, and
-/// the report says why.
+/// stays unrecorded and the next sync retries it. One Teams did not open gets
+/// another read this sync. Any other miss failed, and the report says why.
 fn missed_outcome(missed: crate::audio::teams_recap::MissedRecap) -> Outcome {
+    use crate::audio::teams_recap::MissedRecap;
     match missed {
-        crate::audio::teams_recap::MissedRecap::NoSummary => Outcome::NotReady,
+        MissedRecap::NoSummary => Outcome::NotReady,
+        missed @ MissedRecap::NotOpened { .. } => Outcome::NotOpened(missed.to_string()),
         missed => Outcome::Failed(missed.to_string()),
     }
 }
@@ -401,6 +408,68 @@ async fn import_candidate<R: Runtime>(
     written_outcome(seen_before.is_some(), &persisted)
 }
 
+/// Imports one listed recap. The sync's reads Teams; tests stand in for it.
+trait RecapImporter {
+    /// Before each read: how many recaps already have their outcome.
+    fn starting(&mut self, _settled: usize, _total: usize, _candidate: &RecapCandidate) {}
+    async fn import(&mut self, candidate: &RecapCandidate) -> Outcome;
+}
+
+/// Reads each recap in the sync's Teams window and reports progress.
+struct WindowImporter<'a, R: Runtime> {
+    app: &'a AppHandle<R>,
+    pool: &'a sqlx::SqlitePool,
+    known: &'a HashMap<String, ImportedRecap>,
+    reader: &'a mut crate::audio::teams_recap::RecapReader<R>,
+}
+
+impl<R: Runtime> RecapImporter for WindowImporter<'_, R> {
+    fn starting(&mut self, settled: usize, total: usize, candidate: &RecapCandidate) {
+        let _ = self.app.emit(
+            PROGRESS_EVENT,
+            SyncProgress { done: settled, total, current_title: &candidate.title },
+        );
+    }
+
+    async fn import(&mut self, candidate: &RecapCandidate) -> Outcome {
+        import_candidate(self.app, self.pool, self.known, candidate, &mut *self.reader).await
+    }
+}
+
+/// Import every candidate in order, then once more each one Teams did not
+/// open. On 2026-11-07 the first 7 recaps of a sync never opened and the 23
+/// after them all did.
+async fn import_all(
+    candidates: &[RecapCandidate],
+    importer: &mut impl RecapImporter,
+    report: &mut RecapSyncReport,
+) {
+    let total = candidates.len();
+    let mut settled = 0;
+    let mut not_opened = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        importer.starting(settled, total, candidate);
+        info!("[recap-sync] recap {}/{total}", index + 1);
+        let outcome = importer.import(candidate).await;
+        info!("[recap-sync] recap {}/{total}: {}", index + 1, outcome.label());
+        if matches!(outcome, Outcome::NotOpened(_)) {
+            not_opened.push(candidate);
+        } else {
+            settled += 1;
+            report.tally(&candidate.title, outcome);
+        }
+    }
+    let retries = not_opened.len();
+    for (index, candidate) in not_opened.into_iter().enumerate() {
+        importer.starting(settled, total, candidate);
+        info!("[recap-sync] retry {}/{retries}", index + 1);
+        let outcome = importer.import(candidate).await;
+        info!("[recap-sync] retry {}/{retries}: {}", index + 1, outcome.label());
+        settled += 1;
+        report.tally(&candidate.title, outcome);
+    }
+}
+
 /// Whether the scan window may move on. A sync that read no recap learned
 /// nothing, and may have misread the list, so moving on could lose the rest of
 /// the first sync's backfill for good.
@@ -433,7 +502,7 @@ impl RecapSyncReport {
             Outcome::Updated => self.updated += 1,
             Outcome::Skipped => self.skipped += 1,
             Outcome::NotReady => self.not_ready += 1,
-            Outcome::Failed(error) => {
+            Outcome::NotOpened(error) | Outcome::Failed(error) => {
                 warn!("[recap-sync] {title}: {error}");
                 self.failed.push(RecapSyncFailure { title: title.to_owned(), error });
             }
@@ -457,9 +526,16 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let state = load_state(app);
     let since = scan_window_start(&state, started_at);
     info!("[recap-sync] listing recaps since {}", since.to_rfc3339());
-    let listing = super::teams_recap_list::list_recaps(app, since, false)
-        .await
-        .map_err(|e| e.to_string())?;
+    // One Teams window for the whole sync. It reads the list first, which is
+    // where Teams may ask the user to pick their account, and then every
+    // recap, so they are read where the user signed in. On 2026-11-07 a second
+    // hidden window opened after the list did not open a recap for 10 minutes.
+    let mut reader = crate::audio::teams_recap::RecapReader::open(app).await.map_err(|e| {
+        let error = format!("Could not open the Teams window for the recaps: {e}");
+        warn!("[recap-sync] {error}");
+        error
+    })?;
+    let listing = reader.list(since).await.map_err(|e| e.to_string())?;
     record_listing(app, &LastListing::from_listing(Utc::now(), since, &listing));
     if let Some(error) = &listing.error {
         return Err(error.clone());
@@ -478,28 +554,9 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let mut ordered = listing.candidates;
     ordered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     let total = ordered.len();
-    if total > 0 {
-        // One hidden window reads every recap, so Teams starts once per sync
-        // instead of once per recap. It closes when the loop ends.
-        let mut reader = match crate::audio::teams_recap::RecapReader::open(app).await {
-            Ok(reader) => reader,
-            Err(e) => {
-                let error = format!("Could not open the Teams window for the recaps: {e}");
-                warn!("[recap-sync] {error}");
-                return Err(error);
-            }
-        };
-        for (done, candidate) in ordered.iter().enumerate() {
-            let _ = app.emit(
-                PROGRESS_EVENT,
-                SyncProgress { done, total, current_title: &candidate.title },
-            );
-            info!("[recap-sync] recap {}/{total}", done + 1);
-            let outcome = import_candidate(app, pool, &state.imported, candidate, &mut reader).await;
-            info!("[recap-sync] recap {}/{total}: {}", done + 1, outcome.label());
-            report.tally(&candidate.title, outcome);
-        }
-    }
+    let mut importer = WindowImporter { app, pool, known: &state.imported, reader: &mut reader };
+    import_all(&ordered, &mut importer, &mut report).await;
+    drop(reader);
     let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
 
     if !read_any_recap(&report) {
@@ -657,7 +714,7 @@ mod tests {
         // opened them, and the report called every one "not ready".
         assert_eq!(
             missed_outcome(MissedRecap::NotOpened { waited: std::time::Duration::from_secs(60) }),
-            Outcome::Failed("Teams did not open this recap within 60 seconds.".into())
+            Outcome::NotOpened("Teams did not open this recap within 60 seconds.".into())
         );
         assert_eq!(
             missed_outcome(MissedRecap::Failed(anyhow!("Teams stayed on its app-choice page."))),
@@ -711,10 +768,61 @@ mod tests {
         report.tally("D", Outcome::Skipped);
         report.tally("E", Outcome::NotReady);
         report.tally("F", Outcome::Failed("boom".into()));
+        report.tally("G", Outcome::NotOpened("not open".into()));
         assert_eq!((report.new, report.updated, report.skipped, report.not_ready), (2, 1, 1, 1));
         assert_eq!(report.possible_duplicates, vec!["B".to_string()]);
         assert_eq!(report.failed[0].title, "F");
         assert_eq!(report.failed[0].error, "boom");
+        assert_eq!((report.failed[1].title.as_str(), report.failed[1].error.as_str()), ("G", "not open"));
+    }
+
+    /// Plays back each title's outcomes in turn and notes what it was asked.
+    #[derive(Default)]
+    struct Scripted {
+        outcomes: HashMap<&'static str, Vec<Outcome>>,
+        reads: Vec<String>,
+        settled: Vec<usize>,
+    }
+
+    impl RecapImporter for Scripted {
+        fn starting(&mut self, settled: usize, _total: usize, _candidate: &RecapCandidate) {
+            self.settled.push(settled);
+        }
+
+        async fn import(&mut self, candidate: &RecapCandidate) -> Outcome {
+            self.reads.push(candidate.title.clone());
+            self.outcomes.get_mut(candidate.title.as_str()).expect("scripted title").remove(0)
+        }
+    }
+
+    fn candidate(title: &str) -> RecapCandidate {
+        RecapCandidate { recap_url: format!("https://teams.cloud.microsoft/l/meetingrecap?threadId={title}"), title: title.into(), started_at: None }
+    }
+
+    #[tokio::test]
+    async fn a_recap_teams_did_not_open_is_read_again_after_the_others() {
+        let not_open = || Outcome::NotOpened("Teams did not open this recap within 60 seconds.".into());
+        let mut importer = Scripted {
+            outcomes: HashMap::from([
+                ("A", vec![not_open(), Outcome::New { possible_duplicate: false }]),
+                ("B", vec![Outcome::NotReady]),
+                ("C", vec![not_open(), not_open()]),
+                ("D", vec![Outcome::Skipped]),
+            ]),
+            ..Default::default()
+        };
+        let mut report = RecapSyncReport::default();
+        let candidates = ["A", "B", "C", "D"].map(candidate);
+        import_all(&candidates, &mut importer, &mut report).await;
+
+        // A recap that opened without notes (B) is not read again this sync.
+        assert_eq!(importer.reads, ["A", "B", "C", "D", "A", "C"]);
+        // Progress counts recaps that have their outcome, so it never runs back.
+        assert_eq!(importer.settled, [0, 0, 1, 1, 2, 3]);
+        assert_eq!((report.new, report.not_ready, report.skipped), (1, 1, 1));
+        assert_eq!(report.failed.len(), 1, "a recap counts once, by its second read");
+        assert_eq!(report.failed[0].title, "C");
+        assert_eq!(report.failed[0].error, "Teams did not open this recap within 60 seconds.");
     }
 
     fn recap_link(file: &str) -> String {

@@ -11,8 +11,10 @@ function tab(name, selected = false) {
 }
 function probe(tabs, host = 'teams.cloud.microsoft') {
   return runInNewContext(script, {
-    location: { hostname: host },
-    document: { body: { innerText: '' },
+    window: {},
+    requestAnimationFrame: () => 0,
+    location: { hostname: host, host, pathname: '/' },
+    document: { body: { innerText: '' }, visibilityState: 'visible', hasFocus: () => true,
       querySelectorAll: selector => selector === '[role="tab"]' ? tabs : [] },
   });
 }

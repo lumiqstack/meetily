@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-06. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"): on the Windows machine its list check found the week's 23 meetings, each with a recap link naming its recording file. No real sync has run yet, so the import half of step 3, the QA checklist (step 4) and the live matching of steps 5 and 6 are not yet exercised on Windows.
+Status: 2026-11-07. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"). Three real syncs have run on the Windows machine. The third listed the 30 recaps since Oct 29 and imported all 30 (see Reading recaps). The QA checklist (step 4) and the live matching of steps 5 and 6 are not yet fully exercised on Windows.
 
 ## Goal
 
@@ -69,18 +69,18 @@ code.
 ## Architecture
 
 ```
-Settings (since date)          Teams Recap app, hidden WebView2
+Settings (since date)          the sync's one Teams window (RecapReader)
         │                                  │
         ▼                                  ▼
 sync_teams_recaps_command ──► RecapListScanner ──► Vec<RecapCandidate>
-        │                                           (recap link, title,
+        │                     (Teams Recap app)     (recap link, title,
         │                                            recorded_at, fileUrl)
         ▼
-   for each candidate
+   for each candidate, then once more each one Teams did not open
         ├── identity: canonical fileUrl key
         ├── lookup meeting by key (recap sync state, then meeting_sources)
         ├── no key found: match a live recording by calendar window
-        ├── read the recap in the sync's one Teams window (RecapReader)
+        ├── read the recap in the same window
         ├── create meeting | attach summary to existing meeting
         ├── export_copilot_recap_note (new or overwrite)
         └── record outcome in sync state
@@ -88,9 +88,9 @@ sync_teams_recaps_command ──► RecapListScanner ──► Vec<RecapCandidat
    RecapSyncReport ──► toast
 ```
 
-The scanner and the reader are new. The reader runs the link import's page
-script; everything after it reuses the summary repository and Obsidian
-exporter.
+The scanner and the reader are new. The reader's window reads the list first,
+then every recap, with the link import's page script; everything after it
+reuses the summary repository and Obsidian exporter.
 
 ### Identity
 
@@ -441,8 +441,9 @@ For each candidate, oldest first:
    - not ready: Teams opened the recap but showed no AI notes in time, for
      example because it is still generating them. Count "not ready", do not
      touch the store, continue.
-   - not opened in time, or any other error: count "failed" with the message,
-     continue.
+   - not opened in time: read it once more after the other recaps. If it
+     still does not open, count "failed" with the message.
+   - any other error: count "failed" with the message, continue.
 3. Build the recap markdown exactly as the link import does, including the
    "Open original Teams recap" link.
 4. Compute `content_hash` over the markdown. If the store has the key with the
@@ -483,24 +484,41 @@ starts, and re-running converges to the same state.
 
 ### Reading recaps
 
-The listing has just proved sign-in, so nobody needs to watch the recaps being
-read. One hidden window, opened after the listing and closed when the loop
-ends, reads them one after another, so Teams starts once per sync. The first
-read may take 3 minutes, since Teams starts during it; each later read gets 1
-minute. In the first real sync, on 2026-11-06, each recap had a fresh window and
-a minute. All 30 ran out of time while Teams started. In the one window where
-Teams did start, a recap opened 12 s after its link.
+A sync opens one Teams window and closes it when the sync ends. The list is
+read in it first. Teams may ask the user to pick their account there, so the
+window shows itself when the list is not read within 25 s. Then the same window
+reads every recap, where the user signed in, so Teams starts and signs in once
+per sync. The first read may take 3 minutes; each later read gets 1 minute. If
+the window is still hidden and no recap has opened in it 25 s into a read, it
+shows itself, as the list's does.
+
+Three real syncs led here. In the first, on 2026-11-06, each recap had a fresh
+hidden window and a minute, and all 30 ran out of time while Teams started. In
+the second, on 2026-11-07, the recaps had one hidden window, opened after the
+list's window closed. The first 7 did not open in 10 minutes, and the 23 after
+them opened 7 to 18 s after their links. Whether that window needed the account
+choice again, or Teams waited for something else while hidden, the log did not
+say. The third, later that day, read the list and the recaps in one window,
+shown 25 s into the list. All 30 recaps opened 6 to 16 s after their links, the
+first one included, and none needed the retry.
 
 Before each recap the window goes to `about:blank` and waits until the previous
 recap's page is gone. Otherwise a poll that runs before the next page loads
 could read the previous recap in its place. The page script reports
 `recap_open` once the recap's Share button (`data-tid="recap-share-button"`) or
 its AI summary tab is on the page. A read that runs out of time after that is
-"not ready"; a read that never saw it failed, with `Teams did not open this
+"not ready". A read that never saw it is tried once more after the other
+recaps, and fails if it still does not open, with `Teams did not open this
 recap within N seconds.`
 
+While a read waits, the page script also reports where: the page's host and
+path, with ids masked and no query; whether the page is visible and focused;
+and how many frames it has drawn. The log names them each time they change, and
+in the line ending a read that never opened, so a stall on a sign-in page can
+be told from Teams not drawing in a hidden window.
+
 The window holds `AUTH_FLOW_LOCK` while it is open, so a SharePoint scan or
-recording import started during the loop waits for the loop to end.
+recording import started during the sync waits for it to end.
 
 ### Dedupe in the manual link import
 
@@ -616,8 +634,10 @@ button also writes the probe file described above, on that machine only.
 - Unit, `#[cfg(not(windows))]`-guarded where `mock_app` is used: the loop over a
   fake extractor returning ready, not ready and error in sequence.
 - Unit, for reading recaps: the first read's 3 minutes and later reads' 1
-  minute, and the verdict on a read that ran out of time (not ready only if
-  the recap opened).
+  minute, the verdict on a read that ran out of time (not ready only if the
+  recap opened), and how a waiting page is logged. The loop over a scripted
+  importer: a recap Teams did not open is read again after the others and
+  counts once, by its second read; progress never runs back.
 - Unit, for dates: a listed recap is dated by its row and a pasted one by its
   stamp; only a `copilot-recap` meeting more than 15 minutes off its row moves,
   once; a moved note takes its new date's name, and only that meeting's old
@@ -625,7 +645,8 @@ button also writes the probe file described above, on that machine only.
 - Browser fixture: `frontend/tests/browser/teams-recap-list.browser.cjs`
   checks the list script's links, times, groups, stop rule and probe against a
   synthetic Recap app. `teams-recap-dom.browser.cjs` checks the recap page
-  script, including when it reports `recap_open`.
+  script, including when it reports `recap_open` and what it says about a
+  page it waits on.
 - Manual on Windows: the checklist in `docs/TEAMS_RECAP_SYNC_QA.md`.
 
 ## Open questions
@@ -637,11 +658,16 @@ button also writes the probe file described above, on that machine only.
   started. The 9th window reached a chat at 33 s. Meetily reopened the link,
   and the recap was being read 12 s later when its minute ran out. Recaps are
   now read in one window (see Reading recaps).
-- Settled for recaps: Teams renders in a hidden window. That 9th window, never
-  shown, reached the chat and then the recap's AI summary. Still open for the
-  list: its window is shown after 25 s, before Teams has started. The probe's
-  frame count and the `[recap-list] showing the window` log line tell whether
-  the list was read while hidden.
+- Teams can render in a hidden window: that 9th window, never shown, reached
+  the chat and then the recap's AI summary, and in the second sync 23 recaps
+  were read in a hidden window. But the list has never been read while hidden:
+  its window is shown after 25 s every time, and Teams asked the user to pick
+  their account in it. In the second sync the hidden window opened after the
+  list's did not open a recap for its first 10 minutes. The user's session had
+  locked by the time recaps opened. Still open: what that window waited on.
+  The sync now reads in the list's window. In the third sync that window,
+  shown 25 s into the list, opened all 30 recaps, the first 10 s after its
+  link. The waiting log line will say if a read ever stalls.
 - A read tells a recap Teams opened without AI notes (not ready) from one it
   never opened (failed). It cannot tell "still generating" from "no AI notes
   for this meeting": both count as "not ready" and retry on every sync until
