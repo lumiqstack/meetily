@@ -28,14 +28,15 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function pageFor(content) {
+async function pageWith(body) {
   const page = await browser.newPage();
   // Synthetic local fixture. No authenticated Teams page or personal data.
-  await page.route('https://teams.cloud.microsoft/**', route => route.fulfill({
-    contentType: 'text/html', body: `<button role="tab" aria-selected="true">AI summary</button><div role="tabpanel">${content}</div>`,
-  }));
+  await page.route('https://teams.cloud.microsoft/**', route => route.fulfill({ contentType: 'text/html', body }));
   await page.goto('https://teams.cloud.microsoft/fixture');
   return page;
+}
+async function pageFor(content) {
+  return pageWith(`<button role="tab" aria-selected="true">AI summary</button><div role="tabpanel">${content}</div>`);
 }
 async function ready(page) {
   let result;
@@ -46,6 +47,25 @@ async function ready(page) {
   assert.fail(`Expected complete recap, got ${result.status}`);
 }
 const notes = '<h3>Meeting notes</h3><div role="row"><strong>Planning:</strong> Keep the release small.</div><div role="row" aria-level="2">. Scope: Confirm the estimate.</div>';
+
+// A sync tells a recap Teams opened without an AI summary (not ready) from one
+// Teams never opened (failed) by whether any poll said `recap_open` or later.
+test('says the recap is open from its Share button until its notes can be read', async () => {
+  const share = '<button data-tid="recap-share-button">Share</button>';
+  for (const [body, status] of [
+    ['<div>Loading</div>', 'waiting'],
+    ['<button data-tid="recap-share-button" style="display:none">Share</button>', 'waiting'],
+    [share + '<div role="tablist"><button role="tab" aria-selected="true">Recap</button></div>', 'recap_open'],
+    ['<button role="tab" aria-selected="false">AI summary</button>', 'recap_open'],
+    ['<button role="tab" aria-selected="true">AI summary</button><div role="tabpanel">Generating notes</div>', 'recap_open'],
+    // A chat Teams restored after sign-in is never taken for the recap.
+    [share + '<button role="tab">Chat</button><button role="tab" aria-selected="false">Recap</button>', 'signed_in_chat'],
+  ]) {
+    const page = await pageWith(body);
+    try { assert.equal((await page.evaluate(script)).status, status, body); }
+    finally { await page.close(); }
+  }
+});
 
 test('preserves bold topics, child indentation and follow-up list items', async () => {
   const page = await pageFor(notes + '<h3>Follow-up tasks</h3><ul><li><strong>Send estimate:</strong> Alex to send it tomorrow.</li></ul>');
