@@ -157,7 +157,7 @@ const COPILOT_RECAP_SOURCE: &str = "copilot-recap";
 /// dated further off was dated by something else, such as the import's clock.
 const SAME_START_MINUTES: i64 = 15;
 
-fn listed_instant(listed_start: Option<&str>) -> Option<DateTime<Utc>> {
+pub(crate) fn listed_instant(listed_start: Option<&str>) -> Option<DateTime<Utc>> {
     listed_start
         .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
         .map(|value| value.with_timezone(&Utc))

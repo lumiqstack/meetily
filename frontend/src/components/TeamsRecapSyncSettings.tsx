@@ -34,6 +34,7 @@ interface RecapSyncReport {
   new: number;
   updated: number;
   skipped: number;
+  kept: number;
   notReady: number;
   failed: { title: string; error: string }[];
   possibleDuplicates: string[];
@@ -46,7 +47,11 @@ interface SyncProgress {
   currentTitle: string;
 }
 
-/** One line of counts for the finished-sync toast. */
+/**
+ * One line of counts for the finished-sync toast. A recap the sync kept
+ * without opening counts as unchanged: a sync read it a day or more after its
+ * meeting.
+ */
 export function describeSyncReport(report: RecapSyncReport): string {
   if (report.scanned === 0) {
     return 'No recaps listed in the scan window.';
@@ -54,7 +59,7 @@ export function describeSyncReport(report: RecapSyncReport): string {
   const parts = [
     `${report.new} new`,
     `${report.updated} updated`,
-    `${report.skipped} unchanged`,
+    `${report.skipped + report.kept} unchanged`,
   ];
   if (report.notReady > 0) parts.push(`${report.notReady} not ready yet`);
   if (report.failed.length > 0) parts.push(`${report.failed.length} failed`);
