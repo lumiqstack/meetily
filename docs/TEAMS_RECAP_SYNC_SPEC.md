@@ -446,17 +446,27 @@ For each candidate, oldest first:
 3. Build the recap markdown exactly as the link import does, including the
    "Open original Teams recap" link.
 4. Compute `content_hash` over the markdown. If the store has the key with the
-   same hash, count "skipped" and continue.
+   same hash, count "skipped" and continue, unless the meeting needs a new
+   date (see step 5).
 5. No existing meeting: create it through `create_meeting_with_imported_summary`
    with `import_source` `copilot-recap`, `recording_url` from `fileUrl`, and
-   `recorded_at` from the link. Count "new".
+   `recorded_at` from the link. Date it by the row's start, the earliest
+   transcript or recording start Teams gave. That start is an instant, and many
+   recaps have no recording in their link, so no stamp to date them by. Count
+   "new".
    Existing meeting: write the recap as its summary through
    `update_meeting_summary`, keeping the meeting's title, tags, transcript and
    source. Count "updated" (or "new" if that meeting had no summary yet). A
-   live recording also gets its `meeting_sources` row here.
+   live recording also gets its `meeting_sources` row here. A `copilot-recap`
+   meeting dated more than 15 minutes from the row's start moves to that start.
+   This repairs recaps imported before the sync dated by the row: those with no
+   recording were dated at the import. Closer than 15 minutes is the same start
+   read another way (recording, transcript or calendar slot), so it stays.
 6. Export the vault note through `export_copilot_recap_note` for recap-only
    meetings, or `export_meeting_note` with the stored transcript for meetings
-   that have one. Both overwrite the pinned filename.
+   that have one. Both overwrite the pinned filename. A meeting that moved in
+   step 5 gets the name its new date gives instead, and the note under its old
+   name is deleted if it is still that meeting's note.
 7. Record the key, meeting id, time and hash in the store.
 
 After the loop, `last_sync_date` becomes the sync start time. The next sync
@@ -608,6 +618,10 @@ button also writes the probe file described above, on that machine only.
 - Unit, for reading recaps: the first read's 3 minutes and later reads' 1
   minute, and the verdict on a read that ran out of time (not ready only if
   the recap opened).
+- Unit, for dates: a listed recap is dated by its row and a pasted one by its
+  stamp; only a `copilot-recap` meeting more than 15 minutes off its row moves,
+  once; a moved note takes its new date's name, and only that meeting's old
+  note is deleted, whatever the case of its name.
 - Browser fixture: `frontend/tests/browser/teams-recap-list.browser.cjs`
   checks the list script's links, times, groups, stop rule and probe against a
   synthetic Recap app. `teams-recap-dom.browser.cjs` checks the recap page
@@ -637,9 +651,10 @@ button also writes the probe file described above, on that machine only.
   in November 2026, 11 carry a `UTC` stamp equal to the recorded time. Of the 12
   local stamps, 6 are this machine's zone (UTC−6) and 6 are an hour or two later
   (UTC−5 and UTC−4), presumably the zone of whoever recorded. The sync tries the
-  row's exact time first, and the recording rule tries SharePoint's `created`
-  before an unmarked stamp, so this matters where the stamp is the only time: a
-  pasted link, which then reads an hour or two off, usually misses the live
+  row's exact time first, both to match and to date the meeting, and the
+  recording rule tries SharePoint's `created` before an unmarked stamp, so this
+  matters where the stamp is the only time: a pasted link, which then reads an
+  hour or two off, usually misses the live
   meeting's window and costs a second meeting. It can reach a wrong attach only
   if a meeting sharing the thread or title was recorded live at that wrong hour.
   Still open: how to tell the recorder's zone from the file.
