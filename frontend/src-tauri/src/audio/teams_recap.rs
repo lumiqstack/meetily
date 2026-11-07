@@ -167,10 +167,49 @@ mod reading {
         }
     }
 
+    /// Where the page was while the script said `waiting`, as it reports it:
+    /// host and path with ids masked, never the query or the page's text.
+    #[derive(Debug, Default, Clone, PartialEq, serde::Deserialize)]
+    pub(super) struct Whereabouts {
+        #[serde(default)]
+        page: Option<String>,
+        #[serde(default)]
+        visibility: Option<String>,
+        #[serde(default)]
+        focused: Option<bool>,
+        #[serde(default)]
+        frames: Option<u64>,
+    }
+
+    impl Whereabouts {
+        /// The page and how Teams sees the window, for the log, or `None` when
+        /// the script said nothing about it.
+        pub(super) fn place(&self) -> Option<String> {
+            let page: String = self.page.as_deref()?.chars().take(100).collect();
+            let visibility = match self.visibility.as_deref() {
+                Some("visible") => "visible",
+                Some("hidden") => "hidden",
+                _ => "visibility unknown",
+            };
+            let focus = match self.focused {
+                Some(true) => "focused",
+                Some(false) => "not focused",
+                None => "focus unknown",
+            };
+            Some(format!("{page}, {visibility}, {focus}"))
+        }
+
+        /// Frames the page has drawn since it loaded.
+        pub(super) fn frames(&self) -> Option<u64> {
+            self.frames
+        }
+    }
+
     /// What one read has seen of its recap, from the page script's states.
     #[derive(Debug, Default)]
     pub(super) struct Sighting {
         opened_after: Option<Duration>,
+        last_wait: Option<String>,
     }
 
     impl Sighting {
@@ -180,6 +219,21 @@ mod reading {
             {
                 self.opened_after = Some(elapsed);
             }
+        }
+
+        /// Note where the page waited, for the read's last log line.
+        pub(super) fn waited_on(&mut self, whereabouts: &Whereabouts) {
+            if let Some(place) = whereabouts.place() {
+                self.last_wait = Some(match whereabouts.frames() {
+                    Some(frames) => format!("{place}, {frames} frames"),
+                    None => place,
+                });
+            }
+        }
+
+        /// Where the page last waited, with its frame count then.
+        pub(super) fn last_wait(&self) -> Option<&str> {
+            self.last_wait.as_deref()
         }
 
         /// How long after its link the recap first showed, if it did.
@@ -225,6 +279,38 @@ mod reading {
             sighting.observe("collecting_recap", secs(20));
             assert_eq!(sighting.opened_after(), Some(secs(14)), "the first sighting counts");
             assert!(matches!(sighting.missed(secs(60)), MissedRecap::NoSummary));
+        }
+
+        #[test]
+        fn a_waiting_page_is_logged_by_host_path_visibility_and_frames() {
+            let seen: Whereabouts = serde_json::from_str(
+                r#"{"status":"waiting","page":"login.microsoftonline.com/{id}/oauth2/v2.0/authorize","visibility":"hidden","focused":false,"frames":0}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                seen.place().as_deref(),
+                Some("login.microsoftonline.com/{id}/oauth2/v2.0/authorize, hidden, not focused")
+            );
+            let mut sighting = Sighting::default();
+            assert_eq!(sighting.last_wait(), None);
+            sighting.waited_on(&seen);
+            assert_eq!(
+                sighting.last_wait(),
+                Some("login.microsoftonline.com/{id}/oauth2/v2.0/authorize, hidden, not focused, 0 frames")
+            );
+
+            // Only fixed words for visibility, and a page name of bounded length.
+            let odd: Whereabouts = serde_json::from_str(&format!(
+                r#"{{"page":"{}","visibility":"prerender <b>"}}"#,
+                "a".repeat(300)
+            ))
+            .unwrap();
+            assert_eq!(odd.place(), Some(format!("{}, visibility unknown, focus unknown", "a".repeat(100))));
+            // A script that says nothing about the page leaves no line.
+            let silent: Whereabouts = serde_json::from_str(r#"{"status":"waiting"}"#).unwrap();
+            assert_eq!(silent.place(), None);
+            sighting.waited_on(&silent);
+            assert!(sighting.last_wait().unwrap().starts_with("login.microsoftonline.com"));
         }
 
         #[test]
@@ -294,7 +380,12 @@ pub(crate) mod windows {
         notes: Vec<String>,
         #[serde(default)]
         tasks: Vec<String>,
+        #[serde(flatten)]
+        whereabouts: super::reading::Whereabouts,
     }
+
+    /// The window's title while a sync reads its recaps.
+    const READING_TITLE: &str = "Teams recaps — Meetily is reading them. Leave this window open.";
 
     pub(crate) async fn block_desktop_handoff<R: Runtime>(window: &WebviewWindow<R>) -> Result<()> {
         let (sender, receiver) = oneshot::channel::<Result<(), String>>();
@@ -415,7 +506,7 @@ pub(crate) mod windows {
     ) -> Result<Option<TeamsRecap>> {
         let mut launcher_since = None;
         let mut tasks_since = None;
-        let mut previous_status = String::new();
+        let mut previous_state = String::new();
         while tokio::time::Instant::now() < deadline {
             if window.url().is_err() {
                 return Err(anyhow!(
@@ -424,7 +515,8 @@ pub(crate) mod windows {
             }
             if let Ok(raw) = execute_script(window, RECAP_SCRIPT).await {
                 if let Ok(probe) = serde_json::from_str::<Probe>(&raw) {
-                    // Only log fixed state names, never page text or private URLs.
+                    // Only fixed state names, and for a waiting page its host and
+                    // path: never page text, queries or titles.
                     let status = match probe.status.as_str() {
                         "ready" => "ready",
                         "launcher" => "launcher",
@@ -435,9 +527,20 @@ pub(crate) mod windows {
                         "recap_open" => "recap_open",
                         _ => "waiting",
                     };
-                    if status != previous_status {
-                        log::info!("Teams recap state: {status}");
-                        previous_status = status.to_owned();
+                    let place = if status == "waiting" { probe.whereabouts.place() } else { None };
+                    let state = match &place {
+                        Some(place) => format!("{status} on {place}"),
+                        None => status.to_owned(),
+                    };
+                    if state != previous_state {
+                        match probe.whereabouts.frames().filter(|_| place.is_some()) {
+                            Some(frames) => log::info!("Teams recap state: {state}, {frames} frames"),
+                            None => log::info!("Teams recap state: {state}"),
+                        }
+                        previous_state = state;
+                    }
+                    if place.is_some() {
+                        sighting.waited_on(&probe.whereabouts);
                     }
                     sighting.observe(status, started.elapsed());
                     match navigation.observe(status, started.elapsed().as_millis() as u64) {
@@ -496,7 +599,7 @@ pub(crate) mod windows {
     /// The hidden window every Teams flow here uses, on the shared profile,
     /// with the desktop app hand-off blocked before any Teams page loads.
     /// Callers hold `AUTH_FLOW_LOCK` for as long as it is open.
-    async fn open_window<R: Runtime>(app: &AppHandle<R>, url: &Url) -> Result<WebviewWindow<R>> {
+    pub(crate) async fn open_window<R: Runtime>(app: &AppHandle<R>, url: &Url) -> Result<WebviewWindow<R>> {
         let data_dir = app
             .path()
             .app_data_dir()
@@ -544,12 +647,14 @@ pub(crate) mod windows {
         result
     }
 
-    /// Reads a sync's recaps one after another in one hidden window, so Teams
-    /// starts once per sync instead of once per recap. Dropping it closes the
-    /// window.
+    /// A sync's one Teams window: it reads the Recap app's list, then the
+    /// recaps one after another, so Teams starts and signs in once per sync.
+    /// Dropping it closes the window.
     pub(crate) struct RecapReader<R: Runtime> {
         window: WebviewWindow<R>,
         reads: usize,
+        /// Whether a recap has opened in this window yet.
+        opened_any: bool,
         /// Held while the window is open: every Teams and SharePoint flow
         /// uses its profile and window label.
         _auth_flow: tokio::sync::MutexGuard<'static, ()>,
@@ -561,22 +666,56 @@ pub(crate) mod windows {
             // Names the window only: it opens on about:blank.
             let teams = Url::parse(crate::audio::teams_recap_list::TEAMS_WEB_URL).expect("constant URL");
             let window = open_window(app, &teams).await?;
-            Ok(Self { window, reads: 0, _auth_flow: auth_flow })
+            Ok(Self { window, reads: 0, opened_any: false, _auth_flow: auth_flow })
         }
 
-        /// Read one recap. Nobody is watching, so the window stays hidden and
-        /// a recap that does not open in time is given up.
+        /// Read the Recap app's list in this window. It shows itself when the
+        /// list is not read while hidden, so the user can pick their account,
+        /// and the recaps are then read where they signed in.
+        pub(crate) async fn list(
+            &self,
+            since: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::audio::teams_recap_list::RecapListing> {
+            crate::audio::teams_recap_list::windows::list_in(&self.window, since, false).await
+        }
+
+        /// Read one recap, giving up on it when it does not open in time. If
+        /// the window is hidden and no recap has opened in it yet, it shows
+        /// itself after [`SILENT_WAIT`], as the list does.
         pub(crate) async fn read(&mut self, url: &Url) -> std::result::Result<TeamsRecap, MissedRecap> {
             let wait = super::reading::wait_for(self.reads);
+            if self.reads == 0 {
+                let _ = self.window.set_title(READING_TITLE);
+            }
             self.reads += 1;
             self.leave_page().await.map_err(MissedRecap::Failed)?;
             self.window
                 .navigate(url.clone())
                 .map_err(|error| MissedRecap::Failed(error.into()))?;
             let started = tokio::time::Instant::now();
+            let deadline = started + wait;
             let mut navigation = navigation::Navigation::default();
             let mut sighting = super::reading::Sighting::default();
-            match poll(&self.window, started + wait, url, &mut navigation, &mut sighting, started, false).await {
+            let hidden = matches!(self.window.is_visible(), Ok(false));
+            let reveal_at = (hidden && !self.opened_any).then(|| (started + SILENT_WAIT).min(deadline));
+            let mut result =
+                poll(&self.window, reveal_at.unwrap_or(deadline), url, &mut navigation, &mut sighting, started, false).await;
+            if let Some(reveal_at) = reveal_at.filter(|at| *at < deadline) {
+                if matches!(result, Ok(None)) {
+                    if sighting.opened_after().is_none() {
+                        log::info!(
+                            "Teams recap: showing the window, no recap opened in {} s while it was hidden",
+                            (reveal_at - started).as_secs()
+                        );
+                        let _ = self.window.show();
+                    }
+                    result = poll(&self.window, deadline, url, &mut navigation, &mut sighting, started, false).await;
+                }
+            }
+            if sighting.opened_after().is_some() {
+                self.opened_any = true;
+            }
+            match result {
                 Ok(Some(recap)) => Ok(recap),
                 Ok(None) => {
                     match sighting.opened_after() {
@@ -585,7 +724,13 @@ pub(crate) mod windows {
                             after.as_secs(),
                             wait.as_secs()
                         ),
-                        None => log::info!("Teams recap: not open within {} s", wait.as_secs()),
+                        None => match sighting.last_wait() {
+                            Some(place) => log::info!(
+                                "Teams recap: not open within {} s, last waiting on {place}",
+                                wait.as_secs()
+                            ),
+                            None => log::info!("Teams recap: not open within {} s", wait.as_secs()),
+                        },
                     }
                     Err(sighting.missed(wait))
                 }
@@ -626,6 +771,13 @@ pub(crate) struct RecapReader<R: tauri::Runtime>(std::marker::PhantomData<fn() -
 #[cfg(not(target_os = "windows"))]
 impl<R: tauri::Runtime> RecapReader<R> {
     pub(crate) async fn open(_app: &tauri::AppHandle<R>) -> Result<Self> {
+        Err(anyhow!(WINDOWS_ONLY))
+    }
+
+    pub(crate) async fn list(
+        &self,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::audio::teams_recap_list::RecapListing> {
         Err(anyhow!(WINDOWS_ONLY))
     }
 

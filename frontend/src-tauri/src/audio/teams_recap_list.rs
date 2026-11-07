@@ -208,15 +208,13 @@ pub(crate) fn collect(rows: &[ListedRow]) -> (Vec<RecapCandidate>, usize) {
 }
 
 #[cfg(target_os = "windows")]
-mod windows {
+pub(crate) mod windows {
     use super::*;
     use std::time::Duration;
-    use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
+    use tauri::{AppHandle, Runtime, WebviewWindow};
     use url::Url;
 
-    use crate::audio::teams_recap::windows::{
-        block_desktop_handoff, execute_script, INTERACTIVE_WAIT, POLL_INTERVAL, SILENT_WAIT,
-    };
+    use crate::audio::teams_recap::windows::{execute_script, INTERACTIVE_WAIT, POLL_INTERVAL, SILENT_WAIT};
 
     /// Poll until the script says `done`. `Ok(true)` when it did, `Ok(false)`
     /// at the deadline; the listing holds whatever was seen either way.
@@ -282,38 +280,28 @@ mod windows {
         Ok(false)
     }
 
-    pub async fn list<R: Runtime>(
-        app: &AppHandle<R>,
+    /// Read the list in `window`, which the caller opened on the shared
+    /// profile and keeps open: hidden first, then shown so the user can sign
+    /// in. A page that never shows the list ends in the listing's `error`.
+    pub(crate) async fn list_in<R: Runtime>(
+        window: &WebviewWindow<R>,
         since: DateTime<Utc>,
         probe: bool,
     ) -> Result<RecapListing> {
         let script = render_script(&script_template()?, since, probe);
         let url = Url::parse(TEAMS_WEB_URL).expect("constant URL");
-        // Same lock and profile as the SharePoint and recap flows, so two
-        // hidden Teams windows never fight over the one profile.
-        let _auth_flow = crate::audio::sharepoint::AUTH_FLOW_LOCK.lock().await;
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| anyhow!("Could not resolve app data directory: {e}"))?
-            .join("sp-webview");
-        std::fs::create_dir_all(&data_dir)?;
-        let window =
-            crate::audio::sharepoint::create_auth_window_deferred(app, &url, &data_dir).await?;
-
         let mut listing = RecapListing::default();
         let result: Result<()> = async {
-            block_desktop_handoff(&window).await?;
             window.navigate(url.clone())?;
             let started = tokio::time::Instant::now();
-            if poll(&window, &script, started + SILENT_WAIT, &mut listing).await? {
+            if poll(window, &script, started + SILENT_WAIT, &mut listing).await? {
                 return Ok(());
             }
             log::info!("[recap-list] showing the window: the list was not read while it was hidden");
             window.set_title("Teams recaps — sign in, then open Meeting Recaps")?;
             window.show()?;
             window.set_focus()?;
-            if poll(&window, &script, tokio::time::Instant::now() + INTERACTIVE_WAIT, &mut listing).await? {
+            if poll(window, &script, tokio::time::Instant::now() + INTERACTIVE_WAIT, &mut listing).await? {
                 return Ok(());
             }
             Err(anyhow!(
@@ -321,11 +309,26 @@ mod windows {
             ))
         }
         .await;
-        let _ = window.close();
         if let Err(e) = result {
             listing.error = Some(e.to_string());
         }
         Ok(listing)
+    }
+
+    /// Read the list in a window of its own, for the list check.
+    pub async fn list<R: Runtime>(
+        app: &AppHandle<R>,
+        since: DateTime<Utc>,
+        probe: bool,
+    ) -> Result<RecapListing> {
+        // Same lock and profile as the SharePoint and recap flows, so two
+        // hidden Teams windows never fight over the one profile.
+        let _auth_flow = crate::audio::sharepoint::AUTH_FLOW_LOCK.lock().await;
+        let teams = Url::parse(TEAMS_WEB_URL).expect("constant URL");
+        let window = crate::audio::teams_recap::windows::open_window(app, &teams).await?;
+        let listing = list_in(&window, since, probe).await;
+        let _ = window.close();
+        listing
     }
 }
 
