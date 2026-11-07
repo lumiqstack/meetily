@@ -6,7 +6,9 @@
 //!
 //! The list itself comes from `teams_recap_list`, which reads the Recap app's
 //! ("Meeting Recaps") Home list in a hidden WebView2 window. Rows it lists without a recap link
-//! count as not ready. See docs/TEAMS_RECAP_SYNC_SPEC.md.
+//! count as not ready. The listed recaps are then read one after another in
+//! one more hidden window, `teams_recap::RecapReader`, so Teams starts once
+//! per sync. See docs/TEAMS_RECAP_SYNC_SPEC.md.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -292,11 +294,14 @@ fn content_hash(markdown: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Whether an extraction error means "no AI summary yet" rather than a
-/// broken session or layout. Such a recap stays unrecorded and is retried
-/// on the next sync.
-fn is_not_ready(error: &str) -> bool {
-    error.contains("did not show an AI summary")
+/// A recap Teams opened without an AI summary may still be in the works, so it
+/// stays unrecorded and the next sync retries it. Any other miss failed, and
+/// the report says why.
+fn missed_outcome(missed: crate::audio::teams_recap::MissedRecap) -> Outcome {
+    match missed {
+        crate::audio::teams_recap::MissedRecap::NoSummary => Outcome::NotReady,
+        missed => Outcome::Failed(missed.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +324,7 @@ async fn import_candidate<R: Runtime>(
     pool: &sqlx::SqlitePool,
     known: &HashMap<String, ImportedRecap>,
     candidate: &RecapCandidate,
+    reader: &mut crate::audio::teams_recap::RecapReader<R>,
 ) -> Outcome {
     let validated = match crate::audio::teams_recap::validate_recap_url(&candidate.recap_url) {
         Ok(url) => url,
@@ -328,12 +334,9 @@ async fn import_candidate<R: Runtime>(
     let key = crate::audio::teams_recap::meeting_identity_key(source_url);
     let recording = crate::audio::teams_recap::recording_metadata(&validated);
 
-    // The listing just proved sign-in, so no recap gets a window of its own: a
-    // list with ten unfinished recaps must not cost ten five-minute waits.
-    let recap = match crate::audio::teams_recap::extract_teams_recap_unattended(app, source_url).await {
+    let recap = match reader.read(&validated).await {
         Ok(recap) => recap,
-        Err(e) if is_not_ready(&e.to_string()) => return Outcome::NotReady,
-        Err(e) => return Outcome::Failed(e.to_string()),
+        Err(missed) => return missed_outcome(missed),
     };
     let markdown = crate::summary::commands::recap_markdown_with_source(&recap.markdown, source_url);
     let hash = content_hash(&markdown);
@@ -449,13 +452,20 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let mut ordered = listing.candidates;
     ordered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     let total = ordered.len();
-    for (done, candidate) in ordered.iter().enumerate() {
-        let _ = app.emit(
-            PROGRESS_EVENT,
-            SyncProgress { done, total, current_title: &candidate.title },
-        );
-        let outcome = import_candidate(app, pool, &state.imported, candidate).await;
-        report.tally(&candidate.title, outcome);
+    if total > 0 {
+        // One hidden window reads every recap, so Teams starts once per sync
+        // instead of once per recap. It closes when the loop ends.
+        let mut reader = crate::audio::teams_recap::RecapReader::open(app)
+            .await
+            .map_err(|e| format!("Could not open the Teams window for the recaps: {e}"))?;
+        for (done, candidate) in ordered.iter().enumerate() {
+            let _ = app.emit(
+                PROGRESS_EVENT,
+                SyncProgress { done, total, current_title: &candidate.title },
+            );
+            let outcome = import_candidate(app, pool, &state.imported, candidate, &mut reader).await;
+            report.tally(&candidate.title, outcome);
+        }
     }
     let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
 
@@ -607,11 +617,19 @@ mod tests {
     }
 
     #[test]
-    fn only_a_missing_ai_summary_counts_as_not_ready() {
-        assert!(is_not_ready("Teams did not show an AI summary for this link. Sign in if prompted."));
-        assert!(!is_not_ready("WebView2 is unavailable: boom"));
-        assert!(!is_not_ready("Teams stayed on its app-choice page."));
-        assert!(is_not_ready(crate::audio::teams_recap::UNATTENDED_NO_SUMMARY));
+    fn only_a_recap_that_opened_without_an_ai_summary_counts_as_not_ready() {
+        use crate::audio::teams_recap::MissedRecap;
+        assert_eq!(missed_outcome(MissedRecap::NoSummary), Outcome::NotReady);
+        // On 2026-11-06 all 30 recaps of a sync timed out before Teams had
+        // opened them, and the report called every one "not ready".
+        assert_eq!(
+            missed_outcome(MissedRecap::NotOpened { waited: std::time::Duration::from_secs(60) }),
+            Outcome::Failed("Teams did not open this recap within 60 seconds.".into())
+        );
+        assert_eq!(
+            missed_outcome(MissedRecap::Failed(anyhow!("Teams stayed on its app-choice page."))),
+            Outcome::Failed("Teams stayed on its app-choice page.".into())
+        );
     }
 
     #[test]

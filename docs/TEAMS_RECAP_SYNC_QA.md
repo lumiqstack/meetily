@@ -35,6 +35,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 ## First Sync
 
 - Set `Start from` to 14 days back and press `Sync Teams recaps`. Progress shows done and total counts with the current title.
+- One hidden Teams window reads all the recaps. The log has a `Teams recap extracted after N s` line for each recap read: up to 180 s for the first, while Teams starts, and well under 60 s for the rest. A recap Teams never opens logs `Teams recap: not open within N s` and fails with `Teams did not open this recap within N seconds.`
 - The toast reports new, updated, unchanged, not ready and failed counts, and they add up to the scanned count.
 - The vault holds one note per meeting in `Meetings`, with `meeting_id` in its front matter and an `Open original Teams recap` link at the end of the summary. A recap link that names its recording gives the note the name `YYYY-MM-DD Title.md`.
 - Each new meeting appears in Meetily without a restart, with the recap as its summary and no transcript.
@@ -63,9 +64,9 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 
 ## Failures
 
-- Turn off the network during a sync: the recaps it reaches count as not ready or failed, and none of them is written. A failure toast names the first failed recap. Sync again with the network back: they import, and the others stay unchanged.
+- Turn off the network during a sync: the recaps it reaches fail, since Teams cannot open them, and none of them is written. A failure toast names the first failed recap. Sync again with the network back: they import, and the others stay unchanged.
 - Point the vault at a missing folder and press `Sync Teams recaps`: the sync refuses before reading Teams, with the same message as the link import.
-- A recap with no AI notes yet counts as not ready on every sync until Teams finishes it, then counts as new. No window appears for it, and it takes about a minute.
+- A recap with no AI notes yet counts as not ready on every sync until Teams finishes it, then counts as new. No window appears for it. It takes a minute, or 3 if it is the sync's first recap, and the log shows `Teams recap: open after N s, but no AI summary within N s`.
 - Delete an imported meeting in Meetily and sync: an unchanged recap stays skipped and does not bring the meeting back.
 
 ## Privacy And Diagnostics
