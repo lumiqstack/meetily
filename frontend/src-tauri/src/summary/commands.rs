@@ -149,6 +149,60 @@ fn imported_recap_summary(
     Ok(summary)
 }
 
+/// `import_source` of a meeting created from a Teams recap alone.
+const COPILOT_RECAP_SOURCE: &str = "copilot-recap";
+
+/// Times this close to a recap's listed start are the same start read another
+/// way: the recording's, the transcript's or the calendar slot. A meeting
+/// dated further off was dated by something else, such as the import's clock.
+const SAME_START_MINUTES: i64 = 15;
+
+fn listed_instant(listed_start: Option<&str>) -> Option<DateTime<Utc>> {
+    listed_start
+        .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+/// When a recap's meeting took place: the start its Recap app row gave, when
+/// the recap came from the list, else its title's or recording's stamp, else
+/// now.
+fn recap_meeting_date(title: &str, recorded_at: Option<&str>, listed_start: Option<&str>) -> DateTime<Utc> {
+    listed_instant(listed_start)
+        .unwrap_or_else(|| crate::audio::import::resolve_meeting_date(title, None, recorded_at))
+}
+
+/// The date a meeting made from a recap alone should move to, when it is not
+/// dated by its Recap app row. Before the sync dated recaps by the row, one
+/// with no recording in its link was dated when it was imported.
+fn recap_date_correction(
+    created_at: DateTime<Utc>,
+    source: Option<&MeetingSource>,
+    listed_start: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    let listed = listed_instant(listed_start)?;
+    let recap_only = source.is_some_and(|source| source.import_source == COPILOT_RECAP_SOURCE);
+    (recap_only && (created_at - listed).num_minutes().abs() > SAME_START_MINUTES).then_some(listed)
+}
+
+/// Whether the sync should write a recap it already holds again, because its
+/// meeting is not dated by the recap's Recap app row.
+pub(crate) async fn recap_meeting_needs_redate(
+    pool: &sqlx::SqlitePool,
+    meeting_id: &str,
+    listed_start: Option<&str>,
+) -> Result<bool, String> {
+    if listed_instant(listed_start).is_none() {
+        return Ok(false);
+    }
+    let Some(meeting) = load_meeting(pool, meeting_id).await? else {
+        return Ok(false);
+    };
+    let source = MeetingSource::get(pool, meeting_id)
+        .await
+        .map_err(|e| format!("Failed to read the source of meeting {meeting_id}: {e}"))?;
+    Ok(recap_date_correction(meeting.created_at.0, source.as_ref(), listed_start).is_some())
+}
+
 /// Persist a recap already extracted from the authenticated Teams webview.
 /// This intentionally bypasses recording download, speech-to-text, and LLM
 /// summary generation.
@@ -158,6 +212,7 @@ async fn save_extracted_copilot_recap(
     recap: String,
     source_url: Option<String>,
     recorded_at: Option<String>,
+    created_at: DateTime<Utc>,
 ) -> Result<ImportedRecapResponse, String> {
     let title = title.trim();
     let recap = recap.trim();
@@ -183,7 +238,6 @@ async fn save_extracted_copilot_recap(
 
     let summary = imported_recap_summary(recap, source_url.as_deref(), recorded_at.as_deref())?;
 
-    let created_at = crate::audio::import::resolve_meeting_date(title, None, recorded_at.as_deref());
     let meeting_id = SummaryProcessesRepository::create_meeting_with_imported_summary(
         pool,
         title,
@@ -195,7 +249,7 @@ async fn save_extracted_copilot_recap(
     .map_err(|e| format!("Failed to import Copilot recap: {e}"))?;
 
     let mut meeting_source = MeetingSource::for_import(
-        "copilot-recap",
+        COPILOT_RECAP_SOURCE,
         title,
         source_url.as_deref(),
         None,
@@ -372,8 +426,9 @@ async fn claim_live_meeting(
 /// meeting Meetily already holds for the same recording, an earlier import of
 /// the same link, or a live recording of the same meeting; otherwise it
 /// becomes a new transcript-free meeting. `listed_start` is the start time the
-/// Recap app row gave, when the recap came from the list. Shared by the link
-/// import and the recap sync.
+/// Recap app row gave, when the recap came from the list; a meeting made from
+/// the recap alone is dated by it. Shared by the link import and the recap
+/// sync.
 pub(crate) async fn persist_recap_from_link<R: Runtime>(
     app: &AppHandle<R>,
     pool: &sqlx::SqlitePool,
@@ -390,12 +445,14 @@ pub(crate) async fn persist_recap_from_link<R: Runtime>(
         RecapTarget::Known(meeting) => (meeting, false),
         RecapTarget::Live(meeting) => (meeting, true),
         RecapTarget::New { overlapping } => {
+            let created_at = recap_meeting_date(&title, recorded_at, listed_start);
             let imported = save_extracted_copilot_recap(
                 pool,
                 title,
                 recap_markdown.to_string(),
                 Some(source_url.to_string()),
                 recorded_at.map(str::to_owned),
+                created_at,
             )
             .await?;
             if !overlapping.is_empty() {
@@ -449,13 +506,40 @@ pub(crate) async fn persist_recap_from_link<R: Runtime>(
     );
     crate::api::emit_meetings_changed(app, &meeting.id);
 
+    // A meeting made from this recap alone moves to the recap's listed start
+    // when it was dated otherwise, and its note to the name that date gives.
+    let redated = if live {
+        None
+    } else {
+        let source = MeetingSource::get(pool, &meeting.id)
+            .await
+            .map_err(|e| format!("Failed to read the source of meeting {}: {e}", meeting.id))?;
+        recap_date_correction(meeting.created_at.0, source.as_ref(), listed_start)
+    };
+    if let Some(date) = redated {
+        MeetingsRepository::update_meeting_date(pool, &meeting.id, date)
+            .await
+            .map_err(|e| format!("Failed to correct the date of meeting {}: {e}", meeting.id))?;
+        log_info!(
+            "Recap meeting {} moved from {} to its listed start {}",
+            meeting.id,
+            meeting.created_at.0.to_rfc3339(),
+            date.to_rfc3339()
+        );
+    }
+
     // A meeting that has a transcript keeps it in its note; a recap-only
     // meeting keeps the readable date-and-title filename.
     let (segments, _) = MeetingsRepository::get_meeting_transcripts_paginated(pool, &meeting.id, i64::MAX, 0)
         .await
         .map_err(|e| format!("Failed to load the transcript of meeting {}: {e}", meeting.id))?;
-    let created_at = meeting.created_at.0.to_rfc3339();
-    let exported = if segments.is_empty() {
+    let created_at = redated.unwrap_or(meeting.created_at.0).to_rfc3339();
+    let exported = if segments.is_empty() && redated.is_some() {
+        crate::obsidian::move_copilot_recap_note(
+            app, &meeting.id, &meeting.title, &created_at, recap_markdown, recorded_at,
+        )
+        .await
+    } else if segments.is_empty() {
         crate::obsidian::export_copilot_recap_note(
             app, &meeting.id, &meeting.title, &created_at, recap_markdown, recorded_at,
         )
@@ -1375,6 +1459,68 @@ mod recap_target_tests {
             panic!("expected the live recording");
         };
         assert_eq!(meeting.id, "live");
+    }
+
+    const LISTED: &str = "2026-11-03T10:02:00.000Z";
+
+    fn listed() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 3, 10, 2, 0).unwrap()
+    }
+
+    fn source(import_source: &str) -> MeetingSource {
+        MeetingSource::for_import(import_source, "Weekly sync", Some(RECAP), None, None)
+    }
+
+    #[test]
+    fn a_listed_recap_is_dated_by_its_row_and_a_pasted_one_by_its_stamp() {
+        let stamp = Some("2026-11-03T04:02:00");
+        assert_eq!(recap_meeting_date("Weekly sync", stamp, Some(LISTED)), listed());
+        assert_eq!(recap_meeting_date("Weekly sync", None, Some(LISTED)), listed());
+        assert_eq!(
+            recap_meeting_date("Weekly sync", stamp, None),
+            crate::audio::import::resolve_meeting_date("Weekly sync", None, stamp)
+        );
+        // Neither: the import's own time, as before.
+        let now = Utc::now();
+        let dated = recap_meeting_date("Weekly sync", None, Some("not a time"));
+        assert!((dated - now).num_seconds().abs() < 5, "{dated}");
+    }
+
+    #[test]
+    fn only_a_meeting_made_from_a_recap_alone_and_dated_off_its_row_moves() {
+        let imported_at = Utc.with_ymd_and_hms(2026, 11, 7, 6, 1, 14).unwrap();
+        let recap = source(COPILOT_RECAP_SOURCE);
+        assert_eq!(recap_date_correction(imported_at, Some(&recap), Some(LISTED)), Some(listed()));
+
+        // The same start read another way stays put.
+        let recording_start = listed() + Duration::minutes(SAME_START_MINUTES);
+        assert_eq!(recap_date_correction(recording_start, Some(&recap), Some(LISTED)), None);
+        // Meetily's own recordings and meetings with no source keep their date.
+        let live = source(LIVE_RECORDING_SOURCE);
+        assert_eq!(recap_date_correction(imported_at, Some(&live), Some(LISTED)), None);
+        assert_eq!(recap_date_correction(imported_at, None, Some(LISTED)), None);
+        // A pasted link has no row to go by.
+        assert_eq!(recap_date_correction(imported_at, Some(&recap), None), None);
+    }
+
+    #[tokio::test]
+    async fn the_sync_writes_a_held_recap_again_only_when_its_meeting_is_misdated() {
+        let pool = test_pool().await;
+        // insert_meeting dates both 2026-11-03 16:30 UTC.
+        insert_meeting(&pool, "recap", "Weekly sync").await;
+        source(COPILOT_RECAP_SOURCE).insert(&pool, "recap").await.unwrap();
+        insert_meeting(&pool, "live", "Weekly sync").await;
+        source(LIVE_RECORDING_SOURCE).insert(&pool, "live").await.unwrap();
+
+        assert!(recap_meeting_needs_redate(&pool, "recap", Some(LISTED)).await.unwrap());
+        assert!(!recap_meeting_needs_redate(&pool, "recap", Some("2026-11-03T16:40:00.000Z")).await.unwrap());
+        assert!(!recap_meeting_needs_redate(&pool, "recap", None).await.unwrap());
+        assert!(!recap_meeting_needs_redate(&pool, "live", Some(LISTED)).await.unwrap());
+        assert!(!recap_meeting_needs_redate(&pool, "gone", Some(LISTED)).await.unwrap());
+
+        assert!(MeetingsRepository::update_meeting_date(&pool, "recap", listed()).await.unwrap());
+        assert!(!recap_meeting_needs_redate(&pool, "recap", Some(LISTED)).await.unwrap(), "moved once, then settled");
+        assert!(!MeetingsRepository::update_meeting_date(&pool, "gone", listed()).await.unwrap());
     }
 }
 
