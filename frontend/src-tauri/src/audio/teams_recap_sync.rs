@@ -203,6 +203,19 @@ enum Outcome {
     Failed(String),
 }
 
+impl Outcome {
+    /// For the log, which never names the meeting.
+    fn label(&self) -> &'static str {
+        match self {
+            Outcome::New { .. } => "new",
+            Outcome::Updated => "updated",
+            Outcome::Skipped => "unchanged",
+            Outcome::NotReady => "not ready",
+            Outcome::Failed(_) => "failed",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State store
 // ---------------------------------------------------------------------------
@@ -455,15 +468,22 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     if total > 0 {
         // One hidden window reads every recap, so Teams starts once per sync
         // instead of once per recap. It closes when the loop ends.
-        let mut reader = crate::audio::teams_recap::RecapReader::open(app)
-            .await
-            .map_err(|e| format!("Could not open the Teams window for the recaps: {e}"))?;
+        let mut reader = match crate::audio::teams_recap::RecapReader::open(app).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                let error = format!("Could not open the Teams window for the recaps: {e}");
+                warn!("[recap-sync] {error}");
+                return Err(error);
+            }
+        };
         for (done, candidate) in ordered.iter().enumerate() {
             let _ = app.emit(
                 PROGRESS_EVENT,
                 SyncProgress { done, total, current_title: &candidate.title },
             );
+            info!("[recap-sync] recap {}/{total}", done + 1);
             let outcome = import_candidate(app, pool, &state.imported, candidate, &mut reader).await;
+            info!("[recap-sync] recap {}/{total}: {}", done + 1, outcome.label());
             report.tally(&candidate.title, outcome);
         }
     }
