@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-06. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"): on the Windows machine its list check found the week's 23 meetings, each with a recap link naming its recording file. No real sync has run yet, so the import half of step 3, the QA checklist (step 4) and the live matching of steps 5 and 6 are not yet exercised on Windows.
+Status: 2026-11-07. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"). Three real syncs have run on the Windows machine. The third listed the 30 recaps since Oct 29 and imported all 30 (see Reading recaps). The QA checklist (step 4) and the live matching of steps 5 and 6 are not yet fully exercised on Windows.
 
 ## Goal
 
@@ -492,13 +492,15 @@ per sync. The first read may take 3 minutes; each later read gets 1 minute. If
 the window is still hidden and no recap has opened in it 25 s into a read, it
 shows itself, as the list's does.
 
-Two real syncs led here. In the first, on 2026-11-06, each recap had a fresh
+Three real syncs led here. In the first, on 2026-11-06, each recap had a fresh
 hidden window and a minute, and all 30 ran out of time while Teams started. In
 the second, on 2026-11-07, the recaps had one hidden window, opened after the
 list's window closed. The first 7 did not open in 10 minutes, and the 23 after
 them opened 7 to 18 s after their links. Whether that window needed the account
 choice again, or Teams waited for something else while hidden, the log did not
-say.
+say. The third, later that day, read the list and the recaps in one window,
+shown 25 s into the list. All 30 recaps opened 6 to 16 s after their links, the
+first one included, and none needed the retry.
 
 Before each recap the window goes to `about:blank` and waits until the previous
 recap's page is gone. Otherwise a poll that runs before the next page loads
@@ -663,8 +665,9 @@ button also writes the probe file described above, on that machine only.
   their account in it. In the second sync the hidden window opened after the
   list's did not open a recap for its first 10 minutes. The user's session had
   locked by the time recaps opened. Still open: what that window waited on.
-  The sync now reads in the list's window, and the waiting log line will say
-  if it ever stalls.
+  The sync now reads in the list's window. In the third sync that window,
+  shown 25 s into the list, opened all 30 recaps, the first 10 s after its
+  link. The waiting log line will say if a read ever stalls.
 - A read tells a recap Teams opened without AI notes (not ready) from one it
   never opened (failed). It cannot tell "still generating" from "no AI notes
   for this meeting": both count as "not ready" and retry on every sync until
