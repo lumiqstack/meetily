@@ -230,6 +230,22 @@ impl MeetingsRepository {
         Ok((transcripts, total.0))
     }
 
+    /// Move a meeting to when it took place, for an import that learns the
+    /// meeting's start only after it was saved. `false` when it is gone.
+    pub async fn update_meeting_date(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query("UPDATE meetings SET created_at = ?, updated_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(Utc::now())
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn update_meeting_title(
         pool: &SqlitePool,
         meeting_id: &str,

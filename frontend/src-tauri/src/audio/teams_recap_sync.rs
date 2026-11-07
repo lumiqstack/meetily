@@ -354,8 +354,21 @@ async fn import_candidate<R: Runtime>(
     let markdown = crate::summary::commands::recap_markdown_with_source(&recap.markdown, source_url);
     let hash = content_hash(&markdown);
     let seen_before = known.get(&key);
-    if seen_before.is_some_and(|entry| entry.content_hash == hash) {
-        return Outcome::Skipped;
+    if let Some(entry) = seen_before.filter(|entry| entry.content_hash == hash) {
+        // An unchanged recap is still written again when its meeting is not
+        // dated by the recap's row, so the meeting and its note move to when
+        // it took place.
+        match crate::summary::commands::recap_meeting_needs_redate(
+            pool,
+            &entry.meeting_id,
+            candidate.started_at.as_deref(),
+        )
+        .await
+        {
+            Ok(false) => return Outcome::Skipped,
+            Ok(true) => {}
+            Err(e) => return Outcome::Failed(e),
+        }
     }
 
     let persisted = match crate::summary::commands::persist_recap_from_link(

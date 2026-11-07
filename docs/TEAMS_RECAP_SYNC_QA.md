@@ -37,7 +37,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Set `Start from` to 14 days back and press `Sync Teams recaps`. Progress shows done and total counts with the current title.
 - One hidden Teams window reads all the recaps. The log has a `Teams recap extracted after N s` line for each recap read: up to 180 s for the first, while Teams starts, and well under 60 s for the rest. A recap Teams never opens logs `Teams recap: not open within N s` and fails with `Teams did not open this recap within N seconds.`
 - The toast reports new, updated, unchanged, not ready and failed counts, and they add up to the scanned count.
-- The vault holds one note per meeting in `Meetings`, with `meeting_id` in its front matter and an `Open original Teams recap` link at the end of the summary. A recap link that names its recording gives the note the name `YYYY-MM-DD Title.md`.
+- The vault holds one note per meeting in `Meetings`, with `meeting_id` in its front matter and an `Open original Teams recap` link at the end of the summary. Each note is named `YYYY-MM-DD Title.md` by the day the meeting took place, including recaps whose link names no recording. No note carries the sync's own date unless a meeting took place that day.
 - Each new meeting appears in Meetily without a restart, with the recap as its summary and no transcript.
 - Two occurrences of a recurring meeting are two meetings and two notes, each with its own date.
 - A row with no recap link counts as not ready and creates nothing.
@@ -49,6 +49,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Press `Sync Teams recaps` again straight away: every recap counts as unchanged, no note's `exported` time moves, and the meeting count stays the same.
 - A second press while a sync runs is not possible: the buttons are disabled. A second call reports `A Teams recap sync is already running.`
 - Quit Meetily in the middle of a sync, relaunch and sync again: no duplicates, and the recaps not reached the first time are imported.
+- A recap-only meeting that an older build dated by its import moves to the meeting's date on the next sync. It counts as updated, the log has `Recap meeting <id> moved from <old> to its listed start <new>`, and its note is renamed with no copy left under the old name. The sync after that counts it as unchanged.
 
 ## Recap Changed In Teams
 
