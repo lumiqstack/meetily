@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { describeLastListing, describeSyncReport, type LastListingView } from '../../src/components/TeamsRecapSyncSettings';
 
 const base = {
-  scanned: 0, new: 0, updated: 0, skipped: 0, notReady: 0, failed: [], possibleDuplicates: [], meetingsFolder: 'V/Meetings',
+  scanned: 0, new: 0, updated: 0, skipped: 0, kept: 0, notReady: 0, failed: [], possibleDuplicates: [], meetingsFolder: 'V/Meetings',
 };
 
 describe('describeSyncReport', () => {
@@ -20,6 +20,12 @@ describe('describeSyncReport', () => {
         failed: [{ title: 'Standup', error: 'boom' }],
       })
     ).toBe('3 scanned: 0 new, 0 updated, 1 unchanged, 1 not ready yet, 1 failed.');
+  });
+
+  test('counts the recaps kept without opening as unchanged', () => {
+    expect(describeSyncReport({ ...base, scanned: 30, new: 2, skipped: 3, kept: 25 })).toBe(
+      '30 scanned: 2 new, 0 updated, 28 unchanged.'
+    );
   });
 
   test('names a recap that may duplicate a live recording', () => {

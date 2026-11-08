@@ -2,7 +2,8 @@
 //! Obsidian vault, one button press at a time. Each recap is keyed on the
 //! recording it belongs to (see `teams_recap::meeting_identity_key`), so a
 //! recap never creates a second meeting or a second note, and a content hash
-//! per key turns an unchanged recap into a skip instead of a rewrite.
+//! per key turns an unchanged recap into a skip instead of a rewrite. A recap
+//! a sync has read a day or more after its meeting is not opened again.
 //!
 //! A sync opens one WebView2 window, `teams_recap::RecapReader`. There it
 //! reads the Recap app's ("Meeting Recaps") Home list through
@@ -26,18 +27,29 @@ const LAST_LISTING_KEY: &str = "lastListing";
 /// How far back the first sync reaches when the user has not chosen a date.
 const DEFAULT_BACKFILL_DAYS: i64 = 30;
 /// A recap appears hours after a meeting and Teams may finish generating one
-/// days later, so each sync re-reads this much of the previous window.
+/// days later, so each sync lists this much of the previous window again. It
+/// retries the recaps that were not ready, and opens again the ones it holds
+/// from a read too soon after their meeting (see [`FINAL_AFTER_HOURS`]).
 const OVERLAP_DAYS: i64 = 7;
+/// A recap a sync read this long after its meeting started is taken as final:
+/// later syncs list it but do not open it, which takes about 33 s a recap. On
+/// 2026-11-07 a sync opened again the 23 recaps it held, for 13 of its 18
+/// minutes, and none showed a change since the sync 13 hours before.
+const FINAL_AFTER_HOURS: i64 = 24;
 pub const PROGRESS_EVENT: &str = "teams-recap-sync-progress";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedRecap {
     pub meeting_id: String,
-    /// RFC 3339.
+    /// RFC 3339, when the recap was last written.
     pub imported_at: String,
     /// SHA-256 of the recap markdown last written, hex.
     pub content_hash: String,
+    /// RFC 3339, when a sync last read the recap. Records written before this
+    /// was kept have none, and `imported_at` stands in.
+    #[serde(default)]
+    pub read_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -179,6 +191,9 @@ pub struct RecapSyncReport {
     pub new: usize,
     pub updated: usize,
     pub skipped: usize,
+    /// Held from a read at least [`FINAL_AFTER_HOURS`] after their meeting,
+    /// so not opened.
+    pub kept: usize,
     pub not_ready: usize,
     pub failed: Vec<RecapSyncFailure>,
     /// Titles of recaps imported as their own meeting although a live
@@ -200,6 +215,9 @@ enum Outcome {
     New { possible_duplicate: bool },
     Updated,
     Skipped,
+    /// Held from a read at least [`FINAL_AFTER_HOURS`] after its meeting, so
+    /// not opened.
+    Kept,
     NotReady,
     /// Teams did not open the recap in time. The sync tries it once more after
     /// the others, then counts it failed with this message.
@@ -214,6 +232,7 @@ impl Outcome {
             Outcome::New { .. } => "new",
             Outcome::Updated => "updated",
             Outcome::Skipped => "unchanged",
+            Outcome::Kept => "kept, not opened",
             Outcome::NotReady => "not ready",
             Outcome::NotOpened(_) => "not open",
             Outcome::Failed(_) => "failed",
@@ -312,6 +331,22 @@ fn content_hash(markdown: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Whether the sync keeps its copy of a listed recap without opening it: a
+/// sync read it at least [`FINAL_AFTER_HOURS`] after its meeting started, and
+/// the meeting needs no new date, which takes writing the recap again. A recap
+/// listed without a start is always opened.
+fn keeps_unopened(held: Option<&ImportedRecap>, listed_start: Option<&str>, needs_redate: bool) -> bool {
+    if needs_redate {
+        return false;
+    }
+    let (Some(entry), Some(start)) = (held, crate::summary::commands::listed_instant(listed_start)) else {
+        return false;
+    };
+    let read_at = entry.read_at.as_deref().unwrap_or(&entry.imported_at);
+    DateTime::parse_from_rfc3339(read_at)
+        .is_ok_and(|read| read.with_timezone(&Utc) - start >= Duration::hours(FINAL_AFTER_HOURS))
+}
+
 /// A recap Teams opened without an AI summary may still be in the works, so it
 /// stays unrecorded and the next sync retries it. One Teams did not open gets
 /// another read this sync. Any other miss failed, and the report says why.
@@ -353,29 +388,41 @@ async fn import_candidate<R: Runtime>(
     let source_url = validated.as_str();
     let key = crate::audio::teams_recap::meeting_identity_key(source_url);
     let recording = crate::audio::teams_recap::recording_metadata(&validated);
+    let listed_start = candidate.started_at.as_deref();
+    let seen_before = known.get(&key);
+    // A recap the sync holds is written again, unchanged, when its meeting is
+    // not dated by the recap's row, so the meeting and its note move to when it
+    // took place.
+    let needs_redate = match seen_before {
+        Some(entry) => {
+            match crate::summary::commands::recap_meeting_needs_redate(pool, &entry.meeting_id, listed_start).await {
+                Ok(needs) => needs,
+                Err(e) => return Outcome::Failed(e),
+            }
+        }
+        None => false,
+    };
+    if keeps_unopened(seen_before, listed_start, needs_redate) {
+        return Outcome::Kept;
+    }
 
     let recap = match reader.read(&validated).await {
         Ok(recap) => recap,
         Err(missed) => return missed_outcome(missed),
     };
+    let read_at = Utc::now().to_rfc3339();
     let markdown = crate::summary::commands::recap_markdown_with_source(&recap.markdown, source_url);
     let hash = content_hash(&markdown);
-    let seen_before = known.get(&key);
-    if let Some(entry) = seen_before.filter(|entry| entry.content_hash == hash) {
-        // An unchanged recap is still written again when its meeting is not
-        // dated by the recap's row, so the meeting and its note move to when
-        // it took place.
-        match crate::summary::commands::recap_meeting_needs_redate(
-            pool,
-            &entry.meeting_id,
-            candidate.started_at.as_deref(),
-        )
-        .await
-        {
-            Ok(false) => return Outcome::Skipped,
-            Ok(true) => {}
-            Err(e) => return Outcome::Failed(e),
+    if !needs_redate && seen_before.is_some_and(|entry| entry.content_hash == hash) {
+        // When this read happened decides whether the next sync opens it.
+        if let Err(e) = update_state(app, |state| {
+            if let Some(entry) = state.imported.get_mut(&key) {
+                entry.read_at = Some(read_at);
+            }
+        }) {
+            warn!("[recap-sync] could not record when the recap was read: {e}");
         }
+        return Outcome::Skipped;
     }
 
     let persisted = match crate::summary::commands::persist_recap_from_link(
@@ -384,7 +431,7 @@ async fn import_candidate<R: Runtime>(
         candidate.title.clone(),
         source_url,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
-        candidate.started_at.as_deref(),
+        listed_start,
         &markdown,
     )
     .await
@@ -400,6 +447,7 @@ async fn import_candidate<R: Runtime>(
                 meeting_id: persisted.meeting_id.clone(),
                 imported_at: Utc::now().to_rfc3339(),
                 content_hash: hash,
+                read_at: Some(read_at),
             },
         );
     }) {
@@ -410,7 +458,7 @@ async fn import_candidate<R: Runtime>(
 
 /// Imports one listed recap. The sync's reads Teams; tests stand in for it.
 trait RecapImporter {
-    /// Before each read: how many recaps already have their outcome.
+    /// Before each recap: how many recaps already have their outcome.
     fn starting(&mut self, _settled: usize, _total: usize, _candidate: &RecapCandidate) {}
     async fn import(&mut self, candidate: &RecapCandidate) -> Outcome;
 }
@@ -472,7 +520,8 @@ async fn import_all(
 
 /// Whether the scan window may move on. A sync that read no recap learned
 /// nothing, and may have misread the list, so moving on could lose the rest of
-/// the first sync's backfill for good.
+/// the first sync's backfill for good. Recaps kept unopened do not count: if
+/// Teams stopped opening recaps, moving on could lose the new ones that failed.
 fn read_any_recap(report: &RecapSyncReport) -> bool {
     report.new + report.updated + report.skipped > 0
 }
@@ -501,6 +550,7 @@ impl RecapSyncReport {
             }
             Outcome::Updated => self.updated += 1,
             Outcome::Skipped => self.skipped += 1,
+            Outcome::Kept => self.kept += 1,
             Outcome::NotReady => self.not_ready += 1,
             Outcome::NotOpened(error) | Outcome::Failed(error) => {
                 warn!("[recap-sync] {title}: {error}");
@@ -565,8 +615,14 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
         warn!("[recap-sync] could not persist last sync date: {e}");
     }
     info!(
-        "[recap-sync] scanned {} new {} updated {} skipped {} not ready {} failed {}",
-        report.scanned, report.new, report.updated, report.skipped, report.not_ready, report.failed.len()
+        "[recap-sync] scanned {} new {} updated {} skipped {} kept {} not ready {} failed {}",
+        report.scanned,
+        report.new,
+        report.updated,
+        report.skipped,
+        report.kept,
+        report.not_ready,
+        report.failed.len()
     );
     Ok(report)
 }
@@ -706,6 +762,35 @@ mod tests {
         assert_eq!(content_hash("").len(), 64);
     }
 
+    fn read_at(when: &str) -> ImportedRecap {
+        ImportedRecap { read_at: Some(when.into()), ..Default::default() }
+    }
+
+    #[test]
+    fn a_recap_read_a_day_after_its_meeting_is_kept_unopened() {
+        let start = Some("2026-11-05T19:33:55.000Z");
+        assert!(keeps_unopened(Some(&read_at("2026-11-06T19:33:55+00:00")), start, false), "24 h after");
+        assert!(keeps_unopened(Some(&read_at("2026-11-06T14:00:00-06:00")), start, false), "24 h 26 min after");
+        assert!(!keeps_unopened(Some(&read_at("2026-11-06T13:00:00-06:00")), start, false), "23 h 26 min after");
+        assert!(!keeps_unopened(None, start, false), "a recap the sync does not hold");
+        let late = read_at("2026-11-08T09:00:00Z");
+        assert!(!keeps_unopened(Some(&late), start, true), "its meeting needs a new date");
+        assert!(!keeps_unopened(Some(&late), None, false), "listed without a start");
+        assert!(!keeps_unopened(Some(&late), Some("Thursday"), false));
+        assert!(!keeps_unopened(Some(&read_at("soon")), start, false));
+    }
+
+    #[test]
+    fn a_record_without_a_read_time_goes_by_when_it_was_written() {
+        // Records written before read times were kept.
+        let entry = ImportedRecap { imported_at: "2026-11-07T19:00:00+00:00".into(), ..Default::default() };
+        assert!(keeps_unopened(Some(&entry), Some("2026-11-06T16:00:00Z"), false));
+        assert!(!keeps_unopened(Some(&entry), Some("2026-11-07T09:00:00Z"), false));
+        // The last read decides, not the import.
+        let reread = ImportedRecap { read_at: Some("2026-11-08T10:00:00+00:00".into()), ..entry };
+        assert!(keeps_unopened(Some(&reread), Some("2026-11-07T09:00:00Z"), false));
+    }
+
     #[test]
     fn only_a_recap_that_opened_without_an_ai_summary_counts_as_not_ready() {
         use crate::audio::teams_recap::MissedRecap;
@@ -728,6 +813,8 @@ mod tests {
         assert!(!read_any_recap(&report), "rows without a link prove nothing about the list");
         report.failed.push(RecapSyncFailure { title: "T".into(), error: "boom".into() });
         assert!(!read_any_recap(&report));
+        report.kept = 20;
+        assert!(!read_any_recap(&report), "recaps kept unopened say nothing about the reads");
         assert!(!read_any_recap(&RecapSyncReport::default()));
         for read in [
             RecapSyncReport { new: 1, ..Default::default() },
@@ -769,7 +856,8 @@ mod tests {
         report.tally("E", Outcome::NotReady);
         report.tally("F", Outcome::Failed("boom".into()));
         report.tally("G", Outcome::NotOpened("not open".into()));
-        assert_eq!((report.new, report.updated, report.skipped, report.not_ready), (2, 1, 1, 1));
+        report.tally("H", Outcome::Kept);
+        assert_eq!((report.new, report.updated, report.skipped, report.kept, report.not_ready), (2, 1, 1, 1, 1));
         assert_eq!(report.possible_duplicates, vec!["B".to_string()]);
         assert_eq!(report.failed[0].title, "F");
         assert_eq!(report.failed[0].error, "boom");
@@ -925,13 +1013,28 @@ mod tests {
         let mut state = TeamsRecapSyncState::default();
         state.imported.insert(
             "host/path.mp4".into(),
-            ImportedRecap { meeting_id: "m1".into(), imported_at: "2026-11-02T10:00:00+00:00".into(), content_hash: "ab".into() },
+            ImportedRecap {
+                meeting_id: "m1".into(),
+                imported_at: "2026-11-02T10:00:00+00:00".into(),
+                content_hash: "ab".into(),
+                read_at: Some("2026-11-03T10:00:00+00:00".into()),
+            },
         );
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["imported"]["host/path.mp4"]["meetingId"], "m1");
+        assert_eq!(json["imported"]["host/path.mp4"]["readAt"], "2026-11-03T10:00:00+00:00");
         let back: TeamsRecapSyncState = serde_json::from_value(json).unwrap();
         assert_eq!(back.imported["host/path.mp4"].content_hash, "ab");
+        assert_eq!(back.imported["host/path.mp4"].read_at.as_deref(), Some("2026-11-03T10:00:00+00:00"));
         let empty: TeamsRecapSyncState = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.imported.is_empty());
+        // A store written before read times were kept still loads, whole.
+        let older: TeamsRecapSyncState = serde_json::from_value(serde_json::json!({
+            "lastSyncDate": "2026-11-07T19:00:00+00:00",
+            "imported": { "k": { "meetingId": "m1", "importedAt": "2026-11-07T19:05:00+00:00", "contentHash": "ab" } }
+        }))
+        .unwrap();
+        assert_eq!(older.last_sync_date.as_deref(), Some("2026-11-07T19:00:00+00:00"));
+        assert_eq!(older.imported["k"].read_at, None);
     }
 }
