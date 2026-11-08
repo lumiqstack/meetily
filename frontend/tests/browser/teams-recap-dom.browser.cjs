@@ -28,14 +28,15 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function pageFor(content) {
+async function pageWith(body) {
   const page = await browser.newPage();
   // Synthetic local fixture. No authenticated Teams page or personal data.
-  await page.route('https://teams.cloud.microsoft/**', route => route.fulfill({
-    contentType: 'text/html', body: `<button role="tab" aria-selected="true">AI summary</button><div role="tabpanel">${content}</div>`,
-  }));
+  await page.route('https://teams.cloud.microsoft/**', route => route.fulfill({ contentType: 'text/html', body }));
   await page.goto('https://teams.cloud.microsoft/fixture');
   return page;
+}
+async function pageFor(content) {
+  return pageWith(`<button role="tab" aria-selected="true">AI summary</button><div role="tabpanel">${content}</div>`);
 }
 async function ready(page) {
   let result;
@@ -46,6 +47,51 @@ async function ready(page) {
   assert.fail(`Expected complete recap, got ${result.status}`);
 }
 const notes = '<h3>Meeting notes</h3><div role="row"><strong>Planning:</strong> Keep the release small.</div><div role="row" aria-level="2">. Scope: Confirm the estimate.</div>';
+
+// A sync tells a recap Teams opened without an AI summary (not ready) from one
+// Teams never opened (failed) by whether any poll said `recap_open` or later.
+test('says the recap is open from its Share button until its notes can be read', async () => {
+  const share = '<button data-tid="recap-share-button">Share</button>';
+  for (const [body, status] of [
+    ['<div>Loading</div>', 'waiting'],
+    ['<button data-tid="recap-share-button" style="display:none">Share</button>', 'waiting'],
+    [share + '<div role="tablist"><button role="tab" aria-selected="true">Recap</button></div>', 'recap_open'],
+    ['<button role="tab" aria-selected="false">AI summary</button>', 'recap_open'],
+    ['<button role="tab" aria-selected="true">AI summary</button><div role="tabpanel">Generating notes</div>', 'recap_open'],
+    // A chat Teams restored after sign-in is never taken for the recap.
+    [share + '<button role="tab">Chat</button><button role="tab" aria-selected="false">Recap</button>', 'signed_in_chat'],
+  ]) {
+    const page = await pageWith(body);
+    try { assert.equal((await page.evaluate(script)).status, status, body); }
+    finally { await page.close(); }
+  }
+});
+
+// A read that waits says where, for the log: host and path only, ids masked,
+// with the page's visibility and how many frames it has drawn.
+test('says where it waits, without the query, and whether the page draws', async () => {
+  const page = await browser.newPage();
+  try {
+    await page.route('https://login.microsoftonline.com/**', route =>
+      route.fulfill({ contentType: 'text/html', body: '<div>Pick an account</div>' }));
+    await page.goto('https://login.microsoftonline.com/0f1e2d3c-1111-2222-3333-444455556666/oauth2/v2.0/authorize?client_id=abc&login_hint=someone');
+    const first = await page.evaluate(script);
+    assert.equal(first.status, 'waiting');
+    assert.equal(first.page, 'login.microsoftonline.com/{id}/oauth2/v2.0/authorize');
+    assert.equal(first.visibility, 'visible');
+    assert.equal(typeof first.focused, 'boolean');
+    await page.waitForTimeout(250);
+    const later = await page.evaluate(script);
+    assert.ok(later.frames > first.frames, `frames ${first.frames} then ${later.frames}`);
+  } finally { await page.close(); }
+
+  const teams = await pageWith('<div>Loading</div>');
+  try {
+    const result = await teams.evaluate(script);
+    assert.equal(result.status, 'waiting');
+    assert.equal(result.page, 'teams.cloud.microsoft/fixture');
+  } finally { await teams.close(); }
+});
 
 test('preserves bold topics, child indentation and follow-up list items', async () => {
   const page = await pageFor(notes + '<h3>Follow-up tasks</h3><ul><li><strong>Send estimate:</strong> Alex to send it tomorrow.</li></ul>');

@@ -501,6 +501,9 @@ impl Drop for TempAudioFile {
 
 /// Transcode one chunk of `source` into a temp MP3 ready for upload.
 ///
+/// The MP3 goes in [`crate::storage::tmp_dir`], with the rest of the data, so
+/// a data root moved off the system drive keeps these files off it too.
+///
 /// Honours `cancel` while ffmpeg is running: a 29 MB transcode would otherwise
 /// keep burning CPU after the user cancelled. The child is killed *and
 /// awaited*, so no orphan ffmpeg survives the job.
@@ -512,7 +515,7 @@ pub async fn transcode_chunk(
     let ffmpeg = crate::audio::ffmpeg::find_ffmpeg_path()
         .ok_or_else(|| GeminiBatchError::Transcode("ffmpeg not found".to_string()))?;
 
-    let output_path = std::env::temp_dir().join(format!(
+    let output_path = crate::storage::tmp_dir().join(format!(
         "meetily-gemini-{}-{}.mp3",
         std::process::id(),
         uuid::Uuid::new_v4()

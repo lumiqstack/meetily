@@ -7,7 +7,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Build and launch as `docs/windows/DATABASE_UPGRADE_CHECK.md` describes.
 - Set an Obsidian vault in Meetily preferences. Use an empty test vault for the first-sync scenarios.
 - Have Copilot recaps for meetings in the last 14 days, including two occurrences of one recurring meeting and, if possible, one meeting whose recap is not ready yet.
-- Note how many meetings with a recap the Meet app shows for the week. The list check below is compared against this number.
+- Note how many meetings Meeting Recaps (the Teams Recap app on the app bar) shows on its Home tab for the week. The list check below is compared against this number.
 - Find `Teams recaps` under `Obsidian Vault` in preferences. It shows the last sync date and the known recap count.
 
 ## Availability
@@ -19,20 +19,26 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 ## List Check
 
 - `Check recap list` imports nothing: no new meeting, no new note, last sync date unchanged, known recap count unchanged.
-- The toast reports how many rows have a recap link, how many do not, and where the probe file was saved.
-- The counts match the Meet app's list for the scan window, including rows further down that only load on scrolling.
+- No toast. The line beside the buttons reads `Checked at <time>: N recaps, N already synced, N pending.`, with `N without a recap yet` added when rows have no link. It is still there after Settings is closed and reopened and after a restart, and it names the day once the date has changed.
+- After `Sync Teams recaps`, the line shows the sync's own listing and the synced recaps count as already synced.
+- A list that stopped before the scan window's start adds `The list stopped at <day>, before <day>, so it may be missing older recaps. Check again.`
+- With a sync running, `Check recap list` shows `Check failed: A Teams recap sync is already running.` on the line.
+- The counts match the Home list for the scan window, including rows in collapsed groups and rows further down that only load on scrolling. A meeting listed twice, once for its transcript and once for its recording, counts once.
+- Quit Meetily, start it again and press `Check recap list` within a minute: the counts match a check made a few minutes later. The log may show `[recap-list] state: reloading` once, when the list showed only its newest rows at first.
 - The Teams window stays hidden when the session is still signed in, and closes itself when the list has been read.
-- Signed out: the window appears titled `Teams recaps — sign in and open the Meet app's Recap list`. After signing in, the list is read and the window closes.
+- Signed out: the window appears titled `Teams recaps — sign in, then open Meeting Recaps`. After signing in, the list is read and the window closes.
 - The Teams desktop app does not open at any point.
-- Closing the window early reports that it was closed before the list was read, and writes nothing to the sync state.
-- A page with no recognisable list ends in `Teams did not show the Meet app's recap list`, never in a short list reported as complete.
-- `teams_recap_list_probe.json` appears in the app data folder, and every token value in it reads `REDACTED`.
+- Closing the window early puts `the list was not read. The Teams window was closed before the recap list was read.` on the line, and changes nothing else: last sync date and known recap count stay as they were.
+- A page with no recognisable list ends in `Teams did not show the Meeting Recaps list`, never in a short list reported as complete.
+- `teams_recap_list_probe.json` appears in the app data folder. It holds the candidates (titles, times and recap links, whose file paths name the OneDrive each file sits in) and the listing's counts and timings, and no token, summary or transcript.
 
 ## First Sync
 
 - Set `Start from` to 14 days back and press `Sync Teams recaps`. Progress shows done and total counts with the current title.
+- One Teams window reads the list and then every recap. If Teams asks you to pick your account in it, pick yours. Nothing else in the window needs a click. While it reads recaps its title is `Teams recaps — Meetily is reading them. Leave this window open.` The log has a `Teams recap extracted after N s` line for each recap read, well under 60 s each.
+- A recap Teams does not open in time logs `Teams recap: not open within N s, last waiting on <host and path>, <visible or hidden>, <focused or not focused>, N frames` and is read again after the others (`[recap-sync] retry 1/N`). If it does not open again, it fails with `Teams did not open this recap within N seconds.` A hidden window in which no recap has opened shows itself 25 s into a read, with `Teams recap: showing the window`.
 - The toast reports new, updated, unchanged, not ready and failed counts, and they add up to the scanned count.
-- The vault holds one note per meeting in `Meetings`, with `meeting_id` in its front matter and an `Open original Teams recap` link at the end of the summary. A recap link that names its recording gives the note the name `YYYY-MM-DD Title.md`.
+- The vault holds one note per meeting in `Meetings`, with `meeting_id` in its front matter and an `Open original Teams recap` link at the end of the summary. Each note is named `YYYY-MM-DD Title.md` by the day the meeting took place, including recaps whose link names no recording. No note carries the sync's own date unless a meeting took place that day.
 - Each new meeting appears in Meetily without a restart, with the recap as its summary and no transcript.
 - Two occurrences of a recurring meeting are two meetings and two notes, each with its own date.
 - A row with no recap link counts as not ready and creates nothing.
@@ -44,6 +50,7 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Press `Sync Teams recaps` again straight away: every recap counts as unchanged, no note's `exported` time moves, and the meeting count stays the same.
 - A second press while a sync runs is not possible: the buttons are disabled. A second call reports `A Teams recap sync is already running.`
 - Quit Meetily in the middle of a sync, relaunch and sync again: no duplicates, and the recaps not reached the first time are imported.
+- A recap-only meeting that an older build dated by its import moves to the meeting's date on the next sync. It counts as updated, the log has `Recap meeting <id> moved from <old> to its listed start <new>`, and its note is renamed with no copy left under the old name. The sync after that counts it as unchanged.
 
 ## Recap Changed In Teams
 
@@ -59,14 +66,14 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 
 ## Failures
 
-- Turn off the network during a sync: the recaps it reaches count as not ready or failed, and none of them is written. A failure toast names the first failed recap. Sync again with the network back: they import, and the others stay unchanged.
+- Turn off the network during a sync: the recaps it reaches fail after one more read at the end, since Teams cannot open them, and none of them is written. A failure toast names the first failed recap. Sync again with the network back: they import, and the others stay unchanged.
 - Point the vault at a missing folder and press `Sync Teams recaps`: the sync refuses before reading Teams, with the same message as the link import.
-- A recap with no AI notes yet counts as not ready on every sync until Teams finishes it, then counts as new. No window appears for it, and it takes about a minute.
+- A recap with no AI notes yet counts as not ready on every sync until Teams finishes it, then counts as new. No window appears for it. It takes a minute, or 3 if it is the sync's first recap, and the log shows `Teams recap: open after N s, but no AI summary within N s`.
 - Delete an imported meeting in Meetily and sync: an unchanged recap stays skipped and does not bring the meeting back.
 
 ## Privacy And Diagnostics
 
-- The log's `[recap-list]` and `[recap-sync]` lines hold states, counts, and meeting titles or error messages on failures. They never hold recap text or recap links.
+- The log's `[recap-list]` and `[recap-sync]` lines hold states, counts, and meeting titles or error messages on failures. They never hold recap text or recap links. A `Teams recap state: waiting on …` line holds a page's host and path with ids masked, never its query.
 - `teams_recap_sync.json` holds the since date, the last sync date, and for each recap its key, meeting id, time and content hash. It holds no recap text.
 
 ## Live Recordings
@@ -96,6 +103,7 @@ The build that brings this adds a migration, so follow `docs/windows/DATABASE_UP
 - Scan in the import dialog's SharePoint tab: the file shows `Recorded live` and starts unticked.
 - Sync recaps, or paste the recap link: the recap attaches to the live meeting. Its note has `import_source: live-recording`, `recorded_at`, and the file's name and URL.
 - Have a colleague in another time zone record the Teams side, so that the stamp in the file name is not your local time. The file still links.
+- Have a colleague whose Teams is in Spanish organize and record a meeting you record live, so that the file is `…-Grabación de la reunión.mp4`. The file still links, and its recap attaches to the same meeting.
 - Record a meeting of more than 4 hours, so that Teams writes `…-Meeting Recording.mp4` and `…-Meeting Recording 2.mp4`. Neither downloads, and there is one meeting. Paste a recap that names the second part: it attaches to that meeting.
 
 ### The Other Order

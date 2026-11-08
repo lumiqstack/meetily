@@ -1,12 +1,16 @@
-//! Pull every Copilot recap the Teams Meet app lists into Meetily and the
+//! Pull every Copilot recap the Teams Recap app lists into Meetily and the
 //! Obsidian vault, one button press at a time. Each recap is keyed on the
 //! recording it belongs to (see `teams_recap::meeting_identity_key`), so a
 //! recap never creates a second meeting or a second note, and a content hash
-//! per key turns an unchanged recap into a skip instead of a rewrite.
+//! per key turns an unchanged recap into a skip instead of a rewrite. A recap
+//! a sync has read a day or more after its meeting is not opened again.
 //!
-//! The list itself comes from `teams_recap_list`, which reads the Meet app's
-//! recap tab in a hidden WebView2 window. Rows it lists without a recap link
-//! count as not ready. See docs/TEAMS_RECAP_SYNC_SPEC.md.
+//! A sync opens one WebView2 window, `teams_recap::RecapReader`. There it
+//! reads the Recap app's ("Meeting Recaps") Home list through
+//! `teams_recap_list`, which is where Teams may ask the user to pick their
+//! account, and then every listed recap. So Teams starts and signs in once per
+//! sync. Rows listed without a recap link count as not ready. See
+//! docs/TEAMS_RECAP_SYNC_SPEC.md.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -19,21 +23,33 @@ use tauri_plugin_store::StoreExt;
 
 const SYNC_STORE_FILE: &str = "teams_recap_sync.json";
 const SYNC_STORE_KEY: &str = "state";
+const LAST_LISTING_KEY: &str = "lastListing";
 /// How far back the first sync reaches when the user has not chosen a date.
 const DEFAULT_BACKFILL_DAYS: i64 = 30;
 /// A recap appears hours after a meeting and Teams may finish generating one
-/// days later, so each sync re-reads this much of the previous window.
+/// days later, so each sync lists this much of the previous window again. It
+/// retries the recaps that were not ready, and opens again the ones it holds
+/// from a read too soon after their meeting (see [`FINAL_AFTER_HOURS`]).
 const OVERLAP_DAYS: i64 = 7;
+/// A recap a sync read this long after its meeting started is taken as final:
+/// later syncs list it but do not open it, which takes about 33 s a recap. On
+/// 2026-11-07 a sync opened again the 23 recaps it held, for 13 of its 18
+/// minutes, and none showed a change since the sync 13 hours before.
+const FINAL_AFTER_HOURS: i64 = 24;
 pub const PROGRESS_EVENT: &str = "teams-recap-sync-progress";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedRecap {
     pub meeting_id: String,
-    /// RFC 3339.
+    /// RFC 3339, when the recap was last written.
     pub imported_at: String,
     /// SHA-256 of the recap markdown last written, hex.
     pub content_hash: String,
+    /// RFC 3339, when a sync last read the recap. Records written before this
+    /// was kept have none, and `imported_at` stands in.
+    #[serde(default)]
+    pub read_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,11 +74,100 @@ pub struct TeamsRecapSyncStateView {
     pub since_date: Option<String>,
     pub last_sync_date: Option<String>,
     pub known_recaps: usize,
-    /// The Meet app can be read on this platform.
+    /// The Recap app can be read on this platform.
     pub available: bool,
+    /// The line beside the buttons, once the list has been read.
+    pub last_listing: Option<LastListingView>,
 }
 
-/// One meeting row the Meet app lists.
+/// The list as the last check or sync read it. Stored apart from
+/// [`TeamsRecapSyncState`]: reading the list never moves the scan window or
+/// changes the known recaps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastListing {
+    /// RFC 3339, when the list was read.
+    pub read_at: String,
+    /// RFC 3339 start of the scan window it was read for.
+    pub window_start: String,
+    /// Recaps listed with a link.
+    pub listed: usize,
+    /// Identity keys of the listed recaps whose link is valid, to count the
+    /// synced ones.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default)]
+    pub rows_without_link: usize,
+    /// Why the list was not read, when it was not.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The oldest slot the list reached, when it stopped before the window
+    /// start with rows possibly left unread.
+    #[serde(default)]
+    pub ended_early_at: Option<String>,
+}
+
+impl LastListing {
+    fn from_listing(
+        read_at: DateTime<Utc>,
+        window_start: DateTime<Utc>,
+        listing: &super::teams_recap_list::RecapListing,
+    ) -> Self {
+        // The same key the sync records an import under.
+        let keys = listing
+            .candidates
+            .iter()
+            .filter_map(|candidate| crate::audio::teams_recap::validate_recap_url(&candidate.recap_url).ok())
+            .map(|url| crate::audio::teams_recap::meeting_identity_key(url.as_str()))
+            .collect();
+        Self {
+            read_at: read_at.to_rfc3339(),
+            window_start: window_start.to_rfc3339(),
+            listed: listing.candidates.len(),
+            keys,
+            rows_without_link: listing.rows_without_link,
+            error: listing.error.clone(),
+            ended_early_at: listing
+                .end
+                .filter(|end| end.may_be_short())
+                .and(listing.oldest_row.clone()),
+        }
+    }
+
+    /// Counted against the recaps synced so far, so a sync after the check
+    /// moves its recaps from pending to synced.
+    fn view(&self, imported: &HashMap<String, ImportedRecap>) -> LastListingView {
+        let synced = self.keys.iter().filter(|key| imported.contains_key(*key)).count();
+        LastListingView {
+            read_at: self.read_at.clone(),
+            window_start: self.window_start.clone(),
+            listed: self.listed,
+            synced,
+            pending: self.listed.saturating_sub(synced),
+            not_ready: self.rows_without_link,
+            error: self.error.clone(),
+            ended_early_at: self.ended_early_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastListingView {
+    pub read_at: String,
+    pub window_start: String,
+    pub listed: usize,
+    /// Listed recaps a sync has already saved.
+    pub synced: usize,
+    /// Listed recaps the next sync would save.
+    pub pending: usize,
+    /// Listed meetings without a recap link yet.
+    pub not_ready: usize,
+    pub error: Option<String>,
+    pub ended_early_at: Option<String>,
+}
+
+/// One meeting row the Recap app lists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecapCandidate {
@@ -86,6 +191,9 @@ pub struct RecapSyncReport {
     pub new: usize,
     pub updated: usize,
     pub skipped: usize,
+    /// Held from a read at least [`FINAL_AFTER_HOURS`] after their meeting,
+    /// so not opened.
+    pub kept: usize,
     pub not_ready: usize,
     pub failed: Vec<RecapSyncFailure>,
     /// Titles of recaps imported as their own meeting although a live
@@ -107,8 +215,29 @@ enum Outcome {
     New { possible_duplicate: bool },
     Updated,
     Skipped,
+    /// Held from a read at least [`FINAL_AFTER_HOURS`] after its meeting, so
+    /// not opened.
+    Kept,
     NotReady,
+    /// Teams did not open the recap in time. The sync tries it once more after
+    /// the others, then counts it failed with this message.
+    NotOpened(String),
     Failed(String),
+}
+
+impl Outcome {
+    /// For the log, which never names the meeting.
+    fn label(&self) -> &'static str {
+        match self {
+            Outcome::New { .. } => "new",
+            Outcome::Updated => "updated",
+            Outcome::Skipped => "unchanged",
+            Outcome::Kept => "kept, not opened",
+            Outcome::NotReady => "not ready",
+            Outcome::NotOpened(_) => "not open",
+            Outcome::Failed(_) => "failed",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +277,34 @@ fn update_state<R: Runtime>(
         .map_err(|e| anyhow!("Could not persist the recap sync store: {e}"))
 }
 
+fn load_last_listing<R: Runtime>(app: &AppHandle<R>) -> Option<LastListing> {
+    let store = app.store(SYNC_STORE_FILE).ok()?;
+    store
+        .get(LAST_LISTING_KEY)
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Keep what the list showed for the line beside the buttons. A failure costs
+/// only that line, so it is logged instead of failing the check or sync.
+fn record_listing<R: Runtime>(app: &AppHandle<R>, last: &LastListing) {
+    let saved = (|| -> Result<()> {
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let store = app
+            .store(SYNC_STORE_FILE)
+            .map_err(|e| anyhow!("Could not open the recap sync store: {e}"))?;
+        store.set(
+            LAST_LISTING_KEY,
+            serde_json::to_value(last).context("Could not serialize the list result")?,
+        );
+        store
+            .save()
+            .map_err(|e| anyhow!("Could not persist the recap sync store: {e}"))
+    })();
+    if let Err(e) = saved {
+        warn!("[recap-sync] could not record the list result: {e}");
+    }
+}
+
 fn parse_since_date(value: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d")
         .map_err(|_| anyhow!("Enter the since date as YYYY-MM-DD."))
@@ -174,32 +331,41 @@ fn content_hash(markdown: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Whether an extraction error means "no AI summary yet" rather than a
-/// broken session or layout. Such a recap stays unrecorded and is retried
-/// on the next sync.
-fn is_not_ready(error: &str) -> bool {
-    error.contains("did not show an AI summary")
+/// Whether the sync keeps its copy of a listed recap without opening it: a
+/// sync read it at least [`FINAL_AFTER_HOURS`] after its meeting started, and
+/// the meeting needs no new date, which takes writing the recap again. A recap
+/// listed without a start is always opened.
+fn keeps_unopened(held: Option<&ImportedRecap>, listed_start: Option<&str>, needs_redate: bool) -> bool {
+    if needs_redate {
+        return false;
+    }
+    let (Some(entry), Some(start)) = (held, crate::summary::commands::listed_instant(listed_start)) else {
+        return false;
+    };
+    let read_at = entry.read_at.as_deref().unwrap_or(&entry.imported_at);
+    DateTime::parse_from_rfc3339(read_at)
+        .is_ok_and(|read| read.with_timezone(&Utc) - start >= Duration::hours(FINAL_AFTER_HOURS))
+}
+
+/// A recap Teams opened without an AI summary may still be in the works, so it
+/// stays unrecorded and the next sync retries it. One Teams did not open gets
+/// another read this sync. Any other miss failed, and the report says why.
+fn missed_outcome(missed: crate::audio::teams_recap::MissedRecap) -> Outcome {
+    use crate::audio::teams_recap::MissedRecap;
+    match missed {
+        MissedRecap::NoSummary => Outcome::NotReady,
+        missed @ MissedRecap::NotOpened { .. } => Outcome::NotOpened(missed.to_string()),
+        missed => Outcome::Failed(missed.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
 
-/// The Meet app can only be read through the Windows WebView2 profile.
+/// The Recap app can only be read through the Windows WebView2 profile.
 pub const fn sync_available() -> bool {
     cfg!(target_os = "windows")
-}
-
-/// The Meet app's rows for the window, or the error the listing hit.
-async fn list_recaps<R: Runtime>(
-    app: &AppHandle<R>,
-    since: DateTime<Utc>,
-) -> Result<super::teams_recap_list::RecapListing> {
-    let listing = super::teams_recap_list::list_recaps(app, since, false).await?;
-    if let Some(error) = &listing.error {
-        return Err(anyhow!("{error}"));
-    }
-    Ok(listing)
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +379,7 @@ async fn import_candidate<R: Runtime>(
     pool: &sqlx::SqlitePool,
     known: &HashMap<String, ImportedRecap>,
     candidate: &RecapCandidate,
+    reader: &mut crate::audio::teams_recap::RecapReader<R>,
 ) -> Outcome {
     let validated = match crate::audio::teams_recap::validate_recap_url(&candidate.recap_url) {
         Ok(url) => url,
@@ -221,18 +388,40 @@ async fn import_candidate<R: Runtime>(
     let source_url = validated.as_str();
     let key = crate::audio::teams_recap::meeting_identity_key(source_url);
     let recording = crate::audio::teams_recap::recording_metadata(&validated);
-
-    // The listing just proved sign-in, so no recap gets a window of its own: a
-    // list with ten unfinished recaps must not cost ten five-minute waits.
-    let recap = match crate::audio::teams_recap::extract_teams_recap_unattended(app, source_url).await {
-        Ok(recap) => recap,
-        Err(e) if is_not_ready(&e.to_string()) => return Outcome::NotReady,
-        Err(e) => return Outcome::Failed(e.to_string()),
+    let listed_start = candidate.started_at.as_deref();
+    let seen_before = known.get(&key);
+    // A recap the sync holds is written again, unchanged, when its meeting is
+    // not dated by the recap's row, so the meeting and its note move to when it
+    // took place.
+    let needs_redate = match seen_before {
+        Some(entry) => {
+            match crate::summary::commands::recap_meeting_needs_redate(pool, &entry.meeting_id, listed_start).await {
+                Ok(needs) => needs,
+                Err(e) => return Outcome::Failed(e),
+            }
+        }
+        None => false,
     };
+    if keeps_unopened(seen_before, listed_start, needs_redate) {
+        return Outcome::Kept;
+    }
+
+    let recap = match reader.read(&validated).await {
+        Ok(recap) => recap,
+        Err(missed) => return missed_outcome(missed),
+    };
+    let read_at = Utc::now().to_rfc3339();
     let markdown = crate::summary::commands::recap_markdown_with_source(&recap.markdown, source_url);
     let hash = content_hash(&markdown);
-    let seen_before = known.get(&key);
-    if seen_before.is_some_and(|entry| entry.content_hash == hash) {
+    if !needs_redate && seen_before.is_some_and(|entry| entry.content_hash == hash) {
+        // When this read happened decides whether the next sync opens it.
+        if let Err(e) = update_state(app, |state| {
+            if let Some(entry) = state.imported.get_mut(&key) {
+                entry.read_at = Some(read_at);
+            }
+        }) {
+            warn!("[recap-sync] could not record when the recap was read: {e}");
+        }
         return Outcome::Skipped;
     }
 
@@ -242,7 +431,7 @@ async fn import_candidate<R: Runtime>(
         candidate.title.clone(),
         source_url,
         recording.as_ref().map(|metadata| metadata.recorded_at.as_str()),
-        candidate.started_at.as_deref(),
+        listed_start,
         &markdown,
     )
     .await
@@ -258,6 +447,7 @@ async fn import_candidate<R: Runtime>(
                 meeting_id: persisted.meeting_id.clone(),
                 imported_at: Utc::now().to_rfc3339(),
                 content_hash: hash,
+                read_at: Some(read_at),
             },
         );
     }) {
@@ -266,9 +456,72 @@ async fn import_candidate<R: Runtime>(
     written_outcome(seen_before.is_some(), &persisted)
 }
 
+/// Imports one listed recap. The sync's reads Teams; tests stand in for it.
+trait RecapImporter {
+    /// Before each recap: how many recaps already have their outcome.
+    fn starting(&mut self, _settled: usize, _total: usize, _candidate: &RecapCandidate) {}
+    async fn import(&mut self, candidate: &RecapCandidate) -> Outcome;
+}
+
+/// Reads each recap in the sync's Teams window and reports progress.
+struct WindowImporter<'a, R: Runtime> {
+    app: &'a AppHandle<R>,
+    pool: &'a sqlx::SqlitePool,
+    known: &'a HashMap<String, ImportedRecap>,
+    reader: &'a mut crate::audio::teams_recap::RecapReader<R>,
+}
+
+impl<R: Runtime> RecapImporter for WindowImporter<'_, R> {
+    fn starting(&mut self, settled: usize, total: usize, candidate: &RecapCandidate) {
+        let _ = self.app.emit(
+            PROGRESS_EVENT,
+            SyncProgress { done: settled, total, current_title: &candidate.title },
+        );
+    }
+
+    async fn import(&mut self, candidate: &RecapCandidate) -> Outcome {
+        import_candidate(self.app, self.pool, self.known, candidate, &mut *self.reader).await
+    }
+}
+
+/// Import every candidate in order, then once more each one Teams did not
+/// open. On 2026-11-07 the first 7 recaps of a sync never opened and the 23
+/// after them all did.
+async fn import_all(
+    candidates: &[RecapCandidate],
+    importer: &mut impl RecapImporter,
+    report: &mut RecapSyncReport,
+) {
+    let total = candidates.len();
+    let mut settled = 0;
+    let mut not_opened = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        importer.starting(settled, total, candidate);
+        info!("[recap-sync] recap {}/{total}", index + 1);
+        let outcome = importer.import(candidate).await;
+        info!("[recap-sync] recap {}/{total}: {}", index + 1, outcome.label());
+        if matches!(outcome, Outcome::NotOpened(_)) {
+            not_opened.push(candidate);
+        } else {
+            settled += 1;
+            report.tally(&candidate.title, outcome);
+        }
+    }
+    let retries = not_opened.len();
+    for (index, candidate) in not_opened.into_iter().enumerate() {
+        importer.starting(settled, total, candidate);
+        info!("[recap-sync] retry {}/{retries}", index + 1);
+        let outcome = importer.import(candidate).await;
+        info!("[recap-sync] retry {}/{retries}: {}", index + 1, outcome.label());
+        settled += 1;
+        report.tally(&candidate.title, outcome);
+    }
+}
+
 /// Whether the scan window may move on. A sync that read no recap learned
 /// nothing, and may have misread the list, so moving on could lose the rest of
-/// the first sync's backfill for good.
+/// the first sync's backfill for good. Recaps kept unopened do not count: if
+/// Teams stopped opening recaps, moving on could lose the new ones that failed.
 fn read_any_recap(report: &RecapSyncReport) -> bool {
     report.new + report.updated + report.skipped > 0
 }
@@ -297,8 +550,9 @@ impl RecapSyncReport {
             }
             Outcome::Updated => self.updated += 1,
             Outcome::Skipped => self.skipped += 1,
+            Outcome::Kept => self.kept += 1,
             Outcome::NotReady => self.not_ready += 1,
-            Outcome::Failed(error) => {
+            Outcome::NotOpened(error) | Outcome::Failed(error) => {
                 warn!("[recap-sync] {title}: {error}");
                 self.failed.push(RecapSyncFailure { title: title.to_owned(), error });
             }
@@ -322,7 +576,20 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let state = load_state(app);
     let since = scan_window_start(&state, started_at);
     info!("[recap-sync] listing recaps since {}", since.to_rfc3339());
-    let listing = list_recaps(app, since).await.map_err(|e| e.to_string())?;
+    // One Teams window for the whole sync. It reads the list first, which is
+    // where Teams may ask the user to pick their account, and then every
+    // recap, so they are read where the user signed in. On 2026-11-07 a second
+    // hidden window opened after the list did not open a recap for 10 minutes.
+    let mut reader = crate::audio::teams_recap::RecapReader::open(app).await.map_err(|e| {
+        let error = format!("Could not open the Teams window for the recaps: {e}");
+        warn!("[recap-sync] {error}");
+        error
+    })?;
+    let listing = reader.list(since).await.map_err(|e| e.to_string())?;
+    record_listing(app, &LastListing::from_listing(Utc::now(), since, &listing));
+    if let Some(error) = &listing.error {
+        return Err(error.clone());
+    }
 
     let app_state = app.state::<crate::state::AppState>();
     let pool = app_state.db_manager.pool();
@@ -337,14 +604,9 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
     let mut ordered = listing.candidates;
     ordered.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     let total = ordered.len();
-    for (done, candidate) in ordered.iter().enumerate() {
-        let _ = app.emit(
-            PROGRESS_EVENT,
-            SyncProgress { done, total, current_title: &candidate.title },
-        );
-        let outcome = import_candidate(app, pool, &state.imported, candidate).await;
-        report.tally(&candidate.title, outcome);
-    }
+    let mut importer = WindowImporter { app, pool, known: &state.imported, reader: &mut reader };
+    import_all(&ordered, &mut importer, &mut report).await;
+    drop(reader);
     let _ = app.emit(PROGRESS_EVENT, SyncProgress { done: total, total, current_title: "" });
 
     if !read_any_recap(&report) {
@@ -353,8 +615,14 @@ pub async fn sync_recaps<R: Runtime>(app: &AppHandle<R>) -> Result<RecapSyncRepo
         warn!("[recap-sync] could not persist last sync date: {e}");
     }
     info!(
-        "[recap-sync] scanned {} new {} updated {} skipped {} not ready {} failed {}",
-        report.scanned, report.new, report.updated, report.skipped, report.not_ready, report.failed.len()
+        "[recap-sync] scanned {} new {} updated {} skipped {} kept {} not ready {} failed {}",
+        report.scanned,
+        report.new,
+        report.updated,
+        report.skipped,
+        report.kept,
+        report.not_ready,
+        report.failed.len()
     );
     Ok(report)
 }
@@ -373,11 +641,13 @@ pub async fn get_teams_recap_sync_state_command<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<TeamsRecapSyncStateView, String> {
     let state = load_state(&app);
+    let last_listing = load_last_listing(&app).map(|last| last.view(&state.imported));
     Ok(TeamsRecapSyncStateView {
         since_date: state.since_date,
         last_sync_date: state.last_sync_date,
         known_recaps: state.imported.len(),
         available: sync_available(),
+        last_listing,
     })
 }
 
@@ -393,8 +663,9 @@ pub async fn set_teams_recap_sync_prefs_command<R: Runtime>(
     update_state(&app, |state| state.since_date = since_date).map_err(|e| e.to_string())
 }
 
-/// The raw candidate list, without importing anything. For learning the
-/// Meet app layout and for the QA doc.
+/// The raw candidate list, without importing anything. For checking the
+/// listing against Teams and for the QA doc. Like a sync, it records what the
+/// list showed for the line beside the buttons.
 #[tauri::command]
 pub async fn teams_recap_list_debug_command<R: Runtime>(
     app: AppHandle<R>,
@@ -407,6 +678,7 @@ pub async fn teams_recap_list_debug_command<R: Runtime>(
     let listing = super::teams_recap_list::list_recaps(&app, since, true)
         .await
         .map_err(|e| e.to_string())?;
+    record_listing(&app, &LastListing::from_listing(Utc::now(), since, &listing));
     let probe_file = app
         .path()
         .app_data_dir()
@@ -490,12 +762,49 @@ mod tests {
         assert_eq!(content_hash("").len(), 64);
     }
 
+    fn read_at(when: &str) -> ImportedRecap {
+        ImportedRecap { read_at: Some(when.into()), ..Default::default() }
+    }
+
     #[test]
-    fn only_a_missing_ai_summary_counts_as_not_ready() {
-        assert!(is_not_ready("Teams did not show an AI summary for this link. Sign in if prompted."));
-        assert!(!is_not_ready("WebView2 is unavailable: boom"));
-        assert!(!is_not_ready("Teams stayed on its app-choice page."));
-        assert!(is_not_ready(crate::audio::teams_recap::UNATTENDED_NO_SUMMARY));
+    fn a_recap_read_a_day_after_its_meeting_is_kept_unopened() {
+        let start = Some("2026-11-05T19:33:55.000Z");
+        assert!(keeps_unopened(Some(&read_at("2026-11-06T19:33:55+00:00")), start, false), "24 h after");
+        assert!(keeps_unopened(Some(&read_at("2026-11-06T14:00:00-06:00")), start, false), "24 h 26 min after");
+        assert!(!keeps_unopened(Some(&read_at("2026-11-06T13:00:00-06:00")), start, false), "23 h 26 min after");
+        assert!(!keeps_unopened(None, start, false), "a recap the sync does not hold");
+        let late = read_at("2026-11-08T09:00:00Z");
+        assert!(!keeps_unopened(Some(&late), start, true), "its meeting needs a new date");
+        assert!(!keeps_unopened(Some(&late), None, false), "listed without a start");
+        assert!(!keeps_unopened(Some(&late), Some("Thursday"), false));
+        assert!(!keeps_unopened(Some(&read_at("soon")), start, false));
+    }
+
+    #[test]
+    fn a_record_without_a_read_time_goes_by_when_it_was_written() {
+        // Records written before read times were kept.
+        let entry = ImportedRecap { imported_at: "2026-11-07T19:00:00+00:00".into(), ..Default::default() };
+        assert!(keeps_unopened(Some(&entry), Some("2026-11-06T16:00:00Z"), false));
+        assert!(!keeps_unopened(Some(&entry), Some("2026-11-07T09:00:00Z"), false));
+        // The last read decides, not the import.
+        let reread = ImportedRecap { read_at: Some("2026-11-08T10:00:00+00:00".into()), ..entry };
+        assert!(keeps_unopened(Some(&reread), Some("2026-11-07T09:00:00Z"), false));
+    }
+
+    #[test]
+    fn only_a_recap_that_opened_without_an_ai_summary_counts_as_not_ready() {
+        use crate::audio::teams_recap::MissedRecap;
+        assert_eq!(missed_outcome(MissedRecap::NoSummary), Outcome::NotReady);
+        // On 2026-11-06 all 30 recaps of a sync timed out before Teams had
+        // opened them, and the report called every one "not ready".
+        assert_eq!(
+            missed_outcome(MissedRecap::NotOpened { waited: std::time::Duration::from_secs(60) }),
+            Outcome::NotOpened("Teams did not open this recap within 60 seconds.".into())
+        );
+        assert_eq!(
+            missed_outcome(MissedRecap::Failed(anyhow!("Teams stayed on its app-choice page."))),
+            Outcome::Failed("Teams stayed on its app-choice page.".into())
+        );
     }
 
     #[test]
@@ -504,6 +813,8 @@ mod tests {
         assert!(!read_any_recap(&report), "rows without a link prove nothing about the list");
         report.failed.push(RecapSyncFailure { title: "T".into(), error: "boom".into() });
         assert!(!read_any_recap(&report));
+        report.kept = 20;
+        assert!(!read_any_recap(&report), "recaps kept unopened say nothing about the reads");
         assert!(!read_any_recap(&RecapSyncReport::default()));
         for read in [
             RecapSyncReport { new: 1, ..Default::default() },
@@ -544,10 +855,157 @@ mod tests {
         report.tally("D", Outcome::Skipped);
         report.tally("E", Outcome::NotReady);
         report.tally("F", Outcome::Failed("boom".into()));
-        assert_eq!((report.new, report.updated, report.skipped, report.not_ready), (2, 1, 1, 1));
+        report.tally("G", Outcome::NotOpened("not open".into()));
+        report.tally("H", Outcome::Kept);
+        assert_eq!((report.new, report.updated, report.skipped, report.kept, report.not_ready), (2, 1, 1, 1, 1));
         assert_eq!(report.possible_duplicates, vec!["B".to_string()]);
         assert_eq!(report.failed[0].title, "F");
         assert_eq!(report.failed[0].error, "boom");
+        assert_eq!((report.failed[1].title.as_str(), report.failed[1].error.as_str()), ("G", "not open"));
+    }
+
+    /// Plays back each title's outcomes in turn and notes what it was asked.
+    #[derive(Default)]
+    struct Scripted {
+        outcomes: HashMap<&'static str, Vec<Outcome>>,
+        reads: Vec<String>,
+        settled: Vec<usize>,
+    }
+
+    impl RecapImporter for Scripted {
+        fn starting(&mut self, settled: usize, _total: usize, _candidate: &RecapCandidate) {
+            self.settled.push(settled);
+        }
+
+        async fn import(&mut self, candidate: &RecapCandidate) -> Outcome {
+            self.reads.push(candidate.title.clone());
+            self.outcomes.get_mut(candidate.title.as_str()).expect("scripted title").remove(0)
+        }
+    }
+
+    fn candidate(title: &str) -> RecapCandidate {
+        RecapCandidate { recap_url: format!("https://teams.cloud.microsoft/l/meetingrecap?threadId={title}"), title: title.into(), started_at: None }
+    }
+
+    #[tokio::test]
+    async fn a_recap_teams_did_not_open_is_read_again_after_the_others() {
+        let not_open = || Outcome::NotOpened("Teams did not open this recap within 60 seconds.".into());
+        let mut importer = Scripted {
+            outcomes: HashMap::from([
+                ("A", vec![not_open(), Outcome::New { possible_duplicate: false }]),
+                ("B", vec![Outcome::NotReady]),
+                ("C", vec![not_open(), not_open()]),
+                ("D", vec![Outcome::Skipped]),
+            ]),
+            ..Default::default()
+        };
+        let mut report = RecapSyncReport::default();
+        let candidates = ["A", "B", "C", "D"].map(candidate);
+        import_all(&candidates, &mut importer, &mut report).await;
+
+        // A recap that opened without notes (B) is not read again this sync.
+        assert_eq!(importer.reads, ["A", "B", "C", "D", "A", "C"]);
+        // Progress counts recaps that have their outcome, so it never runs back.
+        assert_eq!(importer.settled, [0, 0, 1, 1, 2, 3]);
+        assert_eq!((report.new, report.not_ready, report.skipped), (1, 1, 1));
+        assert_eq!(report.failed.len(), 1, "a recap counts once, by its second read");
+        assert_eq!(report.failed[0].title, "C");
+        assert_eq!(report.failed[0].error, "Teams did not open this recap within 60 seconds.");
+    }
+
+    fn recap_link(file: &str) -> String {
+        format!(
+            "https://teams.microsoft.com/l/meetingrecap?threadId=19%3Aa&fileUrl=https%3A%2F%2Fcontoso-my.sharepoint.com%2Fpersonal%2Fjdoe%2FDocuments%2FRecordings%2F{file}-Meeting%20Recording.mp4"
+        )
+    }
+
+    /// The key the sync records an import under.
+    fn synced_key(link: &str) -> String {
+        crate::audio::teams_recap::meeting_identity_key(
+            crate::audio::teams_recap::validate_recap_url(link).unwrap().as_str(),
+        )
+    }
+
+    fn listing_of(links: &[String]) -> crate::audio::teams_recap_list::RecapListing {
+        crate::audio::teams_recap_list::RecapListing {
+            candidates: links
+                .iter()
+                .map(|link| RecapCandidate { recap_url: link.clone(), title: "T".into(), started_at: None })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_last_listing_counts_its_recaps_against_the_synced_ones() {
+        let links = [recap_link("Standup-20261103_090000"), recap_link("Review-20261104_090000"), recap_link("Sync-20261105_090000")];
+        let mut listing = listing_of(&links);
+        listing.rows_without_link = 2;
+        let last = LastListing::from_listing(at("2026-11-06T18:40:20Z"), at("2026-10-29T01:16:21Z"), &listing);
+        let mut imported = HashMap::new();
+        imported.insert(synced_key(&links[0]), ImportedRecap::default());
+        let view = last.view(&imported);
+        assert_eq!((view.listed, view.synced, view.pending, view.not_ready), (3, 1, 2, 2));
+        assert_eq!((view.read_at.as_str(), view.window_start.as_str()), ("2026-11-06T18:40:20+00:00", "2026-10-29T01:16:21+00:00"));
+        assert_eq!((view.error, view.ended_early_at), (None, None));
+
+        // A sync after the check moves its recaps from pending to synced.
+        imported.insert(synced_key(&links[2]), ImportedRecap::default());
+        let view = last.view(&imported);
+        assert_eq!((view.synced, view.pending), (2, 1));
+    }
+
+    #[test]
+    fn a_listed_link_that_fails_validation_stays_pending() {
+        let link = "https://example.com/l/meetingrecap?threadId=1".to_string();
+        let last = LastListing::from_listing(at("2026-11-06T18:40:20Z"), at("2026-10-29T00:00:00Z"), &listing_of(&[link.clone()]));
+        assert!(last.keys.is_empty());
+        let mut imported = HashMap::new();
+        imported.insert(crate::audio::teams_recap::meeting_identity_key(&link), ImportedRecap::default());
+        let view = last.view(&imported);
+        assert_eq!((view.listed, view.synced, view.pending), (1, 0, 1));
+    }
+
+    #[test]
+    fn a_list_that_stopped_before_the_window_start_says_how_far_back_it_got() {
+        use crate::audio::teams_recap_list::ListEnd;
+        let oldest = "2026-11-05T15:00:00.000Z";
+        for (end, expected) in [
+            (Some(ListEnd::Idle), Some(oldest)),
+            (Some(ListEnd::Cap), Some(oldest)),
+            (Some(ListEnd::Since), None),
+            (Some(ListEnd::Empty), None),
+            (None, None),
+        ] {
+            let mut listing = listing_of(&[recap_link("Sync-20261105_090000")]);
+            listing.end = end;
+            listing.oldest_row = Some(oldest.into());
+            let last = LastListing::from_listing(at("2026-11-06T17:04:15Z"), at("2026-10-29T01:16:21Z"), &listing);
+            assert_eq!(last.ended_early_at.as_deref(), expected, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_was_not_read_keeps_the_reason() {
+        let mut listing = listing_of(&[]);
+        listing.error = Some("Teams did not show the Meeting Recaps list.".into());
+        let view = LastListing::from_listing(at("2026-11-06T17:04:15Z"), at("2026-10-29T01:16:21Z"), &listing)
+            .view(&HashMap::new());
+        assert_eq!(view.error.as_deref(), Some("Teams did not show the Meeting Recaps list."));
+        assert_eq!((view.listed, view.synced, view.pending), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_last_listing_round_trips_through_json() {
+        let last = LastListing::from_listing(
+            at("2026-11-06T18:40:20Z"),
+            at("2026-10-29T01:16:21Z"),
+            &listing_of(&[recap_link("Sync-20261105_090000")]),
+        );
+        let json = serde_json::to_value(&last).unwrap();
+        assert_eq!(json["readAt"], "2026-11-06T18:40:20+00:00");
+        assert_eq!(json["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(serde_json::from_value::<LastListing>(json).unwrap(), last);
     }
 
     #[test]
@@ -555,13 +1013,28 @@ mod tests {
         let mut state = TeamsRecapSyncState::default();
         state.imported.insert(
             "host/path.mp4".into(),
-            ImportedRecap { meeting_id: "m1".into(), imported_at: "2026-11-02T10:00:00+00:00".into(), content_hash: "ab".into() },
+            ImportedRecap {
+                meeting_id: "m1".into(),
+                imported_at: "2026-11-02T10:00:00+00:00".into(),
+                content_hash: "ab".into(),
+                read_at: Some("2026-11-03T10:00:00+00:00".into()),
+            },
         );
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["imported"]["host/path.mp4"]["meetingId"], "m1");
+        assert_eq!(json["imported"]["host/path.mp4"]["readAt"], "2026-11-03T10:00:00+00:00");
         let back: TeamsRecapSyncState = serde_json::from_value(json).unwrap();
         assert_eq!(back.imported["host/path.mp4"].content_hash, "ab");
+        assert_eq!(back.imported["host/path.mp4"].read_at.as_deref(), Some("2026-11-03T10:00:00+00:00"));
         let empty: TeamsRecapSyncState = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(empty.imported.is_empty());
+        // A store written before read times were kept still loads, whole.
+        let older: TeamsRecapSyncState = serde_json::from_value(serde_json::json!({
+            "lastSyncDate": "2026-11-07T19:00:00+00:00",
+            "imported": { "k": { "meetingId": "m1", "importedAt": "2026-11-07T19:05:00+00:00", "contentHash": "ab" } }
+        }))
+        .unwrap();
+        assert_eq!(older.last_sync_date.as_deref(), Some("2026-11-07T19:00:00+00:00"));
+        assert_eq!(older.imported["k"].read_at, None);
     }
 }

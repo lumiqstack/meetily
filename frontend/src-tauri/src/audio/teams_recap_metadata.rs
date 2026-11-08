@@ -53,11 +53,22 @@ pub struct StampedName {
     pub is_utc: bool,
 }
 
-/// `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-Meeting Recording|Transcript[ <part>].<ext>`.
-/// Teams cuts a recording at 4 hours and numbers the parts after the first.
+/// What Teams writes after the stamp, lowercased. The words are localized: a
+/// Spanish Teams names a recording `Grabación de la reunión`. Its
+/// transcript-only files and later parts have not been seen, so no Spanish
+/// transcript suffix is here, and a part is read as in English.
+pub(crate) const SUFFIXES: [&str; 3] = [
+    "-meeting recording",
+    "-meeting transcript",
+    "-grabación de la reunión",
+];
+
+/// `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-<suffix>[ <part>].<ext>`, raw or
+/// percent-encoded, with a suffix from [`SUFFIXES`]. Teams cuts a recording at
+/// 4 hours and numbers the parts after the first: `Meeting Recording 2`.
 pub fn read_stamped_name(filename: &str) -> Option<StampedName> {
-    let decoded_spaces = filename.replace("%20", " ");
-    let mut name = decoded_spaces.as_str();
+    let decoded = crate::audio::sharepoint_sync::percent_decode_component(filename);
+    let mut name = decoded.as_str();
     for extension in [".mp4", ".vtt"] {
         if name.to_ascii_lowercase().ends_with(extension) {
             name = &name[..name.len() - extension.len()];
@@ -70,7 +81,7 @@ pub fn read_stamped_name(filename: &str) -> Option<StampedName> {
         }
     }
     let lower = name.to_ascii_lowercase();
-    let suffix = ["-meeting recording", "-meeting transcript"]
+    let suffix = SUFFIXES
         .into_iter()
         .find(|suffix| lower.ends_with(suffix))?;
     let (title, stamp) = name[..name.len() - suffix.len()].rsplit_once('-')?;
@@ -139,6 +150,17 @@ mod tests {
         assert_eq!(parsed.title, "Workshop 2");
         assert_eq!(parsed.recorded_at, "2026-10-16T15:00:59");
         assert!(from_filename("Workshop 2.mp4").is_none());
+    }
+    #[test]
+    fn a_spanish_teams_recording_reads_like_an_english_one_raw_or_encoded() {
+        for name in [
+            "Revisión semanal-20261105_133311-Grabación de la reunión.mp4",
+            "Revisi%C3%B3n%20semanal-20261105_133311-Grabaci%C3%B3n%20de%20la%20reuni%C3%B3n.mp4",
+        ] {
+            let parsed = from_filename(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(parsed.title, "Revisión semanal", "{name}");
+            assert_eq!(parsed.recorded_at, "2026-11-05T13:33:11", "{name}");
+        }
     }
     #[test]
     fn a_stamp_marked_utc_is_never_presented_as_local_time() {

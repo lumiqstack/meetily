@@ -1,8 +1,26 @@
 (() => {
+      // Where a read is waiting, for the log: the page's host and path with
+      // ids masked and no query, whether Teams sees the window, and how many
+      // frames the page has drawn.
+      const frames = window.__meetilyFrames ||= (() => {
+        const counter = { drawn: 0 };
+        const tick = () => { counter.drawn += 1; requestAnimationFrame(tick); };
+        requestAnimationFrame(tick);
+        return counter;
+      })();
+      const waiting = () => ({
+        status: 'waiting',
+        page: (location.host + location.pathname)
+          .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '{id}')
+          .slice(0, 80),
+        visibility: document.visibilityState,
+        focused: document.hasFocus(),
+        frames: frames.drawn
+      });
       const host = location.hostname.toLowerCase();
       if (!['teams.microsoft.com', 'teams.cloud.microsoft',
             'teams.microsoft.com.mcas.ms', 'teams.cloud.microsoft.mcas.ms'].includes(host)) {
-        return { status: 'waiting' };
+        return waiting();
       }
       const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
       const tabs = [...document.querySelectorAll('[role="tab"]')];
@@ -29,11 +47,16 @@
             names.some(s => /^(shared|files|recap)$/i.test(s))) {
           return { status: 'signed_in_chat' };
         }
-        return { status: 'waiting' };
+        // The recap's Share button shows Teams has opened the recap, before its
+        // AI summary tab appears or when it has none.
+        const share = [...document.querySelectorAll('[data-tid="recap-share-button"]')]
+          .some(el => el.getClientRects().length > 0);
+        return share ? { status: 'recap_open' } : waiting();
       }
+      // From here the recap is open: 'recap_open' until its notes can be read.
       if (tab.getAttribute('aria-selected') !== 'true') {
         tab.click();
-        return { status: 'waiting' };
+        return { status: 'recap_open' };
       }
 
       const state = window.__meetilyRecapContent ||= {
@@ -47,13 +70,13 @@
             ![...el.children].some(child => pattern.test(text(child))));
       const notesHeading = findHeading(/^meeting notes$/i);
       const tasksHeading = findHeading(/^follow[\s\u2010-\u2015-]*up tasks$/i);
-      if (!notesHeading && !tasksHeading) return { status: 'waiting' };
+      if (!notesHeading && !tasksHeading) return { status: 'recap_open' };
       const expand = [...document.querySelectorAll('button')]
         .find(el => visible(el) && /^expand all$/i.test(text(el)));
       if (expand && !state.expanded) {
         state.expanded = true;
         expand.click();
-        return { status: 'waiting' };
+        return { status: 'recap_open' };
       }
       const follows = (first, second) =>
         !!(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING);
@@ -145,7 +168,7 @@
       if (!tasksHeading || (!state.tasks.length && !emptyTasks)) {
         return { status: 'waiting_tasks' };
       }
-      if (!state.notes.length && !state.tasks.length) return { status: 'waiting' };
+      if (!state.notes.length && !state.tasks.length) return { status: 'recap_open' };
       const snapshot = JSON.stringify([state.notes, state.tasks]);
       state.stable = snapshot === state.last ? state.stable + 1 : 0;
       state.last = snapshot;

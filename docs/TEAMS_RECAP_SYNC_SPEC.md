@@ -1,12 +1,12 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-05. Steps 1 (identity and dedupe in the link import), 2 (sync state, commands, settings UI) and 3 (Meet app scanner with its probe mode) merged; the selectors are still being learned on the Windows machine. Step 4 (QA checklist, `docs/TEAMS_RECAP_SYNC_QA.md`) and step 5 (matching a recap to a live recording) merged, neither yet exercised on Windows. Step 6 (matching a recording to a live recording) is in review.
+Status: 2026-11-07. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"). Four real syncs have run on the Windows machine. The third listed the 30 recaps since Oct 29 and imported all 30 (see Reading recaps). The fourth kept 21 of its 22 recaps without opening them and took 2 minutes (see Sync loop). The QA checklist (step 4) and the live matching of steps 5 and 6 are not yet fully exercised on Windows.
 
 ## Goal
 
 Keep the Obsidian vault complete for every Teams meeting that has a Copilot
 recap, without pasting links one at a time. One button in Meetily reads the
-recap list in the Teams Meet app, imports every recap it has not seen, attaches
+meeting list of the Teams Recap app, imports every recap it has not seen, attaches
 recaps to meetings Meetily already holds from their recordings, and writes or
 refreshes one vault note per meeting. No duplicates, no misses, and a count of
 what happened at the end.
@@ -19,16 +19,16 @@ code.
 
 | Question | Decision |
 | --- | --- |
-| Source page | The Meet app in Teams (its list of recent meetings with recaps), read in the persisted WebView2 profile the recap link import already uses. |
+| Source page | The Recap app in Teams ("Meeting Recaps" on the app bar), whose Home tab lists recent meetings with recaps, read in the persisted WebView2 profile the recap link import already uses. |
 | Microsoft Graph | Not used. No Entra app registration, no admin consent. |
 | Trigger | Manual "Sync Teams recaps" button. No schedule in this version. |
 | Backfill | A since date in settings, default 30 days before the first sync. Each later sync starts from the last confirmed sync date minus an overlap window. |
 | Existing meeting from the recording | Attach the recap to that meeting. One meeting, one note. Match on the recording file URL. |
 | Existing meeting recorded live | Attach the recap when the meeting's calendar window fits the recap's time and its thread id or title confirms it. When that is ambiguous, import the recap separately and report it. See "Matching a recap to a live recording". |
 | Recording of a meeting recorded live | Link the file to the live meeting without downloading or transcribing it. The live transcript stays, and Teams' own transcript of that meeting is never imported. An ambiguous match imports the recording as its own meeting. See "Matching a recording to a live recording". |
-| Recap changed in Teams | Overwrite the vault note. Tags survive (they come from the meeting record); other edits made in Obsidian do not. |
+| Recap changed in Teams | Overwrite the vault note. Tags survive (they come from the meeting record); other edits made in Obsidian do not. A sync sees a change only until it has read the recap a day after the meeting started. After that it keeps its copy without opening the recap. |
 | Recap not ready or absent | Leave the meeting unmarked so the next sync retries. Count it as "not ready" in the report. |
-| Reporting | One toast with counts: new, updated, skipped, not ready, failed, and how many may duplicate a live recording. A link opens the vault Meetings folder. |
+| Reporting | One toast with counts: new, updated, unchanged (skipped, or kept without opening), not ready, failed, and how many may duplicate a live recording. A link opens the vault Meetings folder. |
 | Platform | Windows only. |
 
 ## What exists today
@@ -69,18 +69,18 @@ code.
 ## Architecture
 
 ```
-Settings (since date)          Teams Meet app, hidden WebView2
+Settings (since date)          the sync's one Teams window (RecapReader)
         │                                  │
         ▼                                  ▼
 sync_teams_recaps_command ──► RecapListScanner ──► Vec<RecapCandidate>
-        │                                           (recap link, title,
+        │                     (Teams Recap app)     (recap link, title,
         │                                            recorded_at, fileUrl)
         ▼
-   for each candidate
+   for each candidate, then once more each one Teams did not open
         ├── identity: canonical fileUrl key
         ├── lookup meeting by key (recap sync state, then meeting_sources)
         ├── no key found: match a live recording by calendar window
-        ├── extract recap through existing extract_teams_recap
+        ├── read the recap in the same window
         ├── create meeting | attach summary to existing meeting
         ├── export_copilot_recap_note (new or overwrite)
         └── record outcome in sync state
@@ -88,8 +88,9 @@ sync_teams_recaps_command ──► RecapListScanner ──► Vec<RecapCandidat
    RecapSyncReport ──► toast
 ```
 
-The scanner is new. Everything after it reuses the existing extractor, summary
-repository, and Obsidian exporter.
+The scanner and the reader are new. The reader's window reads the list first,
+then every recap, with the link import's page script; everything after it
+reuses the summary repository and Obsidian exporter.
 
 ### Identity
 
@@ -106,7 +107,9 @@ Stored in two places:
   is created by the sync.
 - A new store `teams_recap_sync.json` (same mechanism as the SharePoint sync
   store) holds `last_sync_date`, `since_date`, and `imported`: key to
-  `{ meeting_id, imported_at, content_hash }`.
+  `{ meeting_id, imported_at, content_hash, read_at }`. `imported_at` is when
+  the recap was last written and `read_at` when a sync last read it. Records
+  from before `read_at` existed have none.
 
 Lookup order for a candidate: the sync store by key, then `meeting_sources` by
 canonical `recording_url`. A hit in either means "existing meeting". With no
@@ -118,6 +121,10 @@ Teams cuts a long recording at 4 hours into `…-Meeting Recording.mp4` and
 lookup therefore looks for the file itself first and then for any other part of
 the same recording, meaning the same folder, title and stamp. The sync store
 keeps its exact keys.
+
+The words after the stamp are localized: a Spanish Teams writes
+`…-Grabación de la reunión.mp4`. `SUFFIXES` in `teams_recap_metadata.rs` lists
+the forms Meetily knows, and both the stamp reader and this lookup use it.
 
 ### Matching a recap to a live recording
 
@@ -136,8 +143,8 @@ good as the title it matched on: see "Matching a recording to a live recording".
 **When the recap happened.** A recap can carry two times. They are tried in
 this order, and the second only if the first fits no live recording:
 
-- In the sync loop, the start time the Meet app row shows, which Teams renders
-  in this user's zone.
+- In the sync loop, the start time the Recap app row gives: when the meeting
+  was recorded, as an exact instant, or else its calendar slot.
 - The stamp in the `fileUrl` file name, which is when the recording started,
   read in this machine's time zone (`teams_recap_metadata.rs`).
 
@@ -248,8 +255,9 @@ with the summary's first heading, usually before the file appears. So the rule
 is stricter than the recap rule, and compares with the event's subject:
 
 - *Only Teams recordings qualify.* The file name must read
-  `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-Meeting Recording|Transcript[ <part>].<ext>`.
-  Other videos the search finds never match.
+  `<title>-<YYYYMMDD>_<HHMMSS>[UTC]-<suffix>[ <part>].<ext>`, with a suffix of
+  `Meeting Recording`, `Meeting Transcript`, or `Grabación de la reunión` from a
+  Spanish Teams. Other videos the search finds never match.
 - *When it happened.* The rule tries up to three times in order, each only if the
   earlier ones fit no live recording. First a stamp marked `UTC`, then SharePoint's
   `created`, which is an instant, then an unmarked stamp read in this machine's
@@ -341,88 +349,196 @@ poll and timeout machinery as `teams_recap.js`. It is given the since date and
 returns one of:
 
 - `{ status: "waiting" }` while the list renders or sign-in is in progress.
-  The existing `launcher`, `opening_web` and `signed_in_chat` handling applies.
-- `{ status: "page", items: [...], more: bool }` with every meeting row visible
-  so far. An item carries the recap deep link, the title, the start time as
-  shown, and whether the row shows a recap indicator.
-- `{ status: "done" }` once a row older than the since date is reached or the
-  list says there are no more.
+  The existing `launcher` and `opening_web` handling applies.
+- `{ status: "navigating" }` while it steers to the list.
+- `{ status: "page", items: [...], more: true }` with every meeting row read so
+  far. An item carries the recap link the script built, the title and the
+  start time.
+- `{ status: "reloading" }` once per listing, when the list stopped growing
+  before reaching the since date: the script reloads the page and reads the
+  list again from the top.
+- `{ status: "done", items: [...], stop, oldest }` once a row older than the
+  since date is reached (`stop: "since"`), the list stops growing after that
+  reload (`"idle"`), it reaches the row cap (`"cap"`), or it shows no meetings
+  at all (`"empty"`). `oldest` is the oldest calendar slot it reached. `idle`
+  and `cap` end before the since date, so the list may be missing older rows:
+  the line beside the buttons says where it stopped.
 
-The Rust side scrolls the list until `done` or a hard cap of 500 rows, then
-dedupes items by key. Rows without a recap link are reported as "not ready"
+The Rust side keeps the last snapshot, caps it at 500 rows and dedupes items
+by key, first row wins. Rows without a recap link are reported as "not ready"
 and never written to the sync store.
 
-The exact selectors are unknown until the Meet app is inspected on the Windows
-machine. Learning them is the first delivery step and the main risk; the
-script must fail with `waiting` and then a clear timeout error on any layout it
-does not recognise, never with a partial list presented as complete.
+The list, as learned on the Windows machine in November 2026
+(`teams_recap_list.rs`, `teams_recap_list.js`):
 
-How the layout is learned (`teams_recap_list.rs`, `teams_recap_list.js`):
-
-- The window opens the Teams web shell (`https://teams.microsoft.com/v2/`),
-  since no direct URL for the Meet app's recap tab is documented. Before any
-  row counts, the script clicks, once each, a rail button named Meet or Recap
-  (opening the "more apps" flyout if the rail has none) and a tab named Recap
-  or similar, because the shell may open on Chat or Activity, whose rows carry
-  dates too. After the silent phase the window is shown so the user can
-  navigate by hand, and the script reads the list wherever it appears,
-  including inside a same-origin frame.
-- A row is any list item, row or article with a date it can parse or a recap
-  link it can find. The link comes from an `href`, from a recap URL embedded
-  in the row's markup, or, failing both, is built from a `19:meeting_…@thread.v2`
-  id in the row's markup. Rows with no link count as not ready.
-- In probe mode (the "Check recap list" button) the script also returns a
-  compact description of the page: rail and tab names, headings, list
-  containers, frames, the first rows with their lines, parsed date, link,
-  attributes and id-looking React props, every `data-tid`, recap-looking hrefs
-  and thread ids in the page. If no row holds a link, the probe opens one past
-  row (the row itself, never a button inside it) and records what that showed.
-  Token query values are redacted. The debug command writes the probe to
-  `teams_recap_list_probe.json` in the app data folder. It contains meeting
-  titles and page text, so it stays on that machine unless the user shares it.
+- The window opens the Teams web shell at `https://teams.cloud.microsoft/v2/`.
+  Starting at `teams.microsoft.com` costs about 40 seconds on a redirect page
+  (`?ocdiRedirect=index`) before Teams reloads on the new domain.
+- The list lives in the Teams Recap app, "Meeting Recaps" on the app bar (app
+  id `981bbfd0-5eb8-4393-8158-bfff69d2d6b5`). The script clicks it once, by id
+  and then by name, opening "more apps" if the bar has no such button. The app
+  has two tabs, Home and Audio recaps, and the list is Home.
+- Home is an accordion of groups ("This week", "Last week", ...), each a list
+  of `li[data-tid="podcast-meeting-item"]` rows, newest calendar slot first.
+  The script opens collapsed groups, scrolls the list's own pane to load older
+  rows, and stops at the first row whose slot is before the since date. Past
+  that row it opens only a collapsed group above it, and it opens a group again
+  if a re-render collapses it, up to three times. A recap left open from an
+  earlier visit hides the list, so the script presses its "Go to Meeting
+  Recaps" button once. It never clicks inside a row.
+- The first listing after Meetily starts can stop at the newest rows. Twice,
+  a check made within a minute of the start showed only the list's first rows
+  (7 and 6 recaps) and never loaded older ones, while checks later in the same
+  session read the whole window (28 and 29).
+  So the list counts as stopped only after 12 seconds with no new row and no
+  deeper scroll. While it waits, the script scrolls back up a screen every 3
+  seconds so the list's end comes into view again. If it still stops before
+  the since date, the script reloads the page once and reads the list again.
+  The mark for that one reload lives in the window's sessionStorage, and every
+  listing opens a new window.
+- A row's markup holds no link. Its React component gets the meeting as a prop
+  (`memoizedProps.meeting`, a few fiber levels up), and that object carries
+  everything a recap sharing link holds: `subject`, `start` and `end`,
+  `threadId`, `iCalUid`, `organizerId`, `transcripts[]` (with `callId`,
+  `startDateTime` and the transcript's drive item), `recordings[]`, and
+  `recommendationData` with the recording file's `driveId`, `driveItemId` and
+  path (`url`). The same object holds the AI summary and action items; the
+  script reads neither.
+- The script builds the link the recap's Share button gives: the same keys in
+  the same order, `fileUrl` set to the file's path with Office's `?web=1`, and
+  `masterICalUid` for an occurrence of a series (the GlobalObjectId with its
+  date bytes zeroed). The link uses the page's own host, so the recap import's
+  fresh window should skip the redirect too (see "Open questions"). Every row
+  seen so far names its file, even a meeting whose row lists no recording, so
+  the link keys on the recording like a pasted link. A row without that path
+  would get a link naming the transcript's drive item, which keys on its own
+  query.
+- A row's time is when it was recorded, the earliest transcript or recording
+  start, not the slot it shows: a recurring row can show the series' next slot
+  beside an earlier occurrence's recap.
+- A meeting can have two rows, one for its transcript and one for its
+  recording. Both name the same file, so they collapse to one candidate.
+- In probe mode (the "Check recap list" button) the script also returns the
+  listing's counts and timings: rows read, link kinds, rows without props, why
+  it stopped, the clicks it made, when rows first appeared and when the list was
+  done, and how many frames the page painted. The debug command writes them,
+  with the candidates, to `teams_recap_list_probe.json` in the app data folder.
+  The candidates carry titles and file paths, so the file stays on that machine
+  unless the user shares it.
 - `MEETILY_RECAP_LIST_SCRIPT=<file>` replaces the bundled script with that
-  file, so selectors can be tuned on Windows without a rebuild. The file must
-  keep the `%SINCE%` and `%PROBE%` placeholders.
+  file, so the script can be tuned on Windows without a rebuild if Teams
+  changes its layout. The file must keep the `%SINCE%` and `%PROBE%`
+  placeholders.
+- `frontend/tests/browser/teams-recap-list.browser.cjs` runs the script
+  against a synthetic Recap app; see `frontend/tests/README.md`.
 
 ### Sync loop
 
 For each candidate, oldest first:
 
 1. Resolve identity and look up an existing meeting, then a live recording.
-2. Call `extract_teams_recap` with the candidate's link. Outcomes:
+   If the store holds the key and a sync read the recap at least 24 hours
+   after the row's start (`read_at`, else `imported_at`), keep it without
+   opening it: count "kept" and continue. A meeting that needs a new date (see
+   step 5) and a row without a start are read.
+2. Read the candidate's recap in the sync's Teams window (see Reading recaps
+   below). Outcomes:
    - ready: continue.
-   - not ready (no AI notes, or Teams still generating): count "not ready",
-     do not touch the store, continue. The listing has just proved sign-in, so
-     no recap gets a window of its own: one that shows no AI notes within a
-     minute, hidden, counts as not ready.
-   - error: count "failed" with the message, continue.
+   - not ready: Teams opened the recap but showed no AI notes in time, for
+     example because it is still generating them. Count "not ready", do not
+     touch the store, continue.
+   - not opened in time: read it once more after the other recaps. If it
+     still does not open, count "failed" with the message.
+   - any other error: count "failed" with the message, continue.
 3. Build the recap markdown exactly as the link import does, including the
    "Open original Teams recap" link.
 4. Compute `content_hash` over the markdown. If the store has the key with the
-   same hash, count "skipped" and continue.
+   same hash, record the read's time as `read_at`, count "skipped" and
+   continue, unless the meeting needs a new date (see step 5).
 5. No existing meeting: create it through `create_meeting_with_imported_summary`
    with `import_source` `copilot-recap`, `recording_url` from `fileUrl`, and
-   `recorded_at` from the link. Count "new".
+   `recorded_at` from the link. Date it by the row's start, the earliest
+   transcript or recording start Teams gave. That start is an instant, and many
+   recaps have no recording in their link, so no stamp to date them by. Count
+   "new".
    Existing meeting: write the recap as its summary through
    `update_meeting_summary`, keeping the meeting's title, tags, transcript and
    source. Count "updated" (or "new" if that meeting had no summary yet). A
-   live recording also gets its `meeting_sources` row here.
+   live recording also gets its `meeting_sources` row here. A `copilot-recap`
+   meeting dated more than 15 minutes from the row's start moves to that start.
+   This repairs recaps imported before the sync dated by the row: those with no
+   recording were dated at the import. Closer than 15 minutes is the same start
+   read another way (recording, transcript or calendar slot), so it stays.
 6. Export the vault note through `export_copilot_recap_note` for recap-only
    meetings, or `export_meeting_note` with the stored transcript for meetings
-   that have one. Both overwrite the pinned filename.
-7. Record the key, meeting id, time and hash in the store.
+   that have one. Both overwrite the pinned filename. A meeting that moved in
+   step 5 gets the name its new date gives instead, and the note under its old
+   name is deleted if it is still that meeting's note.
+7. Record the key, meeting id, hash, and the times of the write and the read
+   in the store.
 
 After the loop, `last_sync_date` becomes the sync start time. The next sync
 scans from `last_sync_date` minus 7 days, because a recap appears hours after
-a meeting and Teams may finish generating one days later. A sync that read no
-recap at all (every row had no link, was not ready, or failed) leaves the date
-where it was: it learned nothing and may have misread the list, and moving on
-would lose the rest of the first sync's backfill.
+a meeting and Teams may finish generating one days later. In those 7 days it
+retries the recaps that were not ready, and opens again the ones it holds from
+a read less than a day after their meeting. Opening a recap takes about 33 s.
+On 2026-11-07 a sync opened again all 23 recaps it held, which took 13 of its
+18 minutes, and none showed a change since the sync 13 hours before: 5 had the
+same hash, and 18 the same counts of notes and tasks. So step 1 keeps a recap
+read a day or more after its meeting without opening it. The next sync, that
+evening, kept 21 of the 22 recaps in its window without opening them. It
+opened the one it had read 22 hours after its meeting, found it unchanged, and
+took 2 minutes: 1 min 42 s to read the list and 26 s to read the recap.
+
+A sync that read no recap at all (every row had no link, was not ready,
+failed, or was kept) leaves the date where it was: it learned nothing and may
+have misread the list, and moving on would lose the rest of the first sync's
+backfill. Kept recaps do not count as read. They say nothing about whether
+Teams still opens recaps, and if it stopped, moving on would lose the new
+recaps that failed.
 
 The whole loop holds a single `RECAP_SYNC_LOCK`; a second click while a sync
 runs returns "already running". The loop is resumable: a crash midway loses
 nothing because every imported recap is in the store before the next one
 starts, and re-running converges to the same state.
+
+### Reading recaps
+
+A sync opens one Teams window and closes it when the sync ends. The list is
+read in it first. Teams may ask the user to pick their account there, so the
+window shows itself when the list is not read within 25 s. Then the same window
+reads every recap, where the user signed in, so Teams starts and signs in once
+per sync. The first read may take 3 minutes; each later read gets 1 minute. If
+the window is still hidden and no recap has opened in it 25 s into a read, it
+shows itself, as the list's does.
+
+Three real syncs led here. In the first, on 2026-11-06, each recap had a fresh
+hidden window and a minute, and all 30 ran out of time while Teams started. In
+the second, on 2026-11-07, the recaps had one hidden window, opened after the
+list's window closed. The first 7 did not open in 10 minutes, and the 23 after
+them opened 7 to 18 s after their links. Whether that window needed the account
+choice again, or Teams waited for something else while hidden, the log did not
+say. The third, later that day, read the list and the recaps in one window,
+shown 25 s into the list. All 30 recaps opened 6 to 16 s after their links, the
+first one included, and none needed the retry.
+
+Before each recap the window goes to `about:blank` and waits until the previous
+recap's page is gone. Otherwise a poll that runs before the next page loads
+could read the previous recap in its place. The page script reports
+`recap_open` once the recap's Share button (`data-tid="recap-share-button"`) or
+its AI summary tab is on the page. A read that runs out of time after that is
+"not ready". A read that never saw it is tried once more after the other
+recaps, and fails if it still does not open, with `Teams did not open this
+recap within N seconds.`
+
+While a read waits, the page script also reports where: the page's host and
+path, with ids masked and no query; whether the page is visible and focused;
+and how many frames it has drawn. The log names them each time they change, and
+in the line ending a read that never opened, so a stall on a sign-in page can
+be told from Teams not drawing in a hidden window.
+
+The window holds `AUTH_FLOW_LOCK` while it is open, so a SharePoint scan or
+recording import started during the sync waits for it to end.
 
 ### Dedupe in the manual link import
 
@@ -434,8 +550,8 @@ note instead of creating a second meeting. This lands first and on its own.
 
 | Command | Purpose |
 | --- | --- |
-| `sync_teams_recaps_command` | Run one sync. Returns `RecapSyncReport { new, updated, skipped, not_ready, failed: Vec<{title, error}>, possible_duplicates: Vec<title>, scanned, meetings_folder }`. |
-| `get_teams_recap_sync_state_command` | Since date, last sync date, count of known recaps. |
+| `sync_teams_recaps_command` | Run one sync. Returns `RecapSyncReport { new, updated, skipped, kept, not_ready, failed: Vec<{title, error}>, possible_duplicates: Vec<title>, scanned, meetings_folder }`. |
+| `get_teams_recap_sync_state_command` | Since date, last sync date, count of known recaps, and the last listing: when the list was read, how many recaps it listed, how many of those are already synced and pending, rows without a link, its error, and where it stopped if it stopped before the since date. |
 | `set_teams_recap_sync_prefs_command` | Since date. |
 | `teams_recap_list_debug_command` | Return the raw candidate list without importing. For learning selectors and for the QA doc. |
 
@@ -448,6 +564,14 @@ emission after each write.
 Under the existing Obsidian section in `PreferenceSettings.tsx`:
 
 - "Sync Teams recaps" button with the last sync date beside it.
+- "Check recap list" button. Its result stays on a line beside the buttons
+  instead of a toast, for example `Checked at 12:40 PM: 28 recaps, 3 already
+  synced, 25 pending.` The line shows the last listing, whether a check or a
+  sync read the list. Its counts are taken against the synced recaps each time
+  the panel loads, so a sync moves recaps from pending to synced. It names the
+  day when the list was read on an earlier one, adds rows without a link as
+  "without a recap yet", gives the error when the list was not read, and warns
+  when the list stopped before the since date.
 - Since date picker, default 30 days back, shown until the first sync completes.
 - Disabled on non-Windows with the note "Available on Windows".
 
@@ -479,8 +603,9 @@ Same boundary as the recap link import. The script reads the rendered DOM
 only; no Tauri IPC is exposed to the Teams page; recap text is never written to
 a URL, clipboard, log or external service. Logs record keys, counts and error
 messages, not recap content. The since date and keys in the store are the only
-persisted additions of a sync; the "Check recap list" button also writes the
-probe file described above, on that machine only.
+persisted additions of a sync, with the last listing beside them (`lastListing`:
+times, counts, keys and the listing's error, no titles); the "Check recap list"
+button also writes the probe file described above, on that machine only.
 
 ## Out of scope
 
@@ -498,9 +623,9 @@ probe file described above, on that machine only.
    lookup. Small PR, lands on its own, fixes duplicates today.
 2. Sync store, report type, commands, settings UI, debug command, everything
    wired to a scanner stub that returns an empty list. Mac-testable.
-3. The Meet app scanner script, learned on the Windows machine through the
+3. The Recap app scanner script, learned on the Windows machine through the
    Stash handoff: first the debug command until it lists the week's meetings
-   correctly, then the real sync.
+   correctly (done in November 2026), then the real sync.
 4. QA doc, `docs/TEAMS_RECAP_SYNC_QA.md`, mirroring
    `TEAMS_MEETING_DETECTION_QA.md`.
 5. Matching a recap to a live recording, in the link import and the sync loop.
@@ -517,41 +642,91 @@ probe file described above, on that machine only.
   double-booked slot and a restarted recording stay ambiguous; back-to-back
   meetings go to the closer one; a second import is an identity hit; the
   replaced summary lands in `result_backup`.
-- Unit, for the recording rule: file name forms, including `UTC` stamps and part
-  numbers; the order of times; only an exact or long truncated title attaches; a
-  tie and an unconfirmed fit stay ambiguous; a meeting without a transcript is not
-  attached to; attaching writes the row and leaves the meeting alone; a re-scan
-  sees the file as held through the row and through the ledger; the order live,
-  recap, recording; a part of a held recording; a recap naming no file on either
-  side of a recording; a contradicting thread takes the key back; a manual import
+- Unit, for the recording rule: file name forms, including `UTC` stamps, part
+  numbers and the Spanish suffix, raw and percent-encoded; the order of times;
+  only an exact or long truncated title attaches; a tie and an unconfirmed fit
+  stay ambiguous; a meeting without a transcript is not attached to; attaching
+  writes the row and leaves the meeting alone; a re-scan sees the file as held
+  through the row and through the ledger; the order live, recap, recording; a
+  part of a held recording; a recap naming no file on either side of a
+  recording; a contradicting thread takes the key back; a manual import
   releases the key.
 - Unit, `#[cfg(not(windows))]`-guarded where `mock_app` is used: the loop over a
   fake extractor returning ready, not ready and error in sequence.
+- Unit, for reading recaps: the first read's 3 minutes and later reads' 1
+  minute, the verdict on a read that ran out of time (not ready only if the
+  recap opened), and how a waiting page is logged. The loop over a scripted
+  importer: a recap Teams did not open is read again after the others and
+  counts once, by its second read; progress never runs back.
+- Unit, for dates: a listed recap is dated by its row and a pasted one by its
+  stamp; only a `copilot-recap` meeting more than 15 minutes off its row moves,
+  once; a moved note takes its new date's name, and only that meeting's old
+  note is deleted, whatever the case of its name.
+- Unit, for the one-day rule: a read 24 hours after the row's start keeps the
+  recap, and a read in another zone counts by its instant. A recap the store
+  does not hold, one listed without a start, and one whose meeting needs a new
+  date are read. A record without `read_at` goes by `imported_at`, and a store
+  written before `read_at` existed still loads. Kept recaps do not move the
+  scan window.
+- Browser fixture: `frontend/tests/browser/teams-recap-list.browser.cjs`
+  checks the list script's links, times, groups, stop rule and probe against a
+  synthetic Recap app. `teams-recap-dom.browser.cjs` checks the recap page
+  script, including when it reports `recap_open` and what it says about a
+  page it waits on.
 - Manual on Windows: the checklist in `docs/TEAMS_RECAP_SYNC_QA.md`.
 
 ## Open questions
 
-- Does the Meet app list show meetings whose recording lives on someone else's
-  OneDrive? If not, recaps for meetings the user did not organise may be
-  missing and the SharePoint scan is the only cross-check.
-- Whether `extract_teams_recap` can distinguish "still generating" from "no
-  recap for this meeting". If not, both count as "not ready" and retry on every
-  sync until the overlap window passes them.
-- Whether the stamp in a recording's file name is always this machine's local
-  time. `teams_recap_metadata.rs` assumes so, but a recording started by someone
-  in another zone may carry theirs. A wrong reading usually misses the window
-  and costs a second meeting. On a pasted link, with no row time to try first, it
-  can reach a wrong attach only if a meeting sharing the thread or title was
-  recorded live at that wrong hour. The probe's rows show a stamp beside the time
-  the Meet app displays, which will settle it. Real file names already show one
-  other form, `…-20261009_180000UTC-Meeting Recording.mp4`.
+- Settled: the Recap app lists meetings whose recording lives in someone
+  else's OneDrive. The week read in November 2026 named files in 16 OneDrives.
+- Settled: an import in a fresh window does not finish within its minute. In
+  the first real sync (2026-11-06) all 30 recaps ran out of time while Teams
+  started. The 9th window reached a chat at 33 s. Meetily reopened the link,
+  and the recap was being read 12 s later when its minute ran out. Recaps are
+  now read in one window (see Reading recaps).
+- Teams can render in a hidden window: that 9th window, never shown, reached
+  the chat and then the recap's AI summary, and in the second sync 23 recaps
+  were read in a hidden window. But the list has never been read while hidden:
+  its window is shown after 25 s every time, and Teams asked the user to pick
+  their account in it. In the second sync the hidden window opened after the
+  list's did not open a recap for its first 10 minutes. The user's session had
+  locked by the time recaps opened. Still open: what that window waited on.
+  The sync now reads in the list's window. In the third sync that window,
+  shown 25 s into the list, opened all 30 recaps, the first 10 s after its
+  link. The waiting log line will say if a read ever stalls.
+- A read tells a recap Teams opened without AI notes (not ready) from one it
+  never opened (failed). It cannot tell "still generating" from "no AI notes
+  for this meeting": both count as "not ready" and retry on every sync until
+  the overlap window passes them.
+- Whether Teams changes a recap more than a day after its meeting. A sync that
+  has read a recap that late keeps its copy without opening the recap again,
+  so it would miss such a change. Microsoft documents no time by which a recap
+  is final. The delays users report are about AI notes not showing yet, which
+  the sync counts as not ready and retries. The recap link import reads a
+  recap again and writes any change.
+- The stamp in a recording's file name is not always this machine's local
+  time, which `teams_recap_metadata.rs` assumes. Of the 23 files the list named
+  in November 2026, 11 carry a `UTC` stamp equal to the recorded time. Of the 12
+  local stamps, 6 are this machine's zone (UTC−6) and 6 are an hour or two later
+  (UTC−5 and UTC−4), presumably the zone of whoever recorded. The sync tries the
+  row's exact time first, both to match and to date the meeting, and the
+  recording rule tries SharePoint's `created` before an unmarked stamp, so this
+  matters where the stamp is the only time: a pasted link, which then reads an
+  hour or two off, usually misses the live
+  meeting's window and costs a second meeting. It can reach a wrong attach only
+  if a meeting sharing the thread or title was recorded live at that wrong hour.
+  Still open: how to tell the recorder's zone from the file.
+- How a Spanish Teams names a transcript-only file and the parts after the
+  first. Neither has been seen. Until one is, a Spanish transcript file gives no
+  stamp and keys on its own path, and a later part counts as a part only if it
+  ends in a space and a number, as in English.
 - What SharePoint's `created` means for a recording. The code comments call it
   the recording's end. In the one real case that can be read back it equals the
   file's UTC stamp, so it may be the start. The recording rule works with either
   as long as the file appears close to the meeting, but a value at the end can
   land in the next slot when two meetings with the same subject run back to back.
-- How many rows the Meet app keeps. Microsoft's admin documentation for the
+- How many rows the Recap app keeps. Microsoft's admin documentation for the
   Meeting Recaps app says it shows recaps from the previous 30 days, which
-  matches the default backfill; to be confirmed on the real list. If it is
-  so, the since date
-  cannot reach further back and the settings UI should say so.
+  matches the default backfill. The list check stops at the since date, so the
+  end of the list has not been seen. If it is so, the since date cannot reach
+  further back and the settings UI should say so.

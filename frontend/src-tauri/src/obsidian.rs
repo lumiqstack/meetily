@@ -446,6 +446,42 @@ async fn lookup_recorded_filename(pool: &SqlitePool, meeting_id: &str) -> Option
         .flatten()
 }
 
+/// Unpin a meeting's note, so its next export takes the name its current date
+/// and title give. Returns the name it was pinned to.
+async fn forget_recorded_filename(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
+    let previous = lookup_recorded_filename(pool, meeting_id).await?;
+    if let Err(e) = sqlx::query("DELETE FROM obsidian_exports WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(pool)
+        .await
+    {
+        warn!("Obsidian export: failed to unpin the note of meeting {}: {}", meeting_id, e);
+        return None;
+    }
+    Some(previous)
+}
+
+/// Delete the note a meeting's note was written over under a new name. Only a
+/// file that is still this meeting's note is deleted. `true` when one was.
+fn remove_superseded_note(written: &Path, previous_filename: &str, meeting_id: &str) -> bool {
+    // Windows and macOS vaults ignore case, so a name that differs only in
+    // case is the note just written.
+    let same_name = written
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().to_lowercase() == previous_filename.to_lowercase());
+    let previous = written.with_file_name(previous_filename);
+    if same_name || !note_belongs_to_meeting(&previous, meeting_id) {
+        return false;
+    }
+    match std::fs::remove_file(&previous) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Obsidian export: failed to remove the old note {:?}: {}", previous, e);
+            false
+        }
+    }
+}
+
 async fn record_exported_filename(pool: &SqlitePool, meeting_id: &str, filename: &str) {
     let exported_at = Utc::now().to_rfc3339();
     if let Err(e) = sqlx::query(
@@ -699,6 +735,39 @@ pub async fn export_copilot_recap_note<R: Runtime>(
     recorded_at: Option<&str>,
 ) -> Result<ObsidianExportResult, String> {
     export_note(app, meeting_id, title, created_at, summary_markdown, "", true, recorded_at).await
+}
+
+/// Export a recap-only meeting's note after its date was corrected: the note
+/// takes the name the new date gives, and the note it had before is removed.
+/// If the export fails, the note stays pinned to its old name.
+pub async fn move_copilot_recap_note<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    title: &str,
+    created_at: &str,
+    summary_markdown: &str,
+    recorded_at: Option<&str>,
+) -> Result<ObsidianExportResult, String> {
+    let pool = pool_of(app);
+    let previous = match pool.as_ref() {
+        Some(pool) => forget_recorded_filename(pool, meeting_id).await,
+        None => None,
+    };
+    let exported = export_copilot_recap_note(app, meeting_id, title, created_at, summary_markdown, recorded_at).await;
+    match (&exported, previous) {
+        (Ok(written), Some(previous)) => {
+            if remove_superseded_note(Path::new(&written.file_path), &previous, meeting_id) {
+                info!("Obsidian export: moved the note of meeting {} from {:?}", meeting_id, previous);
+            }
+        }
+        (Err(_), Some(previous)) => {
+            if let Some(pool) = pool.as_ref() {
+                record_exported_filename(pool, meeting_id, &previous).await;
+            }
+        }
+        (_, None) => {}
+    }
+    exported
 }
 
 async fn export_note<R: Runtime>(
@@ -1408,6 +1477,45 @@ mod tests {
         std::fs::write(dir.path().join(&second), "---\nmeeting_id: \"meeting-bbbb\"\n---\n").unwrap();
         assert_eq!(resolve_export_filename(None, &settings, dir.path(), "meeting-bbbb", "Weekly", created).await, second);
         assert_eq!(std::fs::read_to_string(dir.path().join(&name)).unwrap(), "Keep this personal note");
+    }
+
+    #[tokio::test]
+    async fn a_redated_recap_note_moves_to_its_new_date_and_leaves_no_copy() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings(LEGACY_FILENAME_TEMPLATE);
+        // Exported while the meeting was dated by its import.
+        let old = resolve_export_filename(Some(&pool), &settings, dir.path(), "meeting-r", "Weekly", "2026-11-07T12:00:00Z").await;
+        assert_eq!(old, "2026-11-07 Weekly.md");
+        write_note(dir.path(), &old, "meeting-r", "Weekly");
+        record_exported_filename(&pool, "meeting-r", &old).await;
+
+        // Pinned, the old name would win over the corrected date.
+        assert_eq!(forget_recorded_filename(&pool, "meeting-r").await.as_deref(), Some(old.as_str()));
+        assert_eq!(lookup_recorded_filename(&pool, "meeting-r").await, None);
+        let new = resolve_export_filename(Some(&pool), &settings, dir.path(), "meeting-r", "Weekly", "2026-11-03T12:00:00Z").await;
+        assert_eq!(new, "2026-11-03 Weekly.md");
+        write_note(dir.path(), &new, "meeting-r", "Weekly");
+
+        assert!(remove_superseded_note(&dir.path().join(&new), &old, "meeting-r"));
+        assert!(!dir.path().join(&old).exists());
+        assert!(dir.path().join(&new).exists());
+    }
+
+    #[test]
+    fn only_the_meetings_own_old_note_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_note(dir.path(), "2026-11-03 Weekly.md", "meeting-r", "Weekly");
+        write_note(dir.path(), "2026-11-07 Weekly.md", "meeting-other", "Weekly");
+        let written = dir.path().join("2026-11-03 Weekly.md");
+
+        assert!(!remove_superseded_note(&written, "2026-11-07 Weekly.md", "meeting-r"), "another meeting's note");
+        assert!(dir.path().join("2026-11-07 Weekly.md").exists());
+        assert!(!remove_superseded_note(&written, "2026-11-01 Weekly.md", "meeting-r"), "no old note");
+        // The note just written stays, whatever case its old name had.
+        assert!(!remove_superseded_note(&written, "2026-11-03 Weekly.md", "meeting-r"));
+        assert!(!remove_superseded_note(&written, "2026-11-03 WEEKLY.md", "meeting-r"));
+        assert!(written.exists());
     }
 
     #[test]
