@@ -1,6 +1,6 @@
 # Teams recap sync to Obsidian (Windows)
 
-Status: 2026-11-07. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"). Three real syncs have run on the Windows machine. The third listed the 30 recaps since Oct 29 and imported all 30 (see Reading recaps). The QA checklist (step 4) and the live matching of steps 5 and 6 are not yet fully exercised on Windows.
+Status: 2026-11-07. Steps 1 to 6 merged. Step 3's scanner reads the Teams Recap app ("Meeting Recaps"). Four real syncs have run on the Windows machine. The third listed the 30 recaps since Oct 29 and imported all 30 (see Reading recaps). The fourth kept 21 of its 22 recaps without opening them and took 2 minutes (see Sync loop). The QA checklist (step 4) and the live matching of steps 5 and 6 are not yet fully exercised on Windows.
 
 ## Goal
 
@@ -485,7 +485,10 @@ a read less than a day after their meeting. Opening a recap takes about 33 s.
 On 2026-11-07 a sync opened again all 23 recaps it held, which took 13 of its
 18 minutes, and none showed a change since the sync 13 hours before: 5 had the
 same hash, and 18 the same counts of notes and tasks. So step 1 keeps a recap
-read a day or more after its meeting without opening it.
+read a day or more after its meeting without opening it. The next sync, that
+evening, kept 21 of the 22 recaps in its window without opening them. It
+opened the one it had read 22 hours after its meeting, found it unchanged, and
+took 2 minutes: 1 min 42 s to read the list and 26 s to read the recap.
 
 A sync that read no recap at all (every row had no link, was not ready,
 failed, or was kept) leaves the date where it was: it learned nothing and may
