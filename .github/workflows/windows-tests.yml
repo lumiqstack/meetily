@@ -13,7 +13,7 @@ on:
       - 'llama-helper/**'
       - 'vendor/**'
       - 'tests/whisper-native/**'
-      - 'scripts/windows/meetily-check.ps1'
+      - 'scripts/windows/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-tests.yml'
@@ -143,6 +143,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Nothing else runs build-vulkan.ps1 in CI, so at least prove every
+      # Windows script still parses.
+      - name: Windows scripts parse
+        shell: pwsh
+        run: |
+          $errors = 0
+          foreach ($file in Get-ChildItem scripts/windows -Filter *.ps1) {
+            $found = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$found) | Out-Null
+            foreach ($e in $found) { Write-Host "$($file.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $errors++ }
+          }
+          if ($errors) { throw "$errors parse error(s) in scripts/windows" }
+          Write-Host 'OK: every scripts/windows/*.ps1 parses'
+
       - name: Before and After verdicts
         shell: pwsh
         run: |
@@ -173,6 +187,17 @@ jobs:
           $newer = "$env:RUNNER_TEMP/data-newer"
           New-Db $newer ($versions + '29990101000000')
           Check 'unknown migration stops' 2 @('-Mode', 'Before', '-DataDir', $newer)
+
+          # A data folder that links elsewhere (moved to a data drive) keeps its
+          # backups beside the folder it links to when -BackupRoot is not given.
+          $real = Join-Path $env:RUNNER_TEMP 'data-real'
+          New-Db $real $versions[0..($versions.Count - 3)]
+          $link = Join-Path $env:RUNNER_TEMP 'data-link'
+          New-Item -ItemType Junction -Path $link -Target $real | Out-Null
+          pwsh -File scripts/windows/meetily-check.ps1 -Mode Before -DataDir $link -NoStop -MigrationsDir $migrations
+          if ($LASTEXITCODE -ne 0) { throw "linked data folder: expected exit 0, got $LASTEXITCODE" }
+          if (-not (Get-ChildItem (Join-Path $env:RUNNER_TEMP 'meetily-backups') -Recurse -Filter meeting_minutes.sqlite -ErrorAction SilentlyContinue)) { throw 'linked data folder: no backup beside the folder it links to' }
+          Write-Host 'OK: linked data folder backs up beside its target'
 
           # After: live database plus a log with one caught native exception.
           $log = "$env:RUNNER_TEMP/meetily.log"
