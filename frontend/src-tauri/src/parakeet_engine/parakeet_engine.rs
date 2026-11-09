@@ -539,6 +539,16 @@ impl ParakeetEngine {
 
     /// Transcribe audio samples using the loaded Parakeet model
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
+        Ok(self.transcribe_audio_timestamped(audio_data).await?.text)
+    }
+
+    /// Transcribe and keep the per-token start offsets (seconds from the start of
+    /// `audio_data`), which speaker attribution needs to split a segment where the
+    /// speaker changes.
+    pub async fn transcribe_audio_timestamped(
+        &self,
+        audio_data: Vec<f32>,
+    ) -> Result<super::model::TimestampedResult> {
         let mut model_guard = self.current_model.write().await;
         let model = model_guard
             .as_mut()
@@ -558,7 +568,7 @@ impl ParakeetEngine {
 
         log::debug!("Parakeet transcription result: {} chars", result.text.chars().count());
 
-        Ok(result.text)
+        Ok(result)
     }
 
     /// Get the models directory path

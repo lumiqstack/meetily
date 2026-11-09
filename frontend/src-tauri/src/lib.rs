@@ -41,6 +41,7 @@ pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod diarization;
 pub mod meeting_detection;
 pub mod calendar;
 pub mod notifications;
@@ -747,6 +748,11 @@ pub fn run() {
             parakeet_engine::commands::parakeet_cancel_download,
             parakeet_engine::commands::parakeet_delete_corrupted_model,
             parakeet_engine::commands::open_parakeet_models_folder,
+            diarization::commands::diarization_model_status,
+            diarization::commands::diarization_download_model,
+            diarization::commands::diarization_cancel_download,
+            diarization::commands::diarization_delete_model,
+            diarization::commands::diarization_open_model_folder,
             // Parallel processing commands
             whisper_engine::parallel_commands::initialize_parallel_processor,
             whisper_engine::parallel_commands::start_parallel_processing,
