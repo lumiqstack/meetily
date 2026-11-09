@@ -325,12 +325,101 @@ pub fn webview2_dir() -> PathBuf {
 /// that guard, simply installing this version would relocate every new
 /// recording from `~/Music/meetily-recordings` into the roaming profile — a
 /// worse place than where they started, for a user who opted into nothing.
+///
+/// The one exception is a Music folder that a cloud client syncs (OneDrive's
+/// known-folder move). There the roaming profile is the better place: see
+/// [`is_cloud_synced`].
 pub fn default_recordings_dir() -> PathBuf {
     if is_relocated() {
-        subdir("recordings")
-    } else {
-        historical_recordings_dir()
+        return subdir("recordings");
     }
+    let historical = historical_recordings_dir();
+    if is_cloud_synced(&historical) {
+        // A cloud client (OneDrive) may dehydrate anything under its folder,
+        // after which the recording folders list nothing until it refills
+        // them. Recordings go under the data root instead; a user who wants
+        // them in the cloud can still set `save_folder`.
+        return subdir("recordings");
+    }
+    historical
+}
+
+/// Whether `path` is inside a folder a cloud sync client manages (OneDrive).
+///
+/// Two signs, either of which is enough: the path lies under one of the
+/// OneDrive roots the client publishes in `OneDrive`, `OneDriveCommercial` or
+/// `OneDriveConsumer`, or the nearest existing ancestor carries the cloud
+/// placeholder attributes (a reparse point marked pinned, unpinned, offline or
+/// recall-on-access). Only Windows has the attributes; the environment check
+/// runs everywhere.
+pub fn is_cloud_synced(path: &Path) -> bool {
+    under_any_root(path, &cloud_roots()) || has_cloud_attributes(path)
+}
+
+/// If `folder` exists but lists nothing and is a cloud placeholder, a sentence
+/// telling the user how to get its contents back. `None` for a normal folder.
+pub fn online_only_hint(folder: &Path) -> Option<String> {
+    let empty = std::fs::read_dir(folder).ok()?.next().is_none();
+    if !empty || !has_cloud_attributes(folder) {
+        return None;
+    }
+    Some(format!(
+        "{} is online-only in OneDrive, so its files are not on this computer. \
+         In File Explorer, right-click the folder, choose \"Always keep on this device\", \
+         wait for the download, then retry.",
+        folder.display()
+    ))
+}
+
+fn cloud_roots() -> Vec<PathBuf> {
+    ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"]
+        .iter()
+        .filter_map(|name| std::env::var_os(name))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    let key = lexical_key(path);
+    roots.iter().any(|root| {
+        let root_key = lexical_key(root);
+        !root_key.is_empty() && key.starts_with(&root_key)
+    })
+}
+
+/// Cloud placeholder attributes on `path` or its nearest existing ancestor.
+#[cfg(windows)]
+fn has_cloud_attributes(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_ATTRIBUTE_PINNED: u32 = 0x0008_0000;
+    const FILE_ATTRIBUTE_UNPINNED: u32 = 0x0010_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    const CLOUD_MARKS: u32 = FILE_ATTRIBUTE_OFFLINE
+        | FILE_ATTRIBUTE_PINNED
+        | FILE_ATTRIBUTE_UNPINNED
+        | FILE_ATTRIBUTE_RECALL_ON_OPEN
+        | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+
+    let existing = path
+        .ancestors()
+        .find(|p| std::fs::symlink_metadata(p).is_ok());
+    let Some(existing) = existing else {
+        return false;
+    };
+    let Ok(meta) = std::fs::symlink_metadata(existing) else {
+        return false;
+    };
+    let attrs = meta.file_attributes();
+    attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 && attrs & CLOUD_MARKS != 0
+}
+
+#[cfg(not(windows))]
+fn has_cloud_attributes(_path: &Path) -> bool {
+    false
 }
 
 /// Where recordings lived before the data root existed: the platform's
@@ -595,5 +684,30 @@ mod tests {
             return;
         }
         assert!(same_dir(&dir, &upper));
+    }
+
+    #[test]
+    fn under_any_root_matches_prefix_regardless_of_spelling() {
+        let roots = vec![PathBuf::from("/Users/me/OneDrive - Corp")];
+        assert!(under_any_root(
+            Path::new("/Users/me/OneDrive - Corp/Music/meetily-recordings"),
+            &roots
+        ));
+        assert!(under_any_root(
+            Path::new("/Users/me/OneDrive - Corp/./Music/../Music"),
+            &roots
+        ));
+        assert!(!under_any_root(Path::new("/Users/me/OneDriveX/Music"), &roots));
+        assert!(!under_any_root(Path::new("/Users/me/Music"), &roots));
+        assert!(!under_any_root(Path::new("/Users/me/Music"), &[]));
+    }
+
+    #[test]
+    fn online_only_hint_is_none_for_ordinary_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(online_only_hint(dir.path()), None);
+        std::fs::write(dir.path().join("audio.mp4"), b"x").unwrap();
+        assert_eq!(online_only_hint(dir.path()), None);
+        assert_eq!(online_only_hint(&dir.path().join("missing")), None);
     }
 }
