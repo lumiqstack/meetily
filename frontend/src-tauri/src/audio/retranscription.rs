@@ -264,6 +264,9 @@ fn find_audio_file(folder: &Path) -> Result<PathBuf> {
         }
     }
 
+    if let Some(hint) = crate::storage::online_only_hint(folder) {
+        return Err(anyhow!("No audio file found in: {}. {}", folder.display(), hint));
+    }
     Err(anyhow!("No audio file found in: {}", folder.display()))
 }
 
