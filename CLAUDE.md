@@ -98,7 +98,7 @@ Raw Audio (Mic + System)
 
 ### Audio Device Modularization (Recently Completed)
 
-**Context**: The audio system was refactored from a monolithic 1028-line `core.rs` file into focused modules. See [AUDIO_MODULARIZATION_PLAN.md](AUDIO_MODULARIZATION_PLAN.md) for details.
+**Context**: The audio system was refactored from a monolithic 1028-line `core.rs` file into focused modules.
 
 ```
 audio/
@@ -343,8 +343,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 
 ### Audio Processing
 - Use `perf_debug!()` / `perf_trace!()` for hot-path logging (zero cost in release)
-- `AudioMetricsBatcher` (batch_processor.rs) is wired into the pipeline but left disabled (`metrics_batcher: None`) — it costs a buffer pass and a channel send per chunk and nothing consumes its summaries. Only re-enable it together with a reader.
-- `AudioBufferPool` / `PooledBuffer` (buffer_pool.rs) are currently unused outside their own tests, and `get_buffer()` takes a `std::sync::Mutex` — do not call them from an audio callback. Pre-size buffers with `Vec::with_capacity` instead.
+- Do not take a `std::sync::Mutex` or allocate in an audio callback. Pre-size buffers with `Vec::with_capacity`.
 - VAD filtering reduces Whisper load by ~70% (only processes speech)
 
 ### Whisper Transcription
@@ -352,12 +351,11 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
   - Development: `base` or `small` (fast iteration)
   - Production: `medium` or `large-v3` (best quality)
 - **GPU Acceleration**: 5-10x faster than CPU
-- **Parallel Processing**: Available in `whisper_engine/parallel_processor.rs` for batch workloads
 
 ### Frontend Performance
 - React state updates batched via Sidebar context
 - Transcript rendering uses `VirtualizedTranscriptView`, but virtualization only pays off when the scroll element has a bounded height. If its height comes from content (no `h-full` chain to a sized ancestor, or an ancestor that scrolls instead), the viewport grows with the list and every row renders — the component gives no warning when this happens.
-- Audio level monitoring throttled to 10 Hz (`level_monitor.rs`, 100ms interval)
+- Audio level monitoring throttled to 10 Hz (`simple_level_monitor.rs`, 100ms interval)
 
 ## Important Constraints and Gotchas
 
