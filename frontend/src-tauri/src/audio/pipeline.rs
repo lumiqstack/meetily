@@ -4,13 +4,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use crate::batch_audio_metric;
-use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
-use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
+use super::audio_processing::{audio_to_mono, LoudnessNormalizer, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
 /// How long a silence must last before the VAD closes a speech segment, and
@@ -80,7 +78,7 @@ impl AudioMixerRingBuffer {
         // CRITICAL FIX: Increase max buffer to 400ms for system audio stability
         // System audio (especially Core Audio on macOS) can have significant jitter
         // due to sample-by-sample streaming → batching → channel transmission
-        // Accounts for: RNNoise buffering + Core Audio jitter + processing delays
+        // Accounts for: Core Audio jitter + processing delays
         let max_buffer_size = window_size_samples * 8;  // 400ms (was 200ms)
 
         info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
@@ -338,7 +336,6 @@ impl ProfessionalAudioMixer {
 /// sequential. One mutex covers the whole chain, and `scratch` lets the downmix
 /// reuse a buffer instead of allocating one per callback.
 struct MicChain {
-    noise_suppressor: Option<NoiseSuppressionProcessor>,
     high_pass_filter: Option<HighPassFilter>,
     normalizer: Option<LoudnessNormalizer>,
 }
@@ -545,25 +542,7 @@ impl AudioCapture {
 
         // Initialize audio enhancement processors for MICROPHONE ONLY
         // System audio doesn't need enhancement (already clean)
-        let (noise_suppressor, high_pass_filter, normalizer) = if matches!(device_type, DeviceType::Microphone) {
-            // Initialize noise suppression (RNNoise) at 48kHz - CONDITIONAL based on flag
-            let ns = if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
-                match NoiseSuppressionProcessor::new(TARGET_SAMPLE_RATE) {
-                    Ok(processor) => {
-                        info!("✅ RNNoise noise suppression ENABLED for microphone '{}' (10-15 dB reduction)", device.name);
-                        Some(processor)
-                    }
-                    Err(e) => {
-                        warn!("⚠️ Failed to create noise suppressor: {}, continuing without noise suppression", e);
-                        None
-                    }
-                }
-            } else {
-                info!("ℹ️ RNNoise noise suppression DISABLED for microphone '{}' (flag: RNNOISE_APPLY_ENABLED=false)", device.name);
-                info!("   Whisper handles noise well internally - RNNoise is optional");
-                None
-            };
-
+        let (high_pass_filter, normalizer) = if matches!(device_type, DeviceType::Microphone) {
             // Initialize high-pass filter (removes rumble below 80 Hz)
             let hpf = {
                 let filter = HighPassFilter::new(TARGET_SAMPLE_RATE, 80.0);
@@ -583,11 +562,11 @@ impl AudioCapture {
                 }
             };
 
-            (ns, hpf, norm)
+            (hpf, norm)
         } else {
             // System audio: no enhancement needed
             info!("ℹ️ System audio '{}' captured raw (no enhancement)", device.name);
-            (None, None, None)
+            (None, None)
         };
 
         let resampler = if needs_resampling {
@@ -603,7 +582,6 @@ impl AudioCapture {
 
         let mic_chain = if matches!(device_type, DeviceType::Microphone) {
             Some(Arc::new(std::sync::Mutex::new(MicChain {
-                noise_suppressor,
                 high_pass_filter,
                 normalizer,
             })))
@@ -802,7 +780,7 @@ impl AudioCapture {
         }
 
         // AUDIO ENHANCEMENT PIPELINE (Microphone Only)
-        // Processing order is critical: high-pass → noise suppression → normalization
+        // Processing order is critical: high-pass → normalization
         // This ensures noise is removed before being amplified by the normalizer
         //
         // All three stages live behind one mutex now: they always run together
@@ -816,40 +794,7 @@ impl AudioCapture {
                     filter.process_in_place(&mut mono_data);
                 }
 
-                // STEP 2: Apply RNNoise noise suppression (10-15 dB reduction) - CONDITIONAL
-                // Still allocating: RNNoise buffers into 480-sample frames, so its
-                // output length differs from its input and it cannot work in place.
-                if super::ffmpeg_mixer::RNNOISE_APPLY_ENABLED {
-                    if let Some(ref mut suppressor) = chain.noise_suppressor {
-                        let before_len = mono_data.len();
-                        mono_data = suppressor.process(&mono_data);
-                        let after_len = mono_data.len();
-
-                        // CRITICAL MONITORING: Track buffer health
-                        let chunk_id = self.chunk_counter.load(std::sync::atomic::Ordering::Relaxed);
-                        if chunk_id % 100 == 0 {
-                            let buffered = suppressor.buffered_samples();
-                            let length_delta = (before_len as i32 - after_len as i32).abs();
-
-                            debug!("🔇 Noise suppression health: in={}, out={}, delta={}, buffered={}",
-                                   before_len, after_len, length_delta, buffered);
-
-                            // WARN if accumulating samples (potential latency buildup)
-                            if buffered > 1000 {
-                                warn!("⚠️ RNNoise accumulating samples: {} buffered (potential latency issue!)",
-                                      buffered);
-                            }
-
-                            // WARN if significant length mismatch
-                            if length_delta > 50 {
-                                warn!("⚠️ RNNoise length mismatch: input={} output={} (delta={})",
-                                      before_len, after_len, length_delta);
-                            }
-                        }
-                    }
-                }
-
-                // STEP 3: Apply EBU R128 normalization (professional loudness standard)
+                // STEP 2: Apply EBU R128 normalization (professional loudness standard)
                 if let Some(ref mut normalizer) = chain.normalizer {
                     normalizer.normalize_in_place(&mut mono_data);
                 }
@@ -991,8 +936,6 @@ pub struct AudioPipeline {
     // Performance optimization: reduce logging frequency
     last_summary_time: std::time::Instant,
     processed_chunks: u64,
-    // Smart batching for audio metrics
-    metrics_batcher: Option<AudioMetricsBatcher>,
     // PROFESSIONAL AUDIO MIXING: Ring buffer + RMS-based mixer
     ring_buffer: AudioMixerRingBuffer,
     mixer: ProfessionalAudioMixer,
@@ -1097,11 +1040,6 @@ impl AudioPipeline {
             // Performance optimization: reduce logging frequency
             last_summary_time: std::time::Instant::now(),
             processed_chunks: 0,
-            // Disabled: the batcher costs a full-buffer pass, an Instant::now()
-            // and an unbounded-channel send on every chunk (~200/s), and the
-            // summaries it accumulates have no reader — get_summaries() and
-            // clear_summaries() are never called. Re-enable alongside a consumer.
-            metrics_batcher: None,
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
@@ -1133,20 +1071,6 @@ impl AudioPipeline {
                     // PERFORMANCE OPTIMIZATION: Eliminate per-chunk logging overhead
                     // Logging in hot paths causes severe performance degradation
                     self.processed_chunks += 1;
-
-                    // Smart batching: collect metrics instead of logging every chunk
-                    if let Some(ref batcher) = self.metrics_batcher {
-                        let avg_level = chunk.data.iter().map(|&x| x.abs()).sum::<f32>() / chunk.data.len() as f32;
-                        let duration_ms = chunk.data.len() as f64 / chunk.sample_rate as f64 * 1000.0;
-
-                        batch_audio_metric!(
-                            Some(batcher),
-                            chunk.chunk_id,
-                            chunk.data.len(),
-                            duration_ms,
-                            avg_level
-                        );
-                    }
 
                     // CRITICAL: Log summary only every 200 chunks OR every 60 seconds (99.5% reduction)
                     // This eliminates I/O overhead in the audio processing hot path

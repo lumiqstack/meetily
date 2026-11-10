@@ -65,7 +65,6 @@ function ConditionalImportDialog({
   );
 }
 
-// export { metadata } from './metadata'
 
 export default function RootLayout({
   children,

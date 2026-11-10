@@ -82,8 +82,6 @@ cpal = "0.15.3"
 # Wav encoding - now using manual WAV creation instead of hound
 # hound = "3.5"
 
-# Cli ! shouldn't be required if using as lib
-clap = { version = "4.3", features = ["derive"] }
 
 # Dates
 chrono = { version = "0.4.31", features = ["serde"] }
@@ -100,8 +98,6 @@ bytemuck = "1.16.1"
 # EBU R128 loudness normalization (professional broadcast standard)
 ebur128 = "0.1"
 
-# Noise suppression - RNNoise-based neural network noise reduction
-nnnoiseless = "0.5"
 
 # Speech recognition and async utilities
 # NOTE: whisper-rs is declared in platform-specific sections below (macOS/Windows/Linux)
@@ -155,7 +151,6 @@ bytes = { version = "1.9.0", features = ["serde"] }
 
 esaxx-rs = "0.1.10"
 symphonia = { version = "0.5.4", features = ["aac", "isomp4", "mp3", "flac", "ogg", "vorbis", "pcm", "wav", "opt-simd"] }
-rand = "0.8.5"
 rayon = "1.10"
 rubato = "0.15.0"
 ringbuf = "0.4.8"
@@ -183,14 +178,9 @@ tauri-plugin-single-instance = "=2.3.7"
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri = { version = "2.6.2", features = ["protocol-asset", "macos-private-api", "tray-icon", "devtools"] }
 once_cell = "1.17.1"
-objc = "0.2.7"
-tauri-plugin-log = { version = "2.6.0", features = ["colored"] }
 anyhow = "1.0"
-time = { version = "0.3", features = ["formatting"] }
 reqwest = { version = "0.11", features = ["multipart", "json"] }
-core-graphics = "0.23"
 cidre = { git = "https://github.com/yury/cidre", rev = "a9587fa", features = ["av"] }
-dasp = "0.11.0"
 futures-channel = "0.3.31"
 
 # PERFORMANCE: Enable Metal GPU + CoreML acceleration automatically on macOS
@@ -244,12 +234,6 @@ tauri = { version = "2.6.2", features = ["test"] }
 # fields and status->error mapping without spending real quota.
 wiremock = "0.6"
 tempfile = "3.3.0"
-infer = "0.15"
-criterion = { version = "0.5.1", features = ["async_tokio"] }
-memory-stats = "1.0"
-strsim = "0.10.0"
-futures = "0.3.31"
-tracing-subscriber = "0.3.16"
 
 # NOTE: [profile.*] lives in the workspace root Cargo.toml. Cargo ignores
 # profiles declared in a non-root member and only warns about it.
