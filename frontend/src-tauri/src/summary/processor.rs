@@ -1,3 +1,4 @@
+use crate::summary::glossary;
 use crate::summary::llm_client::{generate_summary, LLMProvider};
 use crate::summary::templates::Template;
 use crate::summary::CopilotCliConfig;
@@ -216,9 +217,18 @@ fn translation_system_prompt(target_language: &str) -> String {
     )
 }
 
-fn build_chunk_summary_user_prompt(chunk: &str) -> String {
+/// The glossary section with its trailing blank line, or nothing when there is
+/// no glossary.
+fn glossary_section(glossary: Option<&str>) -> String {
+    glossary
+        .map(|terms| format!("{}\n\n", glossary::prompt_block(terms)))
+        .unwrap_or_default()
+}
+
+fn build_chunk_summary_user_prompt(chunk: &str, glossary: Option<&str>) -> String {
+    let glossary = glossary_section(glossary);
     format!(
-        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals. Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
+        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals. Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n{glossary}<transcript_chunk>\n{chunk}\n</transcript_chunk>"
     )
 }
 
@@ -230,7 +240,9 @@ fn build_combine_summary_user_prompt(combined_text: &str) -> String {
 fn build_final_report_system_prompt(
     section_instructions: &str,
     clean_template_markdown: &str,
+    glossary: Option<&str>,
 ) -> String {
+    let glossary = glossary_section(glossary);
     format!(
         r#"You are an expert meeting summarizer. Generate a final meeting report by filling in the provided Markdown template based on the source text.
 
@@ -244,7 +256,7 @@ fn build_final_report_system_prompt(
 7. Do not include reasoning, thinking, self-correction, decision strategy, or any meta-commentary sections — output only the completed Markdown report.
 8. If unsure about something, omit it.
 
-**SECTION-SPECIFIC INSTRUCTIONS:**
+{glossary}**SECTION-SPECIFIC INSTRUCTIONS:**
 {section_instructions}
 
 <template>
@@ -416,6 +428,7 @@ pub(crate) async fn generate_meeting_summary(
     text: &str,
     custom_prompt: &str,
     calendar_context: Option<&str>,
+    glossary: Option<&str>,
     template_id: &str,
     template: &Template,
     token_threshold: usize,
@@ -449,14 +462,18 @@ pub(crate) async fn generate_meeting_summary(
             if (provider == &LLMProvider::Ollama || provider == &LLMProvider::BuiltInAI)
                 && total_tokens >= token_threshold
             {
-                let chunks = chunk_for_context(text, token_threshold);
+                // The glossary is repeated in every chunk prompt, so it comes
+                // out of each chunk's share of the context.
+                let glossary_tokens = glossary.map(rough_token_count).unwrap_or(0);
+                let chunks =
+                    chunk_for_context(text, token_threshold.saturating_sub(glossary_tokens));
                 let num_chunks = chunks.len();
                 let mut chunk_summaries = Vec::with_capacity(num_chunks);
                 for (index, chunk) in chunks.iter().enumerate() {
                     if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
                         return Err("Summary generation was cancelled".to_string());
                     }
-                    let prompt = build_chunk_summary_user_prompt(chunk);
+                    let prompt = build_chunk_summary_user_prompt(chunk, glossary);
                     for attempt in 1..=MAX_CHUNK_ATTEMPTS {
                         let result = match generate_summary(
                             client, provider, model_name, api_key, "You are an expert meeting summarizer.",
@@ -541,6 +558,7 @@ pub(crate) async fn generate_meeting_summary(
             let final_system_prompt = build_final_report_system_prompt(
                 &template.to_section_instructions(),
                 &template.to_markdown_structure(),
+                glossary,
             );
             let mut final_user_prompt =
                 format!("<transcript_chunks>\n{content_to_summarize}\n</transcript_chunks>\n");
@@ -768,7 +786,7 @@ mod tests {
 
     #[test]
     fn chunk_summary_prompt_forces_english_base_output() {
-        let prompt = build_chunk_summary_user_prompt("会議の内容");
+        let prompt = build_chunk_summary_user_prompt("会議の内容", None);
 
         assert!(prompt.contains(ENGLISH_BASE_SUMMARY_INSTRUCTION));
         assert!(prompt.contains("<transcript_chunk>"));
@@ -784,7 +802,7 @@ mod tests {
 
     #[test]
     fn final_report_prompt_forces_english_base_output() {
-        let prompt = build_final_report_system_prompt("Fill the section", "# <Add Title here>");
+        let prompt = build_final_report_system_prompt("Fill the section", "# <Add Title here>", None);
 
         assert!(prompt.contains(ENGLISH_BASE_SUMMARY_INSTRUCTION));
         assert!(prompt.contains("SECTION-SPECIFIC INSTRUCTIONS"));
@@ -792,7 +810,7 @@ mod tests {
 
     #[test]
     fn final_report_prompt_forbids_reasoning_output() {
-        let prompt = build_final_report_system_prompt("Fill", "# Title");
+        let prompt = build_final_report_system_prompt("Fill", "# Title", None);
         assert!(prompt.to_lowercase().contains("no reasoning")
             || prompt.contains("meta-commentary")
             || prompt.contains("self-correction"));
@@ -800,12 +818,33 @@ mod tests {
 
     #[test]
     fn chunk_prompt_forbids_reasoning_output() {
-        let prompt = build_chunk_summary_user_prompt("x");
+        let prompt = build_chunk_summary_user_prompt("x", None);
         assert!(
             prompt.contains("Do not include reasoning")
                 || prompt.contains("meta-commentary")
                 || prompt.contains("self-correction")
         );
+    }
+
+    #[test]
+    fn glossary_reaches_chunk_and_final_prompts_before_the_source_text() {
+        let glossary = "man-days: \"Mondays\"";
+        let block = glossary::prompt_block(glossary);
+
+        let chunk = build_chunk_summary_user_prompt("we need 40 Mondays", Some(glossary));
+        assert!(chunk.contains(&block));
+        assert!(chunk.find(&block) < chunk.find("<transcript_chunk>"));
+
+        let report = build_final_report_system_prompt("Fill", "# Title", Some(glossary));
+        assert!(report.contains(&block));
+        assert!(report.find("2. Only use information present") < report.find(&block));
+        assert!(report.find(&block) < report.find("SECTION-SPECIFIC INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn prompts_without_glossary_carry_no_glossary_section() {
+        assert!(!build_chunk_summary_user_prompt("x", None).contains("GLOSSARY"));
+        assert!(!build_final_report_system_prompt("Fill", "# Title", None).contains("GLOSSARY"));
     }
 
     #[test]

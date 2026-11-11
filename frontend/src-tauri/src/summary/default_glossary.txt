@@ -1,0 +1,27 @@
+# Meetily summary glossary
+#
+# Speech-to-text mishears domain terms, and the summary model then copies the
+# mistake into the summary. Each line below names a correct term and the forms
+# it tends to be misheard as. Meetily adds this list to every summary prompt,
+# for every template, with an instruction to fix those garbled terms only. It
+# never asks the model to add content.
+#
+# Lines that start with # are comments and are not sent. Delete every other
+# line to turn the glossary off. Keep the list short: it goes out with every
+# transcript chunk, so small local models lose context room to it. Add your
+# own client, product and project names here; this file is never overwritten.
+#
+# Suggested format (any plain text works):
+#   Correct term: "misheard form", "other misheard form" (context)
+
+man-days: "Mondays", "mandis", "mandates" (in effort, estimate or contract talk)
+Murex: "Miurex", "Nurex"
+Delta 48 (and other Delta numbers): "data 48", "dota" (Murex delivery package)
+securities lending (Sec Lending): "sick landing", "second lending"
+omnibus: "iBonus" (omnibus account or agreement)
+Oracle RAC: "rack" (in database or infrastructure talk)
+TIIE, TIIEF (TIIE de Fondeo): "pie" (Mexican interbank rates, in rates or curves talk)
+BONDES (Mexican government bonds)
+Gober curves: "Google" curves
+Validate Solution: "Valued Solution" (case status, also "Validate Solution (Client)")
+UAT2: "U82" (test environment)

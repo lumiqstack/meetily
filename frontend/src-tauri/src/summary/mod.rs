@@ -48,6 +48,7 @@ pub struct CopilotCliConfig {
 pub mod calendar_context;
 pub mod commands;
 pub mod copilot_cli;
+pub mod glossary;
 pub(crate) mod language_detection;
 pub mod llm_client;
 pub(crate) mod metadata;
