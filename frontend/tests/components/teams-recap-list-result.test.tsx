@@ -3,7 +3,7 @@ import { act, create, type ReactTestRenderer, type ReactTestInstance } from 'rea
 
 // Check recap list reports on a line beside its button that stays, not in a
 // toast that goes. The line comes from the stored last listing, so it is back
-// whenever Settings opens; a check that never reached the list says why there.
+// whenever the home screen opens; a check that never reached the list says why there.
 const originals = {
   core: { ...await import('@tauri-apps/api/core') },
   event: { ...await import('@tauri-apps/api/event') },
@@ -34,7 +34,7 @@ const invoke = mock(async (command: string): Promise<unknown> => {
   return undefined;
 });
 mock.module('@tauri-apps/api/core', () => ({ ...originals.core, invoke }));
-const { TeamsRecapSyncSettings } = await import('../../src/components/TeamsRecapSyncSettings');
+const { TeamsRecapSync } = await import('../../src/components/TeamsRecapSync');
 
 const readNow = (listed: number, synced: number) => ({
   readAt: new Date().toISOString(), windowStart: '2026-10-29T01:16:21+00:00',
@@ -44,7 +44,7 @@ const readNow = (listed: number, synced: number) => ({
 async function render(): Promise<ReactTestRenderer> {
   let renderer: ReactTestRenderer | undefined;
   await act(async () => {
-    renderer = create(<TeamsRecapSyncSettings vaultConfigured />);
+    renderer = create(<TeamsRecapSync vaultConfigured />);
   });
   return renderer!;
 }
@@ -64,7 +64,7 @@ async function pressCheck(renderer: ReactTestRenderer) {
 }
 
 describe('Check recap list result line', () => {
-  test('shows the stored result when Settings opens', async () => {
+  test('shows the stored result when the home screen opens', async () => {
     stored = readNow(28, 3);
     toasts.length = 0;
     const renderer = await render();

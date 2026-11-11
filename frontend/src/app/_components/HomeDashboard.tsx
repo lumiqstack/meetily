@@ -25,6 +25,7 @@ import { useTauriEvent } from '@/hooks/useTauriEvent';
 import { ModalType } from '@/hooks/useModalState';
 import { BackgroundJobsPanel } from '@/components/shared/BackgroundJobsPanel';
 import { PendingWorkPanel } from '@/components/shared/PendingWorkPanel';
+import { TeamsRecapSync } from '@/components/TeamsRecapSync';
 import { armJoinAndRecord, stashCalendarEventForAutoStart } from '@/lib/calendar-handoff';
 import Analytics from '@/lib/analytics';
 import { cn } from '@/lib/utils';
@@ -405,6 +406,11 @@ export function HomeDashboard({ recordingControls, showModal }: HomeDashboardPro
             </div>
           </Section>
         </div>
+
+        {/* Sync needs a saved vault: one typed into Settings but not saved does not count. */}
+        <Section title="Teams recaps">
+          <TeamsRecapSync vaultConfigured={Boolean(vaultPath)} />
+        </Section>
 
         {/* Recent meetings */}
         <Section

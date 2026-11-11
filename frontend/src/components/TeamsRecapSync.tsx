@@ -106,8 +106,8 @@ export function describeLastListing(
   return `${counts} The list stopped at ${day(last.endedEarlyAt)}, before ${day(last.windowStart)}, so it may be missing older recaps. Check again.`;
 }
 
-/** Sync Teams recaps into Meetily and the vault. Lives inside the Obsidian settings block. */
-export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: boolean }) {
+/** Sync Teams recaps into Meetily and the vault. A card on the home screen. */
+export function TeamsRecapSync({ vaultConfigured }: { vaultConfigured: boolean }) {
   const platform = usePlatform();
   const [state, setState] = useState<TeamsRecapSyncStateView | null>(null);
   const [sinceDate, setSinceDate] = useState("");
@@ -202,8 +202,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
     : lastListing?.endedEarlyAt ? 'text-amber-700' : 'text-gray-600';
 
   return (
-    <div className="mt-3 pt-3 border-t border-gray-200 flex flex-col gap-2">
-      <div className="text-sm font-medium">Teams recaps</div>
+    <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-4 flex flex-col gap-2">
       <div className="text-xs text-gray-600">
         Reads Meeting Recaps in Teams and saves every Copilot recap to Meetily and the
         vault, attaching each to the meeting that already holds its recording. Last sync: {lastSync}
@@ -222,7 +221,7 @@ export function TeamsRecapSyncSettings({ vaultConfigured }: { vaultConfigured: b
           <span className="text-xs text-gray-600">Leave empty for the last 30 days.</span>
         </label>
       )}
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <button
           onClick={handleSync}
           disabled={!available || busy}

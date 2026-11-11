@@ -8,18 +8,18 @@ Use this checklist on Windows, signed in to Teams in Meetily's recap window (the
 - Set an Obsidian vault in Meetily preferences. Use an empty test vault for the first-sync scenarios.
 - Have Copilot recaps for meetings in the last 14 days, including two occurrences of one recurring meeting and, if possible, one meeting whose recap is not ready yet.
 - Note how many meetings Meeting Recaps (the Teams Recap app on the app bar) shows on its Home tab for the week. The list check below is compared against this number.
-- Find `Teams recaps` under `Obsidian Vault` in preferences. It shows the last sync date and the known recap count.
+- Find the `Teams recaps` card on the home screen, above `Recent meetings`. It shows the last sync date and the known recap count.
 
 ## Availability
 
-- No vault set: `Sync Teams recaps` and `Check recap list` are disabled, with the note `Set an Obsidian vault first.`
+- No vault saved: `Sync Teams recaps` and `Check recap list` are disabled, with the note `Set an Obsidian vault first.`
 - macOS or Linux build: both buttons are disabled, with the note `Available on Windows.`
 - `Start from` is visible until the first sync completes and is hidden after it. Leaving it empty means the last 30 days.
 
 ## List Check
 
 - `Check recap list` imports nothing: no new meeting, no new note, last sync date unchanged, known recap count unchanged.
-- No toast. The line beside the buttons reads `Checked at <time>: N recaps, N already synced, N pending.`, with `N without a recap yet` added when rows have no link. It is still there after Settings is closed and reopened and after a restart, and it names the day once the date has changed.
+- No toast. The line beside the buttons reads `Checked at <time>: N recaps, N already synced, N pending.`, with `N without a recap yet` added when rows have no link. It is still there after leaving the home screen and coming back, and after a restart, and it names the day once the date has changed.
 - After `Sync Teams recaps`, the line shows the sync's own listing and the synced recaps count as already synced.
 - A list that stopped before the scan window's start adds `The list stopped at <day>, before <day>, so it may be missing older recaps. Check again.`
 - With a sync running, `Check recap list` shows `Check failed: A Teams recap sync is already running.` on the line.

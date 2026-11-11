@@ -22,7 +22,7 @@ code.
 | Source page | The Recap app in Teams ("Meeting Recaps" on the app bar), whose Home tab lists recent meetings with recaps, read in the persisted WebView2 profile the recap link import already uses. |
 | Microsoft Graph | Not used. No Entra app registration, no admin consent. |
 | Trigger | Manual "Sync Teams recaps" button. No schedule in this version. |
-| Backfill | A since date in settings, default 30 days before the first sync. Each later sync starts from the last confirmed sync date minus an overlap window. |
+| Backfill | A since date on the home screen card, default 30 days before the first sync. Each later sync starts from the last confirmed sync date minus an overlap window. |
 | Existing meeting from the recording | Attach the recap to that meeting. One meeting, one note. Match on the recording file URL. |
 | Existing meeting recorded live | Attach the recap when the meeting's calendar window fits the recap's time and its thread id or title confirms it. When that is ambiguous, import the recap separately and report it. See "Matching a recap to a live recording". |
 | Recording of a meeting recorded live | Link the file to the live meeting without downloading or transcribing it. The live transcript stays, and Teams' own transcript of that meeting is never imported. An ambiguous match imports the recording as its own meeting. See "Matching a recording to a live recording". |
@@ -69,7 +69,7 @@ code.
 ## Architecture
 
 ```
-Settings (since date)          the sync's one Teams window (RecapReader)
+Home card (since date)         the sync's one Teams window (RecapReader)
         │                                  │
         ▼                                  ▼
 sync_teams_recaps_command ──► RecapListScanner ──► Vec<RecapCandidate>
@@ -559,9 +559,10 @@ Events: `teams-recap-sync-progress { done, total, current_title }` so the
 background job toast can show progress; the existing `meetings-changed`
 emission after each write.
 
-## Settings
+## Home screen card
 
-Under the existing Obsidian section in `PreferenceSettings.tsx`:
+A `Teams recaps` card on the home screen (`HomeDashboard.tsx`, component
+`TeamsRecapSync.tsx`), above Recent meetings:
 
 - "Sync Teams recaps" button with the last sync date beside it.
 - "Check recap list" button. Its result stays on a line beside the buttons
@@ -575,8 +576,8 @@ Under the existing Obsidian section in `PreferenceSettings.tsx`:
 - Since date picker, default 30 days back, shown until the first sync completes.
 - Disabled on non-Windows with the note "Available on Windows".
 
-The button is disabled when no vault is configured, with the same message the
-link import gives.
+The button is disabled until a vault is saved in Settings, with the same
+message the link import gives.
 
 ## Database
 
