@@ -8,9 +8,14 @@
 ///
 /// The prompt (which embeds the full transcript) can exceed OS argument-length
 /// limits - notably the ~32KB command-line cap on Windows - so it is written to
-/// a temp file that the CLI reads with its built-in file tool. The system temp
+/// temp files that the CLI reads with its built-in file tool. The system temp
 /// directory is readable by the CLI without extra permission flags.
-use std::path::PathBuf;
+///
+/// The CLI's `view` tool refuses a file over 20 KB, so the agent pages through
+/// a long file and may stop early, summarizing only the start of a meeting.
+/// The prompt is therefore split into parts that each fit in one read, and a
+/// run whose tool results do not show every part is rejected.
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -18,6 +23,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 const COPILOT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Copilot CLI 1.0.109 reports `large_output_threshold_bytes: 20480` and its
+/// `view` tool answers "File too large to read at once" above that. 16 KiB
+/// leaves room for the end marker.
+const PROMPT_PART_MAX_BYTES: usize = 16 * 1024;
+
+/// A run that skipped part of the prompt is retried once before failing
+const MAX_READ_ATTEMPTS: usize = 2;
 
 /// Retired Copilot model IDs per GitHub's model retirement history. Must
 /// match `RETIRED_COPILOT_CLI_MODELS` in frontend/src/lib/copilot-cli-models.ts;
@@ -166,6 +179,112 @@ fn extract_final_message(jsonl: &str) -> Option<String> {
     last
 }
 
+/// Numbers (1-based) of the prompt parts whose end marker appears in no tool
+/// result, meaning the agent never read that part to its end
+fn unread_prompt_parts(jsonl: &str, end_markers: &[String]) -> Vec<usize> {
+    let mut read = vec![false; end_markers.len()];
+    for line in jsonl.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("tool.execution_complete") {
+            continue;
+        }
+        let Some(result) = event.get("data").and_then(|data| data.get("result")) else {
+            continue;
+        };
+        let result = result.to_string();
+        for (marker, read) in end_markers.iter().zip(read.iter_mut()) {
+            *read |= result.contains(marker.as_str());
+        }
+    }
+    read.iter()
+        .enumerate()
+        .filter(|(_, read)| !**read)
+        .map(|(index, _)| index + 1)
+        .collect()
+}
+
+/// Splits the prompt at line ends into parts of at most `max_bytes`, cutting
+/// mid-line only for a line longer than that
+fn split_prompt(body: &str, max_bytes: usize) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = body;
+    while rest.len() > max_bytes {
+        let mut window = max_bytes;
+        while !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let cut = rest[..window].rfind('\n').map_or(window, |newline| newline + 1);
+        parts.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    parts.push(rest);
+    parts
+}
+
+/// The prompt as written to temp files, one per part, each ending in a marker
+/// line unique to this run
+struct PromptFiles {
+    paths: Vec<PathBuf>,
+    end_markers: Vec<String>,
+}
+
+impl PromptFiles {
+    fn write(dir: &Path, body: &str) -> std::io::Result<Self> {
+        let run_id = uuid::Uuid::new_v4();
+        let parts = split_prompt(body, PROMPT_PART_MAX_BYTES);
+        let count = parts.len();
+        let mut files = PromptFiles {
+            paths: Vec::with_capacity(count),
+            end_markers: Vec::with_capacity(count),
+        };
+        for (index, part) in parts.into_iter().enumerate() {
+            let number = index + 1;
+            let path = dir.join(format!("meetily-copilot-{run_id}-part{number}of{count}.md"));
+            let end_marker = format!("[end of prompt part {number} of {count}, {run_id}]");
+            if let Err(error) = write_prompt_file(&path, &format!("{part}\n{end_marker}\n")) {
+                files.remove();
+                return Err(error);
+            }
+            files.paths.push(path);
+            files.end_markers.push(end_marker);
+        }
+        Ok(files)
+    }
+
+    /// The `-p` instruction that has the agent read every part, in order
+    fn instruction(&self) -> String {
+        let reply = "Reply with ONLY the requested output - no preamble and no commentary about reading files.";
+        if let [path] = self.paths.as_slice() {
+            return format!(
+                "Read the file at {} and follow the instructions it contains. {reply}",
+                path.display()
+            );
+        }
+        let list: String = self
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| format!("{}. {}\n", index + 1, path.display()))
+            .collect();
+        format!(
+            "Your instructions and the full meeting transcript are split across {} files. \
+             Use the view tool to read every one of these files completely, in this order, \
+             before writing anything:\n{list}Then follow the instructions in those files. {reply}",
+            self.paths.len()
+        )
+    }
+
+    fn remove(&self) {
+        for path in &self.paths {
+            if let Err(e) = std::fs::remove_file(path) {
+                warn!("Failed to remove Copilot CLI prompt file {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
 /// Writes the prompt file restricted to the current user (0600 on Unix) since
 /// it contains the meeting transcript and lives briefly in the shared temp dir
 fn write_prompt_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
@@ -250,7 +369,7 @@ fn extract_cli_error(jsonl: &str) -> Option<String> {
 /// * `binary_path` - Optional explicit path to the `copilot` binary
 /// * `model_name` - Copilot model id (e.g. "auto", "claude-haiku-4.5"); empty or "auto" lets Copilot pick
 /// * `github_token` - Optional GitHub token passed as COPILOT_GITHUB_TOKEN (otherwise `copilot login` credentials are used)
-/// * `system_prompt` / `user_prompt` - Prompts, written to a temp file the CLI reads
+/// * `system_prompt` / `user_prompt` - Prompts, written to temp files the CLI reads
 /// * `cancellation_token` - Optional token to abort (kills the child process)
 pub async fn generate_with_copilot_cli(
     binary_path: Option<&str>,
@@ -263,49 +382,90 @@ pub async fn generate_with_copilot_cli(
     validate_copilot_model(model_name)?;
     let binary = resolve_copilot_binary(binary_path)?;
 
-    let prompt_file =
-        crate::storage::tmp_dir().join(format!("meetily-copilot-{}.md", uuid::Uuid::new_v4()));
     let prompt_body = format!("{}\n\n{}", system_prompt, user_prompt);
-    write_prompt_file(&prompt_file, &prompt_body)
+    let prompt_files = PromptFiles::write(&crate::storage::tmp_dir(), &prompt_body)
         .map_err(|e| format!("Failed to write Copilot CLI prompt file: {}", e))?;
 
-    let result = run_copilot(
+    let result = run_until_prompt_read(
         &binary,
-        &prompt_file,
+        &prompt_files,
         model_name,
         github_token,
         cancellation_token,
     )
     .await;
 
-    if let Err(e) = tokio::fs::remove_file(&prompt_file).await {
-        warn!(
-            "Failed to remove Copilot CLI prompt file {}: {}",
-            prompt_file.display(),
-            e
-        );
-    }
-
+    prompt_files.remove();
     result
 }
 
-async fn run_copilot(
+/// Runs the CLI until a run reads every prompt part, and returns its reply
+async fn run_until_prompt_read(
     binary: &PathBuf,
-    prompt_file: &PathBuf,
+    prompt_files: &PromptFiles,
     model_name: &str,
     github_token: Option<&str>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
-    let instruction = format!(
-        "Read the file at {} and follow the instructions it contains. \
-         Reply with ONLY the requested output - no preamble and no commentary about reading the file.",
-        prompt_file.display()
-    );
+    let instruction = prompt_files.instruction();
+    let part_count = prompt_files.end_markers.len();
+    let mut unread = Vec::new();
+    for attempt in 1..=MAX_READ_ATTEMPTS {
+        let output = run_copilot(
+            binary,
+            &instruction,
+            model_name,
+            github_token,
+            cancellation_token,
+        )
+        .await?;
+        unread = unread_prompt_parts(&output.stdout, &prompt_files.end_markers);
+        if unread.is_empty() {
+            return final_reply(&output);
+        }
+        warn!(
+            "Copilot CLI attempt {}/{} did not read prompt parts {:?} of {}",
+            attempt, MAX_READ_ATTEMPTS, unread, part_count
+        );
+    }
+    Err(format!(
+        "GitHub Copilot CLI read only {} of {} parts of the transcript, so its summary would leave out part of the meeting. Please retry, or choose another Copilot model.",
+        part_count - unread.len(),
+        part_count
+    ))
+}
 
+/// Output of a CLI run that exited successfully
+struct CopilotOutput {
+    stdout: String,
+    stderr: String,
+}
+
+fn final_reply(output: &CopilotOutput) -> Result<String, String> {
+    extract_final_message(&output.stdout).ok_or_else(|| {
+        extract_cli_error(&output.stdout)
+            .or_else(|| extract_cli_error(&output.stderr))
+            .map(|detail| format!("GitHub Copilot CLI failed: {}", detail))
+            .unwrap_or_else(|| {
+                format!(
+                    "GitHub Copilot CLI returned no assistant response. Output: {}",
+                    output_snippet(&output.stdout)
+                )
+            })
+    })
+}
+
+async fn run_copilot(
+    binary: &PathBuf,
+    instruction: &str,
+    model_name: &str,
+    github_token: Option<&str>,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<CopilotOutput, String> {
     let mut command = Command::new(binary);
     command
         .arg("-p")
-        .arg(&instruction)
+        .arg(instruction)
         .arg("--output-format")
         .arg("json")
         .arg("--no-color")
@@ -393,16 +553,9 @@ async fn run_copilot(
         ));
     }
 
-    extract_final_message(&stdout).ok_or_else(|| {
-        extract_cli_error(&stdout)
-            .or_else(|| extract_cli_error(&stderr))
-            .map(|detail| format!("GitHub Copilot CLI failed: {}", detail))
-            .unwrap_or_else(|| {
-                format!(
-                    "GitHub Copilot CLI returned no assistant response. Output: {}",
-                    output_snippet(&stdout)
-                )
-            })
+    Ok(CopilotOutput {
+        stdout: stdout.into_owned(),
+        stderr: stderr.into_owned(),
     })
 }
 
@@ -510,5 +663,100 @@ mod tests {
     fn ignores_warning_without_a_structured_failure() {
         let jsonl = r#"{"type":"session.warning","data":{"message":"Third-party MCP servers are disabled"}}"#;
         assert_eq!(extract_cli_error(jsonl), None);
+    }
+
+    #[test]
+    fn prompt_parts_fit_one_read_and_keep_every_byte() {
+        let body = format!("{}\n{}", "línea de transcripción\n".repeat(50), "ñ".repeat(300));
+        let parts = split_prompt(&body, 64);
+        assert!(parts.iter().all(|part| part.len() <= 64 && !part.is_empty()));
+        assert_eq!(parts.concat(), body);
+        // 25-byte lines, two per part, unless a single line is over the limit
+        assert_eq!(parts[0], "línea de transcripción\n".repeat(2));
+        assert!(parts[..25].iter().all(|part| part.ends_with('\n')));
+    }
+
+    /// A three-hour meeting's worth of transcript, about 120 KB
+    #[cfg(unix)]
+    fn long_transcript() -> String {
+        (0..400)
+            .map(|line| {
+                format!(
+                    "[{:02}:{:02}] Speaker {} discussed settlement, accounting and booking details for this workstream item.\n",
+                    line * 27 / 60,
+                    line * 27 % 60,
+                    line % 4,
+                ) + &"Further context on the same topic. ".repeat(5)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Writes an executable stand-in for the `copilot` binary. It finds the
+    /// prompt files named in the `-p` instruction, emits a `view` tool result
+    /// per read in the CLI's JSONL format, then a final answer.
+    #[cfg(unix)]
+    fn fake_copilot(dir: &std::path::Path, read_files: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!(
+            r#"#!/bin/sh
+emit() {{
+  content=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk '{{printf "%s\\n", $0}}')
+  printf '{{"type":"tool.execution_complete","data":{{"toolName":"view","success":true,"result":{{"content":"%s"}}}}}}\n' "$content"
+}}
+printf '%s\n' "$2" | grep -oE '(/[^/]+)*/meetily-copilot-[^/ ]*\.md' > "$0.files"
+{read_files}
+printf '{{"type":"assistant.message","data":{{"content":"Summary of the meeting.","toolRequests":[]}}}}\n'
+"#
+        );
+        let path = dir.join("copilot");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    async fn summarize_with(binary: &std::path::Path, transcript: &str) -> Result<String, String> {
+        generate_with_copilot_cli(
+            Some(binary.to_str().unwrap()),
+            "auto",
+            None,
+            "You are an expert meeting summarizer.",
+            &format!("<transcript_chunks>\n{transcript}\n</transcript_chunks>"),
+            None,
+        )
+        .await
+    }
+
+    /// The real CLI's `view` tool refuses files over 20 KB, so the agent pages
+    /// through a long prompt and can stop early: a client workshop summary
+    /// covered only the first half of a three-hour transcript. A run that read
+    /// only the start must fail instead of returning a partial summary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_a_summary_written_after_reading_only_the_start_of_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_copilot(
+            dir.path(),
+            r#"head -n 1 "$0.files" | while IFS= read -r f; do head -c 16000 "$f" | emit; done"#,
+        );
+
+        let error = summarize_with(&binary, &long_transcript())
+            .await
+            .expect_err("a summary of the first 16 KB of a 120 KB transcript must not pass");
+        assert!(error.contains("read only"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepts_a_summary_written_after_reading_the_whole_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_copilot(
+            dir.path(),
+            r#"while IFS= read -r f; do emit < "$f"; done < "$0.files""#,
+        );
+
+        let summary = summarize_with(&binary, &long_transcript()).await.unwrap();
+        assert_eq!(summary, "Summary of the meeting.");
     }
 }
