@@ -1,0 +1,57 @@
+{
+  "name": "Delivery Sync",
+  "description": "Project delivery calls: stream dailies, case and defect reviews, Delta release and go-live readiness, production issues and technical investigations",
+  "sections": [
+    {
+      "title": "Status Overview",
+      "instruction": "In 3 to 5 sentences state which stream, case list, release, dress rehearsal or issue the meeting covered, what moved since the last call, the readiness position if one was stated (go, no-go, conditional), and the most pressing blocker or risk",
+      "format": "paragraph"
+    },
+    {
+      "title": "Cases & Issues",
+      "instruction": "One row per case, defect, CRM, PEGA, JIRA or TFS item, or unnumbered issue discussed, in the order discussed. Keep each identifier exactly as spoken and write No ID if none was given. Record the status before and the status agreed as stated (for example Validate Solution, Request Clarification, Pending Delta Deployment, Closed), and the delivery vehicle agreed (Delta number, CTT, hotfix, merge only, none). Write Delta numbers as Delta NN even when the transcript renders them as data or dota",
+      "format": "list",
+      "item_format": "| **Case ID** | **Short title** | **Priority** | **Status before → agreed** | **Delivery vehicle** | **Owner** | **Segment Time stamp** |\n| --- | --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Investigation Findings",
+      "instruction": "For each issue analysed in depth, give the symptom with figures and identifiers as spoken, each suspected cause with how it was tested and whether it was confirmed, ruled out or left open, the root cause if one was established and how certain the participants were, and any workaround with its manual steps versus the permanent fix",
+      "format": "list"
+    },
+    {
+      "title": "Environments & Deployments",
+      "instruction": "List each environment mentioned (UAT1, UAT2, UATFTP, DR, production, migration, date roll) with what is installed or missing, its system date if stated, the next install or deployment step with its timing, order or cutoff, and the effect on testing",
+      "format": "list",
+      "item_format": "| **Environment** | **Current state** | **Next change and when** | **Effect on testing** |\n| --- | --- | --- | --- |"
+    },
+    {
+      "title": "Blockers & Risks",
+      "instruction": "List each blocker or delivery risk, what it blocks, who or what it is waiting on (person, team, Delta, CTT, environment, client decision), and the stated impact or deadline at risk",
+      "format": "list",
+      "item_format": "| **Blocker or risk** | **Blocks** | **Waiting on** | **Impact** |\n| --- | --- | --- | --- |"
+    },
+    {
+      "title": "Dates & Milestones",
+      "instruction": "List the dated milestones mentioned, such as Delta close or delivery dates, freezes, campaign close, UAT or dress rehearsal start, cutoffs, go-live and scheduled follow-up meetings",
+      "format": "list",
+      "item_format": "| **Date** | **Milestone** | **Notes** |\n| --- | --- | --- |"
+    },
+    {
+      "title": "Decisions & Rules",
+      "instruction": "List decisions on fix approach, priority changes, hotfix versus merge, splitting or merging cases, and any rules agreed for freezes, last merge Delta, merging to main, case statuses or coverage, with the reason given",
+      "format": "list"
+    },
+    {
+      "title": "New Cases, CRs & Retests",
+      "instruction": "List cases, change requests or retests that someone said will be raised, split out, cancelled or run, with the proposed priority, who does it and the date or condition when it becomes possible (for example after a Delta install or end of day run)",
+      "format": "list",
+      "item_format": "| **Item** | **Type** | **Priority** | **Who** | **When** |\n| --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Action Items",
+      "instruction": "List every task someone committed to or was assigned. Use the owner's name as spoken in the conversation, write Unassigned when no owner is named, never use speaker labels or descriptions of the speaker, and never merge two people into one owner. Write Not specified when no due date was given, leave out meeting logistics such as sending a link, and always add the reference transcript segment and timestamp",
+      "format": "list",
+      "item_format": "| **Owner** | **Case / Ref** | **Task** | **Due** | **Reference Transcript Segment** | **Segment Time stamp** |\n| --- | --- | --- | --- | --- | --- |"
+    }
+  ]
+}

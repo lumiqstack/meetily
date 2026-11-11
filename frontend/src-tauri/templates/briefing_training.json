@@ -1,0 +1,56 @@
+{
+  "name": "Briefing & Training",
+  "description": "One-to-many sessions: town halls, release presentations, trainings and knowledge transfers, and internal team meetings",
+  "sections": [
+    {
+      "title": "Overview",
+      "instruction": "State the event or session, the organisation, team or product it covers, the presenters with their topics in agenda order, the audience, and a brief note of any other agenda item handled in the same call such as a status check-in",
+      "format": "paragraph"
+    },
+    {
+      "title": "Key Points",
+      "instruction": "For each presented segment, give the presenter, the main argument or findings, and the conclusion, including named client stories, deals, go-lives and anything demonstrated",
+      "format": "list"
+    },
+    {
+      "title": "Announcements & Changes",
+      "instruction": "List launches, organisational changes, appointments, policy or process changes, and new offerings announced, with the effective date when given",
+      "format": "list",
+      "item_format": "| **Topic** | **Announcement** | **Effective / Date** |\n| --- | --- | --- |"
+    },
+    {
+      "title": "Metrics & Results",
+      "instruction": "List every figure presented, such as sales against target, client counts, headcount, revenue, costs, percentages and adoption rates, with the target, prior period or comparison it was given against",
+      "format": "list",
+      "item_format": "| **Metric** | **Value** | **Context** |\n| --- | --- | --- |"
+    },
+    {
+      "title": "Rollout Status & Roadmap",
+      "instruction": "List each product, tool, feature or initiative whose status or timeline was presented, with its stage (general availability, pilot, proof of value, planned), the clients or scope involved, and the date or ETA",
+      "format": "list",
+      "item_format": "| **Item** | **Stage** | **Clients or scope** | **Date / ETA** |\n| --- | --- | --- | --- |"
+    },
+    {
+      "title": "Concepts & Procedures",
+      "instruction": "For trainings and walkthroughs, list the concepts, roles and terms explained with a short explanation, then step-by-step procedures in order naming the tool, screen, field or status used at each step, and the mandatory rules or criteria the audience must apply",
+      "format": "list"
+    },
+    {
+      "title": "What Changes for Us",
+      "instruction": "List what the audience must do or adapt to: new tools and access dates, quotas or budgets, required processes, holidays, deadlines and logistics, retired links or systems, and anything explicitly said to stay the same",
+      "format": "list"
+    },
+    {
+      "title": "Questions & Answers",
+      "instruction": "List each question from the chat, Slido or the floor and the answer given, marking questions deferred or answered offline",
+      "format": "list",
+      "item_format": "| **Question** | **Asked by** | **Answer** |\n| --- | --- | --- |"
+    },
+    {
+      "title": "Action Items",
+      "instruction": "List promised follow-ups, publications, access requests, practice tasks and upcoming sessions, and any task someone committed to. Use the owner's name as spoken in the conversation, write Unassigned when no owner is named, never use speaker labels or descriptions of the speaker, and never merge two people into one owner. Write Not specified when no due date was given, leave out meeting logistics such as sending a link, and always add the reference transcript segment and timestamp",
+      "format": "list",
+      "item_format": "| **Owner** | **Task** | **Due** | **Reference Transcript Segment** | **Segment Time stamp** |\n| --- | --- | --- | --- | --- |"
+    }
+  ]
+}

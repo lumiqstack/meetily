@@ -1,0 +1,50 @@
+{
+  "name": "Client Workshop",
+  "description": "Client design and requirements workshops, kickoffs, scoping and estimation reviews, and reviews of workshop minutes or open points",
+  "sections": [
+    {
+      "title": "Session Overview",
+      "instruction": "Summarize the client, workstream, products and processes covered, whether the client was present or it was an internal Murex session, what was demoed, and which agenda topics were deferred to other sessions. Cover the whole session from start to end",
+      "format": "paragraph"
+    },
+    {
+      "title": "Client Current Process",
+      "instruction": "List how the client works today as described in the meeting: systems used, manual steps, workarounds, spreadsheets and pain points, naming the region, desk or team each applies to",
+      "format": "list"
+    },
+    {
+      "title": "Requirements & Murex Fit",
+      "instruction": "One row per requirement or topic. Give who raised it, how strongly the client needs it (must-have, nice-to-have, not used today) only when stated, what Murex showed or proposed, and classify the fit as standard, configuration, workaround or gap",
+      "format": "list",
+      "item_format": "| **Requirement / Topic** | **Raised by** | **Need stated** | **Murex approach** | **Fit** | **Timestamp** |\n| --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Scope, Phasing & Effort",
+      "instruction": "List items whose scope or phase was stated or changed, the basis cited (SOW, change request, client request), and any effort or cost figure exactly as stated (man-days, amounts, fixed cost or T&M). Do not compute totals that were not said. Write man-days where the transcript says Mondays or mandis in an effort context",
+      "format": "list",
+      "item_format": "| **Item** | **In / Out / Under review** | **Phase** | **Basis** | **Effort or cost** | **Timestamp** |\n| --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Decisions & Agreements",
+      "instruction": "List only points both sides agreed, the client explicitly confirmed, or the team agreed to take as its position, and who confirmed each. Do not list explanations of how Murex works by default",
+      "format": "list"
+    },
+    {
+      "title": "Open Questions & Pending Inputs",
+      "instruction": "List unresolved questions, documents, data or confirmations still needed, and changes made to the open-points register (closed, merged, re-owned, reworded), saying whether the client or Murex owes each item",
+      "format": "list",
+      "item_format": "| **Question or input** | **Owed by (Client / Murex)** | **Person** | **Needed for** | **Timestamp** |\n| --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Risks & Dependencies",
+      "instruction": "List risks and concerns raised, including estimate uncertainty, dependencies on other workstreams, systems, sessions or decommissioning, and follow-up sessions scheduled",
+      "format": "list"
+    },
+    {
+      "title": "Action Items",
+      "instruction": "List tasks someone committed to, saying for each whether the owner is on the Client or Murex side. Use the owner's name as spoken in the conversation, write Unassigned when no owner is named, never use speaker labels or descriptions of the speaker, and never merge two people into one owner. Write Not specified when no due date was given, leave out meeting logistics such as sending a link, and always add the reference transcript segment and timestamp",
+      "format": "list",
+      "item_format": "| **Owner** | **Side** | **Task** | **Due** | **Reference Transcript Segment** | **Segment Time stamp** |\n| --- | --- | --- | --- | --- | --- |"
+    }
+  ]
+}

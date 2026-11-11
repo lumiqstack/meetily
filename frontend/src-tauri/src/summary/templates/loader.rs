@@ -88,12 +88,26 @@ fn load_custom_template(template_id: &str) -> Option<String> {
 /// 4. Return error if not found in any location
 ///
 /// # Arguments
-/// * `template_id` - Template identifier (e.g., "daily_standup", "standard_meeting")
+/// * `template_id` - Template identifier (e.g., "delivery_sync", "standard_meeting")
 ///
 /// # Returns
 /// Parsed and validated Template struct
 pub fn get_template(template_id: &str) -> Result<Template, String> {
     info!("Loading template: {}", template_id);
+
+    // A user's custom file keeps a retired ID alive; otherwise the ID is
+    // redirected to the template that replaced it.
+    if let Some(custom_content) = load_custom_template(template_id) {
+        debug!("Using custom template for '{}'", template_id);
+        return validate_and_parse_template(&custom_content);
+    }
+    let template_id = match defaults::replacement_for_retired_template(template_id) {
+        Some(replacement) => {
+            info!("Template '{}' was retired; using '{}'", template_id, replacement);
+            replacement
+        }
+        None => template_id,
+    };
 
     // Try custom template first, then bundled, then built-in
     let json_content = if let Some(custom_content) = load_custom_template(template_id) {
@@ -223,12 +237,32 @@ mod tests {
 
     #[test]
     fn test_get_builtin_template() {
-        let template = get_template("daily_standup");
+        let template = get_template("standard_meeting");
         assert!(template.is_ok());
 
         let template = template.unwrap();
-        assert_eq!(template.name, "Daily Standup");
+        assert_eq!(template.name, "Standard Meeting Notes");
         assert!(!template.sections.is_empty());
+    }
+
+    #[test]
+    fn test_retired_template_ids_load_their_replacement() {
+        set_bundled_templates_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates"),
+        );
+        for retired in [
+            "daily_standup",
+            "project_sync",
+            "sales_marketing_client_call",
+            "retrospective",
+            "psychatric_session",
+        ] {
+            let replacement = defaults::replacement_for_retired_template(retired)
+                .unwrap_or_else(|| panic!("'{}' has no replacement", retired));
+            let loaded = get_template(retired)
+                .unwrap_or_else(|e| panic!("retired '{}' failed to load: {}", retired, e));
+            assert_eq!(loaded.name, get_template(replacement).unwrap().name);
+        }
     }
 
     #[test]
@@ -240,8 +274,35 @@ mod tests {
     #[test]
     fn test_list_template_ids() {
         let ids = list_template_ids();
-        assert!(ids.contains(&"daily_standup".to_string()));
         assert!(ids.contains(&"standard_meeting".to_string()));
+    }
+
+    /// Every file shipped in `templates/` is bundled as an app resource, and a
+    /// broken one only logs a warning at runtime and vanishes from the picker.
+    #[test]
+    fn test_bundled_template_files_are_valid() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("templates dir exists") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).unwrap();
+            let template = validate_and_parse_template(&content)
+                .unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+            for section in &template.sections {
+                // to_section_instructions appends its own period.
+                assert!(
+                    !section.instruction.trim_end().ends_with('.'),
+                    "{}: instruction for '{}' ends with a period",
+                    path.display(),
+                    section.title
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no templates found in {}", dir.display());
     }
 
     #[test]
