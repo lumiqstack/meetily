@@ -16,7 +16,7 @@
 //! use app_lib::summary::templates;
 //!
 //! // Load a specific template
-//! let template = templates::get_template("daily_standup").expect("daily standup template exists");
+//! let template = templates::get_template("standard_meeting").expect("standard meeting template exists");
 //!
 //! // Generate markdown structure
 //! let markdown = template.to_markdown_structure();

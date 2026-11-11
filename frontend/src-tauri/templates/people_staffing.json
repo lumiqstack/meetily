@@ -1,0 +1,51 @@
+{
+  "name": "People & Staffing",
+  "description": "1:1s, staffing and pipeline reviews, year-end calibration and talent discussions, headcount and hiring",
+  "sections": [
+    {
+      "title": "Summary",
+      "instruction": "In 2 to 4 sentences say what kind of meeting this was (1:1, staffing review, calibration, talent or team review), who leads it, and the main outcomes and deadlines. For a 1:1 state who is the manager and who is the report when the conversation makes it clear. If the recording continues into a different meeting with other participants, say where that starts and leave its content out of the other sections. Refer to people by the names spoken, never by speaker labels",
+      "format": "paragraph"
+    },
+    {
+      "title": "Project & Client Updates",
+      "instruction": "List each project, client or support account discussed with the status given and any risk, blocker, scope dispute or request for help tied to it. Mark items raised only for awareness",
+      "format": "list",
+      "item_format": "| **Project / Client** | **Update** | **Risk or ask** |\n| --- | --- | --- |"
+    },
+    {
+      "title": "Allocations & Capacity",
+      "instruction": "One row per person per project or account whose assignment or availability was discussed. Give the role, the allocation as stated in percent or FTE (old and new values for a change), the period, and whether it is confirmed, provisional or under discussion. Include roll-offs, handovers, leave that affects coverage, and new joiners",
+      "format": "list",
+      "item_format": "| **Person** | **Project / Account** | **Role** | **Allocation** | **Period** | **Status** |\n| --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Open Gaps, Hiring & Pipeline",
+      "instruction": "List each unfilled role, open or requested position, and upcoming project or opportunity that needs staff. Give the skills, seniority, location or language needed, FTE, when it is needed, the stated probability or whether it is signed, the candidates named with the reason each was accepted or rejected, and the next step",
+      "format": "list",
+      "item_format": "| **Project / Position** | **Need** | **FTE** | **Needed by** | **Probability / Status** | **Candidates** | **Next step** |\n| --- | --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "People Discussed",
+      "instruction": "List each person whose performance, rating, level change, growth path, role fit, workload or retention came up. Give the topic, the position taken and the reasons given, and the next step. Record only what was said and never infer a rating or level that was not stated",
+      "format": "list",
+      "item_format": "| **Person** | **Topic** | **Position & rationale stated** | **Next step** |\n| --- | --- | --- | --- |"
+    },
+    {
+      "title": "Process, Deadlines & Policies",
+      "instruction": "List review-process facts (rating scale, distribution guidance, eligibility, submission and communication dates, keeping later corrections), staffing-file or FTE discrepancies raised, contractor renewals, and team policy proposals such as working hours or rotation pools",
+      "format": "list"
+    },
+    {
+      "title": "Coaching & Feedback",
+      "instruction": "List advice, coaching or feedback exchanged, including how to communicate with clients, managers or executives, how to delegate or prioritise, and checks on stress or wellbeing. Say who gave each item",
+      "format": "list"
+    },
+    {
+      "title": "Action Items",
+      "instruction": "List every task someone committed to or was assigned. Use the owner's name as spoken in the conversation, write Unassigned when no owner is named, never use speaker labels or descriptions of the speaker, and never merge two people into one owner. Write Not specified when no due date was given, leave out meeting logistics such as sending a link, and always add the reference transcript segment and timestamp",
+      "format": "list",
+      "item_format": "| **Owner** | **Task** | **Due** | **Reference Transcript Segment** | **Segment Time stamp** |\n| --- | --- | --- | --- | --- |"
+    }
+  ]
+}

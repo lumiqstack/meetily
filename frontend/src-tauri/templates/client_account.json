@@ -1,0 +1,51 @@
+{
+  "name": "Client Account & Sales",
+  "description": "Internal account-team reviews of one client (CET), executive engagement debriefs, and sales or pre-sales opportunity calls",
+  "sections": [
+    {
+      "title": "Account Snapshot",
+      "instruction": "In 3 to 5 sentences name the client, say whether this was an internal account meeting, an internal preparation session or a call with the client or its advisor, give any overall status or RAG color stated, and the single most pressing concern. CT or CET in the transcript refers to the recurring account meeting",
+      "format": "paragraph"
+    },
+    {
+      "title": "Production & Projects",
+      "instruction": "One row per support item, incident, project or workstream discussed. Record the status or RAG color exactly as stated, dates and ETAs, open defects or blockers, and any decision such as continue, pause, re-plan or re-scope",
+      "format": "list",
+      "item_format": "| **Item / Project** | **Status** | **Dates / ETA** | **Open issues** | **Decision / Next step** | **Time** |\n| --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Contracts, CRs & Effort",
+      "instruction": "List contract signatures, amendments, omnibus agreements, change requests, support-versus-change-request rulings, man-day consumption and estimates, rates, CPI and billing points, with figures exactly as stated. Write man-days where the transcript says Mondays, mandis or mandates in an effort context",
+      "format": "list",
+      "item_format": "| **Contract / CR / Effort item** | **Status** | **Figures** | **Next step** | **Time** |\n| --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Opportunities",
+      "instruction": "One row per opportunity or upsell. Give the client need or driver, what Murex proposes and any gaps, the stage, price or value quoted, competitors or in-house alternatives, the decision process or dates mentioned, the internal owner and the agreed next step",
+      "format": "list",
+      "item_format": "| **Opportunity** | **Need & proposed solution** | **Stage / Value** | **Competition** | **Decision process & dates** | **Owner** | **Next step** |\n| --- | --- | --- | --- | --- | --- | --- |"
+    },
+    {
+      "title": "Client Stakeholders & Relationship",
+      "instruction": "For each named client or third-party person discussed, state their role, stance toward Murex, influence, and any concern, escalation or trust signal raised. Then note any agreed messaging for upcoming client meetings, visits or executive sessions",
+      "format": "list"
+    },
+    {
+      "title": "Staffing on the Account",
+      "instruction": "List staffing needs, assignments, start dates, capacity conflicts, role handovers and escalations to the staffing team for this client, naming the people and projects involved",
+      "format": "list"
+    },
+    {
+      "title": "Risks & Escalations",
+      "instruction": "List the delivery, contractual, commercial or client-trust risks and escalations raised, their likely impact, and the mitigation or decision agreed",
+      "format": "list",
+      "item_format": "| **Risk / Escalation** | **Impact** | **Mitigation / Decision** | **Owner** |\n| --- | --- | --- | --- |"
+    },
+    {
+      "title": "Action Items",
+      "instruction": "List every task someone committed to or was assigned. Use the owner's name as spoken in the conversation, write Unassigned when no owner is named, never use speaker labels or descriptions of the speaker, and never merge two people into one owner. Write Not specified when no due date was given, leave out meeting logistics such as sending a link, and always add the reference transcript segment and timestamp",
+      "format": "list",
+      "item_format": "| **Owner** | **Task** | **Due** | **Reference Transcript Segment** | **Segment Time stamp** |\n| --- | --- | --- | --- | --- |"
+    }
+  ]
+}

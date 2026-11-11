@@ -4,25 +4,20 @@ This directory contains template definitions for meeting summary generation.
 
 ## Available Templates
 
-### 1. `daily_standup.json`
-Time-boxed daily updates template designed for engineering/product teams.
+Every `*.json` file in this directory is bundled with the app and appears in the template picker; no code change is needed to add one. Keep the set small: each template covers one kind of meeting, and `standard_meeting` is the fallback for anything else.
 
-**Sections:**
-- Date
-- Attendees
-- Yesterday (completed work)
-- Today (planned work)
-- Blockers
-- Notes
+| ID | Name | Use for |
+| --- | --- | --- |
+| `briefing_training` | Briefing & Training | One-to-many sessions: town halls, release presentations, trainings and knowledge transfers, and internal team meetings |
+| `client_account` | Client Account & Sales | Internal account-team reviews of one client (CET), executive engagement debriefs, and sales or pre-sales opportunity calls |
+| `client_workshop` | Client Workshop | Client design and requirements workshops, kickoffs, scoping and estimation reviews, and reviews of workshop minutes or open points |
+| `delivery_sync` | Delivery Sync | Project delivery calls: stream dailies, case and defect reviews, Delta release and go-live readiness, production issues and technical investigations |
+| `people_staffing` | People & Staffing | 1:1s, staffing and pipeline reviews, year-end calibration and talent discussions, headcount and hiring |
+| `standard_meeting` | Standard Meeting Notes | A standard template for general meetings, focusing on key outcomes and actions |
 
-### 2. `standard_meeting.json`
-General-purpose meeting notes template focusing on key outcomes and actions.
+Retired IDs (`daily_standup`, `project_sync`, `sales_marketing_client_call`, `retrospective`, `psychatric_session`) still load: `defaults::replacement_for_retired_template` maps each to its replacement, unless a custom template with that ID exists.
 
-**Sections:**
-- Summary
-- Key Decisions
-- Action Items
-- Discussion Highlights
+Section instructions must not end with a period: the prompt builder appends one. `test_bundled_template_files_are_valid` checks this and validates every file.
 
 ## Template Structure
 
@@ -75,7 +70,7 @@ Templates are loaded using the `templates` module:
 use crate::summary::templates;
 
 // Get a specific template
-let template = templates::get_template("daily_standup")?;
+let template = templates::get_template("standard_meeting")?;
 
 // List available templates
 let available = templates::list_templates();
