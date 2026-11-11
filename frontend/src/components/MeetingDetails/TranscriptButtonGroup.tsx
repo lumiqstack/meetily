@@ -3,10 +3,13 @@
 import { useState, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, FolderOpen, RefreshCw, Users } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
+import { SpeakersDialog } from './SpeakersDialog';
+import type { RenameSpeaker } from './SpeakerRenamePopover';
+import type { MeetingSpeaker } from '@/lib/speaker-names';
 
 
 interface BackgroundRetranscriptionCompleteDetail {
@@ -20,6 +23,8 @@ interface TranscriptButtonGroupProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+  speakers?: readonly MeetingSpeaker[];
+  onRenameSpeaker?: RenameSpeaker;
 }
 
 
@@ -30,9 +35,13 @@ export function TranscriptButtonGroup({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  speakers = [],
+  onRenameSpeaker,
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
+  const [showSpeakersDialog, setShowSpeakersDialog] = useState(false);
+  const canNameSpeakers = !!onRenameSpeaker && speakers.length > 0;
 
   const handleRetranscribeComplete = useCallback(async () => {
     // Refetch transcripts to show the updated data
@@ -93,6 +102,22 @@ export function TranscriptButtonGroup({
           <span className="hidden @[22rem]:inline">Recording</span>
         </Button>
 
+        {canNameSpeakers && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="px-2 @[22rem]:px-4"
+            onClick={() => {
+              Analytics.trackButtonClick('name_speakers', 'meeting_details');
+              setShowSpeakersDialog(true);
+            }}
+            title="Name the speakers in this meeting"
+          >
+            <Users className="@[22rem]:mr-2" size={18} />
+            <span className="hidden @[22rem]:inline">Speakers</span>
+          </Button>
+        )}
+
         {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
           <Button
             size="sm"
@@ -109,6 +134,15 @@ export function TranscriptButtonGroup({
           </Button>
         )}
       </ButtonGroup>
+
+      {canNameSpeakers && onRenameSpeaker && (
+        <SpeakersDialog
+          open={showSpeakersDialog}
+          onOpenChange={setShowSpeakersDialog}
+          speakers={speakers}
+          onRename={onRenameSpeaker}
+        />
+      )}
 
       {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
         <RetranscribeDialog

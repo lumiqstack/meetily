@@ -10,6 +10,8 @@ import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
 import { displaySpeaker } from "@/lib/speaker-label";
+import type { MeetingSpeaker } from "@/lib/speaker-names";
+import { SpeakerRenamePopover, type RenameSpeaker } from "./MeetingDetails/SpeakerRenamePopover";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -35,7 +37,14 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    /** Makes speaker labels rename buttons (saved meetings only; the live view omits it). */
+    onRenameSpeaker?: RenameSpeaker;
+    /** The meeting's speakers, for segment counts and merge targets in the rename popover. */
+    speakers?: readonly MeetingSpeaker[];
 }
+
+const NO_SPEAKERS: readonly MeetingSpeaker[] = [];
 
 // Threshold for enabling virtualization (below this, use simple rendering)
 const VIRTUALIZATION_THRESHOLD = 10;
@@ -73,6 +82,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     speaker,
     isStreaming,
     showConfidence,
+    speakers,
+    onRenameSpeaker,
 }: {
     id: string;
     timestamp: number;
@@ -81,6 +92,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     speaker?: string | null;
     isStreaming: boolean;
     showConfidence: boolean;
+    speakers: readonly MeetingSpeaker[];
+    onRenameSpeaker?: RenameSpeaker;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
@@ -100,9 +113,11 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     </TooltipContent>
                 </Tooltip>
                 <div className="flex-1">
-                    {speaker && (
+                    {speaker && (onRenameSpeaker ? (
+                        <SpeakerRenamePopover speaker={speaker} speakers={speakers} onRename={onRenameSpeaker} />
+                    ) : (
                         <p className="text-xs font-semibold text-blue-600 mb-0.5">{displaySpeaker(speaker)}</p>
-                    )}
+                    ))}
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
                             <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
@@ -130,6 +145,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onRenameSpeaker,
+    speakers = NO_SPEAKERS,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -303,6 +320,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speakers={speakers}
+                                        onRenameSpeaker={onRenameSpeaker}
                                     />
                                 </div>
                             );
@@ -360,6 +379,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         speaker={segment.speaker}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speakers={speakers}
+                                        onRenameSpeaker={onRenameSpeaker}
                                     />
                                 </motion.div>
                             );

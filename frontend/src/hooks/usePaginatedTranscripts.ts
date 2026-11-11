@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Transcript, MeetingMetadata, PaginatedTranscriptsResponse, TranscriptSegmentData } from "@/types";
+import { applySpeakerRename } from "@/lib/speaker-names";
 
 const DEFAULT_PAGE_SIZE = 100;
 
@@ -25,6 +26,8 @@ interface UsePaginatedTranscriptsReturn {
     loadMore: () => Promise<void>;
     reset: () => void;
     refetch: () => Promise<void>;
+    /** Applies a speaker rename the backend already stored to the loaded pages, keeping scroll position. */
+    renameSpeakerLocally: (oldSpeaker: string, newSpeaker: string) => void;
 }
 
 /**
@@ -186,6 +189,10 @@ export function usePaginatedTranscripts({
         }
     }, [meetingId, reset, loadMetadata, loadTranscriptsAtOffset, isCurrentRequest]);
 
+    const renameSpeakerLocally = useCallback((oldSpeaker: string, newSpeaker: string) => {
+        setTranscripts(prev => applySpeakerRename(prev, oldSpeaker, newSpeaker));
+    }, []);
+
     // A new meeting or effect lifetime owns its own requests.
     useEffect(() => {
         activeMeetingIdRef.current = meetingId;
@@ -220,5 +227,6 @@ export function usePaginatedTranscripts({
         loadMore,
         reset,
         refetch,
+        renameSpeakerLocally,
     };
 }

@@ -6,7 +6,7 @@ use tauri_plugin_store::StoreExt;
 
 use crate::{
     database::{
-        models::{MeetingModel, PendingMeetingModel},
+        models::{MeetingModel, MeetingSpeaker, PendingMeetingModel},
         repositories::{
             meeting::MeetingsRepository,
             meeting_calendar::{MeetingCalendar, MeetingCalendarRepository},
@@ -1143,6 +1143,87 @@ pub async fn api_save_meeting_title<R: Runtime>(
             Err(format!("Failed to update meeting: {}", e))
         }
     }
+}
+
+/// Longest speaker name `api_rename_meeting_speaker` accepts, in characters.
+const MAX_SPEAKER_NAME_CHARS: usize = 80;
+
+#[tauri::command]
+pub async fn api_get_meeting_speakers(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<MeetingSpeaker>, String> {
+    log_info!("api_get_meeting_speakers called for meeting_id: {}", meeting_id);
+    TranscriptsRepository::get_meeting_speakers(state.db_manager.pool(), &meeting_id)
+        .await
+        .map_err(|e| {
+            log_error!("Failed to load speakers for meeting {}: {}", meeting_id, e);
+            format!("Failed to load meeting speakers: {}", e)
+        })
+}
+
+/// Rename one speaker across a whole meeting by rewriting the stored
+/// `speaker` value. `old_speaker` is the stored value and matched exactly;
+/// renaming onto an existing name merges the two speakers. Returns the
+/// number of segments rewritten.
+#[tauri::command]
+pub async fn api_rename_meeting_speaker<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    old_speaker: String,
+    new_speaker: String,
+) -> Result<u64, String> {
+    // Names are meeting content: log only the meeting id.
+    log_info!("api_rename_meeting_speaker called for meeting_id: {}", meeting_id);
+    let new_speaker = new_speaker.trim();
+    if new_speaker.is_empty() {
+        return Err("Speaker name cannot be empty".to_string());
+    }
+    if new_speaker.chars().count() > MAX_SPEAKER_NAME_CHARS {
+        return Err(format!(
+            "Speaker name is too long (at most {} characters)",
+            MAX_SPEAKER_NAME_CHARS
+        ));
+    }
+    if new_speaker == old_speaker {
+        return Ok(0);
+    }
+
+    let pool = state.db_manager.pool();
+    let rows = TranscriptsRepository::rename_meeting_speaker(pool, &meeting_id, &old_speaker, new_speaker)
+        .await
+        .map_err(|e| {
+            log_error!("Failed to rename speaker in meeting {}: {}", meeting_id, e);
+            format!("Failed to rename speaker: {}", e)
+        })?;
+    log_info!("Renamed a speaker on {} segments of meeting {}", rows, meeting_id);
+    if rows == 0 {
+        return Ok(0);
+    }
+
+    // Keep the meeting folder's transcripts.json sidecar in step. Best-effort:
+    // the database is the source of truth.
+    match MeetingsRepository::get_meeting_metadata(pool, &meeting_id).await {
+        Ok(Some(MeetingModel { folder_path: Some(folder), .. })) if !folder.is_empty() => {
+            if let Err(e) = crate::audio::common::rename_speaker_in_transcripts_json(
+                std::path::Path::new(&folder),
+                &old_speaker,
+                new_speaker,
+            ) {
+                log_warn!(
+                    "Speaker renamed in the database but transcripts.json for meeting {} was not updated: {}",
+                    meeting_id,
+                    e
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(e) => log_warn!("Failed to load folder of meeting {}: {}", meeting_id, e),
+    }
+
+    emit_meetings_changed(&app, &meeting_id);
+    Ok(rows)
 }
 
 #[tauri::command]

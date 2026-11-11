@@ -806,6 +806,8 @@ pub fn run() {
             api::api_get_meeting_metadata,
             api::api_get_meeting_transcripts,
             api::api_save_meeting_title,
+            api::api_get_meeting_speakers,
+            api::api_rename_meeting_speaker,
             api::api_save_transcript,
             api::open_meeting_folder,
             api::test_backend_connection,

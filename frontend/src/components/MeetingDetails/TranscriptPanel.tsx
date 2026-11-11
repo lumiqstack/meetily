@@ -4,7 +4,8 @@ import { Transcript, TranscriptSegmentData } from '@/types';
 import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
-import { useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
+import { useSpeakerNames } from '@/hooks/meeting-details/useSpeakerNames';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -28,6 +29,12 @@ interface TranscriptPanelProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+
+  // Speaker naming
+  /** Whether the meeting has a summary; a rename leaves its text unchanged. */
+  hasSummary?: boolean;
+  /** Mirrors a stored speaker rename onto the loaded segments without reloading them. */
+  onSpeakerRenamed?: (oldSpeaker: string, newSpeaker: string) => void;
 }
 
 export function TranscriptPanel({
@@ -48,7 +55,26 @@ export function TranscriptPanel({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  hasSummary = false,
+  onSpeakerRenamed,
 }: TranscriptPanelProps) {
+  const handleSpeakerRenamed = useCallback(async (oldSpeaker: string, newSpeaker: string) => {
+    if (onSpeakerRenamed) {
+      onSpeakerRenamed(oldSpeaker, newSpeaker);
+    } else {
+      await onRefetchTranscripts?.();
+    }
+  }, [onSpeakerRenamed, onRefetchTranscripts]);
+
+  const speakerNames = useSpeakerNames({ meetingId, hasSummary, onRenamed: handleSpeakerRenamed });
+  const refreshSpeakers = speakerNames.refresh;
+
+  // Retranscription can add, drop or relabel speakers, so reload them with the transcript.
+  const handleRefetchTranscripts = useMemo(() => onRefetchTranscripts && (async () => {
+    await onRefetchTranscripts();
+    await refreshSpeakers();
+  }), [onRefetchTranscripts, refreshSpeakers]);
+
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
     if (usePagination && segments) {
@@ -75,7 +101,9 @@ export function TranscriptPanel({
           onOpenMeetingFolder={onOpenMeetingFolder}
           meetingId={meetingId}
           meetingFolderPath={meetingFolderPath}
-          onRefetchTranscripts={onRefetchTranscripts}
+          onRefetchTranscripts={handleRefetchTranscripts}
+          speakers={speakerNames.speakers}
+          onRenameSpeaker={meetingId ? speakerNames.rename : undefined}
         />
       </div>
 
@@ -95,6 +123,8 @@ export function TranscriptPanel({
           totalCount={totalCount}
           loadedCount={loadedCount}
           onLoadMore={onLoadMore}
+          speakers={speakerNames.speakers}
+          onRenameSpeaker={meetingId ? speakerNames.rename : undefined}
         />
       </div>
 

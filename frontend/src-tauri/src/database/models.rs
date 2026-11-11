@@ -54,6 +54,17 @@ pub struct Transcript {
     pub speaker: Option<String>,
 }
 
+/// One distinct speaker label of a meeting's transcript. Derived, not stored.
+#[derive(Debug, Clone, PartialEq, FromRow, Serialize, Deserialize)]
+pub struct MeetingSpeaker {
+    /// The stored `transcripts.speaker` value, matched exactly on rename.
+    pub speaker: String,
+    pub segment_count: i64,
+    /// `audio_start_time` of the speaker's first segment; None for rows
+    /// without recording-relative timing.
+    pub first_start: Option<f64>,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct SummaryProcess {
     pub meeting_id: String,
