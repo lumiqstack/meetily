@@ -125,6 +125,48 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
     Ok(())
 }
 
+/// Rewrite `old_speaker` to `new_speaker` in a meeting folder's transcripts.json,
+/// keeping the sidecar in step with a speaker rename in the database. Every
+/// other field is left as written. Returns the number of segments changed;
+/// 0 (and no write) when the file is missing or nothing matches.
+pub(crate) fn rename_speaker_in_transcripts_json(
+    folder: &Path,
+    old_speaker: &str,
+    new_speaker: &str,
+) -> Result<usize> {
+    let transcript_path = folder.join("transcripts.json");
+    if !transcript_path.exists() {
+        return Ok(0);
+    }
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&transcript_path)?)?;
+
+    let mut changed = 0;
+    if let Some(segments) = json.get_mut("segments").and_then(|s| s.as_array_mut()) {
+        for segment in segments {
+            if let Some(speaker) = segment.get_mut("speaker") {
+                if speaker.as_str() == Some(old_speaker) {
+                    *speaker = serde_json::Value::String(new_speaker.to_string());
+                    changed += 1;
+                }
+            }
+        }
+    }
+    if changed == 0 {
+        return Ok(0);
+    }
+
+    let temp_path = folder.join(".transcripts.json.tmp");
+    std::fs::write(&temp_path, serde_json::to_string_pretty(&json)?)?;
+    std::fs::rename(&temp_path, &transcript_path)?;
+    info!(
+        "Renamed a speaker on {} segments in {}",
+        changed,
+        transcript_path.display()
+    );
+    Ok(changed)
+}
+
 /// Split a long speech segment at the lowest-energy (silence) point near the target size.
 ///
 /// Scans for 100ms windows with minimal RMS energy within +/-3 seconds of each target
@@ -255,5 +297,48 @@ mod tests {
 
         acquired_rx.await.unwrap();
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn rename_speaker_in_transcripts_json_rewrites_only_matching_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = |id: &str, speaker: Option<&str>| TranscriptSegment {
+            id: id.to_string(),
+            text: format!("text {id}"),
+            timestamp: "10:00:00".to_string(),
+            audio_start_time: Some(0.0),
+            audio_end_time: Some(1.0),
+            duration: Some(1.0),
+            speaker: speaker.map(str::to_string),
+        };
+        write_transcripts_json(
+            dir.path(),
+            &[segment("1", Some("Speaker 1")), segment("2", Some("Speaker 2")), segment("3", None)],
+        )
+        .unwrap();
+
+        let changed = rename_speaker_in_transcripts_json(dir.path(), "Speaker 1", "Alice").unwrap();
+
+        assert_eq!(changed, 1);
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("transcripts.json")).unwrap(),
+        )
+        .unwrap();
+        let speakers: Vec<serde_json::Value> = json["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["speaker"].clone())
+            .collect();
+        assert_eq!(speakers, vec![serde_json::json!("Alice"), serde_json::json!("Speaker 2"), serde_json::Value::Null]);
+        assert_eq!(json["segments"][0]["text"], "text 1");
+        assert!(!dir.path().join(".transcripts.json.tmp").exists());
+    }
+
+    #[test]
+    fn rename_speaker_in_transcripts_json_without_a_file_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(rename_speaker_in_transcripts_json(dir.path(), "Speaker 1", "Alice").unwrap(), 0);
+        assert!(!dir.path().join("transcripts.json").exists());
     }
 }

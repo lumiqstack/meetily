@@ -1,4 +1,5 @@
 use crate::api::{TranscriptSearchResult, TranscriptSegment};
+use crate::database::models::MeetingSpeaker;
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
 use tracing::{error, info, warn};
@@ -84,6 +85,60 @@ impl TranscriptsRepository {
         transaction.commit().await?;
 
         Ok(meeting_id)
+    }
+
+    /// The distinct speakers of a meeting with their segment counts, ordered
+    /// by first appearance (the transcript view's `audio_start_time` order).
+    /// Rows with a NULL speaker are left out.
+    pub async fn get_meeting_speakers(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Vec<MeetingSpeaker>, SqlxError> {
+        sqlx::query_as::<_, MeetingSpeaker>(
+            "SELECT speaker, COUNT(*) AS segment_count, MIN(audio_start_time) AS first_start
+             FROM transcripts
+             WHERE meeting_id = ? AND speaker IS NOT NULL
+             GROUP BY speaker
+             ORDER BY first_start ASC, MIN(timestamp) ASC, speaker ASC",
+        )
+        .bind(meeting_id)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Rewrite `old_speaker` to `new_speaker` on every segment of one meeting.
+    /// Renaming onto a name another speaker already has merges the two.
+    /// Bumps the meeting's `updated_at` when any row changed. Returns the
+    /// number of segments rewritten.
+    pub async fn rename_meeting_speaker(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        old_speaker: &str,
+        new_speaker: &str,
+    ) -> Result<u64, SqlxError> {
+        let mut conn = pool.acquire().await?;
+        let mut transaction = conn.begin().await?;
+
+        let rows = sqlx::query(
+            "UPDATE transcripts SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
+        )
+        .bind(new_speaker)
+        .bind(meeting_id)
+        .bind(old_speaker)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+
+        if rows > 0 {
+            sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ?")
+                .bind(Utc::now().naive_utc())
+                .bind(meeting_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        transaction.commit().await?;
+        Ok(rows)
     }
 
     /// Searches for a query string within the transcripts.
@@ -480,6 +535,162 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, dense, "denser match must rank first");
+    }
+
+    fn spoken(text: &str, speaker: Option<&str>, start: f64) -> TranscriptSegment {
+        TranscriptSegment {
+            audio_start_time: Some(start),
+            audio_end_time: Some(start + 1.0),
+            speaker: speaker.map(str::to_string),
+            ..seg(text)
+        }
+    }
+
+    async fn speakers_by_row(pool: &SqlitePool, meeting_id: &str) -> Vec<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT transcript, speaker FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time",
+        )
+        .bind(meeting_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn diarized_meeting(pool: &SqlitePool) -> String {
+        TranscriptsRepository::save_transcript(
+            pool,
+            "Diarized",
+            &[
+                spoken("a", Some("Speaker 2"), 0.0),
+                spoken("b", None, 1.0),
+                spoken("c", Some("Speaker 1"), 2.0),
+                spoken("d", Some("Speaker 2"), 3.0),
+                spoken("e", Some("Speaker 1"), 4.0),
+                spoken("f", Some("Speaker 2"), 5.0),
+            ],
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn meeting_speakers_are_listed_by_first_appearance_with_counts() {
+        let pool = test_pool().await;
+        let meeting_id = diarized_meeting(&pool).await;
+        diarized_meeting(&pool).await; // another meeting's rows must not count
+
+        let speakers = TranscriptsRepository::get_meeting_speakers(&pool, &meeting_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            speakers,
+            vec![
+                MeetingSpeaker { speaker: "Speaker 2".into(), segment_count: 3, first_start: Some(0.0) },
+                MeetingSpeaker { speaker: "Speaker 1".into(), segment_count: 2, first_start: Some(2.0) },
+            ],
+            "NULL speakers excluded; order is first appearance, not name"
+        );
+    }
+
+    #[tokio::test]
+    async fn meeting_speakers_of_unknown_meeting_is_empty() {
+        let pool = test_pool().await;
+        let speakers = TranscriptsRepository::get_meeting_speakers(&pool, "meeting-missing")
+            .await
+            .unwrap();
+        assert!(speakers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_touches_only_the_given_meeting_and_speaker() {
+        let pool = test_pool().await;
+        let meeting_id = diarized_meeting(&pool).await;
+        let other_id = diarized_meeting(&pool).await;
+        let other_before = speakers_by_row(&pool, &other_id).await;
+
+        let rows = TranscriptsRepository::rename_meeting_speaker(&pool, &meeting_id, "Speaker 1", "Alice")
+            .await
+            .unwrap();
+
+        assert_eq!(rows, 2);
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            speakers_by_row(&pool, &meeting_id).await,
+            vec![
+                ("a".into(), s("Speaker 2")),
+                ("b".into(), None),
+                ("c".into(), s("Alice")),
+                ("d".into(), s("Speaker 2")),
+                ("e".into(), s("Alice")),
+                ("f".into(), s("Speaker 2")),
+            ],
+            "only Speaker 1 rows change; the NULL row stays NULL"
+        );
+        assert_eq!(speakers_by_row(&pool, &other_id).await, other_before);
+    }
+
+    #[tokio::test]
+    async fn rename_onto_an_existing_name_merges_the_speakers() {
+        let pool = test_pool().await;
+        let meeting_id = diarized_meeting(&pool).await;
+
+        TranscriptsRepository::rename_meeting_speaker(&pool, &meeting_id, "Speaker 1", "Speaker 2")
+            .await
+            .unwrap();
+
+        let speakers = TranscriptsRepository::get_meeting_speakers(&pool, &meeting_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            speakers,
+            vec![MeetingSpeaker { speaker: "Speaker 2".into(), segment_count: 5, first_start: Some(0.0) }]
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_matches_the_stored_value_exactly() {
+        let pool = test_pool().await;
+        let meeting_id = diarized_meeting(&pool).await;
+
+        for near_miss in ["speaker 1", "Speaker 1 ", "Speaker"] {
+            let rows = TranscriptsRepository::rename_meeting_speaker(&pool, &meeting_id, near_miss, "Alice")
+                .await
+                .unwrap();
+            assert_eq!(rows, 0, "{near_miss:?} must not match \"Speaker 1\"");
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_bumps_updated_at_only_when_rows_change() {
+        let pool = test_pool().await;
+        let meeting_id = diarized_meeting(&pool).await;
+        let stamp = "2000-01-01 00:00:00";
+        sqlx::query("UPDATE meetings SET updated_at = ? WHERE id = ?")
+            .bind(stamp)
+            .bind(&meeting_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let updated_at = || async {
+            sqlx::query_as::<_, (String,)>("SELECT updated_at FROM meetings WHERE id = ?")
+                .bind(&meeting_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .0
+        };
+
+        TranscriptsRepository::rename_meeting_speaker(&pool, &meeting_id, "Nobody", "Alice")
+            .await
+            .unwrap();
+        assert_eq!(updated_at().await, stamp, "a no-op rename leaves updated_at alone");
+
+        TranscriptsRepository::rename_meeting_speaker(&pool, &meeting_id, "Speaker 1", "Alice")
+            .await
+            .unwrap();
+        assert_ne!(updated_at().await, stamp);
     }
 
     #[test]

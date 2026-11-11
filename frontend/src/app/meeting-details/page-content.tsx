@@ -18,6 +18,7 @@ import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
 import { useConfig } from '@/contexts/ConfigContext';
+import { hasVisibleSummaryContent } from '@/lib/summary-content';
 
 export default function PageContent({
   meeting,
@@ -29,6 +30,7 @@ export default function PageContent({
   onAutoGenerateComplete,
   onMeetingUpdated,
   onRefetchTranscripts,
+  onSpeakerRenamed,
   // Pagination props for efficient transcript loading
   segments,
   hasMore,
@@ -46,6 +48,7 @@ export default function PageContent({
   onAutoGenerateComplete?: () => void;
   onMeetingUpdated?: () => Promise<void>;
   onRefetchTranscripts?: () => Promise<void>;
+  onSpeakerRenamed?: (oldSpeaker: string, newSpeaker: string) => void;
   // Pagination props
   segments?: any[];
   hasMore?: boolean;
@@ -223,6 +226,8 @@ export default function PageContent({
               meetingId={meeting.id}
               meetingFolderPath={meeting.folder_path}
               onRefetchTranscripts={onRefetchTranscripts}
+              onSpeakerRenamed={onSpeakerRenamed}
+              hasSummary={hasVisibleSummaryContent(meetingData.aiSummary)}
             />
           }
           summary={

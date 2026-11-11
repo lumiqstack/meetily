@@ -38,3 +38,33 @@ describe("transcript speaker rendering", () => {
     expect(html).toContain("Recorded without attribution.");
   });
 });
+
+describe("speaker rename affordance", () => {
+  const segments: TranscriptSegmentData[] = [
+    { id: "s1", text: "Hello.", timestamp: 1, speaker: "mic" },
+  ];
+
+  test("renders a rename button labelled with the display name when renaming is enabled", () => {
+    const html = renderToStaticMarkup(
+      <TooltipProvider>
+        <VirtualizedTranscriptView
+          segments={segments}
+          speakers={[{ speaker: "mic", segment_count: 1, first_start: 1 }]}
+          onRenameSpeaker={async () => true}
+        />
+      </TooltipProvider>
+    );
+    expect(html).toContain('aria-label="Rename speaker Me"');
+    expect(html).toContain("<button");
+  });
+
+  test("keeps a plain label without a rename callback (live view)", () => {
+    const html = renderToStaticMarkup(
+      <TooltipProvider>
+        <VirtualizedTranscriptView segments={segments} />
+      </TooltipProvider>
+    );
+    expect(html).toContain(">Me</p>");
+    expect(html).not.toContain("Rename speaker");
+  });
+});
