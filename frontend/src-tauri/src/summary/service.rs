@@ -644,11 +644,15 @@ impl SummaryService {
         if calendar_context.is_some() {
             info!("📅 Adding calendar context to the summary prompt for meeting_id: {}", meeting_id);
         }
-        // The calendar block changes the prompt, so it is part of the cache key.
+        // Read at summary time so glossary edits apply to the next summary.
+        let glossary = crate::summary::glossary::load();
+        // The calendar block and the glossary change the prompt, so they are
+        // part of the cache key.
         let prompt_context_for_cache = format!(
-            "{}{}",
+            "{}{}{}",
             custom_prompt,
-            calendar_context.as_deref().unwrap_or_default()
+            calendar_context.as_deref().unwrap_or_default(),
+            glossary.as_deref().unwrap_or_default()
         );
 
         let cache_source = build_summary_cache_source(
@@ -702,6 +706,7 @@ impl SummaryService {
             &text,
             &custom_prompt,
             calendar_context.as_deref(),
+            glossary.as_deref(),
             &template_id,
             &template,
             token_threshold,
