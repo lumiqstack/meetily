@@ -8,7 +8,6 @@ import Analytics from "@/lib/analytics"
 import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
 import { OutlookCalendarSettings } from "./OutlookCalendarSettings"
-import { TeamsRecapSyncSettings } from "./TeamsRecapSyncSettings"
 import { usePlatform } from "@/hooks/usePlatform"
 import { toast } from "sonner"
 
@@ -518,7 +517,6 @@ export function PreferenceSettings() {
                   Meetings
                 </button>
               </div>
-              <TeamsRecapSyncSettings vaultConfigured={obsidianVaultPath.trim().length > 0} />
             </div>
           </div>
         </div>

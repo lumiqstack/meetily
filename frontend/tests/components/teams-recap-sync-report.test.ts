@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { describeLastListing, describeSyncReport, type LastListingView } from '../../src/components/TeamsRecapSyncSettings';
+import { describeLastListing, describeSyncReport, type LastListingView } from '../../src/components/TeamsRecapSync';
 
 const base = {
   scanned: 0, new: 0, updated: 0, skipped: 0, kept: 0, notReady: 0, failed: [], possibleDuplicates: [], meetingsFolder: 'V/Meetings',
