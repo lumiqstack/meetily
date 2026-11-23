@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use log::{error, info, warn};
 use super::recording_state::AudioChunk;
@@ -297,31 +297,7 @@ pub async fn cleanup_checkpoints(meeting_folder: String) -> Result<(), String> {
 /// encoder, or legacy `.checkpoints/*.mp4` awaiting a merge.
 #[tauri::command]
 pub async fn has_audio_checkpoints(meeting_folder: String) -> Result<bool, String> {
-    let folder_path = PathBuf::from(&meeting_folder);
-
-    // Streaming encoder writes here continuously, so a non-empty file means
-    // there is audio to recover even though the recording never finished.
-    if std::fs::metadata(folder_path.join("audio.mp4"))
-        .map(|m| m.len() > 0)
-        .unwrap_or(false)
-    {
-        return Ok(true);
-    }
-
-    let checkpoints_dir = folder_path.join(".checkpoints");
-    if !checkpoints_dir.exists() {
-        return Ok(false);
-    }
-
-    // Legacy layout: scan for .mp4 checkpoint files
-    let has_mp4_files = std::fs::read_dir(&checkpoints_dir)
-        .map_err(|e| format!("Failed to read checkpoints directory: {}", e))?
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            entry.path().extension().and_then(|s| s.to_str()) == Some("mp4")
-        });
-
-    Ok(has_mp4_files)
+    Ok(crate::recordings::has_recoverable_audio(Path::new(&meeting_folder)))
 }
 
 #[cfg(test)]

@@ -3,13 +3,17 @@
 import { useState, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw, Users } from 'lucide-react';
+import { Copy, FolderOpen, HardDrive, RefreshCw, Users } from 'lucide-react';
+import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
 import { SpeakersDialog } from './SpeakersDialog';
 import type { RenameSpeaker } from './SpeakerRenamePopover';
 import type { MeetingSpeaker } from '@/lib/speaker-names';
+import { useMeetingAudio } from '@/hooks/useMeetingAudio';
+import { formatBytes } from '@/lib/recordings';
+import { PurgeConfirmDialog } from '@/components/Storage/PurgeConfirmDialog';
 
 
 interface BackgroundRetranscriptionCompleteDetail {
@@ -41,7 +45,11 @@ export function TranscriptButtonGroup({
   const { betaFeatures } = useConfig();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
   const [showSpeakersDialog, setShowSpeakersDialog] = useState(false);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
   const canNameSpeakers = !!onRenameSpeaker && speakers.length > 0;
+  const { audio, removeAudio } = useMeetingAudio(meetingFolderPath ? meetingId : undefined);
+  const enhanceBlocked = audio?.state === 'absent' ? audio.reason.text : null;
+  const removeBlocked = audio?.state === 'held' ? audio.reason.text : null;
 
   const handleRetranscribeComplete = useCallback(async () => {
     // Refetch transcripts to show the updated data
@@ -122,15 +130,41 @@ export function TranscriptButtonGroup({
           <Button
             size="sm"
             variant="outline"
-            className="bg-gradient-to-r from-blue-50 to-purple-50 hover:from-blue-100 hover:to-purple-100 border-blue-200 px-2 @[22rem]:px-4"
+            className={`bg-gradient-to-r from-blue-50 to-purple-50 hover:from-blue-100 hover:to-purple-100 border-blue-200 px-2 @[22rem]:px-4 ${enhanceBlocked ? 'opacity-50 cursor-not-allowed' : ''}`}
+            aria-disabled={!!enhanceBlocked}
             onClick={() => {
+              // aria-disabled rather than disabled, so the reason stays readable on hover.
+              if (enhanceBlocked) {
+                toast.info(enhanceBlocked);
+                return;
+              }
               Analytics.trackButtonClick('enhance_transcript', 'meeting_details');
               setShowRetranscribeDialog(true);
             }}
-            title="Retranscribe to enhance your recorded audio"
+            title={enhanceBlocked ?? 'Retranscribe to enhance your recorded audio'}
           >
             <RefreshCw className="@[22rem]:mr-2" size={18} />
             <span className="hidden @[22rem]:inline">Enhance</span>
+          </Button>
+        )}
+
+        {audio && audio.state !== 'absent' && (
+          <Button
+            size="sm"
+            variant="outline"
+            className={`px-2 @[22rem]:px-4 ${removeBlocked ? 'opacity-50 cursor-not-allowed' : ''}`}
+            aria-disabled={!!removeBlocked}
+            onClick={() => {
+              if (removeBlocked) {
+                toast.info(removeBlocked);
+                return;
+              }
+              setConfirmingRemove(true);
+            }}
+            title={removeBlocked ?? `Remove this meeting's audio and free ${formatBytes(audio.bytes)}`}
+          >
+            <HardDrive className="@[22rem]:mr-2" size={18} />
+            <span className="hidden @[22rem]:inline">Remove audio</span>
           </Button>
         )}
       </ButtonGroup>
@@ -141,6 +175,18 @@ export function TranscriptButtonGroup({
           onOpenChange={setShowSpeakersDialog}
           speakers={speakers}
           onRename={onRenameSpeaker}
+        />
+      )}
+
+      {audio?.state === 'removable' && (
+        <PurgeConfirmDialog
+          open={confirmingRemove}
+          summary={{ meetings: 1, orphans: 0, bytes: audio.bytes }}
+          onCancel={() => setConfirmingRemove(false)}
+          onConfirm={async () => {
+            await removeAudio();
+            setConfirmingRemove(false);
+          }}
         />
       )}
 

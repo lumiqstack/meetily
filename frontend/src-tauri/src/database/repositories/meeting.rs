@@ -56,7 +56,38 @@ const MEETING_LIST_SQL: &str = r#"
     ORDER BY m.created_at DESC
 "#;
 
+/// `has_transcript` and `transcription_incomplete` are the inputs
+/// [`MEETING_LIST_SQL`]'s `transcript_needed` reads; the purge rule must agree
+/// with it (`recordings::tests::judge_agrees_with_transcript_needed`).
+const AUDIO_FACTS_SQL: &str = r#"
+    SELECT m.id AS meeting_id, m.title, m.created_at, m.folder_path,
+           EXISTS (SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id) AS has_transcript,
+           m.transcription_incomplete
+    FROM meetings m
+"#;
+
 impl MeetingsRepository {
+    /// One row per meeting, or only `meeting_id`'s, with what the audio purge
+    /// rule needs to know about it.
+    pub(crate) async fn audio_facts(
+        pool: &SqlitePool,
+        meeting_id: Option<&str>,
+    ) -> Result<Vec<crate::recordings::Facts>, sqlx::Error> {
+        match meeting_id {
+            Some(id) => {
+                sqlx::query_as(&format!("{AUDIO_FACTS_SQL} WHERE m.id = ?"))
+                    .bind(id)
+                    .fetch_all(pool)
+                    .await
+            }
+            None => {
+                sqlx::query_as(&format!("{AUDIO_FACTS_SQL} ORDER BY m.created_at DESC"))
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+    }
+
     pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<Meeting>, sqlx::Error> {
         sqlx::query_as::<_, Meeting>(MEETING_LIST_SQL)
             .fetch_all(pool)

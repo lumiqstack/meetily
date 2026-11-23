@@ -26,6 +26,10 @@ pub(crate) struct JobRegistry {
     id_noun: &'static str,
     active: Mutex<HashSet<String>>,
     cancelled: Mutex<HashSet<String>>,
+    /// IDs no job may start on, kept apart from `active` so a reservation is
+    /// invisible to `is_active`, `has_active_jobs` and `cancel`. Lock order:
+    /// `active` before `reserved`.
+    reserved: Mutex<HashSet<String>>,
 }
 
 /// RAII guard for one active job. Dropping it clears the job's active and
@@ -55,6 +59,7 @@ impl JobRegistry {
             id_noun,
             active: Mutex::new(HashSet::new()),
             cancelled: Mutex::new(HashSet::new()),
+            reserved: Mutex::new(HashSet::new()),
         }
     }
 
@@ -66,6 +71,14 @@ impl JobRegistry {
             if active.contains(&job_id) {
                 return Err(format!(
                     "{} already in progress for {} {}",
+                    self.kind_title, self.id_noun, job_id
+                ));
+            }
+
+            // Worded so the pipeline's retry classifier treats it as busy, not broken.
+            if self.reserved.lock().unwrap_or_else(|e| e.into_inner()).contains(&job_id) {
+                return Err(format!(
+                    "{} cannot start for {} {}: a change to its audio is already in progress",
                     self.kind_title, self.id_noun, job_id
                 ));
             }
@@ -120,6 +133,21 @@ impl JobRegistry {
         })
     }
 
+    /// Keep any job with `job_id` from starting until the returned guard drops,
+    /// without claiming an engine or a remote slot. `None` while such a job is
+    /// running or another reservation holds the ID.
+    pub(crate) fn reserve(&self, job_id: String) -> Option<Reservation<'_>> {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.contains(&job_id) {
+            return None;
+        }
+        let mut reserved = self.reserved.lock().unwrap_or_else(|e| e.into_inner());
+        if !reserved.insert(job_id.clone()) {
+            return None;
+        }
+        Some(Reservation { registry: self, job_id })
+    }
+
     /// Whether the given job ID is currently active.
     pub(crate) fn is_active(&self, job_id: &str) -> bool {
         self.active
@@ -166,6 +194,22 @@ impl JobRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+    }
+}
+
+/// RAII hold from [`JobRegistry::reserve`].
+pub(crate) struct Reservation<'a> {
+    registry: &'a JobRegistry,
+    job_id: String,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job_id);
     }
 }
 
@@ -412,6 +456,40 @@ mod tests {
         );
         drop(fresh);
         assert!(!registry.has_active_jobs());
+    }
+
+    #[test]
+    fn a_reservation_blocks_starts_but_is_invisible_to_observers() {
+        let _serial = global_coordinator_test_lock();
+        let registry = JobRegistry::new(
+            LocalEngineUser::Retranscription,
+            "Retranscription",
+            "retranscription",
+            "meeting",
+        );
+
+        let reservation = registry.reserve("meeting-1".to_string()).expect("idle ID reserves");
+        assert!(!registry.is_active("meeting-1"));
+        assert!(!registry.has_active_jobs());
+        assert!(registry.reserve("meeting-1".to_string()).is_none());
+
+        let err = match registry.acquire("meeting-1".to_string(), true) {
+            Ok(_) => panic!("a reserved ID must not start"),
+            Err(err) => err,
+        };
+        assert!(err.contains("already in progress"), "{err}");
+        assert!(!registry.is_active("meeting-1"), "the refused start must not linger");
+
+        registry.cancel(None);
+        assert!(!registry.is_cancelled("meeting-1"), "cancel-all must not see a reservation");
+
+        let other = registry.acquire("meeting-2".to_string(), true).expect("other IDs still start");
+        drop(other);
+
+        drop(reservation);
+        let guard = registry.acquire("meeting-1".to_string(), true).expect("starts after release");
+        assert!(registry.reserve("meeting-1".to_string()).is_none(), "a running job refuses a reservation");
+        drop(guard);
     }
 
     #[test]

@@ -35,6 +35,7 @@ import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '
 import { MISSING_STAGE_FILTERS, isMissingStage, missingStage, type MeetingStage } from './meetingStages';
 import type { SidebarItem } from './SidebarProvider';
 import { cn } from '@/lib/utils';
+import { deleteReportText, type DeleteMeetingReport } from '@/lib/recordings';
 
 const SEARCH_DEBOUNCE_MS = 250;
 
@@ -339,7 +340,7 @@ const Sidebar: React.FC = () => {
 
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      await invoke('api_delete_meeting', {
+      const report = await invoke<DeleteMeetingReport>('api_delete_meeting', {
         meetingId: itemId,
       });
       console.log('Meeting deleted successfully');
@@ -350,8 +351,8 @@ const Sidebar: React.FC = () => {
       Analytics.trackMeetingDeleted(itemId);
 
       // Show success toast
-      toast.success("Meeting deleted successfully", {
-        description: "All associated data has been removed"
+      toast.success("Meeting deleted", {
+        description: deleteReportText(report)
       });
 
       // If deleting the active meeting, navigate to home

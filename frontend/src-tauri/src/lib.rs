@@ -56,6 +56,7 @@ pub mod groq;
 pub mod openrouter;
 pub mod parakeet_engine;
 pub mod pipeline;
+pub mod recordings;
 pub mod state;
 pub mod storage;
 pub mod summary;
@@ -908,6 +909,9 @@ pub fn run() {
             audio::incremental_saver::recover_audio_from_checkpoints,
             audio::incremental_saver::cleanup_checkpoints,
             audio::incremental_saver::has_audio_checkpoints,
+            recordings::recordings_survey,
+            recordings::recordings_audio_status,
+            recordings::recordings_purge,
             console_utils::show_console,
             console_utils::hide_console,
             console_utils::toggle_console,
