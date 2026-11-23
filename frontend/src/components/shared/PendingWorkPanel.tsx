@@ -8,6 +8,7 @@ import { Loader2, Pause, Play, Trash2, LogIn } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ConfirmationModal } from '@/components/ConfirmationModel/confirmation-modal';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import { deleteReportText, type DeleteMeetingReport } from '@/lib/recordings';
 
 type PipelineStage = 'transcribe' | 'summarize';
 
@@ -200,7 +201,7 @@ export function PendingWorkPanel() {
     const meetingId = deleteTarget.meeting_id;
     setDeleteTarget(null);
     try {
-      await invoke('api_delete_meeting', { meetingId });
+      const report = await invoke<DeleteMeetingReport>('api_delete_meeting', { meetingId });
       setSelected((prev) => {
         const next = new Set(prev);
         next.delete(meetingId);
@@ -208,7 +209,7 @@ export function PendingWorkPanel() {
       });
       await refresh();
       await refetchMeetings();
-      toast.success('Meeting deleted');
+      toast.success('Meeting deleted', { description: deleteReportText(report) });
     } catch (error) {
       toast.error('Failed to delete meeting', {
         description: error instanceof Error ? error.message : String(error),

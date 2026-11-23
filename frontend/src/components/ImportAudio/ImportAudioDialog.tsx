@@ -50,6 +50,7 @@ import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionMod
 import { getSharedImportQueue } from '@/lib/import-queue';
 import { backgroundJobStore } from '@/components/shared/BackgroundJobToast';
 import { oldestMeetingFirst, startsSelected } from '@/lib/sharepoint-order';
+import { formatBytes } from '@/lib/recordings';
 
 /** Matches the Rust BatchCandidate returned by the batch-selection commands. */
 interface BatchCandidate {
@@ -109,13 +110,6 @@ function formatDuration(seconds: number): string {
     return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   }
   return `${minutes}:${secs.toString().padStart(2, '0')}`;
-}
-
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 // Derive a meeting title from a SharePoint/Stream recording link by taking the
@@ -697,7 +691,7 @@ export function ImportAudioDialog({
                       {batchFiles.length} file{batchFiles.length === 1 ? '' : 's'} selected
                     </p>
                     <span className="text-sm text-gray-500">
-                      {formatFileSize(batchFiles.reduce((sum, f) => sum + f.size_bytes, 0))}
+                      {formatBytes(batchFiles.reduce((sum, f) => sum + f.size_bytes, 0))}
                     </span>
                   </div>
                   <div className="max-h-44 overflow-y-auto space-y-1 pr-1">
@@ -711,7 +705,7 @@ export function ImportAudioDialog({
                           {file.file_name}
                         </span>
                         <span className="text-xs text-gray-400 flex-shrink-0">
-                          {formatFileSize(file.size_bytes)}
+                          {formatBytes(file.size_bytes)}
                         </span>
                         <button
                           type="button"
@@ -755,7 +749,7 @@ export function ImportAudioDialog({
                         </span>
                         <span className="flex items-center gap-1">
                           <HardDrive className="h-3.5 w-3.5" />
-                          {formatFileSize(fileInfo.size_bytes)}
+                          {formatBytes(fileInfo.size_bytes)}
                         </span>
                         <span className="text-blue-600 font-medium">{fileInfo.format}</span>
                       </div>
@@ -996,7 +990,7 @@ export function ImportAudioDialog({
                             )}
                             <span className="text-xs text-gray-400 flex-shrink-0">
                               {rec.created ? rec.created.slice(0, 10) : ''}
-                              {rec.size_bytes ? ` · ${formatFileSize(rec.size_bytes)}` : ''}
+                              {rec.size_bytes ? ` · ${formatBytes(rec.size_bytes)}` : ''}
                             </span>
                           </label>
                         ))}
