@@ -422,6 +422,23 @@ fn has_cloud_attributes(_path: &Path) -> bool {
     false
 }
 
+/// Whether `path` is a cloud placeholder whose data is not on this computer
+/// (Windows `OFFLINE` or `RECALL_ON_DATA_ACCESS`). Always false elsewhere.
+#[cfg(windows)]
+pub fn is_online_only_file(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_attributes() & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+pub fn is_online_only_file(_path: &Path) -> bool {
+    false
+}
+
 /// Where recordings lived before the data root existed: the platform's
 /// Music/Movies folder. Also used by the migration to find data to move.
 pub fn historical_recordings_dir() -> PathBuf {

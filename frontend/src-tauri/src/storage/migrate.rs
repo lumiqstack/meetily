@@ -779,7 +779,7 @@ fn migrate_recordings(
 
 /// Files a meeting folder holds (see recording_saver.rs), or `.checkpoints/` from
 /// builds that wrote incremental checkpoints.
-fn is_meeting_folder(dir: &Path) -> bool {
+pub(crate) fn is_meeting_folder(dir: &Path) -> bool {
     dir.is_dir()
         && ["metadata.json", "transcripts.json", "audio.mp4", ".checkpoints"]
             .iter()

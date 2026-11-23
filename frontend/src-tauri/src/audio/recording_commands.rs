@@ -1619,6 +1619,22 @@ pub async fn get_recording_state() -> serde_json::Value {
     }
 }
 
+/// True from the start transition until the stop tail finishes.
+pub(crate) fn recording_in_progress() -> bool {
+    IS_RECORDING.load(Ordering::SeqCst)
+        || IS_RECORDING_STARTING.load(Ordering::SeqCst)
+        || IS_RECORDING_STOPPING.load(Ordering::SeqCst)
+}
+
+/// The folder the live recording writes into, while its manager still holds it.
+pub(crate) fn current_meeting_folder() -> Option<std::path::PathBuf> {
+    RECORDING_MANAGER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get_meeting_folder().map(|p| p.to_path_buf()))
+}
+
 /// Get the meeting folder path for the current recording
 /// Returns the path if a meeting name was set and folder structure initialized
 #[tauri::command]

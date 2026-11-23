@@ -156,7 +156,10 @@ pub async fn reconcile_interrupted_jobs(
             sqlx::query_scalar("SELECT folder_path FROM meetings WHERE folder_path IS NOT NULL")
                 .fetch_all(pool)
                 .await?;
-        if meeting_folders.iter().any(|m| is_same_path(m, folder)) {
+        if meeting_folders
+            .iter()
+            .any(|m| crate::recordings::FolderKey::of(m) == crate::recordings::FolderKey::of(folder))
+        {
             continue;
         }
         match std::fs::remove_dir_all(folder) {
@@ -169,32 +172,6 @@ pub async fn reconcile_interrupted_jobs(
         interrupted,
         removed_folders,
     })
-}
-
-/// True when two recorded paths refer to the same folder even if the writers
-/// rendered them differently (e.g. `C:/x/y` vs `C:\x\y`, a trailing
-/// separator, or — on Windows, where filesystems are case-insensitive — a
-/// case difference). Pure comparison that never errors, so the check stays
-/// fail-safe.
-fn is_same_path(a: &str, b: &str) -> bool {
-    normalized_components(a) == normalized_components(b)
-}
-
-fn normalized_components(path: &str) -> Vec<String> {
-    // `\\?\C:\x` and `C:\x` name the same folder; strip the verbatim prefix
-    // so their drive components compare equal.
-    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-    std::path::Path::new(path)
-        .components()
-        .map(|c| {
-            let component = c.as_os_str().to_string_lossy();
-            if cfg!(windows) {
-                component.to_lowercase()
-            } else {
-                component.into_owned()
-            }
-        })
-        .collect()
 }
 
 /// Drop an interrupted job the user has dismissed (or retried — the retry
